@@ -15,6 +15,11 @@ from .engine_types import ExecutionError, _structural_value
 
 _PERIODIC_EPOCH_MISS_MULTIPLIER = 2
 _PERIODIC_COLD_ISSUE_MULTIPLIER = 2
+_PERIODIC_BASE_MAX_LAG = 24
+_PERIODIC_LAG_MULTIPLIER = 2
+_MAX_PERIODIC_DETECTOR_LAG = 128
+_PERIODIC_BASE_HISTORY_BYTES = 8 * 1024 * 1024
+_PERIODIC_HISTORY_BYTES_PER_RUN = 1024 * 1024
 _MAX_PERIODIC_LIVE_TASKS = 4096
 _MAX_PERIODIC_RUNS = 64
 _MAX_PERIODIC_LIVE_SLOTS = 128
@@ -261,16 +266,18 @@ class _EnginePeriodicMixin:
             for run_id, run in sorted(self._periodic_runs.items())
             if run.get("slots")
         )
+        active_runs = max(1, len(epoch_key))
         miss_budget = _PERIODIC_EPOCH_MISS_MULTIPLIER * detector.history_limit
         any_retired = any(
             int(run.get("finished", 0)) > 0
             for run in self._periodic_runs.values()
             if run.get("slots")
         )
+        base_issue_limit = detector.max_lag * active_runs
         issue_limit = (
-            detector.max_lag
+            base_issue_limit
             if any_retired
-            else _PERIODIC_COLD_ISSUE_MULTIPLIER * detector.max_lag
+            else _PERIODIC_COLD_ISSUE_MULTIPLIER * base_issue_limit
         )
         if epoch_key != self._periodic_stall_epoch:
             if (self._periodic_stall_obs >= miss_budget
@@ -295,9 +302,68 @@ class _EnginePeriodicMixin:
         self._periodic_no_issue_streak = 0
         return False
 
+    def _ensure_periodic_detector(self):
+        """Return (or auto-size) the CycleDetector for the current active periodic run count."""
+        active_runs = max(
+            1,
+            sum(1 for run in self._periodic_runs.values() if run.get("slots")),
+        )
+        required_lag = (
+            _PERIODIC_BASE_MAX_LAG
+            if active_runs * _PERIODIC_LAG_MULTIPLIER <= _PERIODIC_BASE_MAX_LAG
+            else min(_MAX_PERIODIC_DETECTOR_LAG, active_runs * _PERIODIC_LAG_MULTIPLIER)
+        )
+        required_bytes = max(
+            _PERIODIC_BASE_HISTORY_BYTES,
+            active_runs * _PERIODIC_HISTORY_BYTES_PER_RUN,
+        )
+        detector = self._periodic_detector
+        if detector is None:
+            try:
+                from ..engine_periodic import CycleDetector
+            except ImportError:
+                return None
+            detector = CycleDetector(
+                max_lag=required_lag,
+                history_bytes_limit=required_bytes,
+            )
+            self._periodic_detector = detector
+            self._periodic_detector_auto = True
+        elif getattr(self, "_periodic_detector_auto", False) and (
+            detector.max_lag < required_lag
+            or detector.history_bytes_limit < required_bytes
+        ):
+            from ..engine_periodic import CycleDetector
+            detector = CycleDetector(
+                max_lag=max(detector.max_lag, required_lag),
+                history_bytes_limit=max(detector.history_bytes_limit, required_bytes),
+            )
+            self._periodic_detector = detector
+            self._periodic_last = None
+        return detector
+
+    def _periodic_wave_landmark(self):
+        """Compute the issue-wave landmark (per-tile for 1 run; wave-aligned for >1 runs)."""
+        stall_runs = max(1, len(self._periodic_stall_epoch))
+        if stall_runs <= 1:
+            return (self._periodic_stall_epoch, self._periodic_last_next_sum)
+        progressing_next = [
+            int(run.get("next", 0))
+            for run in self._periodic_runs.values()
+            if run.get("slots")
+            and int(run.get("next", 0)) < int(run.get("phase_end", run.get("total", 0)))
+        ]
+        wave_cursor = (
+            min(progressing_next)
+            if progressing_next
+            else self._periodic_last_next_sum
+        )
+        wave_bucket = self._periodic_last_next_sum // stall_runs
+        return (self._periodic_stall_epoch, wave_cursor, wave_bucket)
+
     def _periodic_observe(self, stop_at: float):
         """Read-only periodic frontier observation on the settled Engine."""
-        if not self._periodic_runs:
+        if not self._periodic_runs or self._trace_maxlen > 0:
             return None
         if any(run.get("indexed") for run in self._periodic_runs.values()):
             # G1 selects an indexed catalog by absolute panel. The ordered
@@ -317,14 +383,9 @@ class _EnginePeriodicMixin:
                 or sum(len(tuple(run.get("slots", ())))
                        for run in self._periodic_runs.values()) > _MAX_PERIODIC_LIVE_SLOTS):
             return None
-        detector = self._periodic_detector
+        detector = self._ensure_periodic_detector()
         if detector is None:
-            try:
-                from ..engine_periodic import CycleDetector
-            except ImportError:
-                return None
-            detector = CycleDetector()
-            self._periodic_detector = detector
+            return None
         if not self._progressable_periodic_run(detector.evidence_periods):
             # No run can reach the next comparable period, so no skip is
             # possible here.  Keep the measured interval baseline: the next
@@ -341,12 +402,13 @@ class _EnginePeriodicMixin:
             return None
         previous = self._periodic_last
         stop_at = self._periodic_stop(stop_at)
-        landmark = (self._periodic_stall_epoch, self._periodic_last_next_sum)
+        landmark = self._periodic_wave_landmark()
         clock_steps = None
         if previous is not None:
             clock_steps = previous["clock_steps"]
             clock = self._periodic_clock_step
-            if (clock_steps is not None and len(clock_steps) < detector.max_lag
+            clock_step_limit = detector.max_lag * max(1, len(self._periodic_stall_epoch))
+            if (clock_steps is not None and len(clock_steps) < clock_step_limit
                     and clock is not None and clock[0] == self.advance_steps == previous["advance_steps"] + 1
                     and not self._crossed_external_or_opaque(previous, stop_at)):
                 clock_steps.append(clock[1])

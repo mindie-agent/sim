@@ -35,6 +35,7 @@ from .common import (
 from .lowering import A5_ROCE, CCU, SHMEM, declared_incoming_routes
 
 TARGET_BACKEND = "ascend"
+SCALE_BYTES_MATCH_TOL = 1e-9
 _OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 _SKILLS_REVISION = "750045df251d031bf708de9dc1614c2202eed6dd"
 _XLLM_REVISION = "c77a313bfdd59c0f6e312558808c0de7d2a8d019"
@@ -506,8 +507,20 @@ def _bind_quantized_expert_input(
                        and meta.get("activation_scale_format") == "fp32"
                        and tuple(meta.get("activation_scale_shape", ())) == (math.ceil(received_assignments),))
             requirement = "matching_int8_fp32_per_row"
-        if (not direct or not matched
-                or meta.get("activation_scale_bytes") != received_assignments * layouts[0].scale_bytes):
+        scale_bytes = meta.get("activation_scale_bytes")
+        expected_scale_bytes = float(received_assignments * layouts[0].scale_bytes)
+        scale_bytes_ok = (
+            not isinstance(scale_bytes, bool)
+            and isinstance(scale_bytes, (int, float))
+            and math.isfinite(float(scale_bytes))
+            and math.isclose(
+                float(scale_bytes),
+                expected_scale_bytes,
+                rel_tol=SCALE_BYTES_MATCH_TOL,
+                abs_tol=SCALE_BYTES_MATCH_TOL,
+            )
+        )
+        if not direct or not matched or not scale_bytes_ok:
             raise ModelingError(f"mc2_{quant}_expert_input_requires_{requirement}_producer")
         # The fused dispatch owns the absorbed init-routing quantization,
         # so it publishes both the quantized payload and its scales.

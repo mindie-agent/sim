@@ -407,8 +407,10 @@ class _Mc2Program(Mc2ProgramState):
         count_specs = []
         active = tuple((plan.metadata or {}).get(
             "active_owner_domain") or ())
-        by_name = {str(stage.name): stage
-                   for stage in getattr(program, "stages", ())}
+        status_records = max(0, int(self.experts))
+        if not active or status_records <= 0:
+            return count_specs
+        stages = tuple(getattr(program, "stages", ()))
         count_local = {
             int(item) for item in
             (transport or {}).get("sources", ())}
@@ -421,23 +423,21 @@ class _Mc2Program(Mc2ProgramState):
             if pname == "count_status_exchange"
             and destination in count_local
             and source != destination}
-        status_records = max(0, int(self.experts))
-        quotient, remainder = (
-            divmod(status_records, len(active)) if active else (0, 0))
+        quotient, remainder = divmod(status_records, len(active))
+        covered_stages = 0
         for index, owner in enumerate(active):
-            start = (index * quotient
-                     + min(index, remainder))
+            start = index * quotient + min(index, remainder)
             end = start + quotient + int(index < remainder)
             required_sources = {
                 row % max(1, int(self.peer_count))
                 for row in range(start, end)}
             incoming = tuple(dict.fromkeys(
-                ev for (source, destination, pname), ev
+                ev for (source, _destination, _pname), ev
                 in count_cells.items()
                 if source in required_sources))
             prefix = f"owner{owner}:"
             owner_stages = [
-                stage for stage in getattr(program, "stages", ())
+                stage for stage in stages
                 if str(stage.name).startswith(prefix)]
             read = next((stage for stage in owner_stages
                          if str(stage.name).endswith(":read_status")),
@@ -445,83 +445,43 @@ class _Mc2Program(Mc2ProgramState):
             check = next((stage for stage in owner_stages
                           if str(stage.name).endswith(":check_status")),
                          None)
-            if read is None or check is None:
-                count_specs = []
-                break
-            read = replace(read, after=())
-            check = replace(check, after=(read.name,))
-            stale = {read.name, check.name}
-            tail_stages = []
-            for stage in owner_stages:
-                if stage.name in stale:
-                    continue
-                after = tuple(name for name in stage.after
-                              if name not in stale)
-                tail_stages.append(replace(stage, after=after))
-            if not tail_stages:
-                count_specs = []
-                break
-            failed = KernelProgram((read, check))
-            tail = KernelProgram(tuple(tail_stages))
-            if not any(stage.work for stage in
-                       (read, check, *tail.stages)):
-                count_specs = []
-                break
-            count_specs.append((owner, incoming, failed, tail))
+            if read is None or check is None or len(owner_stages) <= 2:
+                return []
+            if not any(stage.work for stage in owner_stages):
+                return []
+            owner_stage_names = {stage.name for stage in owner_stages}
+            if any(dep not in owner_stage_names for stage in owner_stages for dep in stage.after):
+                return []
+            covered_stages += len(owner_stages)
+            count_specs.append((owner, incoming, KernelProgram(tuple(owner_stages))))
+        if covered_stages != len(stages):
+            return []
         return count_specs
 
-    def _start_receive_count_retries(self, engine, name, phase_name, phase_ready, count_specs):
-        count_done = engine.future(
-            f"{name}:{phase_name}:success")
-        remaining = [len(count_specs)]
-        def owner_try(spec, after_event, *, phase_name=phase_name,
-                      remaining=remaining, count_done=count_done):
-            owner, incoming, failed, tail = spec
-            attempt = [0]
-            def finish(_event):
-                remaining[0] -= 1
-                if remaining[0] == 0:
-                    engine.resolve(count_done)
-            def start_gate(previous, *, owner=owner,
-                           incoming=incoming, failed=failed,
-                           tail=tail, attempt=attempt):
-                def gate(_event, *, owner=owner,
-                         incoming=incoming, failed=failed,
-                         tail=tail, attempt=attempt):
-                    complete = all(item.done for item in incoming)
-                    read_event = failed.start(
-                        engine,
-                        f"{name}:{phase_name}:owner{owner}:"
-                        f"failed{attempt[0]}",
-                        _event)
-                    def read_done(_read, *, owner=owner,
-                                  complete=complete, tail=tail,
-                                  attempt=attempt):
-                        if complete:
-                            final = tail.start(
-                                engine,
-                                f"{name}:{phase_name}:owner{owner}:"
-                                "success", _read)
-                            engine.submit(
-                                f"{name}:{phase_name}:owner{owner}:"
-                                "finish", after=(final,),
-                                owner="receive_count_success",
-                                on_complete=finish, native_hook=True)
-                        else:
-                            attempt[0] += 1
-                            start_gate(_read)
-                    engine.submit(
-                        f"{name}:{phase_name}:owner{owner}:read_done",
-                        after=(read_event,), owner="receive_count_try",
-                        on_complete=read_done, native_hook=True)
+    def _start_receive_count_waits(self, engine, name, phase_name, phase_ready, count_specs):
+        """Gate each owner's status read on exact causal completion of its required count arrivals."""
+        owner_done = []
+        for owner, incoming, owner_program in count_specs:
+            wait_deps = tuple(dict.fromkeys((phase_ready, *incoming)))
+            owner_ready = (
                 engine.submit(
-                    f"{name}:{phase_name}:owner{owner}:gate{attempt[0]}",
-                    after=(previous,), owner="receive_count_try",
-                    on_complete=gate, native_hook=True)
-            start_gate(after_event)
-        for spec in count_specs:
-            owner_try(spec, phase_ready)
-        return count_done
+                    f"{name}:{phase_name}:owner{owner}:ready",
+                    after=wait_deps,
+                )
+                if len(wait_deps) > 1
+                else phase_ready
+            )
+            owner_done.append(
+                owner_program.start(
+                    engine,
+                    f"{name}:{phase_name}:owner{owner}",
+                    owner_ready,
+                )
+            )
+        return engine.submit(
+            f"{name}:{phase_name}:success",
+            after=tuple(owner_done),
+        )
 
     def _start_receive_flag_retries(
         self, engine, name, phase_name, phase_ready, incoming, programs,
@@ -621,16 +581,16 @@ class _Mc2Program(Mc2ProgramState):
             count_specs = self._receive_count_specs(
                 plan, program, view, transport, placeholder_map, source_map=source_map,
             )
-            if count_specs and local_count_event is not None:
+            if (count_specs and local_count_event is not None
+                    and any(incoming for _, incoming, _ in count_specs)):
                 deps = (local_count_event,)
 
         phase_ready = (engine.submit(f"{name}:{phase.name}:ready",
                                      after=deps) if deps else ready)
         if count_specs:
-            event = self._start_receive_count_retries(
+            event = self._start_receive_count_waits(
                 engine, name, phase.name, phase_ready, count_specs,
             )
-            handles["receive_counts_retry"] = True
         elif flag_programs is not None:
             event = self._start_receive_flag_retries(
                 engine, name, phase.name, phase_ready, incoming, flag_programs,

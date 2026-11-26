@@ -652,7 +652,13 @@ def _template_has_prepared_collision(template: PipelineTemplate) -> bool:
 def _template_needs_direct(template: PipelineTemplate) -> bool:
     if any(stage.previous_lags for stage in _iter_template_stages(template)):
         return True
-    if template.indexed_panels is None and any(phase.residue_stages for phase in template.phases):
+    if template.indexed_panels is None and any(
+        stage.program is not None
+        for phase in template.phases
+        if phase.residue_stages
+        for group in phase.residue_stages
+        for stage in group
+    ):
         return True
     return _template_has_prepared_collision(template)
 
@@ -905,9 +911,10 @@ class PipelineTemplateProgram:
             return _start_template_direct(engine, self.template, name, ready, owner)
         nested = any(stage.program is not None for stage in stages)
         allocated = any(stage.acquire or stage.free for stage in stages)
+        has_residue = any(phase.residue_stages for phase in self.template.phases)
         from ..program.catalog import submit_template
         if (
-            not nested and not allocated
+            not nested and not allocated and not has_residue
             and self.template.indexed_panels is None
             and callable(getattr(engine, "submit_catalog", None))
         ):

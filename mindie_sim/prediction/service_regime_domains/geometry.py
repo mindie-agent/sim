@@ -463,6 +463,107 @@ def _match_subpath(value, suffix: str):
     return current
 
 
+_OPERATOR_IDENTITY_KEYS = (
+    "kernel",
+    "recipe",
+    "family",
+    "metadata.program_kind",
+    "metadata.implementation_scope",
+)
+_MATMUL_FAMILIES = frozenset({"gemm", "grouped_gemm", "matmul"})
+_MC2_DISPATCH_RECIPES = frozenset({"mc2_dispatch", "expert_dispatch"})
+_MC2_COMBINE_RECIPES = frozenset({"mc2_combine", "expert_combine"})
+
+
+def _operator_identity_selectors(match: Mapping) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key in _OPERATOR_IDENTITY_KEYS:
+        val = _resolve_match_value(match, key)
+        if val is not _MISSING:
+            out[key] = val
+    return out
+
+
+_HCCL_FAMILIES = frozenset({"hccl_boundary", "hccl_local"})
+
+
+def _known_native_kernel_compatible(kernel_val, key: str, other_val) -> bool | None:
+    """Return bool for known native HCCL/MC2 kernel namespaces, else None."""
+    if not isinstance(kernel_val, str) or not isinstance(other_val, str):
+        return None
+    if kernel_val.startswith("HCCL_"):
+        if key == "recipe":
+            return other_val == "hccl_entry" or other_val == kernel_val
+        if key == "family":
+            return other_val in _HCCL_FAMILIES
+        return False
+    if kernel_val.startswith("MoeDistributeDispatch"):
+        if key == "recipe":
+            return other_val in _MC2_DISPATCH_RECIPES or other_val == kernel_val
+        if key == "family":
+            return other_val == "mc2_dispatch"
+        return False
+    if kernel_val.startswith("MoeDistributeCombine"):
+        if key == "recipe":
+            return other_val in _MC2_COMBINE_RECIPES or other_val == kernel_val
+        if key == "family":
+            return other_val == "mc2_combine"
+        return False
+    return None
+
+
+def _matmul_family_compatible(matmul_match: Mapping, family_val) -> bool:
+    if family_val not in _MATMUL_FAMILIES:
+        return False
+    if family_val == "grouped_gemm" and _resolve_match_value(matmul_match, "metadata.matrix_groups") == 1:
+        return False
+    return True
+
+
+def _operator_namespaces_overlap(left_match: Mapping, right_match: Mapping) -> bool:
+    """True iff two match selectors can match the same physical operator namespace."""
+    left_ids = _operator_identity_selectors(left_match)
+    right_ids = _operator_identity_selectors(right_match)
+    if not left_ids or not right_ids:
+        return True
+    for side_a, side_b, match_a in (
+        (left_ids, right_ids, left_match),
+        (right_ids, left_ids, right_match),
+    ):
+        if "kernel" in side_a:
+            for key in ("recipe", "family", "metadata.program_kind", "metadata.implementation_scope"):
+                if key in side_b:
+                    compat = _known_native_kernel_compatible(side_a["kernel"], key, side_b[key])
+                    if compat is False:
+                        return False
+        if side_a.get("metadata.program_kind") == "matmul" and "family" in side_b:
+            if not _matmul_family_compatible(match_a, side_b["family"]):
+                return False
+    if left_ids.keys() & right_ids.keys():
+        return True
+    # Disjoint selector keys: only physically valid cross-axis bridges can match one op.
+    for side_a, side_b, match_a in (
+        (left_ids, right_ids, left_match),
+        (right_ids, left_ids, right_match),
+    ):
+        if "kernel" in side_a and "recipe" in side_b:
+            if _match_values_equal(side_a["kernel"], side_b["recipe"]):
+                return True
+            if _known_native_kernel_compatible(side_a["kernel"], "recipe", side_b["recipe"]) is True:
+                return True
+        if "kernel" in side_a and "family" in side_b:
+            compat = _known_native_kernel_compatible(side_a["kernel"], "family", side_b["family"])
+            if compat is True or (compat is None and _match_values_equal(side_a["kernel"], side_b["family"])):
+                return True
+        if "family" in side_a and "recipe" in side_b:
+            if _match_values_equal(side_a["family"], side_b["recipe"]):
+                return True
+        if side_a.get("metadata.program_kind") == "matmul" and "family" in side_b:
+            if _matmul_family_compatible(match_a, side_b["family"]):
+                return True
+    return False
+
+
 def _matches_overlap(left_match, right_match) -> bool:
     """True iff some axis assignment can satisfy both match selectors."""
     if not isinstance(left_match, Mapping) or not isinstance(right_match, Mapping):
@@ -479,7 +580,7 @@ def _matches_overlap(left_match, right_match) -> bool:
                 resolved = _match_subpath(parent_val, child_path[len(prefix):])
                 if resolved is _MISSING or not _match_values_equal(resolved, child_val):
                     return False
-    return True
+    return _operator_namespaces_overlap(left_match, right_match)
 
 
 _REDUCERS = {
