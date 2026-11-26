@@ -32,19 +32,29 @@ def _allocation_sig(items):
     return tuple(sorted((item.name, item.pool, item.size, tuple(item.units)) for item in items))
 
 
-def _fold_stage_key(stage):
-    """Exact physical identity of one repeated stage, work included."""
+def _fold_stage_key(stage, *, fair_resources=None):
+    """Exact physical identity of one single-resource allocation-free repeated stage."""
     if stage.program is not None or stage.fragment is not None:
         return None
     if (
         stage.latency > 0.0 or stage.coupled
         or stage.latency_from_first_service or stage.previous_lags
         or stage.deliveries or stage.keep_empty
+        or stage.acquire or stage.free
+        or stage.cohort_size > 1 or stage.cohort_widened or stage.cohort_members
+        or len(stage.work) > 1
     ):
         return None
+    if stage.work:
+        if fair_resources is None:
+            return None
+        rname = next(iter(stage.work))
+        if rname not in fair_resources:
+            return None
     return (
         stage.name, stage.after, stage.previous, stage.priority,
         stage.cohort_size, stage.cohort_widened,
+        tuple(sorted(stage.cohort_members.items())),
         tuple(sorted(stage.work.items())),
         tuple(sorted(stage.caps.items())),
         tuple((key, tuple(units)) for key, units in stage.placement.items()),
@@ -55,14 +65,13 @@ def _fold_stage_key(stage):
     )
 
 
-def _fold_tile_key(stages):
-    rows = []
-    for stage in stages:
-        key = _fold_stage_key(stage)
-        if key is None:
-            return None
-        rows.append(key)
-    return tuple(rows)
+def _fold_tile_key(stages, *, fair_resources=None):
+    # Multi-stage tiles (e.g. load -> compute) cannot batch across tile
+    # boundaries without shifting inter-stage overlap against concurrent peers.
+    if len(stages) != 1:
+        return None
+    key = _fold_stage_key(stages[0], fair_resources=fair_resources)
+    return None if key is None else (key,)
 
 
 def _fold_scaled(stages, repeat: int):
@@ -73,7 +82,7 @@ def _fold_scaled(stages, repeat: int):
     )
 
 
-def interior_fold_plan(program: PipelineProgram):
+def interior_fold_plan(program: PipelineProgram, *, fair_resources=None):
     """Return ``[(representative index, repeat, stages)]`` or ``None``."""
     count, slots = program.count, program.slots
     if program.homogeneous or count < _MIN_FOLD_TILES or slots != 1:
@@ -81,9 +90,9 @@ def interior_fold_plan(program: PipelineProgram):
     if count > PIPELINE_FOLD_WINDOW:
         return None
     tiles = [tuple(program.tile(index)) for index in range(count)]
-    if any(not stages for stages in tiles):
+    if any(len(stages) != 1 for stages in tiles):
         return None
-    keys = [_fold_tile_key(stages) for stages in tiles]
+    keys = [_fold_tile_key(stages, fair_resources=fair_resources) for stages in tiles]
     if any(key is None for key in keys):
         return None
     period = None
@@ -110,9 +119,9 @@ def interior_fold_plan(program: PipelineProgram):
     return folded
 
 
-def fold_interior_pipeline(program: PipelineProgram):
+def fold_interior_pipeline(program: PipelineProgram, *, fair_resources=None):
     """Return an exactly-folded equivalent program, or ``None``."""
-    plan = interior_fold_plan(program)
+    plan = interior_fold_plan(program, fair_resources=fair_resources)
     if plan is None:
         return None
     stages = tuple(entry[2] for entry in plan)
@@ -228,7 +237,10 @@ class PipelineProgram:
                 engine, name, ready, owner=owner
             )
         if self.interior_fold:
-            folded = fold_interior_pipeline(self)
+            fair_resources = frozenset(
+                rname for rname, res in engine.resources.items() if res.policy == "fair"
+            )
+            folded = fold_interior_pipeline(self, fair_resources=fair_resources)
             if folded is not None:
                 return folded.start(engine, name, ready, owner=owner)
         if self.count == 0 and not self.setup_ms and not self.minimum_ms:

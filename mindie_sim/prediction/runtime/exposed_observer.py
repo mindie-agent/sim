@@ -139,11 +139,92 @@ class ServiceGrantObserver:
     def on_allocation(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
-    def extract_cycle_pattern(self, *_args: Any, **_kwargs: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-        return (), ()
+    def extract_cycle_pattern(
+        self, start_ms: float, end_ms: float,
+    ) -> tuple[tuple[tuple[str, int, int, float, float, float], ...], tuple[Any, ...]]:
+        """Extract service grants clipped to ``[start_ms, end_ms]`` relative to ``start_ms``."""
+        s0 = float(start_ms)
+        s1 = float(end_ms)
+        if s1 <= s0:
+            return (), ()
+        pattern: list[tuple[str, int, int, float, float, float]] = []
+        for (t0_ms, t1_ms, rname, owner, idx), deliv in self._grant_acc.items():
+            if deliv <= 0.0 or t1_ms <= s0 or t0_ms >= s1:
+                continue
+            span = t1_ms - t0_ms
+            if span <= 0.0:
+                continue
+            c_lo = t0_ms if t0_ms > s0 else s0
+            c_hi = t1_ms if t1_ms < s1 else s1
+            if c_hi <= c_lo:
+                continue
+            frac = 1.0 if (c_lo == t0_ms and c_hi == t1_ms) else (c_hi - c_lo) / span
+            clipped = deliv * frac
+            if clipped > 0.0:
+                pattern.append((rname, owner, idx, c_lo - s0, c_hi - s0, clipped))
+        pattern.sort()
+        return tuple(pattern), ()
 
-    def on_period(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
+    def on_period(
+        self,
+        anchor_ms: float,
+        period_ms: float,
+        repeats: int,
+        *,
+        template_id: str = "",
+        state_digest: str = "",
+        service_pattern: Sequence[tuple[str, int, int, float, float, float]] = (),
+        handoff_pattern: Sequence[Any] = (),
+    ) -> None:
+        """Project conserved per-owner service across ``repeats`` cycles preserving phase overlap."""
+        del template_id, state_digest, handoff_pattern
+        count = int(repeats)
+        p_ms = float(period_ms)
+        if count <= 0 or p_ms <= 0.0 or not service_pattern:
+            return
+        a_ms = float(anchor_ms)
+        cleaned: list[tuple[str, int, int, float, float, float]] = []
+        for rname, owner, idx, rel_t0, rel_t1, deliv in service_pattern:
+            t0_r = max(0.0, min(p_ms, float(rel_t0)))
+            t1_r = max(0.0, min(p_ms, float(rel_t1)))
+            amt = float(deliv)
+            if amt > 0.0 and t1_r > t0_r:
+                cleaned.append((str(rname), int(owner), int(idx), t0_r, t1_r, amt))
+        if not cleaned:
+            return
+        if count == 1:
+            for rname, owner, idx, t0_r, t1_r, amt in cleaned:
+                t0 = a_ms + t0_r
+                t1 = a_ms + t1_r
+                if t1 > t0:
+                    key = (t0, t1, rname, owner, idx)
+                    self._grant_acc[key] = self._grant_acc.get(key, 0.0) + amt
+            return
+        # Pack elementary within-cycle phases contiguously across [a_ms, a_ms + count * p_ms)
+        # so memory stays O(|pattern|) while instantaneous within-cycle resource contention
+        # and exact delivered service per owner remain identical to literal replay.
+        cuts_set: set[float] = {0.0, p_ms}
+        for _, _, _, t0_r, t1_r, _ in cleaned:
+            cuts_set.add(t0_r)
+            cuts_set.add(t1_r)
+        cuts = sorted(cuts_set)
+        scale = float(count)
+        for u_lo, u_hi in zip(cuts, cuts[1:]):
+            seg = u_hi - u_lo
+            if seg <= 0.0:
+                continue
+            p_lo = a_ms + u_lo * scale
+            p_hi = a_ms + u_hi * scale
+            if p_hi <= p_lo:
+                continue
+            for rname, owner, idx, t0_r, t1_r, amt in cleaned:
+                if t0_r <= u_lo and t1_r >= u_hi:
+                    span = t1_r - t0_r
+                    part = amt if (u_lo == t0_r and u_hi == t1_r) else amt * (seg / span)
+                    total_deliv = part * scale
+                    if total_deliv > 0.0:
+                        key = (p_lo, p_hi, rname, owner, idx)
+                        self._grant_acc[key] = self._grant_acc.get(key, 0.0) + total_deliv
 
 
 @dataclass(frozen=True)
@@ -755,7 +836,7 @@ class ExposedObserver:
         )
 
     def begin_scope(self, scope_id: Any, start_ms: float, inputs: Any = ()) -> None:
-        clocks = ()
+        clocks: tuple[ExposedClocks, ...] = ()
         seeded: dict[Any, ExposedClocks] = {}
         if isinstance(inputs, Mapping):
             seeded = {key: value for key, value in inputs.items()

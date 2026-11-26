@@ -117,7 +117,6 @@ def compact_refill(context, pattern, repeats, tail=(), *, refill_slots=2, consum
     ))
 
 
-_PROBE_CACHE_MAX = (2 * 2 * 2 * 2) * (2 * 2 * 2 * 2) * (2 * 2)
 _PROBE_TRACE_TASKS_PER_STAGE = 2
 _PROBE_TRACE_OVERHEAD_TASKS = 8
 _PERIODIC_SLOPE_REL_TOL = 1e-7
@@ -136,15 +135,17 @@ def _encoded_tile_stage_count(records):
     return total
 
 
-def _trace_tile_index(task_name: str) -> int | None:
+def _trace_tile_stage(task_name: str) -> tuple[int, str] | None:
     marker = ":tile"
     pos = task_name.find(marker)
     if pos < 0:
         return None
     rest = task_name[pos + len(marker):]
     sep = rest.find(":")
-    token = rest if sep < 0 else rest[:sep]
-    return int(token) if token.isdigit() else None
+    if sep < 0:
+        return (int(rest), "") if rest.isdigit() else None
+    token = rest[:sep]
+    return (int(token), rest[sep + 1:]) if token.isdigit() else None
 
 
 def _decode_periodic_program(nested, slot):
@@ -187,7 +188,6 @@ def _decode_periodic_stage(record, slot):
     )
 
 
-@lru_cache(maxsize=_PROBE_CACHE_MAX)
 def _periodic_probe(
     resources, pools, resident_records, slots,
     head_records, steady_records, tail_records, s_count,
@@ -201,13 +201,11 @@ def _periodic_probe(
     pool_dict = {pid: cap for pid, cap, _ in pools}
     pool_units = {pid: units for pid, _, units in pools}
     total = h_len + s_count + t_len
-    trace_limit = 0
-    if h_len:
-        per_tile = max(
-            (_encoded_tile_stage_count(rec) for rec in (*head_records, steady_records, *tail_records)),
-            default=1,
-        )
-        trace_limit = total * (per_tile * _PROBE_TRACE_TASKS_PER_STAGE + _TWO_FACTOR) + _PROBE_TRACE_OVERHEAD_TASKS
+    per_tile = max(
+        (_encoded_tile_stage_count(rec) for rec in (*head_records, steady_records, *tail_records)),
+        default=1,
+    )
+    trace_limit = total * (per_tile * _PROBE_TRACE_TASKS_PER_STAGE + _THREE_FACTOR) + _PROBE_TRACE_OVERHEAD_TASKS
     engine = Engine(
         tuple(Resource(name, rate, policy=policy, units=units) for name, rate, units, policy in resources),
         pools=pool_dict, pool_units=pool_units, trace_limit=trace_limit,
@@ -241,21 +239,36 @@ def _periodic_probe(
             delta = peak - resident_by_unit.get((pid, unit), 0.0)
             if delta > 0.0:
                 peaks.append((pid, unit, delta))
+    trace_entries = tuple(engine.trace)
+    trace_complete = engine.trace_dropped == 0 and len(trace_entries) < trace_limit
     head_end = 0.0
-    steady_starts: list[float] = [done.time] * s_count
-    if h_len:
-        for entry in engine.trace:
-            idx = _trace_tile_index(entry["task"])
-            if idx is None:
-                continue
-            if idx < h_len:
-                if entry["end_ms"] > head_end:
-                    head_end = float(entry["end_ms"])
-            elif h_len <= idx < h_len + s_count:
-                offset = idx - h_len
-                if entry["start_ms"] < steady_starts[offset]:
-                    steady_starts[offset] = float(entry["start_ms"])
-    return done.time, tuple(peaks), head_end, tuple(steady_starts)
+    tail_start = inf
+    tile_events: list[list[tuple[str, float, float]]] = [[] for _ in range(total)]
+    tile_starts: list[float] = [done.time] * total
+    tile_ends: list[float] = [0.0] * total
+    for entry in trace_entries:
+        parsed = _trace_tile_stage(entry["task"])
+        if parsed is None:
+            continue
+        idx, stage_path = parsed
+        if not (0 <= idx < total):
+            continue
+        start_ms = float(entry["start_ms"])
+        end_ms = float(entry["end_ms"])
+        tile_events[idx].append((stage_path, start_ms, end_ms))
+        if start_ms < tile_starts[idx]:
+            tile_starts[idx] = start_ms
+        if end_ms > tile_ends[idx]:
+            tile_ends[idx] = end_ms
+        if idx < h_len and end_ms > head_end:
+            head_end = end_ms
+        elif idx >= h_len + s_count and start_ms < tail_start:
+            tail_start = start_ms
+    schedules = tuple(tuple(sorted(items)) for items in tile_events)
+    return (
+        done.time, tuple(peaks), head_end, tail_start,
+        tuple(tile_starts), tuple(tile_ends), schedules, trace_complete,
+    )
 
 
 _PERIODIC_CACHE_SIZE = 1024
@@ -276,26 +289,83 @@ def _merge_probe_peaks(*peak_sets):
     return tuple((pid, unit, size) for (pid, unit), size in sorted(merged.items()))
 
 
+def _window_shifted_exact(sched_a, sched_b, delta: float, tol: float) -> bool:
+    """True iff every stage start and end across two equal-length tile windows shifts by delta."""
+    if not sched_a or len(sched_a) != len(sched_b):
+        return False
+    for tile_a, tile_b in zip(sched_a, sched_b, strict=True):
+        if not tile_a or len(tile_a) != len(tile_b):
+            return False
+        for (stage_a, start_a, end_a), (stage_b, start_b, end_b) in zip(tile_a, tile_b, strict=True):
+            if stage_a != stage_b:
+                return False
+            if abs((start_b - start_a) - delta) > tol or abs((end_b - end_a) - delta) > tol:
+                return False
+    return True
+
+
+def _probe_steady_state_proved(r1, r2, *, h_len: int, t_len: int, w: int, step: int, lookback: int, delta: float) -> bool:
+    """Prove exact periodic steady state across a full lookback window after prologue drain."""
+    if not (r1[7] and r2[7]):
+        return False
+    t2 = r2[0]
+    tol = _PERIODIC_SLOPE_REL_TOL * max(_JOINT_TIME_EPS_MS, abs(delta)) + 1e-12 * max(1.0, abs(t2))
+    # Pure steady windows inside r2: [a_idx, a_idx + lookback) -> [b_idx, b_idx + lookback)
+    # stay at least ``step`` steady tiles before the tail and require full prologue/straggler drain.
+    a_idx = h_len + w - lookback
+    b_idx = a_idx + step
+    r2_starts, r2_ends, r2_sched = r2[4], r2[5], r2[6]
+    min_a_start = min(r2_starts[a_idx:a_idx + lookback])
+    if h_len and r2[2] > min_a_start + _JOINT_TIME_EPS_MS:
+        return False
+    straggler_end = max(r2_ends[:max(0, a_idx - lookback + 1)], default=0.0)
+    if straggler_end > min_a_start + _JOINT_TIME_EPS_MS:
+        return False
+    min_b_start = min(r2_starts[b_idx:b_idx + lookback])
+    if max(r2_ends[:a_idx], default=0.0) > min_b_start + _JOINT_TIME_EPS_MS:
+        return False
+    if t_len and max(r2_ends[b_idx:b_idx + lookback], default=0.0) > r2[3] + _JOINT_TIME_EPS_MS:
+        return False
+    if not _window_shifted_exact(
+        r2_sched[a_idx:a_idx + lookback], r2_sched[b_idx:b_idx + lookback], delta, tol,
+    ):
+        return False
+    # Suffix entering tail + entire tail must shift by the exact same period between r1 and r2.
+    r1_suf_start = h_len + w + step - lookback
+    r2_suf_start = h_len + w + _TWO_FACTOR * step - lookback
+    return _window_shifted_exact(r1[6][r1_suf_start:], r2_sched[r2_suf_start:], delta, tol)
+
+
 @lru_cache(maxsize=_PERIODIC_CACHE_SIZE)
 def _periodic_pair(
     resources, pools, resident_records, slots,
     head_records, steady_records, tail_records, max_steady, max_lag=_ONE_TILE,
 ):
-    """Verify 3-point periodic convergence and extract (base_w, t0, slope, peaks, converged)."""
+    """Verify 3-point periodic convergence and exact stage-shift steady state."""
     step = max(_TWO_FACTOR, slots)
+    lookback = max(step, max_lag)
+    h_len, t_len = len(head_records), len(tail_records)
+
+    # Keep probe traces scoped to this convergence search so module-level LRU
+    # caches retain only the compact 5-scalar result from ``_periodic_pair``.
+    local_probes: dict[int, tuple] = {}
 
     def run_for(s_count):
-        return _periodic_probe(
-            resources, pools, resident_records, slots,
-            head_records, steady_records, tail_records, s_count,
-        )
+        cached = local_probes.get(s_count)
+        if cached is None:
+            cached = _periodic_probe(
+                resources, pools, resident_records, slots,
+                head_records, steady_records, tail_records, s_count,
+            )
+            local_probes[s_count] = cached
+        return cached
 
     bn = _FOUR_TILES
     b0 = bn * _TWO_FACTOR
     b1 = b0 * _THREE_FACTOR
     b2 = b1 * _THREE_FACTOR
     b3 = b2 * _TWO_FACTOR
-    min_w = max(step, ((max_lag + step - 1) // step) * step)
+    min_w = ((lookback + step - 1) // step) * step
     tried = set()
     for base in (bn, b0, b1, b2, b3):
         w = max((base // step) * step, min_w)
@@ -305,13 +375,16 @@ def _periodic_pair(
         if w + _TWO_FACTOR * step > max_steady:
             break
         r0, r1, r2 = run_for(w), run_for(w + step), run_for(w + _TWO_FACTOR * step)
-        if head_records and r1[2] > r1[3][w] + _JOINT_TIME_EPS_MS:
-            continue
         t0, t1, t2 = r0[0], r1[0], r2[0]
         d1 = t1 - t0
         d2 = t2 - t1
-        if d1 > 0 and abs(d2 - d1) <= _PERIODIC_SLOPE_REL_TOL * max(_JOINT_TIME_EPS_MS, abs(d1)):
-            return w, t0, d1 / step, _merge_probe_peaks(r0[1], r1[1], r2[1]), True
+        if not (d1 > 0 and abs(d2 - d1) <= _PERIODIC_SLOPE_REL_TOL * max(_JOINT_TIME_EPS_MS, abs(d1))):
+            continue
+        if not _probe_steady_state_proved(
+            r1, r2, h_len=h_len, t_len=t_len, w=w, step=step, lookback=lookback, delta=d1,
+        ):
+            continue
+        return w, t0, d1 / step, _merge_probe_peaks(r0[1], r1[1], r2[1]), True
     return 0, 0.0, 0.0, (), False
 
 

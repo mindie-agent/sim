@@ -583,3 +583,122 @@ def test_periodic_clock_exact_matches_reference_addition_loop():
         assert _advance_periodic_clock_exact(now, steps, cycles) == _advance_periodic_clock(now, steps, cycles)
     huge = (1 << 31) + 98
     assert _advance_periodic_clock_exact(4.0, (1.0,), huge) == float(4 + huge)
+
+
+@pytest.mark.parametrize("backend", ["python", "c"])
+def test_disconnected_priority_task_never_perturbs_peer_resource_rates(backend):
+    """Priority differences on unrelated resources must not alter peer completions."""
+    def finish(aux_priorities):
+        eng = Engine([Resource("pipe", 4, units=2), Resource("aux", 1)], backend=backend)
+        wide = eng.submit("all", {"pipe": 8}, priority=1)
+        pinned = eng.submit("pinned", {"pipe": 16}, placement={"pipe": (1,)}, priority=1)
+        for idx, prio in enumerate(aux_priorities):
+            eng.submit(f"aux{idx}", {"aux": 100}, priority=prio)
+        eng.advance(until=(wide, pinned), first=False)
+        return tuple(round(ev.time, 6) for ev in (wide, pinned))
+
+    baseline = finish(())
+    assert baseline == (6.0, 10.0)
+    assert finish((1,)) == baseline and finish((0,)) == baseline and finish((0, 1)) == baseline
+
+    # A lower-priority waiter on a saturated unit must not speed up higher-priority work.
+    eng_wait = Engine([Resource("pipe", 4, units=2), Resource("aux", 1)], backend=backend)
+    w_hi = eng_wait.submit("wide", {"pipe": 8}, priority=0)
+    p_hi = eng_wait.submit("pin", {"pipe": 16}, placement={"pipe": (1,)}, priority=0)
+    eng_wait.submit("aux", {"aux": 100}, priority=1)
+    eng_wait.submit("low", {"pipe": 100}, placement={"pipe": (1,)}, priority=1)
+    eng_wait.advance(until=(w_hi, p_hi), first=False)
+    assert tuple(round(ev.time, 6) for ev in (w_hi, p_hi)) == baseline
+
+    # An unplaced lower tier must absorb non-uniform residual capacity rather than stranding it.
+    eng_res = Engine([Resource("pipe", 4, units=2)], backend="python")
+    hi = eng_res.submit("hi", {"pipe": 2}, caps={"pipe": 1}, placement={"pipe": (1,)}, priority=0)
+    lo = eng_res.submit("lo", {"pipe": 6}, priority=1)
+    eng_res.advance(until=(hi, lo), first=False)
+    assert (round(hi.time, 6), round(lo.time, 6)) == (2.0, 2.0)
+
+    # A lower-priority coupled waiter on {q, r} must not alter uncoupled arbitration on p via {p, q}.
+    if backend == "python":
+        def coupled_waiter_finish(add_waiter: bool):
+            eng_c = Engine([Resource("p", 4, units=2), Resource("q", 1), Resource("r", 1)], backend="python")
+            w_c = eng_c.submit("wide", {"p": 8, "q": 1}, priority=0)
+            p_c = eng_c.submit("pin", {"p": 16}, placement={"p": (1,)}, priority=0)
+            if add_waiter:
+                eng_c.submit("waiter", {"q": 10, "r": 10}, priority=1, coupled=True)
+            eng_c.advance(until=(w_c, p_c), first=False)
+            return round(w_c.time, 6), round(p_c.time, 6)
+
+        assert coupled_waiter_finish(False) == coupled_waiter_finish(True) == (6.0, 10.0)
+
+
+def test_stalled_periodic_epoch_bypasses_observe_and_skips_idle_cohort_scan(monkeypatch):
+    """Multi-run lag scales cleanly; stalled epochs bypass observe and reset on external/phase change."""
+    from mindie_sim.prediction.program import PipelinePhase, PipelineTemplate
+    from mindie_sim.prediction.scheduling.templates import start_pipeline_template
+
+    eng_scale = Engine([Resource("cube", 1)], backend="python")
+    assert eng_scale._ensure_periodic_detector(24).max_lag == 48
+    assert eng_scale._ensure_periodic_detector(100).max_lag == 128
+
+    # Zero-cohort and unplaced-cohort workloads skip _settle_asymmetric_cohorts cleanly.
+    split_calls = 0
+    orig_settle = Engine._settle_asymmetric_cohorts
+
+    def _counting_settle(self):
+        nonlocal split_calls
+        split_calls += 1
+        return orig_settle(self)
+
+    monkeypatch.setattr(Engine, "_settle_asymmetric_cohorts", _counting_settle)
+    eng_no_coh = Engine([Resource("cube", 2, units=2)], backend="python")
+    ev0 = eng_no_coh.submit("solo", {"cube": 2}, placement={"cube": (0,)})
+    eng_no_coh.advance(until=(ev0,))
+    assert split_calls == 0 and eng_no_coh._cohort_active == 0
+
+    sync_calls = 0
+    eng_stag = Engine([Resource("cube", 2, units=2)], backend="python")
+    orig_sync = eng_stag._sync_cohort_active
+
+    def _counting_sync():
+        nonlocal sync_calls
+        sync_calls += 1
+        return orig_sync()
+
+    monkeypatch.setattr(eng_stag, "_sync_cohort_active", _counting_sync)
+    for idx in range(40):
+        eng_stag.submit(f"c{idx}", {"cube": 2}, cohort_size=2, release=2 * idx)
+    eng_stag.advance()
+    assert split_calls == 0 and sync_calls == 0
+
+    eng_coh = Engine([Resource("cube", 2, units=2)], backend="python")
+    ev_c = eng_coh.submit(
+        "coh", {"cube": 4}, placement={"cube": (0, 1)}, cohort_size=2,
+        cohort_widened=("cube",), cohort_members={"cube": ((0,), (1,))},
+    )
+    ev_p = eng_coh.submit("peer", {"cube": 1}, placement={"cube": (0,)})
+    eng_coh.advance(until=(ev_c, ev_p), first=False)
+    assert split_calls >= 1 and eng_coh._cohort_active == 0
+
+    # A stalled non-periodic phase latches O(1) bypass, then resets on phase change so phase 2 skips.
+    eng_stall = Engine([Resource("cube", 1), Resource("aux", 1)], backend="python")
+    p_stall = PipelinePhase("stall", (Stage("t", {"cube": 1}),), 20)
+    p_steady = PipelinePhase("steady", (Stage("t", {"cube": 1}),), 200)
+    ready = eng_stall.submit("ready")
+    done = start_pipeline_template(eng_stall, PipelineTemplate(0, 1, (p_stall, p_steady)), "op", ready)
+    for idx in range(12):
+        eng_stall.submit(f"ext{idx}", {"aux": 1.3}, release=idx * 1.3)
+    eng_stall.advance(until=(done,))
+    assert done.time == pytest.approx(220.0)
+    assert eng_stall.serviced["cube"] == pytest.approx(220.0)
+    assert eng_stall._periodic_detector.stats()["skipped_cycles"] > 150
+
+    # Finishing a long external task mid-phase unlatches the stall so the steady suffix still skips.
+    eng_ext = Engine([Resource("cube", 1), Resource("aux", 1)], backend="python")
+    done_ext = start_pipeline_template(
+        eng_ext, PipelineTemplate(0, 1, (PipelinePhase("steady", (Stage("t", {"cube": 1}),), 200),)),
+        "op", eng_ext.submit("ready"),
+    )
+    eng_ext.submit("ext_bg", {"aux": 150})
+    eng_ext.advance(until=(done_ext,))
+    assert done_ext.time == pytest.approx(200.0)
+    assert eng_ext._periodic_detector.stats()["skipped_cycles"] >= 40

@@ -13,8 +13,11 @@ import math
 
 from .engine_types import ExecutionError, _structural_value
 
+_PERIODIC_EPOCH_MISS_MULTIPLIER = 2
 _PERIODIC_COLD_ISSUE_MULTIPLIER = 2
 _PERIODIC_BASE_MAX_LAG = 24
+_PERIODIC_LAG_MULTIPLIER = 2
+_MAX_PERIODIC_DETECTOR_LAG = 128
 _PERIODIC_NO_ISSUE_STEPS_PER_RUN = 8
 _MAX_PERIODIC_NO_ISSUE_STEPS = 256
 _PERIODIC_CLOCK_STEPS_PER_RUN = 16
@@ -343,6 +346,53 @@ class _EnginePeriodicMixin:
             active_items.sort(key=lambda item: item[0])
         return indexed, total_slots, active_items
 
+    def _mark_periodic_epoch_stalled(self, detector) -> None:
+        """Record an O(1) stall latch for the current active periodic epoch."""
+        self._periodic_epoch_is_stalled = True
+        self._periodic_stalled_seq = self._sequence
+        self._periodic_stalled_completed = self.completed_count
+        self._periodic_stalled_runs_len = len(self._periodic_runs)
+        self._periodic_stalled_detector = detector
+        self._periodic_stall_ext = self._external_completions
+        self._periodic_last = None
+        self._periodic_clock_step = None
+
+    def _periodic_epoch_still_stalled(self) -> bool:
+        """Return True in O(1) while the stalled periodic epoch has not transitioned."""
+        if not self._periodic_epoch_is_stalled:
+            return False
+        runs = self._periodic_runs
+        if (self._periodic_stalled_detector is not self._periodic_detector
+                or self._external_completions != self._periodic_stall_ext):
+            self._periodic_epoch_is_stalled = False
+            return False
+        if (self._sequence == self._periodic_stalled_seq
+                and self.completed_count == self._periodic_stalled_completed
+                and len(runs) == self._periodic_stalled_runs_len):
+            return True
+        epoch = self._periodic_stall_epoch
+        if epoch is None:
+            self._periodic_epoch_is_stalled = False
+            return False
+        active_count = 0
+        for run_id, p_ord, p_end in epoch:
+            run = runs.get(run_id)
+            if (run is None or not run.get("slots")
+                    or run.get("phase_ordinal", 0) != p_ord
+                    or run.get("phase_end", 0) != p_end):
+                self._periodic_epoch_is_stalled = False
+                return False
+            active_count += 1
+        if len(runs) != active_count:
+            real_active = sum(1 for run in runs.values() if run.get("slots"))
+            if real_active != active_count:
+                self._periodic_epoch_is_stalled = False
+                return False
+        self._periodic_stalled_seq = self._sequence
+        self._periodic_stalled_completed = self.completed_count
+        self._periodic_stalled_runs_len = len(runs)
+        return True
+
     def _periodic_epoch_stalled(self, detector, active_items=None) -> bool:
         """Return True once the active periodic epoch cannot match within ``max_lag``."""
         if active_items is None:
@@ -352,7 +402,7 @@ class _EnginePeriodicMixin:
             for run_id, run, _ in active_items
         )
         active_runs = max(1, len(epoch_key))
-        miss_budget = detector.history_limit
+        miss_budget = _PERIODIC_EPOCH_MISS_MULTIPLIER * detector.history_limit
         any_retired = False
         next_sum = 0
         for _, run, _ in active_items:
@@ -368,20 +418,29 @@ class _EnginePeriodicMixin:
             if any_retired
             else _PERIODIC_COLD_ISSUE_MULTIPLIER * base_issue_limit
         )
-        if epoch_key != self._periodic_stall_epoch:
-            if (self._periodic_stall_obs >= miss_budget
+        if (epoch_key != self._periodic_stall_epoch
+                or self._external_completions != self._periodic_stall_ext):
+            if (self._periodic_epoch_is_stalled
+                    or self._periodic_stall_obs >= miss_budget
                     or self._periodic_no_issue_streak > issue_limit):
                 self._periodic_last = None
+                self._periodic_clock_step = None
+            self._periodic_epoch_is_stalled = False
             self._periodic_stall_epoch = epoch_key
+            self._periodic_stall_ext = self._external_completions
             self._periodic_stall_obs = 0
             self._periodic_last_next_sum = -1
             self._periodic_no_issue_streak = 0
         if (self._periodic_stall_obs >= miss_budget
                 or self._periodic_no_issue_streak > issue_limit):
+            self._mark_periodic_epoch_stalled(detector)
             return True
         if next_sum == self._periodic_last_next_sum:
             self._periodic_no_issue_streak += 1
-            return self._periodic_no_issue_streak > issue_limit
+            if self._periodic_no_issue_streak > issue_limit:
+                self._mark_periodic_epoch_stalled(detector)
+                return True
+            return False
         self._periodic_last_next_sum = next_sum
         self._periodic_no_issue_streak = 0
         return False
@@ -395,9 +454,10 @@ class _EnginePeriodicMixin:
             )
         else:
             active_runs = max(1, active_runs)
-        # Wave-aligned landmarks collapse concurrent cohorts to O(1) lag per wave;
-        # keep max_lag bounded while scaling history bytes linearly with run count.
-        required_lag = _PERIODIC_BASE_MAX_LAG
+        required_lag = min(
+            _MAX_PERIODIC_DETECTOR_LAG,
+            max(_PERIODIC_BASE_MAX_LAG, active_runs * _PERIODIC_LAG_MULTIPLIER),
+        )
         required_bytes = min(
             _MAX_PERIODIC_HISTORY_BYTES,
             max(
@@ -559,6 +619,7 @@ class _EnginePeriodicMixin:
         skip = self._periodic_detector.observe(
             frame, interval, stop_at=stop_at)
         if skip is not None:
+            self._periodic_epoch_is_stalled = False
             self._periodic_stall_obs = 0
             self._periodic_last_next_sum = -1
             self._periodic_no_issue_streak = 0
@@ -592,11 +653,12 @@ class _EnginePeriodicMixin:
             raise ExecutionError("periodic_skip_period_invalid")
         start_before = self.now
         if skip.delta.clock_steps:
-            self.now = _advance_periodic_clock_exact(self.now, skip.delta.clock_steps, skip.cycles)
-            dt = self.now - start_before
+            next_now = _advance_periodic_clock_exact(self.now, skip.delta.clock_steps, skip.cycles)
+            dt = next_now - start_before
         else:
-            self.now += dt
+            next_now = start_before + dt
         wave_rec = getattr(self, "_wave_recorder", None)
+        wave_period_args = None
         if wave_rec is not None:
             per_cycle = getattr(skip, "delta", None)
             cycle_dt = float(per_cycle.dt) if per_cycle is not None else dt
@@ -605,17 +667,24 @@ class _EnginePeriodicMixin:
                 start_before - cycle_dt, start_before,
             )
             if svc_pat or ho_pat:
-                wave_rec.on_period(
-                    start_before, cycle_dt, cycle_count,
-                    template_id="periodic_skip", state_digest="skip",
-                    service_pattern=svc_pat, handoff_pattern=ho_pat,
-                )
-            elif hasattr(wave_rec, "_service_by_pipe") and any(
+                wave_period_args = (start_before, cycle_dt, cycle_count, svc_pat, ho_pat)
+            elif any(
                 float(amt) > 0.0
                 for amt in dict(getattr(per_cycle, "busy_by_resource", None) or ()).values()
             ):
                 raise ExecutionError("periodic_skip_missing_proved_cycle_pattern")
+        self.now = next_now
+        if wave_period_args is not None:
+            a_ms, c_dt, c_cnt, svc_pat, ho_pat = wave_period_args
+            wave_rec.on_period(
+                a_ms, c_dt, c_cnt,
+                template_id="periodic_skip", state_digest="skip",
+                service_pattern=svc_pat, handoff_pattern=ho_pat,
+            )
+        seq_before = self._sequence
         self._sequence += int(total.sequence_count)
+        if self._cohort_checked_seq == seq_before:
+            self._cohort_checked_seq = self._sequence
         self.allocation_event_count += int(total.allocation_event_count)
         skipped_completions = int(total.logical_completions)
         self.completed_count += skipped_completions
@@ -777,6 +846,7 @@ _CACHED_MIXED_PLAN_KIND = 3
 _CACHED_MIXED_REM_IDX = 6
 _TRIPLE_ACTIVE_COUNT = 3
 
+_COHORT_PRUNE_FACTOR = 2
 _NATIVE_EPOCH_STEP_LIMIT = 1 << 20
 _STALL_NAME_LIMIT = 300
 _SERVICE_ROUNDING_ULPS = 4
@@ -840,6 +910,15 @@ class Engine(
         self._hbm_acct_live: int = 0
         self._hbm_accounting_serviced: dict[str, float] = {}
         self._periodic_clock_step: tuple[int, float] | None = None
+        self._periodic_epoch_is_stalled: bool = False
+        self._periodic_stalled_seq: int = -1
+        self._periodic_stalled_completed: int = -1
+        self._periodic_stalled_runs_len: int = -1
+        self._periodic_stalled_detector: Any = None
+        self._periodic_stall_ext: int = 0
+        self._cohort_active: int = 0
+        self._cohort_live_seqs: set[int] = set()
+        self._cohort_checked_seq: int = 0
         self._pending_hbm_retrofits: dict[str, tuple[Any, bool]] = {}
         self._discover_hbm_bus_aliases()
         if self._accel is not None and getattr(self._accel, "mode", "") == "c":
@@ -1087,13 +1166,83 @@ class Engine(
             "ledger": record["ledger"], "binding": dict(record["binding"]),
         }
 
-    def _rates(self) -> dict[str, dict[int, float]]:
+    def _sync_cohort_active(self) -> int:
+        """O(min(|active|, |live_cohorts|)) amortized count of active ``cohort_size > 1`` tasks."""
+        cur_seq = self._sequence
+        prev_seq = self._cohort_checked_seq
+        live = self._cohort_live_seqs
+        tasks = self._tasks
+        if cur_seq > prev_seq:
+            if prev_seq == 0 or (cur_seq - prev_seq) > len(tasks):
+                for seq, task in tasks.items():
+                    if task.cohort_size > 1:
+                        live.add(seq)
+            else:
+                for seq in range(prev_seq + 1, cur_seq + 1):
+                    task = tasks.get(seq)
+                    if task is not None and task.cohort_size > 1:
+                        live.add(seq)
+            self._cohort_checked_seq = cur_seq
+        if not live:
+            self._cohort_active = 0
+            return 0
+        active = self._active
+        if not active:
+            self._cohort_active = 0
+            return 0
+        if len(live) > _COHORT_PRUNE_FACTOR * len(tasks):
+            live.intersection_update(tasks)
+            if not live:
+                self._cohort_active = 0
+                return 0
+        if len(active) <= len(live):
+            count = 0
+            for seq in active:
+                if tasks[seq].cohort_size > 1:
+                    count += 1
+            self._cohort_active = count
+            return count
+        stale: list[int] = []
+        added: list[int] = []
+        count = 0
+        for seq in live:
+            task = tasks.get(seq)
+            if task is None:
+                stale.append(seq)
+                continue
+            if seq in active:
+                count += 1
+            children = task.split_children
+            if not children:
+                continue
+            for child_ev in children:
+                cseq = child_ev.sequence
+                if cseq in live:
+                    continue
+                child_task = tasks.get(cseq)
+                if child_task is not None and child_task.cohort_size > 1:
+                    added.append(cseq)
+                    if cseq in active:
+                        count += 1
+        if stale:
+            live.difference_update(stale)
+        if added:
+            live.update(added)
+        self._cohort_active = count
+        return count
+
+    def _rates(
+        self,
+        *,
+        owner_rates_out: dict[str, dict[int, tuple[tuple[int, float], ...]]] | None = None,
+    ) -> dict[str, dict[int, float]]:
         return component_rates(
             self.resources, self._tasks, self._active,
             coupled_solver=coupled_rates,
             coupled_active=self._coupled_active,
             placed_active=self._placed_active,
-            allow_native=self._accel is not None)
+            allow_native=self._accel is not None,
+            owner_rates_out=owner_rates_out)
 
     def advance(
         self, *, until: Sequence[Event] = (), horizon: float = math.inf,
@@ -1151,14 +1300,19 @@ class Engine(
                 return complete
             if max_steps is not None and steps >= max_steps:
                 raise ExecutionError("execution_step_budget_exhausted")
-            if self._placed_active or self._fifo_live:
+            if (self._placed_active or self._fifo_live) and self._sync_cohort_active():
                 self._settle_asymmetric_cohorts()
+            periodic_stalled = False
             if self._periodic_runs:
-                skipped = self._periodic_observe(horizon)
-                if skipped is not None:
-                    self._apply_periodic_skip(skipped)
-                    steps += 1
-                    continue
+                if self._periodic_epoch_still_stalled():
+                    periodic_stalled = True
+                else:
+                    skipped = self._periodic_observe(horizon)
+                    if skipped is not None:
+                        self._apply_periodic_skip(skipped)
+                        steps += 1
+                        continue
+                    periodic_stalled = self._periodic_epoch_is_stalled
             accel = self._accel
             if accel is not None and (self._native_seqs or accel.pending
                                       or accel.made_progress):
@@ -1171,7 +1325,7 @@ class Engine(
                     continue
                 if accel.made_progress:
                     continue
-            if not self._periodic_runs:
+            if not self._periodic_runs or periodic_stalled:
                 n_act = len(active)
                 if n_act == 0:
                     dt = horizon - now
@@ -1373,7 +1527,11 @@ class Engine(
         self, now, horizon, releases, latency_active, tasks, busy_ms, serviced,
         completable, completable_seen,
     ) -> float:
-        rates = self._rates()
+        wave_rec = self._wave_recorder
+        owner_rates: dict[str, dict[int, tuple[tuple[int, float], ...]]] | None = (
+            {} if wave_rec is not None else None
+        )
+        rates = self._rates(owner_rates_out=owner_rates)
         dt = _stop_window(now, horizon, releases, latency_active, tasks)
         stop_dt = dt
         for name, consumers in rates.items():
@@ -1386,16 +1544,18 @@ class Engine(
         if not math.isfinite(dt):
             names = ",".join(task.event.name for task in tasks.values())
             raise ExecutionError(f"execution_stalled:{names[:_STALL_NAME_LIMIT]}")
-        if self._periodic_runs:
+        if self._periodic_runs and not self._periodic_epoch_is_stalled:
             self._periodic_clock_step = (self.advance_steps + 1, dt) if dt < stop_dt else None
         next_time = now + dt
         if dt > 0 and next_time == now:
             next_time = math.nextafter(now, math.inf)
-        wave_rec = self._wave_recorder
+        resources = self.resources
         hbm_touched = None
         deliv_touched = None
         for name, consumers in rates.items():
             busy_ms[name] += dt
+            r_units = resources[name].units
+            res_owner_weights = owner_rates.get(name) if owner_rates else None
             for key, rate in consumers.items():
                 task = tasks[key]
                 remaining = task.remaining[name]
@@ -1416,6 +1576,8 @@ class Engine(
                 if wave_rec is not None and dt > 0.0:
                     _emit_wave_service(
                         wave_rec, key, name, task.placement, now, next_time, used,
+                        units=r_units,
+                        owner_weights=res_owner_weights.get(key) if res_owner_weights else None,
                     )
                 if residual:
                     task.remaining[name] = residual

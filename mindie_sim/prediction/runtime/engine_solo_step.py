@@ -22,11 +22,40 @@ from .prepared_terms import RESIDUAL_SNAP_ULPS
 def _emit_wave_service(
     wave_rec, key: int, rname: str, placement,
     t0_ms: float, t1_ms: float, used: float,
+    *, units: int = 1,
+    owner_weights: tuple[tuple[int, float], ...] | None = None,
 ) -> None:
-    """Publish service across explicitly placed unit owners with exact work conservation."""
+    """Publish service across exact per-owner weights or uniform owners with conservation."""
+    if owner_weights:
+        n_w = len(owner_weights)
+        if n_w == 1:
+            wave_rec.on_service(key, rname, owner_weights[0][0], t0_ms, t1_ms, used)
+            return
+        total_w = math.fsum(w for _, w in owner_weights)
+        if total_w > 0.0:
+            prev = 0.0
+            cum_w = 0.0
+            for idx, (owner_u, weight) in enumerate(owner_weights, 1):
+                cum_w += weight
+                cur = used if idx == n_w else used * (cum_w / total_w)
+                share = cur - prev
+                prev = cur
+                if share > 0.0:
+                    wave_rec.on_service(key, rname, owner_u, t0_ms, t1_ms, share)
+            return
     pl_u = placement.get(rname) if placement else None
     if not pl_u:
-        wave_rec.on_service(key, rname, 0, t0_ms, t1_ms, used)
+        n_u = int(units)
+        if n_u <= 1:
+            wave_rec.on_service(key, rname, 0, t0_ms, t1_ms, used)
+            return
+        prev = 0.0
+        denom = float(n_u)
+        for idx in range(1, n_u + 1):
+            cur = used if idx == n_u else used * (float(idx) / denom)
+            share = cur - prev
+            prev = cur
+            wave_rec.on_service(key, rname, idx - 1, t0_ms, t1_ms, share)
         return
     n_u = len(pl_u)
     if n_u == 1:
@@ -143,7 +172,10 @@ class _EngineSoloStepMixin:
         serviced[rname] += used
         wave_rec = self._wave_recorder
         if wave_rec is not None and dt > 0.0:
-            _emit_wave_service(wave_rec, key, rname, task.placement, now, next_time, used)
+            _emit_wave_service(
+                wave_rec, key, rname, task.placement, now, next_time, used,
+                units=resources[rname].units,
+            )
         if residual:
             rem[rname] = residual
         else:
@@ -205,7 +237,10 @@ class _EngineSoloStepMixin:
                 service[rname] = service.get(rname, 0.0) + remaining
                 serviced[rname] += remaining
                 if wave_rec is not None and wdt > 0.0:
-                    _emit_wave_service(wave_rec, key, rname, task.placement, now, now + wdt, remaining)
+                    _emit_wave_service(
+                        wave_rec, key, rname, task.placement, now, now + wdt, remaining,
+                        units=resources[rname].units,
+                    )
             rem.clear()
             if task.latency <= 0.0:
                 completable_seen.add(key)
@@ -234,7 +269,10 @@ class _EngineSoloStepMixin:
             service[rname] = service.get(rname, 0.0) + used
             serviced[rname] += used
             if wave_rec is not None and dt > 0.0:
-                _emit_wave_service(wave_rec, key, rname, task.placement, now, next_time, used)
+                _emit_wave_service(
+                    wave_rec, key, rname, task.placement, now, next_time, used,
+                    units=resources[rname].units,
+                )
             if residual:
                 rem[rname] = residual
             else:
@@ -322,7 +360,10 @@ class _EngineSoloStepMixin:
             service[rname] = service.get(rname, 0.0) + used
             serviced[rname] += used
             if wave_rec is not None and dt > 0.0:
-                _emit_wave_service(wave_rec, key, rname, task.placement, now, next_time, used)
+                _emit_wave_service(
+                    wave_rec, key, rname, task.placement, now, next_time, used,
+                    units=resources[rname].units,
+                )
             if residual:
                 rem[rname] = residual
             else:
@@ -360,10 +401,15 @@ class _EngineSoloStepMixin:
     ) -> None:
         for k, t, prev_svc in watched:
             if wave_rec is not None and next_time > now:
+                resources = self.resources
                 for rn, post in t.service.items():
                     delta = post - prev_svc.get(rn, 0.0)
                     if delta > 0.0:
-                        _emit_wave_service(wave_rec, k, rn, t.placement, now, next_time, delta)
+                        res = resources.get(rn)
+                        _emit_wave_service(
+                            wave_rec, k, rn, t.placement, now, next_time, delta,
+                            units=res.units if res is not None else 1,
+                        )
             if t.hbm_accounting:
                 _sync_task_hbm_accounting(self, t)
             if t.deliveries:

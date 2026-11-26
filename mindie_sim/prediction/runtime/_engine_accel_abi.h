@@ -652,7 +652,9 @@ drain_compl_snapshot:
                     for (k = 0; k < (int32_t)t->nlink; k++) {
                         msim_link *l = &c->link[t->lstart + k];
                         if (l->rate > 0.0 && l->rem > 0.0) {
-                            uint32_t emit_n = l->plen > 0 ? (uint32_t)l->plen : 1u;
+                            uint32_t emit_n = l->plen > 0
+                                ? (uint32_t)l->plen
+                                : (c->res[l->res].units > 0 ? (uint32_t)c->res[l->res].units : 1u);
                             if (emit_n > UINT32_MAX - need_obs) {
                                 rc = MSIM_E_RANGE;
                                 goto fail;
@@ -741,8 +743,25 @@ drain_compl_snapshot:
                                 c, now, next_time, seq, rid,
                                 c->units[l->pstart], used);
                         } else {
-                            msim_emit_obs_service(
-                                c, now, next_time, seq, rid, 0u, used);
+                            uint32_t nu = c->res[rid].units > 0
+                                ? (uint32_t)c->res[rid].units : 1u;
+                            if (nu > 1u) {
+                                double prev = 0.0;
+                                double denom = (double)nu;
+                                uint32_t u;
+                                for (u = 0u; u < nu; u++) {
+                                    double cur = (u + 1u == nu)
+                                        ? used
+                                        : used * ((double)(u + 1u) / denom);
+                                    double share = cur - prev;
+                                    prev = cur;
+                                    msim_emit_obs_service(
+                                        c, now, next_time, seq, rid, u, share);
+                                }
+                            } else {
+                                msim_emit_obs_service(
+                                    c, now, next_time, seq, rid, 0u, used);
+                            }
                         }
                     }
                 }
