@@ -7,7 +7,7 @@
   visibility and bounded residency accounting.
 [Invariants] The catalog is built from quotient/remainder geometry, never by
   enumerating waves: both 20- and 80-panel sizes construct exactly 6 phases,
-  18 stages and 6 builder calls. A reader without ``indexed_panels_abi == 1``
+  24 stages (load/operand/compute/store per phase) and 6 builder calls. A reader without ``indexed_panels_abi == 1``
   gets the exact ordered template, never the catalog, and an explicit catalog
   refuses to start. Indexed work, dependencies, allocations, timing and peaks
   equal the detailed reference for equal groups, tails, single K and quant
@@ -199,7 +199,7 @@ def test_valid_indexed_template_selects_its_single_phase():
 
 
 @pytest.mark.parametrize("m,n,expected_tiles", [(64, 64, 20), (128, 128, 80)])
-def test_finite_catalog_construction_is_six_phase_eighteen_stage_six_builder(monkeypatch, m, n, expected_tiles):
+def test_finite_catalog_construction_is_six_phase_twenty_four_stage_six_builder(monkeypatch, m, n, expected_tiles):
     counts = {"stage": 0, "phase": 0}
     for cls, key in ((Stage, "stage"), (PipelinePhase, "phase")):
         def counted(self, *args, _original=cls.__init__, _key=key, **kwargs):
@@ -209,13 +209,13 @@ def test_finite_catalog_construction_is_six_phase_eighteen_stage_six_builder(mon
     templates = recipe().finite_templates(matmul_context(m, n, 160))
     monkeypatch.undo()
     # Real constructor observations, not self-reported fields.
-    assert counts == {"stage": 18, "phase": 6}
+    assert counts == {"stage": 24, "phase": 6}
     assert len(templates) == 2
     for field in ("tiles", "indexed_panels", "dynamic_instances"):
         assert sum(getattr(template, field) for template in templates) == expected_tiles
     for field in ("phase_objects", "tile_factory_calls", "static_phase_classes"):
         assert sum(getattr(template, field) for template in templates) == 6
-    assert sum(len(phase.stages) for template in templates for phase in template.phases) == 18
+    assert sum(len(phase.stages) for template in templates for phase in template.phases) == 24
     for owner, template in enumerate(templates):
         assert template.motif_phases == () and template.motif_repeats == 1
         assert template.owner == owner
@@ -319,7 +319,7 @@ def test_lower_pipeline_templates_and_reference_stages_share_one_catalog(monkeyp
     for left, right in zip(templates, lowered):
         assert (left.tiles, left.indexed_panels, left.bindings) == (right.tiles, right.indexed_panels, right.bindings)
         assert left.phase_objects == right.phase_objects == 3
-        assert left.stage_objects == right.stage_objects == 9
+        assert left.stage_objects == right.stage_objects == 12
         assert [phase.key for phase in left.phases] == [phase.key for phase in right.phases]
         for index in range(left.tiles):
             assert left.index_of(index) == right.index_of(index)
@@ -339,7 +339,7 @@ def test_no_marker_keeps_exact_ordered_template_and_refuses_explicit_indexed(mon
     templates = recipe().pipeline_templates(context)
     assert all(template.indexed_panels is None for template in templates)
     assert sum(template.tiles for template in templates) == 20
-    for field, expected in (("phase_objects", 12), ("stage_objects", 36), ("tile_factory_calls", 12)):
+    for field, expected in (("phase_objects", 12), ("stage_objects", 48), ("tile_factory_calls", 12)):
         assert sum(getattr(template, field) for template in templates) == expected
     lowered = lowered_templates(recipe().lower(context))
     assert all(template.indexed_panels is None for template in lowered)
@@ -355,7 +355,7 @@ def test_default_mode_tracks_the_actual_consumer_marker():
     context = matmul_context(64, 64, 160)
     available = indexed_pipeline_consumer_available()
     templates = recipe().pipeline_templates(context)
-    phases, stages = (6, 18) if available else (12, 36)
+    phases, stages = (6, 24) if available else (12, 48)
     assert sum(template.tiles for template in templates) == 20
     assert sum(template.phase_objects for template in templates) == phases
     assert sum(template.stage_objects for template in templates) == stages

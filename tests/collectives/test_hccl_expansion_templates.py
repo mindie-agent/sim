@@ -355,20 +355,23 @@ def test_endpoint_loads_and_self_output_conserve_ccu_work(ranks, size):
 
 @pytest.mark.parametrize('ranks', [8, 16])
 def test_public_model_caller_frames_payload_and_three_remote_notifications_once(ranks):
+    from mindie_sim.catalog.weight_terms import vocab_parallel_rows
+
     size = 30
     raw = _endpoint_case(ranks, size)
     raw['machine']['links'][0].update(transaction_bytes=16, protocol_overhead_bytes=4)
+    payload_size = vocab_parallel_rows(raw['model']['vocab_size'], ranks) * 2
     ops = _endpoint_ops(raw)
     result = graph_costs(raw, ops, input_ready_ms=7, trace_limit=10000, isolated=False)
     serviced = result['execution']['serviced']
-    assert serviced['link:fabric'] == pytest.approx(ranks * (ranks - 1) * (ceil(size / 16) * 20 + 3 * 20))
-    assert serviced['memory@r0:s0'] == pytest.approx((ranks + 2) * size)
+    assert serviced['link:fabric'] == pytest.approx(ranks * (ranks - 1) * (ceil(payload_size / 16) * 20 + 3 * 20))
+    assert serviced['memory@r0:s0'] == pytest.approx((ranks + 2) * payload_size)
     resource = 'ccu_copy@r0:s0'
     owned = Counter()
     for event in result['events']:
         if amount := event['demand'].get(resource):
             owned[event['placement'][resource][0]] += amount
-    assert owned == {0: 2 * size, 1: size}
+    assert owned == {0: 2 * payload_size, 1: payload_size}
     rank_order = list(range(2 * ranks - 1, 0, -2))
     raw["machine"]["devices"] = [{"rank": rank} for rank in rank_order]
     raw["machine"]["links"][0]["members"] = rank_order

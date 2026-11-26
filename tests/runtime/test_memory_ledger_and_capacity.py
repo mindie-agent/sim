@@ -193,10 +193,15 @@ def test_suballocation_shares_bytes_and_holds_its_parent(capacity, span, parent_
     if parent_first:
         result = Ledger.release(state, _key(), after=Completion(3))
         assert result.deferred and not result.released and not domain.grants[_key()].released
-    assert Ledger.release(state, child.key, after=Completion(4)).released
-    if not parent_first:
+    child_release = Ledger.release(state, child.key, after=Completion(4))
+    assert child_release.released
+    if parent_first:
+        assert child_release.freed_by_pool == ((pool, float(capacity)),)
+        assert _key() not in domain.grants
+        assert not Ledger.release(state, _key(), after=Completion(5)).released
+    else:
         assert domain.current[pool] == capacity
-    assert Ledger.release(state, _key(), after=Completion(5)).released
+        assert Ledger.release(state, _key(), after=Completion(5)).released
     assert domain.current[pool] == 0
 
 

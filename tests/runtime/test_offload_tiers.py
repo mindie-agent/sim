@@ -136,7 +136,7 @@ def test_memory_offload_metadata_and_resident_weight_shares():
     headroom = offloaded["physical_rank_headroom_bytes_per_replica_stage"]
     assert all(value >= 0 for replica in headroom for stage in replica for value in stage)
 def test_kvc_ratio_scales_resize_and_capacity_is_bounded():
-    parsed = parse_case(tight_case(gpu_memory_utilization=0.048, layers=8, mtp_proposal_tokens=0)); no_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=0.75)); with_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=0.75, kvc_ddr_ratio=0.5))
+    parsed = parse_case(tight_case(gpu_memory_utilization=0.038, layers=8, mtp_proposal_tokens=0)); no_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=0.75)); with_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=0.75, kvc_ddr_ratio=0.5))
     assert no_kvc.to_dict()["status"] == with_kvc.to_dict()["status"] == "feasible"
     context = 2 * 327680; raw, scaled = no_kvc.cache_bytes(context), with_kvc.cache_bytes(context)
     assert scaled == raw
@@ -216,7 +216,7 @@ def test_state_tier_projection_uses_actual_occurrence_rows():
             case_execution, "dcp", 0, 0, 0, work(),
             case_execution.engine.submit("producer", latency=1.0), state_accesses=(item,))
         result = serviced(case_execution, events)
-        assert result["offload_ddr@r0:s0"] == pytest.approx(16.0); assert result["offload_ssd@r0:s0"] == pytest.approx(8.0); assert result["memory@r0:s0"] == pytest.approx(24.0)
+        assert result["offload_ddr_d2h@r0:s0"] == pytest.approx(16.0); assert result["offload_ssd@r0:s0"] == pytest.approx(8.0); assert result["memory@r0:s0"] == pytest.approx(24.0)
     target = access(bytes=256, occurrence="target:cache_store"); draft = access(bytes=192, occurrence="draft:cache_store", scope="draft"); projected = project_state_tiers((target, draft), TIER)
     assert sum(row["ddr_bytes"] for row in projected) == pytest.approx(224.0); assert sum(row["ssd_bytes"] for row in projected) == pytest.approx(112.0); assert sum(row["hbm_bytes"] for row in projected) == pytest.approx(336.0)
     tail = access(bytes=1024, occurrence="index_pool_tail_store", storage="index_pool_tail"); projected, = project_state_tiers((tail,), TIER)
@@ -316,7 +316,7 @@ def test_issued_registry_splits_writers_and_ignores_old_layer_hints():
     case_spec = with_offload(parse_case(_raw_case())); case_execution = execution(case_spec); a, b = access(bytes=32, occurrence="writer:A"), access(bytes=64, occurrence="writer:B"); event_a = case_execution.engine.submit("writer:A", latency=1.0); event_b = case_execution.engine.submit("writer:B", latency=2.0); current_work = work()
     first = schedule_kv_layer_writeback(
         case_execution, "one", 0, 0, 0, current_work, event_a, state_accesses=(a,))
-    assert serviced(case_execution, first)["offload_ddr@r0:s0"] == pytest.approx(16.0); assert schedule_kv_iteration_offload(
+    assert serviced(case_execution, first)["offload_ddr_d2h@r0:s0"] == pytest.approx(16.0); assert schedule_kv_iteration_offload(
         case_execution, "fallback", 0, current_work, event_a, (),
         {"writer:A": event_a}, scheduled_layers={(0, 0)}, state_accesses=(a, b)) == ()
     later = schedule_kv_iteration_offload(
@@ -324,15 +324,15 @@ def test_issued_registry_splits_writers_and_ignores_old_layer_hints():
         {"writer:A": event_a, "writer:B": event_b}, scheduled_layers={(0, 0)},
         state_accesses=(a, b))
     result = serviced(case_execution, later)
-    assert result["offload_ddr@r0:s0"] == pytest.approx(16.0 + 32.0); assert result["offload_ssd@r0:s0"] == pytest.approx(8.0 + 16.0); assert len(later) == 2
+    assert result["offload_ddr_d2h@r0:s0"] == pytest.approx(16.0 + 32.0); assert result["offload_ssd@r0:s0"] == pytest.approx(8.0 + 16.0); assert len(later) == 2
     first_access = access(bytes=32, occurrence="call0"); second_access = access(bytes=32, occurrence="call0", direction="write"); work0, work1 = work(), work(); event0 = case_execution.engine.submit("writer:0", latency=1.0); event1 = case_execution.engine.submit("writer:1", latency=2.0)
     first = schedule_kv_layer_writeback(case_execution, "batch0", 0, 0, 0, work0,
                                         event0, state_accesses=(first_access,))
     assert release_offload_access(case_execution, work0) > 0
     second = schedule_kv_layer_writeback(case_execution, "batch1", 0, 0, 0, work1,
                                          event1, state_accesses=(second_access,))
-    before_batches = case_execution.engine.serviced["offload_ddr@r0:s0"]
-    assert serviced(case_execution, first + second)["offload_ddr@r0:s0"] - before_batches == pytest.approx(32.0)
+    before_batches = case_execution.engine.serviced["offload_ddr_d2h@r0:s0"]
+    assert serviced(case_execution, first + second)["offload_ddr_d2h@r0:s0"] - before_batches == pytest.approx(32.0)
     ring0 = access(bytes=1024, occurrence="ring", storage="index_pool_tail"); ring1 = access(bytes=1024, occurrence="ring", storage="index_pool_tail"); ring_work0, ring_work1 = work(), work(); before = serviced(case_execution, first + second)
     ring_events0 = schedule_kv_layer_writeback(
         case_execution, "ring0", 0, 0, 0, ring_work0, event0, state_accesses=(ring0,))
@@ -340,7 +340,7 @@ def test_issued_registry_splits_writers_and_ignores_old_layer_hints():
         case_execution, "ring1", 0, 0, 0, ring_work1, event1, state_accesses=(ring1,))
     assert len(ring_events0) == len(ring_events1) == 2
     result = serviced(case_execution, ring_events0 + ring_events1)
-    assert result["offload_ddr@r0:s0"] - before["offload_ddr@r0:s0"] == pytest.approx(1024.0); assert result["offload_ssd@r0:s0"] - before["offload_ssd@r0:s0"] == pytest.approx(512.0)
+    assert result["offload_ddr_d2h@r0:s0"] - before["offload_ddr_d2h@r0:s0"] == pytest.approx(1024.0); assert result["offload_ssd@r0:s0"] - before["offload_ssd@r0:s0"] == pytest.approx(512.0)
 def test_prefetch_strategies_respect_source_and_grant_edges():
     case_spec = with_offload(parse_case(_raw_case())); case_execution = execution(case_spec); item = access(bytes=32, occurrence="fetch", direction="read"); input_ready = case_execution.engine.submit("input", latency=0.0); source_ready = case_execution.engine.submit("source", release=3.0); grant_ready = case_execution.engine.submit("grant", release=5.0); early = case_execution.engine.submit("early", latency=0.0); unrelated_late = case_execution.engine.submit("unrelated-late", release=10.0)
     for version in ("v1", "v2", "v3", "v4"):
@@ -368,7 +368,7 @@ def test_prefetch_strategies_respect_source_and_grant_edges():
         state_accesses=(read,))
     assert fetch
     reader = draft_execution.engine.submit("reader", latency=0.0, after=fetch); draft_execution.engine.advance(until=(reader,), first=False)
-    assert fetch[0].time >= source.time and reader.time >= fetch[0].time; assert draft_execution.engine.serviced["offload_ddr@r0:s0"] == pytest.approx(32.0); assert draft_execution.engine.serviced["offload_ssd@r0:s0"] == pytest.approx(16.0)
+    assert fetch[0].time >= source.time and reader.time >= fetch[0].time; assert draft_execution.engine.serviced["offload_ddr_h2d@r0:s0"] == pytest.approx(32.0); assert draft_execution.engine.serviced["offload_ssd@r0:s0"] == pytest.approx(16.0)
 def test_writer_binding_selects_actual_producer_output():
     case_spec = with_offload(parse_case(_raw_case())); case_execution = execution(case_spec); current_work = work()
     call0 = SimpleNamespace(op_id="call0", family="attention", stage=0, layer=0,
@@ -382,7 +382,7 @@ def test_writer_binding_selects_actual_producer_output():
     assert schedule_kv_iteration_offload(
         case_execution, "only-call0", 0, current_work, e1, (call0, store_b),
         {"call0": e1}, state_accesses=(binding,)) == ()
-    assert case_execution.engine.serviced.get("offload_ddr@r0:s0", 0.0) == 0.0; assert release_offload_access(case_execution, current_work) == 0
+    assert case_execution.engine.serviced.get("offload_ddr_d2h@r0:s0", 0.0) == 0.0; assert release_offload_access(case_execution, current_work) == 0
     events = schedule_kv_iteration_offload(
         case_execution, "bound", 0, current_work, e1, (call0, store_b),
         {"call0": e1}, state_accesses=(binding,), access_events={("storeB", "out"): e_b})
@@ -390,7 +390,7 @@ def test_writer_binding_selects_actual_producer_output():
     case_execution.engine.advance(until=events, first=False)
     assert min(event.time for event in events) >= 5.0
     result = dict(case_execution.engine.serviced)
-    assert result["offload_ddr@r0:s0"] == pytest.approx(32.0); assert result["offload_ssd@r0:s0"] == pytest.approx(16.0); assert result["memory@r0:s0"] == pytest.approx(48.0); assert schedule_kv_iteration_offload(
+    assert result["offload_ddr_d2h@r0:s0"] == pytest.approx(32.0); assert result["offload_ssd@r0:s0"] == pytest.approx(16.0); assert result["memory@r0:s0"] == pytest.approx(48.0); assert schedule_kv_iteration_offload(
         case_execution, "same-batch-repeat", 0, current_work, e1, (call0, store_b),
         {"storeB": e_b}, state_accesses=(binding,)) == ()
     assert release_offload_access(case_execution, current_work) == 1
@@ -401,7 +401,7 @@ def test_writer_binding_selects_actual_producer_output():
         {"call0": e1}, state_accesses=(access2,))
     assert again
     case_execution.engine.advance(until=again, first=False)
-    assert case_execution.engine.serviced["offload_ddr@r0:s0"] == pytest.approx(64.0); assert release_offload_access(case_execution, work2) == 1; assert not getattr(case_execution, "_offload_access_events", {})
+    assert case_execution.engine.serviced["offload_ddr_d2h@r0:s0"] == pytest.approx(64.0); assert release_offload_access(case_execution, work2) == 1; assert not getattr(case_execution, "_offload_access_events", {})
 def test_multiple_producers_padding_and_empty_accesses():
     case_spec = with_offload(parse_case(_raw_case())); case_execution = execution(case_spec); producer = case_execution.engine.submit("producer", latency=1.0)
     with pytest.raises(Exception, match="one_producer_event_per_call"):
@@ -412,18 +412,18 @@ def test_multiple_producers_padding_and_empty_accesses():
     padding = execution(case_spec); input_ready = padding.engine.submit("producer", latency=1.0)
     assert schedule_kv_layer_writeback(
         padding, "pad", 0, 0, 0, work(), input_ready, state_accesses=()) == ()
-    assert padding.engine.serviced.get("offload_ddr@r0:s0", 0.0) == 0.0
+    assert padding.engine.serviced.get("offload_ddr_d2h@r0:s0", 0.0) == 0.0
     active = access(bytes=32, occurrence="active:cache_store", request="active"); active_execution = execution(case_spec)
     active_events = schedule_kv_layer_writeback(
         active_execution, "active", 0, 0, 0, work(),
         active_execution.engine.submit("producer", latency=1.0), state_accesses=(active,))
-    assert serviced(active_execution, active_events)["offload_ddr@r0:s0"] == pytest.approx(16.0)
+    assert serviced(active_execution, active_events)["offload_ddr_d2h@r0:s0"] == pytest.approx(16.0)
     physical = execution(case_spec); padding_view = RequestView("padding", 4, 0, False, "decode", padding=True)
     step = physical.add(linear_work(IterationPlan((padding_view,), iteration=0),
                                     case_spec.model, case_spec.runtime,
                                     case_spec.machine), 0, 0.0, emitted_tokens={})
     physical.engine.advance(until=(step.completion,), first=False)
-    assert step.padded_tokens == 4 and step.operators == 1; assert physical.engine.serviced.get("offload_ddr@r0:s0", 0.0) == 0.0; assert physical.engine.serviced["matrix@r0:s0"] > 0
+    assert step.padded_tokens == 4 and step.operators == 1; assert physical.engine.serviced.get("offload_ddr_d2h@r0:s0", 0.0) == 0.0; assert physical.engine.serviced["matrix@r0:s0"] > 0
     empty_execution = execution(case_spec); input_ready = empty_execution.engine.submit("input", latency=1.0)
     assert schedule_kv_iteration_offload(
         empty_execution, "empty", 0, work(ops=(_index_tail_op(),)), input_ready, (), {}) == ()
@@ -435,7 +435,7 @@ def test_multiple_producers_padding_and_empty_accesses():
     events = schedule_kv_iteration_offload(
         positive_execution, "positive", 0, positive, input_ready, positive.ops,
         {"opaque:state_store": producer})
-    assert serviced(positive_execution, events)["offload_ddr@r0:s0"] == pytest.approx(16.0)
+    assert serviced(positive_execution, events)["offload_ddr_d2h@r0:s0"] == pytest.approx(16.0)
     discovered = _accesses_from_ops(positive, positive.ops)
     assert len(discovered) == 1 and discovered[0].occurrence == "opaque:state_store"; assert discovered[0].bytes == 32.0
 def test_target_and_draft_keep_separate_write_sets():
@@ -451,7 +451,7 @@ def test_target_and_draft_keep_separate_write_sets():
     assert all("draft_kv_writeback" not in event.name for event in target_events)
     assert all("draft_kv_writeback" in event.name for event in draft_events)
     result = serviced(case_execution, target_events + draft_events)
-    assert result["offload_ddr@r0:s0"] == pytest.approx(224.0)
+    assert result["offload_ddr_d2h@r0:s0"] == pytest.approx(224.0)
     assert result["offload_ssd@r0:s0"] == pytest.approx(112.0)
     assert result["memory@r0:s0"] == pytest.approx(336.0)
     assert target_events[0].time >= target_producer.time
@@ -492,7 +492,7 @@ def test_real_draft_store_is_not_the_proposal_transfer():
         case_execution, "real", 0, 1, frontend_work, producer,
         state_accesses=tuple(draft_accesses),
         access_events={item.producer: producer for item in draft_accesses})
-    assert events and all("draft_kv_writeback" in event.name for event in events); assert serviced(case_execution, events)["offload_ddr@r0:s1"] > 0
+    assert events and all("draft_kv_writeback" in event.name for event in events); assert serviced(case_execution, events)["offload_ddr_d2h@r0:s1"] > 0
 def _memfabric_op(name, recipe, direction, rows, entries, payload):
     return OpSpec(name, f"kv_offload_{direction}", "decode", 0, 0, ("r0",),
                   (rows, 576), (rows, 576), (rows, 576), (rows, 576), recipe=recipe,

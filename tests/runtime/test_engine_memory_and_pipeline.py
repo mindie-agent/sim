@@ -269,12 +269,13 @@ def test_three_ledger_sector_union_turnaround_and_l2_sector_residency_rules():
     bus = HbmBusSpec(die=0, read_bytes_per_ms=1024.0, write_bytes_per_ms=1024.0, alpha_rw=0.25)
     v_dep = AdmissionMemoryView({0: 256})
     b1, b2 = ctx.bind_access(pa, state=v_dep, hbm_bus=bus), ctx.bind_access(pa, state=v_dep, hbm_bus=bus)
-    e_dep = Engine([Resource("mte2_aiv@d0", 800_000_000.0)], backend="python")
+    e_dep = Engine([Resource("mte2_aiv@d0", 800_000_000.0), Resource("l2@d0", 3_200_000_000.0)], backend="python")
     e_dep.add_hbm_bus(bus)
     ev1 = e_dep.submit_bound_access("r1", b1, memory_state=v_dep, pattern=pa)
     ev2 = e_dep.submit_bound_access("r2", b2, after=(ev1,), memory_state=v_dep, pattern=pa)
     e_dep.advance(until=(ev2,))
     assert e_dep.delivered["hbm_read@d0"] == pytest.approx(128.0, rel=1e-12)
+    assert e_dep.delivered["l2@d0"] == pytest.approx(128.0, rel=1e-12)
     v_b = AdmissionMemoryView({0: 256})
     k_b = ReuseKey(0, "bb", 1)
     assert v_b.admit_access(MemoryAccessPattern("h", 1, 0, 0, "read", "mte2_aiv", 32, AddressRunPlan((AddressRun(0, 1, 32, 32),)), reuse_key=k_b), 32) == (0, 32)
@@ -442,8 +443,10 @@ def test_service_grants_preserve_unsorted_placement_and_event_times(backend):
     observer = ServiceGrantObserver()
     assert run(None) == run(observer) == [1.0, 1.0]
     grants = observer.to_observed_grants(("a", "b"))
-    assert {(g.occurrence_id, g.start_ns, g.end_ns, g.delivered) for g in grants} == {
-        ("a", 0, 1_000_000, 2.0), ("b", 0, 1_000_000, 2.0)}
+    assert {(g.occurrence_id, g.owner, g.start_ns, g.end_ns, g.delivered) for g in grants} == {
+        ("a", 0, 0, 1_000_000, 1.0), ("a", 2, 0, 1_000_000, 1.0),
+        ("b", 1, 0, 1_000_000, 1.0), ("b", 3, 0, 1_000_000, 1.0),
+    }
 
 @pytest.mark.parametrize("backend", ["python", "c"])
 def test_sub_nanosecond_service_completes_before_rounding_grants(backend):

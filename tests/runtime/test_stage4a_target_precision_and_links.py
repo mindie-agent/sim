@@ -52,7 +52,13 @@ MS_PER_SECOND = 1000.0
 SYNTHETIC_ROCE_BPMS = 50.0 * BYTES_PER_MB
 
 
-def _packed_fp4_gemm(activation_format: str, *, m: int = 1024, n: int = 4096, k: int = 4096) -> OpSpec:
+def _packed_fp4_gemm(
+    activation_format: str, *, m: int = 1024, n: int = 4096, k: int = 4096, microscaled: bool = True,
+) -> OpSpec:
+    act_scale_opts = (
+        dict(activation_group_size=32, activation_scale_format="fp8_e8m0", activation_scale_pack=2)
+        if microscaled and activation_format in FP4_ACTIVATION_FORMATS else {}
+    )
     q = QuantSpec(
         "mixed",
         weight_format="mxfp4",
@@ -60,6 +66,7 @@ def _packed_fp4_gemm(activation_format: str, *, m: int = 1024, n: int = 4096, k:
         weight_block=(1, 32),
         scale_format="fp8_e8m0",
         scale_bytes=1,
+        **act_scale_opts,
     )
     return gemm_op(
         op_id=f"s0.l0.mx_{activation_format}",
@@ -98,6 +105,11 @@ def test_packed_fp4_matrix_precision_resolves_w4a4_w4a8_and_w4a16() -> None:
         assert res_gen3.dtype == "bf16"
         assert dict(res_gen3.metadata)["precision_resolution_reason"] == "fp4_unavailable"
 
+        bare_w4a4 = _packed_fp4_gemm(act_fmt, microscaled=False)
+        res_bare = resolve_matrix_precision(bare_w4a4, devices=dies_gen5, policy="auto", recipe=None)
+        assert res_bare.dtype == "bf16"
+        assert dict(res_bare.metadata)["precision_resolution_reason"] == "fp4_unavailable"
+
     op_w4a8 = _packed_fp4_gemm("fp8_e4m3")
     res_w4a8 = resolve_matrix_precision(op_w4a8, devices=dies_gen5, policy="auto", recipe=None)
     assert res_w4a8.dtype == "fp8_e4m3"
@@ -124,7 +136,7 @@ def test_packed_fp4_matrix_precision_resolves_w4a4_w4a8_and_w4a16() -> None:
         for target_dies in (dies_gen3, mixed_dies):
             fell_back = resolve_matrix_precision(cat_op, devices=target_dies, policy="auto", recipe=None)
             assert fell_back.dtype == "bf16"
-            assert fell_back.matrix_flops == ()
+            assert fell_back.matrix_flops == (("bf16", cat_op.flops),)
             assert dict(fell_back.metadata)["precision_resolution_reason"] == expected_reason
             assert dict(fell_back.metadata)["compute_format"] == "bf16"
         exp_meta = dict(meta)
@@ -181,7 +193,7 @@ def test_prepared_opspec_persists_across_context_dual_bound_and_prefill_models()
     for model_name in ("gemma-4-31b", "qwen3.8-flash-next"):
         raw_case = compose_case(
             model_name, GEN5_DT_SKU, tp=1, ep=1, dp=1, layers=COMPACT_LAYERS,
-            prompt_tokens=PREFILL_TOKENS, output_tokens=2, quant="mxfp4", feature_track="merged",
+            prompt_tokens=PREFILL_TOKENS, output_tokens=2, quant="mxfp4", feature_track="shipping",
         )
         parsed = parse_case(raw_case)
         body_ops = target_graphs(parsed, scope="body", phase="prefill", tokens=PREFILL_TOKENS, context=0, sequences=1)[0]
