@@ -29,7 +29,7 @@ from mindie_sim.prediction.cache_path import (
     AccessSummary, CacheAccessGeometry, CacheGeometry, CachePolicy, CacheState,
 )
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.capacity.features import batch_cache_bytes
+from _support.capacity_features import batch_cache_bytes
 from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.efficiency import capacity_window
 from mindie_sim.prediction.engine import Engine

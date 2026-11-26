@@ -784,6 +784,18 @@ owns = [
 ]
 
 [[module]]
+path = "hygiene/test_ag015_architecture_bijection.py"
+tier = "tier0"
+owns = [
+  "scripts/_arch_governance_ag015.py",
+  "scripts/check_arch_governance.py",
+  "scripts/verify_m1.py",
+  "docs/architecture.md",
+  ".github/scripts/ci_scope.py",
+  ".github/workflows/ci.yml",
+]
+
+[[module]]
 path = "hygiene/test_d0_contracts.py"
 tier = "tier0"
 owns = [

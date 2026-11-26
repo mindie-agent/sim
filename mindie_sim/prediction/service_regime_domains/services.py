@@ -18,7 +18,7 @@ from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.collectives.topology import Topology, _declared_peer_traffic
-from mindie_sim.prediction.program import KernelProgram, Stage
+from mindie_sim.prediction.program.stages import KernelProgram, Stage
 
 
 _COMMUNICATION_FAMILIES = frozenset({

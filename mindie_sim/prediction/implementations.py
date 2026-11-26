@@ -18,8 +18,8 @@ from mindie_sim.schema.common import ModelingError as ModelingError, dtype_bytes
 from mindie_sim.schema.operators import FieldDisposition as FieldDisposition
 from mindie_sim.schema.tensors import TensorLayout as TensorLayout, TensorValue as TensorValue
 
-from .program import implementation_audit as _audit
-from .program import implementation_registry as _registry
+import mindie_sim.prediction.program.implementation_audit as _audit
+import mindie_sim.prediction.program.implementation_registry as _registry
 from .values import typed as _typed
 from .values import rewrite as _rewrite
 from .values import uses as _uses

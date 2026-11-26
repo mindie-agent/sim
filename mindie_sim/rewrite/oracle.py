@@ -1280,7 +1280,8 @@ def prepare_scenario(
 ) -> ScenarioDossier:
     deadline = _deadline(budget, request.replay)
     _check_budget(budget, deadline)
-    case = Case.from_mapping(request.case)
+    from mindie_sim.prediction.structure import parse_case
+    case = parse_case(request.case)
     prim_table = primitive_table if primitive_table is not None else request.primitive_table
     if isinstance(primitives, PrimitiveStore):
         cache = None

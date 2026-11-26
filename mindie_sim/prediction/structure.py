@@ -17,7 +17,7 @@ from collections import OrderedDict
 from mindie_sim.model_catalog import normalize_model
 from mindie_sim.schema.model import ModelSpec, SloSpec, WorkloadSpec
 from mindie_sim.schema.common import ModelingError, _unknown
-from mindie_sim.schema.case import Case, Software
+from mindie_sim.schema.case import Case, Software, _decode_raw_case, register_case_normalizer
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema import runtime_features
 
@@ -50,29 +50,7 @@ def _memoized_parse(value: Case) -> Case:
 
 
 def _parse_case_uncached(value: Case | Mapping) -> Case:
-    if not isinstance(value, Mapping):
-        case = value
-        if not isinstance(case.machine, Hardware):
-            case = Case(Hardware.from_mapping(case.machine.to_dict()), case.model, case.workload,
-                        Software.from_mapping(case.runtime.to_dict()), case.slo)
-    else:
-        value = runtime_features.normalize_case_runtime(value)
-        _unknown(value, {"machine", "model", "workload", "runtime", "slo",
-                         "schema", "structure_variant", "software"}, "case")
-        missing = {"machine", "model", "workload"} - value.keys()
-        if missing:
-            raise ModelingError("case_missing_fields:" + ",".join(sorted(missing)))
-        raw_model = value["model"]
-        model = ModelSpec.from_mapping(raw_model)
-        if value.get("structure_variant"):
-            raise ModelingError("structure_variant_retired:use_model_layer_plans_or_layer_overrides")
-        case = Case(
-            machine=Hardware.from_mapping(value["machine"]), model=model,
-            workload=WorkloadSpec.from_mapping(value["workload"]),
-            runtime=Software.from_mapping(value.get("runtime", {})),
-            slo=SloSpec.from_mapping(value.get("slo")),
-        )
-    return _normalize_parsed_case(case)
+    return _normalize_parsed_case(_decode_raw_case(value))
 
 
 def parse_case(value: Case | Mapping) -> Case:
@@ -264,6 +242,9 @@ def _normalize_parsed_case(case: Case) -> Case:
         case = replace(case, machine=replace(case.machine, assumptions=tuple(sorted(assumptions.items()))))
     return replace(case, model=model, runtime=replace(
         runtime, pp_layer_partition=counts, metadata=tuple(sorted(metadata.items()))))
+
+
+register_case_normalizer(_normalize_parsed_case)
 
 
 def stage_map(model, runtime) -> tuple[int, ...]:

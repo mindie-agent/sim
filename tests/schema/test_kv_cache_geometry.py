@@ -44,7 +44,7 @@ from mindie_sim.prediction.operators.attention.batch_prefix_attention import nes
 from mindie_sim.prediction.body_defaults import effective_body_declaration
 from mindie_sim.prediction.cache_representation import store
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.capacity.features import batch_cache_bytes
+from _support.capacity_features import batch_cache_bytes
 from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.execution.state import bind_op_accesses

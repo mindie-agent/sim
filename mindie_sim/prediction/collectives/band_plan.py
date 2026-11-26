@@ -46,7 +46,7 @@ _POST_NETWORK_STAGE_NAMES = frozenset({
 
 
 def _unwrap_collective_stages(stages_in):
-    from ..program import KernelProgram
+    from ..program.stages import KernelProgram
 
     if (len(stages_in) == TWO_PHASES
             and stages_in[0].name == "setup"
@@ -408,7 +408,7 @@ class BandCollectivePlan:
         return replace(self, groups=tuple(scoped_groups))
 
     def _append_local_hbm(self, context, out: list, after: tuple[str, ...]) -> tuple[str, ...]:
-        from ..program import Stage
+        from ..program.stages import Stage
 
         local_hbm = max(
             (float(g.lowered.local_hbm_bytes_per_rank) for g in self.groups),
@@ -446,7 +446,7 @@ class BandCollectivePlan:
 
     def lower_with_local_work(self, context, base_program):
         """Wrap this lowered collective plan inside causally ordered local stages."""
-        from ..program import KernelProgram, Stage
+        from ..program.stages import KernelProgram, Stage
 
         if any(isinstance(stg.program, BandCollectivePlan) for stg in base_program.stages):
             return base_program
@@ -546,7 +546,7 @@ class BandCollectivePlan:
         stages before ONE shared ``BandCollectivePlan`` network submission and
         runs its local reduction/HBM/unpack stages strictly after rank arrivals.
         """
-        from ..program import KernelProgram
+        from ..program.stages import KernelProgram
 
         link_names = frozenset(self.accounting().wire_by_resource) | frozenset(extra_link_names)
         stages_in = _unwrap_collective_stages(base_program.stages)

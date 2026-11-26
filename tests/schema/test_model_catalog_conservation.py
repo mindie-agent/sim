@@ -585,7 +585,7 @@ def test_draft_indexer_and_prepared_router_are_resident() -> None:
 def test_pp_partition_is_shared_by_capacity_and_catalog_paths() -> None:
     from mindie_sim.catalog.cache import request_cache_breakdown
     from mindie_sim.prediction.capacity import Memory
-    from mindie_sim.prediction.capacity.features import batch_cache_bytes
+    from _support.capacity_features import batch_cache_bytes
     case = parse_case(compose_case(
         "deepseek-v3", hardware=A5_SKU, graph_capture_mode="none", prompt_tokens=128,
         output_tokens=2, tp=8, ep=8, layers=5, pp=2, pp_layer_partition=(1, 4), quant="w8a8"))

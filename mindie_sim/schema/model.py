@@ -460,7 +460,7 @@ class ModelSpec:
         _unknown(raw, allowed, "model")
         catalog_key = raw.get("catalog_key", raw.get("model_catalog_key", raw.get("preset")))
         if catalog_key:
-            from mindie_sim.model_catalog import load_model
+            from mindie_sim.catalog import load_model
 
             model = load_model(str(catalog_key))
             from .serialization import apply_model_overrides
@@ -572,7 +572,7 @@ class ModelSpec:
         return self.attention
 
     def weight_bytes(self, parallel) -> float:
-        from mindie_sim.prediction.structure import normalize_model
+        from mindie_sim.catalog import normalize_model
         from mindie_sim.catalog.weights import stage_weight_bytes
         model = normalize_model(self)
         partition = tuple(model.layers // parallel.pp + int(i < model.layers % parallel.pp)
@@ -580,9 +580,14 @@ class ModelSpec:
         return max(stage_weight_bytes(model, parallel, layer_partition=partition))
 
     def parameter_count(self) -> float:
-        from mindie_sim.prediction.structure import normalize_model
+        from mindie_sim.catalog import normalize_model
         from mindie_sim.catalog.weights import body_parameter_count
         return body_parameter_count(normalize_model(self))
+
+    def normalized(self) -> "ModelSpec":
+        from mindie_sim.catalog import normalize_model
+        from mindie_sim.catalog.draft import declare_native_auxiliary_plans
+        return declare_native_auxiliary_plans(normalize_model(self))
 
     def to_dict(self):
         from dataclasses import asdict

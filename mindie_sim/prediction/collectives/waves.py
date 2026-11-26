@@ -369,7 +369,7 @@ class StartupWaves:
     algorithm = "startup_waves"
 
     def lower(self, context):
-        from mindie_sim.prediction.program import KernelProgram, Stage
+        from mindie_sim.prediction.program.stages import KernelProgram, Stage
 
         if any(amount for role, amount in context.native_work.items()
                if role != "link"):

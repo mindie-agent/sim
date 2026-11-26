@@ -942,16 +942,19 @@ def _select_mla_lowerings(
         # on an idle DP replica; no native binding is claimed without rows.
         mixed_quant = None
     if mixed_quant:
-        reason = mixed_quant.module.unsupported_reason(
-            views=views, plan=plan, parallel=parallel, model=model,
-            padded_tokens=padded_tokens, cores=_aic_owners(machine),
-            topk_present=bool(plan.index_topk),
-            implementation=mixed_quant.name, **mixed_quant.options)
-        if reason:
+        if not is_automatic_lowering(runtime.metadata, "mqsmla_attention"):
+            mixed_quant.module.validate(
+                views=views, plan=plan, parallel=parallel, model=model,
+                padded_tokens=padded_tokens, cores=_aic_owners(machine),
+                topk_present=bool(plan.index_topk),
+                implementation=mixed_quant.name, **mixed_quant.options)
+        elif mixed_quant.module.unsupported_reason(
+                views=views, plan=plan, parallel=parallel, model=model,
+                padded_tokens=padded_tokens, cores=_aic_owners(machine),
+                topk_present=bool(plan.index_topk),
+                implementation=mixed_quant.name, **mixed_quant.options):
             # A default-installed policy must never turn a supported graph into
             # a planner failure; an explicitly requested binding still must.
-            if not is_automatic_lowering(runtime.metadata, "mqsmla_attention"):
-                raise ModelingError(reason)
             mixed_quant = None
     if selected:
         selected.module.validate(

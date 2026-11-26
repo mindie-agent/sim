@@ -23,6 +23,8 @@ jobs:
           fetch-depth: 0
       - name: LF line endings
         run: python3 .github/scripts/check_lf_eol.py
+      - name: Architecture governance (AG001-AG015)
+        run: python3 -B scripts/check_arch_governance.py --root . --strict
       - name: Differential numeric literals
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

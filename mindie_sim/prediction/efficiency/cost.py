@@ -281,11 +281,11 @@ class CostModel:
         # Delegate to the one public profile loader: schema validation,
         # top-level hardware propagation, file/mapping consistency, frozen
         # reload and provenance all stay in the observations layer.
-        from mindie_sim.observations.calibration import load_resource_profile
-        loaded = load_resource_profile(profile)
         from mindie_sim.observations.resource_services import (
+            load_resource_profile,
             normalize_resource_service,
         )
+        loaded = load_resource_profile(profile)
         normalized = tuple(
             normalize_resource_service(item) for item in loaded["services"])
         identifiers = [item.service_id for item in normalized]
@@ -314,7 +314,7 @@ class CostModel:
         context.  A missing or ambiguous declaration is an explicit input
         error, not a fallback to a nominal rate.
         """
-        from mindie_sim.observations.calibration import (
+        from mindie_sim.observations.resource_services import (
             select_resource_service_candidate,
         )
         context = _resource_service_context(context)
@@ -332,7 +332,7 @@ class CostModel:
         path consumes.  Selection and binding are one operation, not a
         separate unconsumed lookup.
         """
-        from mindie_sim.observations.calibration import (
+        from mindie_sim.observations.resource_services import (
             bind_operator_resource_service as _bind,
         )
         context = _resource_service_context(context)

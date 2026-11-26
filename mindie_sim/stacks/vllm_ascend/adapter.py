@@ -1249,6 +1249,74 @@ def _select_sparse_kv_offload_binding(
     return ("sparse_kv_offload", SPARSE_KV_OFFLOAD_IMPL, tuple(sorted(opts_dict.items())))
 
 
+_BF16_FORMATS = frozenset({"bf16", "bfloat16"})
+
+
+def _is_unquantized_bf16_moe(
+    model: ModelSpec,
+    quant_plan: RuntimeQuantPlan | None = None,
+) -> bool:
+    has_moe = any(str(p.ffn).lower() == "moe" for p in model.layer_plans) or model.num_experts > 0
+    if not has_moe:
+        return False
+    q = model.quant
+    w_fmt = str(getattr(q, "expert_weight_format", "") or getattr(q, "weight_format", "bf16") or "bf16").lower()
+    a_fmt = str(getattr(q, "activation_format", "bf16") or "bf16").lower()
+    if w_fmt not in _BF16_FORMATS or a_fmt not in _BF16_FORMATS:
+        return False
+    if quant_plan is not None:
+        for coord, abi in quant_plan.port_abis:
+            if "experts" in str(coord[2]).lower():
+                if (
+                    str(abi.linear_method).lower() != "dense"
+                    or str(abi.weight_dtype).lower() not in _BF16_FORMATS
+                    or str(abi.input_dtype).lower() not in _BF16_FORMATS
+                    or str(abi.output_dtype).lower() not in _BF16_FORMATS
+                ):
+                    return False
+    return True
+
+
+def _resolve_grouped_gemm_bf16_nd_option(
+    model: ModelSpec,
+    *,
+    hw: str,
+    track: StackTrack,
+    requested_options: Mapping[str, Any],
+    dispositions: list[tuple[str, str, str]],
+) -> bool:
+    if not requested_options.get("grouped_gemm_bf16_nd"):
+        return False
+    if track == "eager":
+        dispositions.append(("grouped_gemm_bf16_nd", "dropped", "disabled_on_eager_track"))
+        return False
+    if hw not in A2_A3_INT_ONLY_FAMILIES:
+        dispositions.append(("grouped_gemm_bf16_nd", "dropped", f"unsupported_hw_family:{hw}"))
+        return False
+    if not _is_unquantized_bf16_moe(model):
+        dispositions.append(("grouped_gemm_bf16_nd", "dropped", "requires_unquantized_bf16_moe"))
+        return False
+    return True
+
+
+def _select_grouped_nd_bf16_binding(
+    model: ModelSpec,
+    *,
+    hw: str,
+    quant_plan: RuntimeQuantPlan,
+    raw_config: Any,
+) -> tuple[str, str, tuple[tuple[str, Any], ...]] | None:
+    """Validate and bind ``ascendc_grouped_nd_bf16`` for Arch22 unquantized BF16 MoE grouped GEMM."""
+    if not raw_config or hw not in A2_A3_INT_ONLY_FAMILIES:
+        return None
+    if not _is_unquantized_bf16_moe(model, quant_plan):
+        return None
+    from mindie_sim.prediction.program.implementation_registry import select as select_implementation
+
+    select_implementation({"grouped_gemm": "ascendc_grouped_nd_bf16"}, "grouped_gemm")
+    return ("grouped_gemm", "ascendc_grouped_nd_bf16", ())
+
+
 _GENERAL_TIER_OFFLOAD_KEYS = frozenset({"kvc_ddr_ratio", "kvc_ssd_ratio", "expert_ddr_ratio"})
 
 
@@ -1403,6 +1471,18 @@ def _select_recipe_bindings(
         if sparse_binding is not None:
             bindings.append(sparse_binding)
             origins.append((sparse_binding[0], "stack_profile"))
+
+    if (
+        track != "eager"
+        and eff_opts.get("grouped_gemm_bf16_nd")
+        and "ascendc_grouped_nd_bf16" not in excluded
+    ):
+        grouped_nd = _select_grouped_nd_bf16_binding(
+            model, hw=hw, quant_plan=quant_plan, raw_config=eff_opts.get("grouped_gemm_bf16_nd"),
+        )
+        if grouped_nd is not None:
+            bindings.append(grouped_nd)
+            origins.append((grouped_nd[0], "stack_profile"))
 
     return tuple(bindings), tuple(passes), tuple(dict.fromkeys(origins)), manifest_hits
 
@@ -1629,6 +1709,10 @@ class VllmAscendStackAdapter:
         ]
         if sparse_offload_opts is not None:
             effective_mechanisms.append(("sparse_kv_offload", sparse_offload_opts))
+        if _resolve_grouped_gemm_bf16_nd_option(
+            model, hw=hw, track=track, requested_options=requested_options, dispositions=dispositions,
+        ):
+            effective_mechanisms.append(("grouped_gemm_bf16_nd", True))
         requested_pairs = tuple(
             sorted((str(k), v) for k, v in requested_options.items() if not isinstance(v, SpeculativeSpec))
         )

@@ -15,7 +15,7 @@ import json
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.invocation import FloorConstraint, InvocationTiming
 from mindie_sim.prediction.engine import Engine, Event
-from mindie_sim.prediction.program import KernelProgram, Program, Stage
+from mindie_sim.prediction.program.stages import KernelProgram, Program, Stage
 from mindie_sim.prediction.service_regime_domains.services import ResourceService
 
 

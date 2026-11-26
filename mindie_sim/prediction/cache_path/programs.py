@@ -14,7 +14,7 @@ import math
 from mindie_sim.schema.common import ModelingError
 
 from ..engine import Allocation, Engine, Event
-from ..program import KernelProgram, Stage
+from ..program.stages import KernelProgram, Stage
 from ..collectives.transfer import FiniteTransfer
 from .contracts import A5_LINE_BYTES, CacheAccessResult
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from .mechanism import Work
-from .program import Stage
+from .program.stages import Stage
 
 
 @dataclass(frozen=True)

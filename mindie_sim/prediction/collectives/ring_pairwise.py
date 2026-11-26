@@ -411,7 +411,7 @@ class RingCollective:
     algorithm: ClassVar[str] = "ring"
 
     def lower(self, context):
-        from ..program import KernelProgram, Stage
+        from ..program.stages import KernelProgram, Stage
 
         if any(amount for role, amount in context.native_work.items() if role != "link"):
             raise ModelingError("ring_collective_requires_transport_only_work")
@@ -434,7 +434,7 @@ class PairwiseCollective:
     algorithm: ClassVar[str] = "pairwise"
 
     def lower(self, context):
-        from ..program import KernelProgram, Stage
+        from ..program.stages import KernelProgram, Stage
 
         if any(amount for role, amount in context.native_work.items() if role != "link"):
             raise ModelingError("pairwise_collective_requires_transport_only_work")
@@ -623,7 +623,7 @@ class OneShotCollective:
     algorithm: ClassVar[str] = "oneshot"
 
     def lower(self, context):
-        from ..program import KernelProgram, Stage
+        from ..program.stages import KernelProgram, Stage
 
         if any(amount for role, amount in context.native_work.items() if role != "link"):
             raise ModelingError("oneshot_collective_requires_transport_only_work")
