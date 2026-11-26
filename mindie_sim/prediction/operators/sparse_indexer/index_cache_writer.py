@@ -86,6 +86,32 @@ from mindie_sim.prediction.operators.sparse_indexer.common import (
 )
 
 
+def _region_view_counts(view, region: int) -> tuple[int, int]:
+    """Return ``(summary_rows, tail_rows)`` owned by this rank for one live view."""
+    ctx_len = int(view.context)
+    raw_ranges = getattr(view, "query_ranges", None) or ()
+    if raw_ranges:
+        owned = tuple((int(s), int(e)) for s, e in raw_ranges if int(e) > int(s))
+        global_q = max(
+            int(getattr(view, "global_q_len", 0) or 0),
+            max((e for _, e in owned), default=0),
+        )
+    else:
+        global_q = max(0, int(view.q_len))
+        owned = ((0, global_q),) if global_q > 0 else ()
+    if global_q <= 0 or not owned:
+        return 0, 0
+    total_end = ctx_len + global_q
+    completed = sum(
+        max(0, (ctx_len + e) // region - (ctx_len + s) // region)
+        for s, e in owned
+    )
+    tail_len = total_end % region
+    tail_lo = max(0, global_q - tail_len)
+    tail = sum(max(0, min(e, global_q) - max(s, tail_lo)) for s, e in owned)
+    return completed, tail
+
+
 def _resolve_mode(mode: str, *, cache_dtype: str, compress_ratio: int, region_summary: bool = False) -> str:
     tag = str(mode or "auto").strip().lower()
     if tag != "auto":
@@ -236,8 +262,26 @@ def emit_index_cache_write(
 
     if selected == REGION_SUMMARY_MODE:
         region = max(1, int(resolved_block or DEFAULT_REGION_SUMMARY_BLOCK))
-        summary_rows = max(0, int(completed_rows)) if completed_rows is not None else (math.ceil(total_rows / region) if total_rows > 0 else 0)
-        tail_rows = min(total_rows, region)
+        live_views = (
+            tuple(v for v in views if not getattr(v, "padding", False))
+            if views is not None else None
+        )
+        view_counts = (
+            tuple(_region_view_counts(v, region) for v in live_views)
+            if live_views is not None else None
+        )
+        if completed_rows is not None:
+            summary_rows = max(0, int(completed_rows))
+        elif view_counts is not None:
+            summary_rows = sum(done for done, _ in view_counts)
+        else:
+            summary_rows = math.ceil(total_rows / region) if total_rows > 0 else 0
+        if view_counts is not None:
+            tail_rows = sum(tail for _, tail in view_counts)
+        elif raw_rows is not None:
+            tail_rows = max(0, int(raw_rows))
+        else:
+            tail_rows = min(total_rows, max(1, len(requests)) * region)
         slot_bytes = float(summary_rows * SLOT_INDEX_BYTES)
         read_bytes = float(total_rows * head_count * width * in_bytes) + slot_bytes
         write_bytes = float(summary_rows * head_count * (width * out_elem + scale_bytes) + tail_rows * head_count * width * in_bytes)
@@ -249,7 +293,8 @@ def emit_index_cache_write(
             shape=(max(total_rows, summary_rows), head_count, width),
             metadata=metadata + (
                 ("read_pipe", "aiv"), ("slot_table_bytes", slot_bytes), ("region_block_size", region),
-                ("summary_rows", summary_rows), ("summary_reduction", "ssmax"), ("native_source", REGION_SUMMARY_SOURCE),
+                ("summary_rows", summary_rows), ("tail_rows", tail_rows),
+                ("summary_reduction", "ssmax"), ("native_source", REGION_SUMMARY_SOURCE),
             ),
         ), slot_bytes)]
 

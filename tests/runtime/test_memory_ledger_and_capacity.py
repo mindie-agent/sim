@@ -873,3 +873,30 @@ def test_dp_cohort_zero_drift_uneven_rank_receipt_and_ngram_zero_draft_cache():
     assert (d_live.kv_cache_allocated_bytes, d_live.staging_bytes, d_live.simultaneous_live_hbm_bytes) == (
         d_proj.kv_cache_allocated_bytes, d_proj.staging_bytes, d_proj.simultaneous_live_hbm_bytes,
     ) == (16_777_216, 4_194_304, d_live.simultaneous_live_hbm_bytes)
+
+
+def test_nested_alias_release_and_fixpipe_onchip_budget():
+    """Nested alias chains free root backing on final leaf release and fb enforces on-chip budget."""
+    # 1. Multi-level alias chain releases root backing once the final leaf alias releases.
+    mem = budget_memory(PAGE)
+    chain = (
+        Allocation("buf", PAGE, "workspace", physical_key="P"),
+        Allocation("view", PAGE, "workspace", alias_of="buf"),
+        Allocation("slice", PAGE, "workspace", alias_of="view"),
+    )
+    assert mem.attach_allocation_plan(AllocationPlan(chain))
+    assert mem.release_selected_allocation("buf") and mem.occupied_bytes(0, 0) == PAGE
+    assert mem.release_selected_allocation("view") and mem.occupied_bytes(0, 0) == PAGE
+    assert mem.release_selected_allocation("slice") and mem.occupied_bytes(0, 0) == 0.0
+    assert mem.grant_batch(0, [("next", PAGE)])
+
+    # 2. Fixpipe buffer (fb / fixpipe_buffer alias) is on-chip and enforced against its declared cap.
+    for buf_key in ("fb", "fixpipe_buffer"):
+        raw_fb = case()
+        raw_fb["machine"]["device"].update(buffers={buf_key: PAGE}, buffer_units={buf_key: 1})
+        mem_fb = Memory(parse_case(raw_fb))
+        assert not mem_fb.attach_allocation_effects((AllocationEffect.acquire("too_big", "fb", 2 * PAGE),))
+        assert mem_fb.occupied_bytes(0, 0) == 0.0
+        assert mem_fb.attach_allocation_effects((AllocationEffect.acquire("fits", "fb", PAGE),))
+        assert not mem_fb.attach_allocation_effects((AllocationEffect.acquire("overflow", "fb", PAGE),))
+        assert mem_fb.occupied_bytes(0, 0) == 0.0 and mem_fb.onchip_effects

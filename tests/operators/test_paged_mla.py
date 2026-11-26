@@ -760,3 +760,86 @@ def test_arch_aware_mla_and_mc2_native_binding_projection():
             assert not any("FusedInferAttentionScore" in k for k in mla_kernels)
     assert a3_case.machine.arch_family == "A3"
     assert callable(export_msprof_trace)
+
+
+def test_fia_narrow_s2_tile_conserves_bf16_flops():
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+
+    geom = Geometry.from_devices(sku_case(DIRECT_SKU).machine.dies)
+    expected = 2 * 4096 * 64 * (DQK + LATENT)
+    for tile in (128, 64):
+        op = governed.make_op(
+            sequences=((1, 4096),), logical_heads=64, physical_heads=64,
+            abi=FIA_ABI, s2_base_size=tile,
+        )
+        assert int(governed.build(op, geom).work.matrix["bf16"]) == expected
+
+    # Direct-strategy MQS workspace residency honors live usable L2 capacity.
+    mqs_op = governed.make_op(
+        sequences=((1, 256),), logical_heads=64, physical_heads=64,
+        abi=MQS_ABI, n_ori=128, n_cmp=128,
+    )
+    full_l2 = int(geom.buffers["l2"])
+    reserved = AdmissionMemoryView({0: full_l2})
+    reserved.grant_reservation(0, "peer", full_l2)
+    free_plan = governed.build(mqs_op, geom)
+    res_plan = governed.build(mqs_op, replace(geom, admission_memory_view=reserved))
+    assert free_plan.work.resources["l2"] == 524_288
+    assert res_plan.work.resources.get("l2", 0) == 0
+    assert res_plan.work.resources["hbm"] == free_plan.work.resources["hbm"] + 524_288
+
+
+def test_indexed_split_kv_includes_mandatory_incomplete_pool_tail():
+    from mindie_sim import compose_case
+    from mindie_sim.prediction.operators.paged_mla import indexed_attention as ia
+    from mindie_sim.prediction.structure import parse_case
+
+    raw = compose_case(
+        "glm-5.3-flash", "a3", tp=8, ep=1, dp=1, layers=4,
+        kv_cache_dtype="bf16", prompt_tokens=8192, output_tokens=4,
+    )
+    for pool in (4, 2048):
+        raw["model"]["layer_plans"][3]["index_kpool"] = pool
+        case = parse_case(raw)
+        geom = Geometry.from_devices(case.machine.dies[:1])
+        ops = target_graphs(case, phase="decode", tokens=1, sequences=1, context=6142, scope="body")[0]
+        op = next(o for o in ops if "indexed_attention_geometry" in dict(o.metadata))
+        shape = dict(op.metadata)["indexed_attention_geometry"]
+        plan = ia.build(op, geom, scratch_policy="offchip", rope0_analytic=True)
+        aligned_h = ((shape["heads"] + 15) // 16) * 16
+        issued_cols = int(plan.work.matrix["bf16"]) // (2 * aligned_h * (3 * shape["latent"] + shape["rope"]))
+        live_keys = shape["topk"] + 6143 % pool
+        assert issued_cols == ((live_keys + 15) // 16) * 16
+        assert issued_cols >= live_keys
+
+    raw_batch = compose_case(
+        "glm-5.3-flash", "a3", tp=8, ep=1, dp=1, layers=4,
+        kv_cache_dtype="bf16", prompt_tokens=8192, output_tokens=2,
+        max_model_len=16384, concurrency=6, max_num_seqs=6,
+    )
+    batch_case = parse_case(raw_batch)
+    batch_geom = Geometry.from_devices(batch_case.machine.dies[:1])
+    batch_ops = target_graphs(batch_case, phase="decode", tokens=1, sequences=6, context=8191, scope="body")[0]
+    batch_op = next(o for o in batch_ops if "indexed_attention_geometry" in dict(o.metadata))
+    batch_plan = ia.build(batch_op, batch_geom, scratch_policy="offchip", rope0_analytic=True)
+    closure = dict(zip(
+        batch_plan.program.__code__.co_freevars,
+        [cell.cell_contents for cell in batch_plan.program.__closure__],
+    ))
+    assert len(closure["active_owners"]) == 18
+
+    # Resident split-KV scratch checks live usable L2 capacity rather than raw L2 capacity.
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+    l2_size = 32 << 20
+    view = AdmissionMemoryView({0: l2_size})
+    view.grant_reservation(0, "peer", 28 << 20)
+    res_geom = Geometry(4, buffers={"l2": l2_size}, admission_memory_view=view)
+    with pytest.raises(ModelingError, match="indexed_attention_resident_scratch_requires_shared_cache_capacity"):
+        ia.build_pipeline(
+            dict(
+                sequences=((1, 2050),), topk=512, index_pool_size=4, index_pool_tail=True,
+                heads=16, latent=512, rope=64,
+            ),
+            res_geom,
+            scratch_policy="resident",
+        )

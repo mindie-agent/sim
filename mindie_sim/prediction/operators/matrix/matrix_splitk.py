@@ -26,7 +26,12 @@ from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
-from .matrix import directional_mte1_available, operand_transfer, plain_store_role
+from .matrix import (
+    directional_mte1_available,
+    l2_hbm_read_scale,
+    operand_transfer,
+    plain_store_role,
+)
 from .matrix_epilogue import MatrixEpilogue
 from .matrix_mapping import (
     STREAM_K_K_ALIGN,
@@ -713,6 +718,7 @@ def _build_split_slice_stages(load_work, mte1_work, cube_key, cube_val, *,
                               k_slice, tile_k, load_caps, write_caps, load_place,
                               mte1_place, mma_place, fixpipe_place, clear_place,
                               l0c_alloc, pipelined: bool,
+                              l1_alloc=(), l0_alloc=(),
                               defer_l0c_free: bool = False):
     """Build K-panel stages for one Split-K task conserving exact work."""
     n_panels = max(1, math.ceil(k_slice / float(max(1, tile_k)))) if tile_k else 1
@@ -742,34 +748,41 @@ def _build_split_slice_stages(load_work, mte1_work, cube_key, cube_val, *,
             epi_work[key] = epi_work.get(key, 0.0) + val * p_frac
         body_place = {**load_place, **mte1_place, **mma_place}
         epi_place = {**mma_place, **mte1_place} if mte1_work else mma_place
-        stages.append(Stage("prologue_load", pro_work, caps=load_caps, placement=load_place))
+        epi_free = (*l1_alloc, *l0_alloc) if hold_l0c else (*l1_alloc, *l0_alloc, *l0c_alloc)
+        stages.append(Stage("prologue_load", pro_work, caps=load_caps,
+                            placement=load_place, acquire=l1_alloc))
         stages.append(Stage("k_body", body_work, after=("prologue_load",),
                             caps=load_caps, placement=body_place, coupled=True,
-                            acquire=l0c_alloc))
+                            acquire=(*l0_alloc, *l0c_alloc)))
         stages.append(Stage("epilogue_mma", epi_work, after=("k_body",),
-                            caps=load_caps, placement=epi_place,
-                            free=() if hold_l0c else l0c_alloc))
+                            caps=load_caps, placement=epi_place, free=epi_free))
         predecessor = "epilogue_mma"
     else:
         has_mma = cube_key is not None and cube_val > 0.0
+        has_mte1 = bool(mte1_work)
+        load_acq = (*l1_alloc, *(() if has_mma else l0c_alloc))
+        load_free = () if (has_mte1 or has_mma) else (*l1_alloc, *(() if hold_l0c else l0c_alloc))
         stages.append(Stage(
             "load", load_work,
             caps=(load_caps if load_work else {}),
             placement=load_place,
-            acquire=() if has_mma else l0c_alloc,
-            free=() if (has_mma or hold_l0c) else l0c_alloc,
+            acquire=load_acq,
+            free=load_free,
         ))
         predecessor = "load"
-        if mte1_work:
+        if has_mte1:
+            op_free = () if has_mma else (*l1_alloc, *l0_alloc, *(() if hold_l0c else l0c_alloc))
             stages.append(Stage("operand", mte1_work, after=(predecessor,),
-                                placement=mte1_place))
+                                placement=mte1_place, acquire=l0_alloc, free=op_free))
             predecessor = "operand"
         if has_mma:
+            mma_acq = (*(() if has_mte1 else l0_alloc), *l0c_alloc)
+            mma_free = (*l1_alloc, *l0_alloc, *(() if hold_l0c else l0c_alloc))
             stages.append(Stage(
                 "mma", {cube_key: cube_val}, after=(predecessor,),
                 caps=load_caps, placement=mma_place,
-                acquire=l0c_alloc,
-                free=() if hold_l0c else l0c_alloc,
+                acquire=mma_acq,
+                free=mma_free,
             ))
             predecessor = "mma"
     if has_partial_write:
@@ -822,7 +835,7 @@ def _role_placement_for_units(context, names, cores: int, units: tuple[int, ...]
 def _merge_burst_program(context, names, *, units: tuple[int, ...], row_frac: float,
                          burst_elems: float, vector_share: float, mte3_share: float,
                          hbm_write_share: float, partial_read: float,
-                         scale_copy: float, merges: int, output_cast: bool,
+                         scale_copy: float, scale_hbm: float, merges: int, output_cast: bool,
                          read_caps: dict, store_caps: dict, cores: int,
                          mem_tier: str | None, vread_role: str | None,
                          vread_name: str | None, scale_role: str | None,
@@ -844,10 +857,18 @@ def _merge_burst_program(context, names, *, units: tuple[int, ...], row_frac: fl
         )
         stages.append(Stage("partial_read", pr_work, caps=scaled_read_caps, placement=read_place))
         predecessor = ("partial_read",)
-    if scale_copy > 0 and scale_name is not None and scale_role is not None:
-        scale_place = _role_placement_for_units(context, names, cores, units, (scale_role,))
-        stages.append(Stage("scales", {scale_name: scale_copy * row_frac},
-                            after=predecessor, placement=scale_place))
+    scale_work: dict[str, float] = {}
+    if scale_copy > 0 and scale_name is not None:
+        scale_work[scale_name] = scale_copy * row_frac
+    if scale_hbm > 0 and hbm is not None:
+        scale_work[hbm] = scale_hbm * row_frac
+    if scale_work:
+        scale_place = (
+            _role_placement_for_units(context, names, cores, units, (scale_role,))
+            if (scale_name is not None and scale_role is not None and scale_name in scale_work)
+            else {}
+        )
+        stages.append(Stage("scales", scale_work, after=predecessor, placement=scale_place))
         predecessor = ("scales",)
     merged = {}
     if vector is not None:
@@ -873,7 +894,7 @@ def _merge_burst_program(context, names, *, units: tuple[int, ...], row_frac: fl
 
 def _tile_merge_program(context, names, tile_m: int, ws_tile_n: int,
                         vector_share, mte3_share, hbm_write_share,
-                        scale_copy: float, merges: int, output_cast: bool,
+                        scale_copy: float, scale_hbm: float, merges: int, output_cast: bool,
                         read_caps, store_caps, index: int, cores: int, *,
                         align_burst: bool = False,
                         mem_tier: str | None = None,
@@ -888,7 +909,7 @@ def _tile_merge_program(context, names, tile_m: int, ws_tile_n: int,
     common = dict(
         vector_share=vector_share, mte3_share=mte3_share,
         hbm_write_share=hbm_write_share, scale_copy=scale_copy,
-        merges=merges, output_cast=output_cast, read_caps=read_caps,
+        scale_hbm=scale_hbm, merges=merges, output_cast=output_cast, read_caps=read_caps,
         store_caps=store_caps, cores=cores, mem_tier=mem_tier,
         vread_role=vread_role, vread_name=vread_name,
         scale_role=scale_role, scale_name=scale_name,
@@ -963,7 +984,7 @@ def _record_traffic(record, *, split_count, slices, tasks, partial_write_bytes,
 
 def _splitk_task_loads(context, tasks, weights, *, names, hbm, vector, mte3, cube,
                        total_m, n, k, groups, compute_width, directional_mte1,
-                       recipe=None):
+                       recipe=None, group_rows=None):
     """Build per-task load dicts (private A/B operand copies + HBM) and MTE1 dicts."""
     operand_read = read_role(names)
     operand_name = names.get(operand_read)
@@ -980,15 +1001,59 @@ def _splitk_task_loads(context, tasks, weights, *, names, hbm, vector, mte3, cub
     mte3_total = float(context.work.get(mte3, 0)) if mte3 is not None else 0.0
     hbm_write = min(hbm_total, mte3_total)
     hbm_read = max(0.0, hbm_total - hbm_write)
+    reuse_inputs = bool(getattr(recipe, "reuse_inputs", True))
+    reuse_weights = bool(getattr(recipe, "reuse_weights", True))
+    eff_tile_m = max(1, int(recipe.tile_m)) if recipe is not None else max(1, int(total_m))
+    eff_tile_n = max(1, int(recipe.tile_n)) if recipe is not None else max(1, int(n))
+    rows_tuple = (
+        tuple(int(row) for row in group_rows)
+        if group_rows is not None
+        else ((int(total_m) // groups,) * groups if groups > 0 else (int(total_m),))
+    )
+    nn = math.ceil(int(n) / eff_tile_n) if n > 0 else 0
+    admitted_l2_hit = max(
+        0.0, float(dict(context.op.metadata).get("admitted_l2_read_hit_bytes", 0.0) or 0.0),
+    )
+    hbm_read_scale = l2_hbm_read_scale(
+        context.op, inputs=inputs, weight=weight, groups=groups,
+        group_rows=rows_tuple, nn=nn, tile_m=eff_tile_m,
+        reuse_inputs=reuse_inputs, reuse_weights=reuse_weights,
+        row_scale_bytes=epilogue.row_scale_bytes,
+        column_scale_bytes=epilogue.column_scale_bytes,
+    )
+    declared_base_read = inputs + weight + epilogue.row_scale_bytes + epilogue.column_scale_bytes
     loads = [{} for _ in tasks]
     for key, value in split_keys.items():
         for index, share in enumerate(_allocate(value, weights)):
             if share > 0:
                 loads[index][key] = share
-    if hbm is not None and hbm_read > 0:
-        for index, share in enumerate(_allocate(hbm_read, weights)):
-            if share > 0:
-                loads[index][hbm] = loads[index].get(hbm, 0.0) + share
+    use_per_task_hbm = (
+        hbm is not None
+        and (hbm_read > 0.0 or admitted_l2_hit > 0.0)
+        and declared_base_read > 0.0
+    )
+    if use_per_task_hbm:
+        # When admitted_l2_read_hit_bytes is set, op.hbm_bytes is pre-discounted by
+        # the caller; recover effective cold reads so extra HBM traffic is conserved
+        # while the L2 hit credit is applied strictly once via hbm_read_scale.
+        effective_cold_read = hbm_read + admitted_l2_hit
+        hbm_ratio = min(1.0, effective_cold_read / declared_base_read)
+        extra_hbm_read = max(0.0, effective_cold_read - declared_base_read)
+        scale_hbm_factor = hbm_ratio * hbm_read_scale
+        active_groups = sum(1 for row in rows_tuple if row > 0)
+        active_weight_ratio = float(active_groups) / float(groups) if groups > 0 else 1.0
+        if extra_hbm_read > 0.0:
+            for index, share in enumerate(_allocate(extra_hbm_read, weights)):
+                if share > 0:
+                    loads[index][hbm] = loads[index].get(hbm, 0.0) + share
+    else:
+        hbm_ratio = 0.0
+        scale_hbm_factor = 0.0
+        active_weight_ratio = 1.0
+        if hbm is not None and hbm_read > 0.0:
+            for index, share in enumerate(_allocate(hbm_read, weights)):
+                if share > 0:
+                    loads[index][hbm] = loads[index].get(hbm, 0.0) + share
     mte1_loads = []
     rec_cm = int(getattr(recipe, "compute_m", 0) or 0) if recipe is not None else 0
     rec_cn = int(getattr(recipe, "compute_n", 0) or 0) if recipe is not None else 0
@@ -998,13 +1063,21 @@ def _splitk_task_loads(context, tasks, weights, *, names, hbm, vector, mte3, cub
         b_copy = weight * (float(tn) / (n * float(groups))) * k_frac if n > 0 else 0.0
         if has_private_operands and (a_copy + b_copy) > 0.0:
             loads[index][operand_name] = a_copy + b_copy
+        if use_per_task_hbm:
+            a_hbm = (inputs * weights[index] if reuse_inputs else a_copy) * hbm_ratio * hbm_read_scale
+            b_hbm = (
+                weight * active_weight_ratio * weights[index]
+                if reuse_weights else b_copy
+            ) * hbm_ratio * hbm_read_scale
+            if (a_hbm + b_hbm) > 0.0:
+                loads[index][hbm] = loads[index].get(hbm, 0.0) + a_hbm + b_hbm
         inner_m = math.ceil(int(tm) / rec_cm) if rec_cm > 0 else 1
         inner_n = math.ceil(int(tn) / rec_cn) if rec_cn > 0 else 1
         left_l0 = float(inner_n) * max(a_copy, float(tm) * k_slice * compute_width)
         right_l0 = float(inner_m) * max(b_copy, float(tn) * k_slice * compute_width)
         mte1_loads.append(operand_transfer(
             context, left_l0, right_l0, directional=directional_mte1))
-    return loads, mte1_loads, hbm_total, mte3_total, hbm_write, epilogue
+    return loads, mte1_loads, hbm_total, mte3_total, hbm_write, epilogue, scale_hbm_factor
 
 
 def _workspace_totals(context, tile_shapes, *, splits: int, cores: int,
@@ -1031,10 +1104,10 @@ def _workspace_totals(context, tile_shapes, *, splits: int, cores: int,
 
 def _build_dp_tile_program(load_work, mte1_work, cube_key, cube_val, *,
                            store_name, hbm, vector, scale_name, store_bytes,
-                           hbm_bytes, vector_bytes, scale_copy, k_slice, tile_k,
+                           hbm_bytes, vector_bytes, scale_copy, scale_hbm, k_slice, tile_k,
                            load_caps, store_caps, load_place, mte1_place,
                            mma_place, store_place, vec_place, scale_place,
-                           l0c_alloc, pipelined: bool) -> KernelProgram:
+                           l0c_alloc, pipelined: bool, l1_alloc=(), l0_alloc=()) -> KernelProgram:
     """Direct DP tile (Cube->Fixpipe/MTE3->GM) with zero partials or AIV merge."""
     store_work: dict[str, float] = {}
     if store_name is not None and store_bytes > 0.0:
@@ -1048,13 +1121,19 @@ def _build_dp_tile_program(load_work, mte1_work, cube_key, cube_val, *,
         k_slice=k_slice, tile_k=tile_k, load_caps=load_caps, write_caps={},
         load_place=load_place, mte1_place=mte1_place, mma_place=mma_place,
         fixpipe_place={}, clear_place={}, l0c_alloc=l0c_alloc,
+        l1_alloc=l1_alloc, l0_alloc=l0_alloc,
         pipelined=pipelined, defer_l0c_free=hold_l0c)
     stages = list(base.stages)
     predecessor = stages[-1].name if stages else ""
+    dp_scale_work: dict[str, float] = {}
     if scale_copy > 0.0 and scale_name is not None:
-        stages.append(Stage("dp_scales", {scale_name: scale_copy},
+        dp_scale_work[scale_name] = scale_copy
+    if scale_hbm > 0.0 and hbm is not None:
+        dp_scale_work[hbm] = scale_hbm
+    if dp_scale_work:
+        stages.append(Stage("dp_scales", dp_scale_work,
                             after=(predecessor,) if predecessor else (),
-                            placement=scale_place))
+                            placement=scale_place if (scale_name in dp_scale_work) else {}))
         predecessor = "dp_scales"
     if vector is not None and vector_bytes > 0.0:
         stages.append(Stage("dp_epilogue", {vector: vector_bytes},
@@ -1069,10 +1148,10 @@ def _build_dp_tile_program(load_work, mte1_work, cube_key, cube_val, *,
     return KernelProgram(tuple(stages))
 
 
-def _group_dp_waves(dp_entries: list[tuple[int, KernelProgram]]) -> ParallelProgram:
-    """Chain DP tiles assigned to the same physical AIC serially to avoid L0C overlap."""
+def _group_core_waves(entries: list[tuple[int, KernelProgram]], prefix: str = "dp_w") -> ParallelProgram:
+    """Chain tasks assigned to the same physical AIC serially to avoid buffer overlap."""
     by_core: dict[int, list[KernelProgram]] = {}
-    for phys_core, prog in dp_entries:
+    for phys_core, prog in entries:
         by_core.setdefault(phys_core, []).append(prog)
     branches = []
     for progs in by_core.values():
@@ -1082,7 +1161,7 @@ def _group_dp_waves(dp_entries: list[tuple[int, KernelProgram]]) -> ParallelProg
             chained = []
             prev = ()
             for idx, prog in enumerate(progs):
-                name = f"dp_w{idx}"
+                name = f"{prefix}{idx}"
                 chained.append(Stage(name, after=prev, program=prog))
                 prev = (name,)
             branches.append(KernelProgram(tuple(chained)))
@@ -1095,33 +1174,80 @@ def _build_splitk_programs(
     tile_ws_ns, all_vector_shares, all_mte3_shares, all_hbm_shares,
     names, cube, hbm, vector, mte3, fixpipe, mem_tier, vread_role, vread_name,
     scale_role, scale_name, dp_store_role, dp_store_name, epilogue,
-    total_m, n, groups, reuse_inputs, reuse_weights, payload_width,
-    tile_k_dim, splits, output_cast, arch35, eff_nd_fixpipe, cores, eff_cores,
-    stream_aic, stream_aiv, dp_split_caps, sk_split_caps, write_caps,
-    merge_read_caps, merge_store_caps, used_cores, pipelined: bool,
+    total_m, n, k, groups, reuse_inputs, reuse_weights, scale_hbm_factor,
+    payload_width, recipe, tile_k_dim, splits, output_cast, arch35,
+    eff_nd_fixpipe, cores, eff_cores, stream_aic, stream_aiv, dp_split_caps,
+    sk_split_caps, write_caps, merge_read_caps, merge_store_caps, used_cores,
+    pipelined: bool,
 ):
     """Build per-tile DP wave, SK slice, and AIV merge programs."""
     load_roles = tuple(role for role in ("mte2_aic", "mte2") if role in names)
     mte1_roles = ("mte1",) if "mte1" in names else ()
     mma_roles = ("cube",) if "cube" in names else ()
     fixpipe_roles = ("fixpipe",) if "fixpipe" in names else ()
+    l1_pool = context.pool_names.get("l1")
+    l0a_pool = context.pool_names.get("l0a")
+    l0b_pool = context.pool_names.get("l0b")
     l0c_pool = context.pool_names.get("l0c")
+    inputs, weight = epilogue.operands(context.op)
+    meta = dict(context.op.metadata)
+    output_width = float(dtype_bytes(meta.get("output_format", "bf16")))
+    l0c_elem_bytes = max(float(FP32_BYTES), output_width)
+    rec_cm = int(getattr(recipe, "compute_m", 0) or 0) if recipe is not None else 0
+    rec_cn = int(getattr(recipe, "compute_n", 0) or 0) if recipe is not None else 0
+    l1_slots = int(getattr(recipe, "slots", 2) or 2) if recipe is not None else 0
+    l0_slots = int(getattr(recipe, "compute_slots", 2) or 2) if recipe is not None else 0
     total_aivs = max(1, int(context.resource_units.get("vector", cores)))
     aiv_ratio = max(1, total_aivs // cores)
     has_scales = (epilogue.row_scale_bytes + epilogue.column_scale_bytes) > 0.0
 
-    def _slice_l0c(index: int, tm: int, tn: int, phys_core: int):
-        size = float(tm * tn * FP32_BYTES)
-        if l0c_pool is not None and size > 0.0:
-            return (Allocation(f"splitk_l0c_{index}", l0c_pool, size, (phys_core,)),)
-        return ()
+    def _pool_unit(role: str, phys_core: int) -> tuple[int, ...]:
+        units = max(1, int(context.pool_units.get(role, cores)))
+        return (phys_core % units,)
 
-    def _scale_bytes(tm: int, tn: int) -> float:
+    def _slice_buffers(index: int, tm: int, tn: int, k_slice: float, phys_core: int):
+        l0c_size = float(tm * tn) * l0c_elem_bytes
+        l0c_alloc = (
+            (Allocation(f"splitk_l0c_{index}", l0c_pool, l0c_size, _pool_unit("l0c", phys_core)),)
+            if l0c_pool is not None and l0c_size > 0.0 else ()
+        )
+        if recipe is None or tile_k_dim <= 0 or k <= 0.0:
+            return (), (), l0c_alloc
+        kd = min(float(k_slice), float(tile_k_dim))
+        ai = min(int(tm), rec_cm) if rec_cm > 0 else int(tm)
+        bi = min(int(tn), rec_cn) if rec_cn > 0 else int(tn)
+        k_panel_frac = kd / float(k)
+        left = inputs * (float(tm) / float(total_m)) * k_panel_frac if total_m > 0.0 else 0.0
+        right = weight * (float(tn) / (float(n) * float(groups))) * k_panel_frac if n > 0.0 else 0.0
+        l1_size = float(l1_slots) * (left + right)
+        l1_alloc = (
+            (Allocation(f"splitk_l1_{index}", l1_pool, l1_size, _pool_unit("l1", phys_core)),)
+            if l1_pool is not None and l1_size > 0.0 else ()
+        )
+        l0a_size = float(l0_slots) * max(
+            left * float(ai) / float(tm) if tm > 0 else 0.0,
+            float(ai) * kd * float(payload_width),
+        )
+        l0b_size = float(l0_slots) * max(
+            right * float(bi) / float(tn) if tn > 0 else 0.0,
+            float(bi) * kd * float(payload_width),
+        )
+        l0_list = []
+        if l0a_pool is not None and l0a_size > 0.0:
+            l0_list.append(Allocation(
+                f"splitk_l0a_{index}", l0a_pool, l0a_size, _pool_unit("l0a", phys_core)))
+        if l0b_pool is not None and l0b_size > 0.0:
+            l0_list.append(Allocation(
+                f"splitk_l0b_{index}", l0b_pool, l0b_size, _pool_unit("l0b", phys_core)))
+        return l1_alloc, tuple(l0_list), l0c_alloc
+
+    def _scale_pair(tm: int, tn: int) -> tuple[float, float]:
         if not has_scales:
-            return 0.0
-        return epilogue.scales(
+            return 0.0, 0.0
+        copy_b, hbm_b = epilogue.scales(
             tm, tn, total_m, n, groups,
-            reuse_inputs=reuse_inputs, reuse_weights=reuse_weights)[0]
+            reuse_inputs=reuse_inputs, reuse_weights=reuse_weights)
+        return copy_b, hbm_b * scale_hbm_factor
 
     dp_used = max(1, min(eff_cores, len(dp_task_indices))) if dp_task_indices else 1
     dp_entries: list[tuple[int, KernelProgram]] = []
@@ -1132,11 +1258,13 @@ def _build_splitk_programs(
             context, dp_split_caps, loads[index], used_cores=dp_used,
             tile_m=float(tm), tile_n=float(tn), k_slice=k_slice,
             elem_bytes=payload_width, cube_key=cube, core_index=phys_core, cores=cores)
+        l1_alloc, l0_alloc, l0c_alloc = _slice_buffers(index, tm, tn, k_slice, phys_core)
+        sc_copy, sc_hbm = _scale_pair(tm, tn)
         prog = _build_dp_tile_program(
             loads[index], mte1_loads[index], cube, cubes[index],
             store_name=dp_store_name, hbm=hbm, vector=vector, scale_name=scale_name,
             store_bytes=all_mte3_shares[tile_idx], hbm_bytes=all_hbm_shares[tile_idx],
-            vector_bytes=all_vector_shares[tile_idx], scale_copy=_scale_bytes(tm, tn),
+            vector_bytes=all_vector_shares[tile_idx], scale_copy=sc_copy, scale_hbm=sc_hbm,
             k_slice=k_slice, tile_k=tile_k_dim, load_caps=load_caps, store_caps={},
             load_place=_placement(context, phys_core, cores, load_roles),
             mte1_place=_placement(context, phys_core, cores, mte1_roles),
@@ -1145,10 +1273,10 @@ def _build_splitk_programs(
                 context, phys_core, cores, (dp_store_role,) if dp_store_role in names else ()),
             vec_place=_placement(context, phys_core, cores, ("vector",) if "vector" in names else ()),
             scale_place=_placement(context, phys_core, cores, (scale_role,) if scale_role in names else ()),
-            l0c_alloc=_slice_l0c(index, tm, tn, phys_core), pipelined=pipelined)
+            l0c_alloc=l0c_alloc, l1_alloc=l1_alloc, l0_alloc=l0_alloc, pipelined=pipelined)
         dp_entries.append((phys_core, prog))
 
-    sk_progs = []
+    sk_entries: list[tuple[int, KernelProgram]] = []
     for sk_pos, index in enumerate(sk_task_indices):
         _tile_index, tm, tn, _area, k_slice = tasks[index]
         phys_core = int(stream_aic[sk_pos % len(stream_aic)]) if stream_aic else sk_pos % cores
@@ -1165,7 +1293,8 @@ def _build_splitk_programs(
             _role_placement_for_units(context, names, cores, (clear_aiv,), ("mte3",))
             if clear_tn > 0 else {}
         )
-        sk_progs.append(_build_split_slice_stages(
+        l1_alloc, l0_alloc, l0c_alloc = _slice_buffers(index, tm, tn, k_slice, phys_core)
+        sk_entries.append((phys_core, _build_split_slice_stages(
             loads[index], mte1_loads[index], cube, cubes[index],
             fixpipe=fixpipe, mte3=mte3, mem_tier=mem_tier,
             fixpipe_area=float(tm * fixpipe_tn), clear_area=float(tm * clear_tn),
@@ -1175,20 +1304,20 @@ def _build_splitk_programs(
             mte1_place=_placement(context, phys_core, cores, mte1_roles),
             mma_place=_placement(context, phys_core, cores, mma_roles),
             fixpipe_place=_placement(context, phys_core, cores, fixpipe_roles),
-            clear_place=clear_place, l0c_alloc=_slice_l0c(index, tm, tn, phys_core),
-            pipelined=pipelined))
+            clear_place=clear_place, l0c_alloc=l0c_alloc,
+            l1_alloc=l1_alloc, l0_alloc=l0_alloc, pipelined=pipelined)))
 
-    merges = tuple(
-        _tile_merge_program(
+    merges = []
+    for sk_i, (tile_idx, (tm, tn)) in enumerate(zip(sk_unique_tiles, sk_tile_shapes)):
+        sc_copy, sc_hbm = _scale_pair(tm, tn)
+        merges.append(_tile_merge_program(
             context, names, tm, tile_ws_ns[sk_i], all_vector_shares[tile_idx],
             all_mte3_shares[tile_idx], all_hbm_shares[tile_idx],
-            _scale_bytes(tm, tn), splits, output_cast, merge_read_caps,
+            sc_copy, sc_hbm, splits, output_cast, merge_read_caps,
             merge_store_caps, sk_i, cores, align_burst=arch35,
             mem_tier=mem_tier, vread_role=vread_role, vread_name=vread_name,
-            scale_role=scale_role, scale_name=scale_name)
-        for sk_i, (tile_idx, (tm, tn)) in enumerate(zip(sk_unique_tiles, sk_tile_shapes))
-    )
-    return dp_entries, tuple(sk_progs), merges
+            scale_role=scale_role, scale_name=scale_name))
+    return dp_entries, sk_entries, tuple(merges)
 
 
 def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
@@ -1256,12 +1385,13 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
         geometry.groups if geometry is not None
         else max(1, int(meta.get("matrix_groups", 1) or 1))
     )
-    loads, mte1_loads, hbm_total, mte3_total, hbm_write, epilogue = _splitk_task_loads(
+    loads, mte1_loads, hbm_total, mte3_total, hbm_write, epilogue, scale_hbm_factor = _splitk_task_loads(
         context, tasks, weights, names=names, hbm=hbm, vector=vector,
         mte3=mte3, cube=cube, total_m=total_m, n=n, k=k, groups=groups,
         compute_width=payload_width,
         directional_mte1=(pt is not None and directional_mte1_available(context)),
         recipe=recipe,
+        group_rows=(geometry.group_rows if geometry is not None else None),
     )
     output_cast = _needs_output_cast(context.op, meta, epilogue)
     scale_role = read_role(names, aiv=0)
@@ -1315,7 +1445,9 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
     merge_read_caps, merge_store_caps = _merge_owner_cap(
         context, max(1, len(sk_tile_shapes)), total_partial_bytes=partial_read,
         l2_resident=l2_resident)
-    dp_entries, sk_progs, merges = _build_splitk_programs(
+    reuse_inputs = bool(getattr(recipe, "reuse_inputs", True))
+    reuse_weights = bool(getattr(recipe, "reuse_weights", True))
+    dp_entries, sk_entries, merges = _build_splitk_programs(
         context, tasks, loads, mte1_loads, cubes,
         dp_task_indices=dp_task_indices, sk_task_indices=sk_task_indices,
         sk_unique_tiles=sk_unique_tiles, sk_tile_shapes=sk_tile_shapes,
@@ -1325,10 +1457,10 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
         fixpipe=fixpipe, mem_tier=mem_tier, vread_role=vread_role,
         vread_name=vread_name, scale_role=scale_role, scale_name=scale_name,
         dp_store_role=dp_store_role, dp_store_name=dp_store_name,
-        epilogue=epilogue, total_m=total_m, n=n, groups=groups,
-        reuse_inputs=bool(getattr(recipe, "reuse_inputs", True)),
-        reuse_weights=bool(getattr(recipe, "reuse_weights", True)),
-        payload_width=payload_width, tile_k_dim=tile_k_dim, splits=splits,
+        epilogue=epilogue, total_m=total_m, n=n, k=k, groups=groups,
+        reuse_inputs=reuse_inputs, reuse_weights=reuse_weights,
+        scale_hbm_factor=scale_hbm_factor, payload_width=payload_width,
+        recipe=recipe, tile_k_dim=tile_k_dim, splits=splits,
         output_cast=output_cast, arch35=arch35, eff_nd_fixpipe=eff_nd_fixpipe,
         cores=cores, eff_cores=eff_cores, stream_aic=stream_aic,
         stream_aiv=stream_aiv, dp_split_caps=dp_split_caps,
@@ -1339,13 +1471,29 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
         sum(all_mte3_shares[tile_idx] for tile_idx in range(dp_tile_count))
         if (is_dpsk and dp_store_role == "fixpipe" and dp_store_name is not None) else 0.0
     )
+    has_scales = (epilogue.row_scale_bytes + epilogue.column_scale_bytes) > 0.0
+    issued_load_hbm = sum(load.get(hbm, 0.0) for load in loads) if hbm is not None else 0.0
+    issued_scale_hbm = (
+        sum(
+            epilogue.scales(
+                tm, tn, total_m, n, groups,
+                reuse_inputs=reuse_inputs, reuse_weights=reuse_weights,
+            )[1] * scale_hbm_factor
+            for tm, tn in tile_dims
+        )
+        if (has_scales and hbm is not None and scale_hbm_factor > 0.0) else 0.0
+    )
+    issued_matrix_hbm = (
+        issued_load_hbm + issued_scale_hbm + hbm_write
+        if hbm is not None else hbm_total
+    )
     _record_traffic(
         record, split_count=splits, slices=slices, tasks=tasks,
         partial_write_bytes=partial_write, partial_read_bytes=partial_read,
         fixpipe_write_bytes=(fixpipe_total if has_partial_sink else 0.0) + dp_fixpipe_bytes,
         clear_write_bytes=clear_total if has_partial_sink else 0.0,
         vector_merge=vector_merge, vector_cast=vector_cast,
-        final_write=hbm_write, cube_total=cube_total, declared_hbm=hbm_total,
+        final_write=hbm_write, cube_total=cube_total, declared_hbm=issued_matrix_hbm,
         issued_vector=vector_total + vector_merge + vector_cast,
         output_tiles=len(tile_dims), dp_tiles=dp_tile_count, sk_tiles=len(sk_unique_tiles),
         l2_resident=l2_resident, fixpipe_present=(fixpipe is not None))
@@ -1356,9 +1504,10 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
     split_after = ("setup",)
     if dp_entries:
         top_stages.append(Stage("dp_tiles", after=("setup",),
-                                program=_group_dp_waves(dp_entries)))
+                                program=_group_core_waves(dp_entries, "dp_w")))
         split_after = ("dp_tiles",)
-    top_stages.append(Stage("splits", after=split_after, program=ParallelProgram(sk_progs)))
+    top_stages.append(Stage("splits", after=split_after,
+                            program=_group_core_waves(sk_entries, "sk_w")))
     if sync_ms > 0.0:
         top_stages.append(Stage("split_sync", after=("splits",), latency=sync_ms, keep_empty=True))
         merge_after = ("split_sync",)

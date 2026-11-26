@@ -13,6 +13,12 @@ from mindie_sim.catalog.cache_pages import Allocation, AllocationPlan
 from .contracts import _union_bytes
 
 
+_ONCHIP_POOL_ALIASES = {
+    "fixpipe_buffer": "fb",
+    "fixpipe": "fb",
+}
+
+
 class _MemorySelectionsMixin:
     def _install_selected(
         self, replica: int, stage: int, items: dict[str, Allocation], *,
@@ -97,10 +103,16 @@ class _MemorySelectionsMixin:
         return row
 
     @staticmethod
+    def _canonical_onchip_pool(pool: str) -> str:
+        norm = str(pool).strip().lower()
+        return _ONCHIP_POOL_ALIASES.get(norm, norm)
+
+    @staticmethod
     def _effect_is_onchip(effect) -> bool:
         pool = str(getattr(effect, "pool", "")).strip().lower()
-        return pool in {"l0a", "l0b", "l0c", "l1", "l2", "ub", "smp", "aic",
-                        "aiv", "onchip", "local"}
+        return pool in {"l0a", "l0b", "l0c", "l1", "l2", "ub", "fb",
+                        "fixpipe", "fixpipe_buffer", "smp", "aic", "aiv",
+                        "onchip", "local"}
 
     def _onchip_budget_ok(
         self, replica: int, stage: int, staged_onchip: dict,
@@ -125,33 +137,50 @@ class _MemorySelectionsMixin:
         engine_units: dict[str, int] = {}
         if isinstance(engine_pools, dict):
             for k, val in engine_pools.items():
-                norm_k = str(k).strip().lower()
+                norm_k = self._canonical_onchip_pool(k)
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
-                    engine_caps[norm_k] = float(val)
+                    cap_v = float(val)
+                    engine_caps[norm_k] = (
+                        min(engine_caps[norm_k], cap_v) if norm_k in engine_caps else cap_v
+                    )
                 elif hasattr(val, "capacity"):
-                    engine_caps[norm_k] = float(getattr(val, "capacity"))
+                    cap_v = float(getattr(val, "capacity"))
+                    engine_caps[norm_k] = (
+                        min(engine_caps[norm_k], cap_v) if norm_k in engine_caps else cap_v
+                    )
                     if hasattr(val, "units"):
-                        engine_units[norm_k] = max(1, int(getattr(val, "units") or 1))
+                        u_v = max(1, int(getattr(val, "units") or 1))
+                        engine_units[norm_k] = (
+                            min(engine_units[norm_k], u_v) if norm_k in engine_units else u_v
+                        )
         if isinstance(engine_pool_units, dict):
             for k, val in engine_pool_units.items():
                 if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                    engine_units[str(k).strip().lower()] = int(val)
+                    norm_k = self._canonical_onchip_pool(k)
+                    u_v = int(val)
+                    engine_units[norm_k] = (
+                        min(engine_units[norm_k], u_v) if norm_k in engine_units else u_v
+                    )
         for die_idx, die in enumerate(dies):
-            buffers = {
-                str(k).strip().lower(): float(v)
-                for k, v in dict(getattr(die, "buffers", ()) or ()).items()
-            }
-            unit_counts = {
-                str(k).strip().lower(): int(v)
-                for k, v in dict(getattr(die, "buffer_units", ()) or ()).items()
-            }
+            buffers: dict[str, float] = {}
+            for k, v in dict(getattr(die, "buffers", ()) or ()).items():
+                norm_k = self._canonical_onchip_pool(k)
+                cap_v = float(v)
+                buffers[norm_k] = min(buffers[norm_k], cap_v) if norm_k in buffers else cap_v
+            unit_counts: dict[str, int] = {}
+            for k, v in dict(getattr(die, "buffer_units", ()) or ()).items():
+                norm_k = self._canonical_onchip_pool(k)
+                u_v = int(v)
+                unit_counts[norm_k] = (
+                    min(unit_counts[norm_k], u_v) if norm_k in unit_counts else u_v
+                )
             default_units = max(1, int(getattr(die, "compute_units", 1) or 1))
             usage: dict[tuple[str, int], float] = {}
             for rec in stage_entries:
                 rec_rank = rec.get("rank")
                 if rec_rank is not None and self._account_rank(rec_rank) != die_idx:
                     continue
-                pool_norm = str(rec.get("pool", "")).strip().lower()
+                pool_norm = self._canonical_onchip_pool(rec.get("pool", ""))
                 size = float(rec.get("size", 0.0))
                 units = tuple(int(u) for u in (rec.get("units") or (0,)))
                 hw_cap = buffers.get(pool_norm)
@@ -307,14 +336,22 @@ class _MemorySelectionsMixin:
             released_set.add((replica, stage, name))
             return replaced
         del replaced[name]
-        if target.alias_of:
-            root = target.alias_of
-            root_released = (replica, stage, root) in released_set
-            other_aliases = [value for value in replaced.values()
-                             if value.live and value.alias_of == root]
-            if root_released and not other_aliases:
-                replaced.pop(root, None)
-                released_set.discard((replica, stage, root))
+        released_set.discard((replica, stage, name))
+        parent_name = target.alias_of
+        seen = {name}
+        while parent_name and parent_name not in seen:
+            seen.add(parent_name)
+            if (replica, stage, parent_name) not in released_set:
+                break
+            has_live_alias = any(
+                value.live and value.alias_of == parent_name and value.name != parent_name
+                for value in replaced.values()
+            )
+            if has_live_alias:
+                break
+            parent_item = replaced.pop(parent_name, None)
+            released_set.discard((replica, stage, parent_name))
+            parent_name = parent_item.alias_of if parent_item is not None else None
         return replaced
 
     def release_selected_plan(

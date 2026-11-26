@@ -8,6 +8,7 @@
 [Timeouts & Locks] O(requests) integer sums; no I/O or locks.
 [Side-Effect Policy] Append one operator to the caller-owned builder only.
 """
+from bisect import bisect_right
 from dataclasses import replace
 import math
 from typing import Literal
@@ -96,7 +97,143 @@ def recipes():
             ARCH35_RECIPE: PlannedRecipe(_build_arch35)}
 
 
+def _slice_span_geometry(spans, start: int, stop: int):
+    """Slice contiguous query rows ``[start, stop)`` from ``(q, context, kv_len)`` spans."""
+    sliced = []
+    pos = 0
+    for q_i, ctx_i, kv_i in spans:
+        end = pos + q_i
+        lo, hi = max(pos, start), min(end, stop)
+        if hi > lo:
+            sliced.append((hi - lo, ctx_i + (lo - pos), kv_i))
+        pos = end
+    return tuple(sliced)
+
+
+def _span_metrics(spans, ratio: int, topk: int, *, noncausal: bool = False):
+    """Return ``(pairs, visible_rows, sentinel_fills, topk_comparisons)`` for spans."""
+    pairs = visible_rows = sentinel_fills = 0
+    for q_i, ctx_i, kv_i in spans:
+        if q_i <= 0:
+            continue
+        if noncausal:
+            k_vis = max(0, kv_i) // ratio
+            pairs += q_i * k_vis
+            if k_vis > 0:
+                visible_rows += q_i
+            sentinel_fills += q_i * max(0, topk - k_vis)
+        else:
+            pairs += _floor_sum(q_i, ratio, 1, ctx_i + 1)
+            visible_rows += max(0, q_i - max(0, ratio - ctx_i - 1))
+            short = max(0, min(q_i, topk * ratio - (ctx_i + 1)))
+            if short:
+                sentinel_fills += short * topk - _floor_sum(short, ratio, 1, ctx_i + 1)
+    return pairs, visible_rows, sentinel_fills, _selection_comparisons(pairs, topk, visible_rows)
+
+
+def _balanced_owner_bounds(spans, query_rows: int, active_owners: int, ratio: int, *, noncausal: bool):
+    """Partition ``[0, query_rows)`` across ``active_owners`` minimizing peak owner QK cost."""
+    if query_rows <= active_owners:
+        return tuple((i, i + 1) for i in range(query_rows))
+    ends = [0]
+    cum_cost = [0]
+    for q_i, ctx_i, kv_i in spans:
+        ends.append(ends[-1] + q_i)
+        span_pairs = q_i * (max(0, kv_i) // ratio) if noncausal else _floor_sum(q_i, ratio, 1, ctx_i + 1)
+        cum_cost.append(cum_cost[-1] + span_pairs + q_i)
+
+    def prefix_cost(row: int) -> int:
+        if row <= 0:
+            return 0
+        if row >= query_rows:
+            return cum_cost[-1]
+        idx = bisect_right(ends, row) - 1
+        local = row - ends[idx]
+        if local == 0:
+            return cum_cost[idx]
+        _, ctx_i, kv_i = spans[idx]
+        part = local * (max(0, kv_i) // ratio) if noncausal else _floor_sum(local, ratio, 1, ctx_i + 1)
+        return cum_cost[idx] + part + local
+
+    def max_end_within(pos: int, limit: int, cap: int) -> int:
+        base = prefix_cost(pos)
+        lo_i, hi_i = pos + 1, limit
+        while lo_i < hi_i:
+            mid = (lo_i + hi_i + 1) // 2
+            if prefix_cost(mid) - base <= cap:
+                lo_i = mid
+            else:
+                hi_i = mid - 1
+        return lo_i
+
+    def feasible(cap: int) -> bool:
+        pos = 0
+        for _ in range(active_owners):
+            if pos >= query_rows:
+                return True
+            if prefix_cost(pos + 1) - prefix_cost(pos) > cap:
+                return False
+            pos = max_end_within(pos, query_rows, cap)
+        return pos >= query_rows
+
+    lo_cap, hi_cap = 1, cum_cost[-1]
+    while lo_cap < hi_cap:
+        mid_cap = (lo_cap + hi_cap) // 2
+        if feasible(mid_cap):
+            hi_cap = mid_cap
+        else:
+            lo_cap = mid_cap + 1
+
+    bounds = []
+    pos = 0
+    for owner in range(active_owners):
+        rem = active_owners - owner
+        end = query_rows if rem == 1 else max_end_within(pos, query_rows - (rem - 1), lo_cap)
+        bounds.append((pos, end))
+        pos = end
+    return tuple(bounds)
+
+
+def _owner_work_slices(op, ledger, query_rows: int, active_owners: int):
+    """Derive exact per-owner ``(rows, pairs, visible_rows, topk_vec_raw)`` slices."""
+    if active_owners <= 0 or query_rows <= 0:
+        return ()
+    raw_spans = ledger.get("span_geometry")
+    native_view = dict(op.metadata).get("native_tensor_view") or {}
+    if raw_spans is not None:
+        spans = tuple((int(q_i), int(c_i), int(kv_i)) for q_i, c_i, kv_i in raw_spans)
+        ratio = max(1, int(ledger.get("compress_ratio") or native_view.get("compression_ratio") or 1))
+        noncausal = bool(ledger.get("noncausal", False))
+        topk = int(ledger.get("index_topk") or (native_view.get("output_shape") or (0,))[-1] or 0)
+    elif ledger.get("sequence_partition"):
+        spans = tuple((int(q_i), int(c_i), int(q_i) + int(c_i)) for q_i, c_i in ledger["sequence_partition"])
+        ratio = max(1, int(native_view.get("compression_ratio") or 1))
+        noncausal = bool(ledger.get("noncausal", False))
+        out_shape = native_view.get("output_shape") or ()
+        topk = int(out_shape[-1]) if out_shape else 0
+    else:
+        spans = ()
+        ratio, noncausal, topk = 1, False, 0
+    use_spans = bool(spans) and sum(q_i for q_i, _, _ in spans) == query_rows and topk > 0
+    if use_spans:
+        bounds = _balanced_owner_bounds(spans, query_rows, active_owners, ratio, noncausal=noncausal)
+        slices = []
+        for start, end in bounds:
+            sub = _slice_span_geometry(spans, start, end)
+            o_pairs, o_vis, o_sent, o_cmp = _span_metrics(sub, ratio, topk, noncausal=noncausal)
+            slices.append((end - start, float(o_pairs), float(o_vis), float(o_cmp + o_sent + 2.0 * o_pairs)))
+        return tuple(slices)
+    base_rows, rem_rows = divmod(query_rows, active_owners)
+    slices = []
+    for owner in range(active_owners):
+        my_rows = base_rows + (1 if owner < rem_rows else 0)
+        share = float(my_rows) / float(query_rows)
+        slices.append((my_rows, share, share, share))
+    return tuple(slices)
+
+
 def _build(op, geometry):
+    """[Cohesive-Pipeline] Build per-owner INT8 QK, FP16 head-reduce, and TopK program."""
     ledger = dict(op.metadata)["quant_indexer_work"]
     aic_read = float(ledger["aic_read_bytes"])
     aiv_read = float(ledger["aiv_read_bytes"])
@@ -141,41 +278,74 @@ def _build(op, geometry):
     int8_flops = float(matrix_map.get("int8", 0.0))
     fp16_flops = float(matrix_map.get("fp16", 0.0))
 
+    # Split mixed-dependency totals into visible-row vs pair components for exact conservation.
+    q_bytes_total = float(ledger.get("query_bytes", 0.0))
+    aic_vis_total = min(aic_read, q_bytes_total + weight_ws)
+    aic_pair_total = max(0.0, aic_read - aic_vis_total)
+    key_scale_total = min(scale_w_read, 2.0 * float(ledger.get("query_key_pairs", 0.0)))
+    q_scale_w_total = max(0.0, scale_w_read - key_scale_total)
+    qk_mte1_vis = min(qk_mte1, q_bytes_total)
+    qk_mte1_pair = max(0.0, qk_mte1 - qk_mte1_vis)
+    red_mte1_vis = min(reduce_mte1, weight_ws)
+    red_mte1_pair = max(0.0, reduce_mte1 - red_mte1_vis)
+    owner_slices = _owner_work_slices(op, ledger, query_rows, active_owners)
+    total_slice_pairs = sum(s[1] for s in owner_slices)
+    total_slice_vis = sum(s[2] for s in owner_slices)
+    total_slice_topk = sum(s[3] for s in owner_slices)
+
     def program(context):
         if active_owners <= 0:
             return KernelProgram((Stage("empty_quant_indexer", keep_empty=True),))
         has_split_mte2 = ("mte2_aic" in context.resource_names and "mte2_aiv" in context.resource_names)
         read_roles = ("mte2_aic", "mte2_aiv") if has_split_mte2 else ("mte2",)
         owned_roles = ("cube", "mte1", "fixpipe", "vector", "mte3", *read_roles)
-        base_rows, rem_rows = divmod(query_rows, active_owners)
+        load_denom = aic_read + scale_w_read
+        reduce_denom = reduce_mte3 + reduce_fixpipe
+        topk_denom = score_aiv_read + topk_mte3
         owner_programs = []
-        for owner in range(active_owners):
-            my_rows = base_rows + (1 if owner < rem_rows else 0)
-            share = float(my_rows) / float(query_rows)
+        for owner, (my_rows, s_pairs, s_vis, s_topk) in enumerate(owner_slices):
+            row_share = float(my_rows) / float(query_rows)
+            pair_share = (s_pairs / total_slice_pairs) if total_slice_pairs > 0.0 else 0.0
+            vis_share = (s_vis / total_slice_vis) if total_slice_vis > 0.0 else 0.0
+            topk_share = (s_topk / total_slice_topk) if total_slice_topk > 0.0 else row_share
+            o_aic_read = aic_vis_total * vis_share + aic_pair_total * pair_share
+            o_scale_w = q_scale_w_total * vis_share + key_scale_total * pair_share
+            o_score_read = score_aiv_read * pair_share
+            o_qk_mte1 = qk_mte1_vis * vis_share + qk_mte1_pair * pair_share
+            o_red_mte1 = red_mte1_vis * vis_share + red_mte1_pair * pair_share
+            o_qk_fixpipe = qk_fixpipe * pair_share
+            o_red_fixpipe = reduce_fixpipe * pair_share
+            o_red_mte3 = reduce_mte3 * vis_share
+            o_topk_mte3 = topk_mte3 * row_share
+            o_load_hbm = load_hbm * ((o_aic_read + o_scale_w) / load_denom) if load_denom > 0.0 else load_hbm * row_share
+            o_red_hbm = reduce_hbm * ((o_red_mte3 + o_red_fixpipe) / reduce_denom) if reduce_denom > 0.0 else reduce_hbm * row_share
+            o_topk_hbm = topk_hbm * ((o_score_read + o_topk_mte3) / topk_denom) if topk_denom > 0.0 else topk_hbm * row_share
             placement = context.owned(owner, aic_units, owned_roles)
-            load_res = {"hbm": load_hbm * share}
+            load_res = {"hbm": o_load_hbm}
             if has_split_mte2:
-                load_res["mte2_aic"] = aic_read * share
-                load_res["mte2_aiv"] = scale_w_read * share
+                load_res["mte2_aic"] = o_aic_read
+                load_res["mte2_aiv"] = o_scale_w
             else:
-                load_res["mte2"] = (aic_read + scale_w_read) * share
+                load_res["mte2"] = o_aic_read + o_scale_w
             topk_res = {
-                "hbm": topk_hbm * share,
-                "mte3": topk_mte3 * share,
-                "vector": topk_vec * share,
-                ("mte2_aiv" if has_split_mte2 else "mte2"): score_aiv_read * share,
+                "hbm": o_topk_hbm,
+                "mte3": o_topk_mte3,
+                "vector": topk_vec * topk_share,
+                ("mte2_aiv" if has_split_mte2 else "mte2"): o_score_read,
             }
+            o_int8 = int8_flops * pair_share
+            o_fp16 = fp16_flops * pair_share
             owner_programs.append(KernelProgram((
                 Stage("load_inputs", context.bind(Work(resources=load_res)), placement=placement),
                 Stage("qk_int8_cube", context.bind(Work(
-                    {"int8": int8_flops * share} if int8_flops else {},
-                    {"mte1": qk_mte1 * share, "fixpipe": qk_fixpipe * share},
+                    {"int8": o_int8} if o_int8 else {},
+                    {"mte1": o_qk_mte1, "fixpipe": o_qk_fixpipe},
                 )), after=("load_inputs",), placement=placement),
                 Stage("head_reduce_fp16", context.bind(Work(
-                    {"fp16": fp16_flops * share} if fp16_flops else {},
-                    {"mte1": reduce_mte1 * share, "fixpipe": reduce_fixpipe * share,
-                     "mte3": reduce_mte3 * share, "hbm": reduce_hbm * share,
-                     "vector": reduce_vec * share},
+                    {"fp16": o_fp16} if o_fp16 else {},
+                    {"mte1": o_red_mte1, "fixpipe": o_red_fixpipe,
+                     "mte3": o_red_mte3, "hbm": o_red_hbm,
+                     "vector": reduce_vec * vis_share},
                 )), after=("qk_int8_cube",), placement=placement),
                 Stage("topk_select", context.bind(Work(resources=topk_res)),
                       after=("head_reduce_fp16",), placement=placement),
@@ -510,26 +680,19 @@ def declare(builder, *, deps, views, plan, quant, parallel, block_size=None,
                               block_size=block_size, prefix_cache_mode=prefix_cache_mode)
     _check_domain(plan, quant, parallel, block_size)
     tokens = sum(view.q_len for view in views)
-    # Causal compressed-key counts follow each owned span. PCP chunks pass
-    # query_ranges; padding and cache allocation do not create index work.
+    # Compressed-key counts follow each owned span (causal or noncausal).
+    # PCP chunks pass query_ranges; padding and cache allocation do not create index work.
     ratio = plan.compress_ratio
+    noncausal = bool(getattr(plan, "noncausal_attention", False))
     spans = tuple((view, start, end) for view in views for start, end in _owned_spans(view))
-    pairs = sum(_floor_sum(end - start, ratio, 1, view.context + start + 1)
-                for view, start, end in spans)
+    span_geometry = tuple((end - start, view.context + start, int(view.kv_len)) for view, start, end in spans)
     heads, width = plan.index_heads, plan.index_dim
-    visible_rows = _visible_rows(
-        tuple((end - start, view.context + start) for view, start, end in spans), ratio)
-    topk_comparisons = _selection_comparisons(pairs, plan.index_topk, visible_rows)
-    sentinel_fills = sum(
-        short * plan.index_topk - _floor_sum(short, ratio, 1, view.context + start + 1)
-        for view, start, end in spans
-        if (short := max(0, min(end - start, plan.index_topk * ratio - (view.context + start + 1))))
+    pairs, visible_rows, sentinel_fills, topk_comparisons = _span_metrics(
+        span_geometry, ratio, plan.index_topk, noncausal=noncausal,
     )
     # QueryNd2Nz, ProcessVec0 and WeightDmaCopy all execute under the same
-    # isFirstS2InnerLoop guard for queries with at least one compressed key.
-    active_query_rows = sum(
-        end - start for view, start, end in spans if (view.context + end) // ratio > 0
-    )
+    # isFirstS2InnerLoop guard strictly for query rows with >= 1 visible compressed key.
+    active_query_rows = visible_rows
     query_bytes = active_query_rows * heads * width
     key_bytes = pairs * width
     scale_weight_bytes = active_query_rows * heads * FP32_SCALE_WEIGHT_BYTES + pairs * 2
@@ -553,6 +716,10 @@ def declare(builder, *, deps, views, plan, quant, parallel, block_size=None,
     ledger = {
         "query_key_pairs": pairs, "query_rows": tokens,
         "sequence_partition": tuple((view.q_len, view.context) for view in views),
+        "span_geometry": span_geometry,
+        "compress_ratio": ratio,
+        "index_topk": plan.index_topk,
+        "noncausal": noncausal,
         "qk_int8_flops": matrix["int8"],
         "weighted_head_reduce_fp16_flops": matrix["fp16"],
         "head_reduce_physical_m": HEAD_REDUCTION_CUBE_TILE_ROWS,

@@ -352,7 +352,7 @@ def build(op, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE, slots=INDE
 def _check_resident_l2(geometry, scratch_policy, owners, per_owner_scratch):
     if scratch_policy == "resident":
         if (geometry.buffer_units.get("l2", 1) != 1
-                or geometry.buffers.get("l2", 0) < owners * per_owner_scratch):
+                or int(geometry.usable_l2_bytes()) < owners * per_owner_scratch):
             raise ModelingError("indexed_attention_resident_scratch_requires_shared_cache_capacity")
 
 
@@ -363,13 +363,26 @@ def _build_split_kv_plan(
     per_seq_tuple, per_owner_scratch,
 ):
     """CANN >= 9.3 Arch22 split-KV partitioning along half-open 512-key tile boundaries."""
-    pool_size = shape.get("index_pool_size", 1)
-    pool_tail = shape.get("index_pool_tail", False)
-    # sparse_flash_attention_tiling.cpp:414-418: split-KV requires s2Size >= sparseTokens and no sinks.
-    sparse_tokens = max(per_seq_tuple) if per_seq_tuple is not None else int(topk)
+    pool_size = max(1, int(shape.get("index_pool_size", 1) or 1))
+    pool_tail = bool(shape.get("index_pool_tail", False))
+    # sparse_flash_attention_tiling.cpp:414-418: split-KV sizes partitions from
+    # the declared sparse index tensor width (topk + incomplete pool tail) and
+    # requires s2Size >= sparseTokens with no sinks.
+    base_sparse = max(per_seq_tuple) if per_seq_tuple is not None else int(topk)
+    sparse_tokens = base_sparse + (pool_size - 1 if pool_tail and base_sparse > 0 else 0)
     max_s2 = max((ctx_len + q_cnt for q_cnt, ctx_len in sequences if q_cnt > 0), default=0)
     if sparse_tokens <= 0 or max_s2 < sparse_tokens or shape.get("sinks"):
         return None
+    row_counts = tuple(
+        selected_tokens(
+            ctx_len + pos + 1,
+            per_seq_tuple[seq_idx] if per_seq_tuple is not None else topk,
+            pool_size,
+            pool_tail,
+        )
+        for seq_idx, (q_cnt, ctx_len) in enumerate(sequences)
+        for pos in range(q_cnt)
+    )
     n_tiles = (sparse_tokens + key_tile - 1) // key_tile
     p_cap = min(geometry.compute_units // query, n_tiles) if n_tiles > 1 else 1
     tiles_per_part = (n_tiles + p_cap - 1) // p_cap if p_cap > 1 else n_tiles
@@ -379,30 +392,25 @@ def _build_split_kv_plan(
     owner_tiles: dict[int, tuple[tuple[int, bool, bool], ...]] = {}
     merge_specs = []
     empty_rows = []
-    q_flat = 0
-    for seq_idx, (q_cnt, ctx_len) in enumerate(sequences):
-        seq_topk = per_seq_tuple[seq_idx] if per_seq_tuple is not None else topk
-        for pos in range(q_cnt):
-            k_row = selected_tokens(ctx_len + pos + 1, seq_topk, pool_size, pool_tail)
-            merge_owner = q_flat * parts
-            if k_row == 0:
-                empty_rows.append((q_flat, merge_owner))
-            else:
-                active_parts = 0
-                for p_idx in range(parts):
-                    k_start = ((n_tiles * p_idx) // parts) * key_tile
-                    k_end = min(k_row, ((n_tiles * (p_idx + 1)) // parts) * key_tile)
-                    pk = k_end - k_start
-                    if pk > 0:
-                        part_tiles = tuple(
-                            (min(key_tile, pk - off), off == 0, off + min(key_tile, pk - off) == pk)
-                            for off in range(0, pk, key_tile)
-                        )
-                        owner_tiles[merge_owner + p_idx] = part_tiles
-                        active_parts += 1
-                if active_parts > 0:
-                    merge_specs.append((q_flat, active_parts, merge_owner))
-            q_flat += 1
+    for q_flat, k_row in enumerate(row_counts):
+        merge_owner = q_flat * parts
+        if k_row == 0:
+            empty_rows.append((q_flat, merge_owner))
+        else:
+            active_parts = 0
+            for p_idx in range(parts):
+                k_start = ((n_tiles * p_idx) // parts) * key_tile
+                k_end = min(k_row, ((n_tiles * (p_idx + 1)) // parts) * key_tile)
+                pk = k_end - k_start
+                if pk > 0:
+                    part_tiles = tuple(
+                        (min(key_tile, pk - off), off == 0, off + min(key_tile, pk - off) == pk)
+                        for off in range(0, pk, key_tile)
+                    )
+                    owner_tiles[merge_owner + p_idx] = part_tiles
+                    active_parts += 1
+            if active_parts > 0:
+                merge_specs.append((q_flat, active_parts, merge_owner))
     active_owners = tuple(sorted(owner_tiles))
     _check_resident_l2(geometry, scratch_policy, len(active_owners), per_owner_scratch)
     fd_factory = _FD_PHASES if phase_factory is _phases else partial(phase_factory, flash_decode=True)

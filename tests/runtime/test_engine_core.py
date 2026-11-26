@@ -702,3 +702,161 @@ def test_stalled_periodic_epoch_bypasses_observe_and_skips_idle_cohort_scan(monk
     eng_ext.advance(until=(done_ext,))
     assert done_ext.time == pytest.approx(200.0)
     assert eng_ext._periodic_detector.stats()["skipped_cycles"] >= 40
+
+
+def test_catalog_allocation_guards_last_reader_release_and_start_ports():
+    """ProgramCatalog honors allocation/release guards, last_reader_port, and start ports."""
+    from mindie_sim.prediction.runtime.contracts import (
+        AllocationSpec, BindingFrame, EdgeSpec, FiniteProgramSpec, PortBinding, PortSpec,
+        ProgramCatalog, ReleaseSpec, StageClass, StageSpec,
+    )
+
+    # 1. Release with last_reader_port holds pool occupancy until the reader finishes.
+    eng = Engine([], pools={"ub": 64}, backend="python")
+    reader = eng.submit("reader", latency=10)
+    frame = BindingFrame(occurrence=eng.new_occurrence(), values={"reader": PortBinding(ready=reader)})
+    hold = AllocationSpec(symbol=1, label="buf", pool_role="ub", amount=64)
+    cat = ProgramCatalog(
+        catalog_id="hold", implementation_id="hold",
+        stages=(
+            StageSpec(local_id=0, label="acquire", acquire=(hold,)),
+            StageSpec(local_id=1, label="release", relative_after=(EdgeSpec(source_node=0),),
+                      release=(ReleaseSpec(symbol=1, last_reader_port="reader"),)),
+        ),
+        ports=(PortSpec(name="reader"),), allocation_symbols=(hold,),
+    )
+    sub = eng.submit_catalog(cat, frame, name="first")
+    reuse = Allocation("next", "ub", 64)
+    nxt = eng.submit("next", after=(sub.done,), acquire=(reuse,), free=(reuse,), latency=1)
+    eng.advance(until=(nxt, reader), first=False)
+    assert (nxt.time, reader.time, eng.allocated["ub"]) == (11.0, 10.0, 0)
+
+    # 2. Condition guards gate both acquire and release effects.
+    def occupancy(take: bool):
+        e2 = Engine([], pools={"ub": 64}, backend="python")
+        f2 = BindingFrame(occurrence=e2.new_occurrence(), conditions={"take": take, "early": False})
+        a_spec = AllocationSpec(symbol=1, label="tmp", pool_role="ub", amount=64, condition="take")
+        r_early = ReleaseSpec(symbol=1, condition="early")
+        r_late = ReleaseSpec(symbol=1, condition="take")
+        c2 = ProgramCatalog(
+            catalog_id="cond", implementation_id="cond",
+            stages=(
+                StageSpec(local_id=0, label="first", latency_expr=5, acquire=(a_spec,), release=(r_early,)),
+                StageSpec(local_id=1, label="last", latency_expr=5,
+                          relative_after=(EdgeSpec(source_node=0),), release=(r_late,)),
+            ),
+            allocation_symbols=(a_spec,),
+        )
+        sub2 = e2.submit_catalog(c2, f2, name="cond")
+        e2.advance(horizon=1)
+        at_one = e2.allocated["ub"]
+        e2.advance(horizon=6)
+        at_six = e2.allocated["ub"]
+        e2.advance(until=(sub2.done,))
+        return at_one, at_six, e2.allocated["ub"]
+
+    assert occupancy(False) == (0.0, 0.0, 0.0)
+    assert occupancy(True) == (64.0, 64.0, 0.0)
+
+    # 3. Output ports with producer_boundary="start" wake consumers at producer start,
+    #    including when declared solely on catalog.ports and chained into a start edge.
+    e3 = Engine([], backend="python")
+    f3 = BindingFrame(occurrence=e3.new_occurrence())
+    c3 = ProgramCatalog(
+        catalog_id="start_port", implementation_id="start_port",
+        stages=(StageSpec(local_id=0, label="work", latency_expr=10),),
+        ports=(PortSpec(name="started", direction="out", producer_node=0, producer_boundary="start"),),
+    )
+    sub3 = e3.submit_catalog(c3, f3, name="producer")
+    c3_cons = ProgramCatalog(
+        catalog_id="start_consumer", implementation_id="start_consumer",
+        stages=(StageSpec(
+            local_id=0, label="consume", latency_expr=1,
+            relative_after=(EdgeSpec(external_port="in", source_boundary="start"),),
+        ),),
+        ports=(PortSpec(name="in"),),
+    )
+    sub3_cons = e3.submit_catalog(
+        c3_cons,
+        BindingFrame(occurrence=e3.new_occurrence(), values={"in": sub3.ports["started"]}),
+        name="consumer",
+    )
+    e3.advance(until=(sub3_cons.done, sub3.done), first=False)
+    assert (sub3_cons.done.time, sub3.done.time) == (1.0, 10.0)
+
+    # 4. A finite catalog setup release naming a drain output port holds storage until drain completes.
+    e4 = Engine([], pools={"ub": 64}, backend="python")
+    hold4 = AllocationSpec(symbol=1, label="buf", pool_role="ub", amount=64)
+    setup_stage = StageSpec(
+        local_id=0, label="setup", latency_expr=1, acquire=(hold4,),
+        release=(ReleaseSpec(symbol=1, last_reader_port="drain_done"),),
+    )
+    body_stage = StageSpec(local_id=0, label="body", latency_expr=2)
+    drain_stage = StageSpec(local_id=0, label="drain", latency_expr=9, output_ports=("drain_done",))
+    finite4 = FiniteProgramSpec(
+        total=1, slots=1,
+        classes=(StageClass(class_id=0, stages=(body_stage,)),),
+        index_of=lambda idx: (0, idx + 1, idx, idx, 0),
+        setup=(setup_stage,), drain=(drain_stage,),
+    )
+    cat4 = ProgramCatalog(
+        catalog_id="fin_rel", implementation_id="fin_rel",
+        ports=(PortSpec(name="drain_done", direction="out"),),
+        allocation_symbols=(hold4,), finite=finite4,
+    )
+    sub4 = e4.submit_catalog(cat4, BindingFrame(occurrence=e4.new_occurrence()), name="fin")
+    reuse4 = Allocation("reuse", "ub", 64)
+    waiter4 = e4.submit("reuse", release=1.0, acquire=(reuse4,), free=(reuse4,), latency=1)
+    e4.advance(until=(waiter4, sub4.done), first=False)
+    assert (sub4.done.time, waiter4.started, waiter4.time, e4.allocated["ub"]) == (12.0, 12.0, 13.0, 0)
+
+    # 5. A finite body release naming a drain output port also holds storage until drain completes,
+    #    and a finite catalog with an unambiguous producer_node publishes its declared start port.
+    e5 = Engine([], pools={"ub": 64}, backend="python")
+    hold5 = AllocationSpec(symbol=1, label="buf", pool_role="ub", amount=64)
+    body5 = StageSpec(
+        local_id=7, label="body", latency_expr=2, acquire=(hold5,),
+        release=(ReleaseSpec(symbol=1, last_reader_port="drain_r"),),
+    )
+    drain5 = StageSpec(local_id=8, label="drain", latency_expr=9, output_ports=("drain_r",))
+    finite5 = FiniteProgramSpec(
+        total=1, slots=1,
+        classes=(StageClass(class_id=0, stages=(body5,)),),
+        index_of=lambda idx: (0, idx + 1, idx, idx, 0),
+        drain=(drain5,),
+    )
+    cat5 = ProgramCatalog(
+        catalog_id="fin_body_rel", implementation_id="fin_body_rel",
+        ports=(
+            PortSpec(name="drain_r", direction="out"),
+            PortSpec(name="started", direction="out", producer_node=7, producer_boundary="start"),
+        ),
+        allocation_symbols=(hold5,), finite=finite5,
+    )
+    sub5 = e5.submit_catalog(cat5, BindingFrame(occurrence=e5.new_occurrence()), name="fin_body")
+    assert "started" in sub5.ports
+    reuse5 = Allocation("reuse5", "ub", 64)
+    waiter5 = e5.submit("reuse5", release=0.5, acquire=(reuse5,), free=(reuse5,), latency=1)
+    e5.advance(until=(waiter5, sub5.done), first=False)
+    assert (sub5.done.time, waiter5.started, waiter5.time, e5.allocated["ub"]) == (11.0, 11.0, 12.0, 0)
+
+    # 6. Pending task-owned host-launch start observers are accepted directly on start edges.
+    e6 = Engine([Resource("host", 1)], backend="python")
+    gate6 = e6.submit("gate", latency=2)
+    prep = e6.prepare_stage("launch", {"host": 4})
+    launch_ev, start_obs = e6._submit_host_launch(prep, "launch", "launch:started", gate6)
+    c6 = ProgramCatalog(
+        catalog_id="host_start_consumer", implementation_id="host_start_consumer",
+        stages=(StageSpec(
+            local_id=0, label="after_host_start", latency_expr=1,
+            relative_after=(EdgeSpec(external_port="in", source_boundary="start"),),
+        ),),
+        ports=(PortSpec(name="in"),),
+    )
+    sub6 = e6.submit_catalog(
+        c6,
+        BindingFrame(occurrence=e6.new_occurrence(), values={"in": PortBinding(ready=start_obs)}),
+        name="host_cons",
+    )
+    e6.advance(until=(sub6.done, launch_ev), first=False)
+    assert (start_obs.time, sub6.done.time, launch_ev.time) == (2.0, 3.0, 6.0)

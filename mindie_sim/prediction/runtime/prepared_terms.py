@@ -135,6 +135,68 @@ def _append_vector_group_stages(stages, grp, issue_res, pipe_res, deps_after,
             ))
 
 
+def _causal_vector_lower_bound(
+    ordered_ids: Sequence[str],
+    *,
+    by_id: Mapping[str, VectorInstructionGroup],
+    start_by_id: Mapping[str, float],
+    children_by_id: Mapping[str, Sequence[str]],
+    ancestors_by_id: Mapping[str, set[str]],
+    issue_by_id: Mapping[str, float],
+    exec_by_id: Mapping[str, tuple[str, float]],
+    pre_issue_by_id: Mapping[str, float],
+    pre_exec_by_id: Mapping[str, tuple[str, float]],
+    pre_thru_by_id: Mapping[str, float],
+    self_tail_by_id: Mapping[str, float],
+    eff_issue: float,
+    eff_pipes: Mapping[str, float],
+) -> float:
+    """Carlier-Jackson causal lower bound over release times, pre-anchor work, and RAW tails."""
+    if not ordered_ids:
+        return 0.0
+    node_set = set(ordered_ids)
+    tail_by_id: dict[str, float] = {}
+    for gid in reversed(ordered_ids):
+        child_tail = max(
+            (pre_thru_by_id[c] + tail_by_id[c] for c in children_by_id.get(gid, ()) if c in node_set),
+            default=0.0,
+        )
+        tail_by_id[gid] = self_tail_by_id[gid] + child_tail
+    pos_ids = [gid for gid in ordered_ids if by_id[gid].count > 0]
+    if not pos_ids:
+        return 0.0
+    topo_pos = {gid: idx for idx, gid in enumerate(ordered_ids)}
+    best = 0.0
+    for r_thresh in sorted({start_by_id[gid] for gid in pos_ids}):
+        eligible = sorted(
+            (gid for gid in pos_ids if start_by_id[gid] >= r_thresh),
+            key=lambda gid: (-tail_by_id[gid], topo_pos[gid]),
+        )
+        in_sub: set[str] = set()
+        upgraded: set[str] = set()
+        sum_issue = 0.0
+        sum_pipes: dict[str, float] = {}
+        n_el = len(eligible)
+        for idx, gid in enumerate(eligible):
+            sum_issue += pre_issue_by_id[gid]
+            g_pipe, g_pre_exec = pre_exec_by_id[gid]
+            sum_pipes[g_pipe] = sum_pipes.get(g_pipe, 0.0) + g_pre_exec
+            in_sub.add(gid)
+            for anc in ancestors_by_id[gid]:
+                if anc in in_sub and anc not in upgraded:
+                    upgraded.add(anc)
+                    sum_issue += issue_by_id[anc] - pre_issue_by_id[anc]
+                    a_pipe, a_exec = exec_by_id[anc]
+                    _, a_pre_exec = pre_exec_by_id[anc]
+                    sum_pipes[a_pipe] = sum_pipes.get(a_pipe, 0.0) + (a_exec - a_pre_exec)
+            if idx == n_el - 1 or tail_by_id[eligible[idx + 1]] < tail_by_id[gid]:
+                pipe_lb = max((w / eff_pipes[p] for p, w in sum_pipes.items()), default=0.0)
+                cand = r_thresh + max(sum_issue / eff_issue, pipe_lb) + tail_by_id[gid]
+                if cand > best:
+                    best = cand
+    return best
+
+
 def bind_vector_groups(
     groups: Sequence[VectorInstructionGroup],
     *,
@@ -178,10 +240,17 @@ def bind_vector_groups(
     total_issue = 0.0
     pipe_totals: dict[str, float] = {}
     stages: list[Stage] = []
+    ordered_ids: list[str] = []
+    start_by_id: dict[str, float] = {}
     raw_ready_by_id: dict[str, float] = {}
     ancestors_by_id: dict[str, set[str]] = {}
+    children_by_id: dict[str, list[str]] = {grp.group_id: [] for grp in groups}
     issue_by_id: dict[str, float] = {}
     exec_by_id: dict[str, tuple[str, float]] = {}
+    pre_issue_by_id: dict[str, float] = {}
+    pre_exec_by_id: dict[str, tuple[str, float]] = {}
+    pre_thru_by_id: dict[str, float] = {}
+    self_tail_by_id: dict[str, float] = {}
     max_raw_lat = 0.0
 
     for grp in groups:
@@ -200,7 +269,26 @@ def bind_vector_groups(
                 u_pipe, u_exec = exec_by_id[u]
                 anc_pipes[u_pipe] = anc_pipes.get(u_pipe, 0.0) + u_exec
             anc_pipe_lb = max((w / eff_pipes[p] for p, w in anc_pipes.items()), default=0.0)
-            start_ms = max(start_ms, anc_issue, anc_pipe_lb)
+            anc_ordered = [uid for uid in ordered_ids if uid in ancestors]
+            anc_causal_lb = _causal_vector_lower_bound(
+                anc_ordered,
+                by_id=by_id,
+                start_by_id=start_by_id,
+                children_by_id=children_by_id,
+                ancestors_by_id=ancestors_by_id,
+                issue_by_id=issue_by_id,
+                exec_by_id=exec_by_id,
+                pre_issue_by_id=pre_issue_by_id,
+                pre_exec_by_id=pre_exec_by_id,
+                pre_thru_by_id=pre_thru_by_id,
+                self_tail_by_id=self_tail_by_id,
+                eff_issue=eff_issue,
+                eff_pipes=eff_pipes,
+            )
+            start_ms = max(start_ms, anc_issue, anc_pipe_lb, anc_causal_lb)
+        start_by_id[grp.group_id] = start_ms
+        for dep in grp.dependencies:
+            children_by_id[dep].append(grp.group_id)
         issue_w = float(grp.count * grp.issue_slots)
         exec_w = float(grp.count * grp.initiation_cycles)
         issue_by_id[grp.group_id] = issue_w
@@ -208,24 +296,44 @@ def bind_vector_groups(
         total_issue += issue_w
         pipe_totals[grp.pipe] = pipe_totals.get(grp.pipe, 0.0) + exec_w
         thru_ms = max(issue_w / eff_issue, exec_w / eff_pipes[grp.pipe]) if grp.count > 0 else 0.0
-        raw_lat_ms = float(grp.result_latency_cycles) * cycle_ms
+        raw_lat_ms = float(grp.result_latency_cycles) * cycle_ms if grp.count > 0 else 0.0
         if raw_lat_ms > max_raw_lat:
             max_raw_lat = raw_lat_ms
         if raw_lat_ms > 0.0 and grp.count > 0:
             if grp.last_issue_mark:
+                pre_i = float((grp.count - 1) * grp.issue_slots)
+                pre_e = float((grp.count - 1) * grp.initiation_cycles)
+                tail_thru = max(
+                    float(grp.issue_slots) / eff_issue,
+                    float(grp.initiation_cycles) / eff_pipes[grp.pipe],
+                )
+                self_tail = max(tail_thru, raw_lat_ms)
                 per_inst_ms = thru_ms / float(grp.count)
                 last_issue_ms = start_ms + float(grp.count - 1) * per_inst_ms
                 raw_ready = max(start_ms + thru_ms, last_issue_ms + raw_lat_ms)
             else:
+                pre_i = issue_w
+                pre_e = exec_w
+                self_tail = raw_lat_ms
                 raw_ready = start_ms + thru_ms + raw_lat_ms
         else:
+            pre_i = issue_w
+            pre_e = exec_w
+            self_tail = 0.0
             raw_ready = start_ms + thru_ms if grp.count > 0 else start_ms
+        pre_issue_by_id[grp.group_id] = pre_i
+        pre_exec_by_id[grp.group_id] = (grp.pipe, pre_e)
+        pre_thru_by_id[grp.group_id] = (
+            max(pre_i / eff_issue, pre_e / eff_pipes[grp.pipe]) if grp.count > 0 else 0.0
+        )
+        self_tail_by_id[grp.group_id] = self_tail
         raw_ready_by_id[grp.group_id] = raw_ready
+        ordered_ids.append(grp.group_id)
 
         issue_res = res_map.get("vec_issue", "vec_issue")
         pipe_res = res_map.get(grp.pipe, grp.pipe)
         deps_after = tuple(
-            f"{d}:raw" if by_id[d].result_latency_cycles > 0 else d
+            f"{d}:raw" if (by_id[d].count > 0 and by_id[d].result_latency_cycles > 0) else d
             for d in grp.dependencies
         )
         pl = {issue_res: (owner,), pipe_res: (owner,)}
@@ -234,10 +342,26 @@ def bind_vector_groups(
             raw_lat_ms, target_eff, pl,
         )
 
+    causal_lb = _causal_vector_lower_bound(
+        ordered_ids,
+        by_id=by_id,
+        start_by_id=start_by_id,
+        children_by_id=children_by_id,
+        ancestors_by_id=ancestors_by_id,
+        issue_by_id=issue_by_id,
+        exec_by_id=exec_by_id,
+        pre_issue_by_id=pre_issue_by_id,
+        pre_exec_by_id=pre_exec_by_id,
+        pre_thru_by_id=pre_thru_by_id,
+        self_tail_by_id=self_tail_by_id,
+        eff_issue=eff_issue,
+        eff_pipes=eff_pipes,
+    )
     span_ms = max(
         total_issue / eff_issue,
         max((w / eff_pipes[p] for p, w in pipe_totals.items()), default=0.0),
         max(raw_ready_by_id.values(), default=0.0),
+        causal_lb,
     )
 
     return BoundVectorOp(

@@ -621,3 +621,57 @@ def test_public_source_selection_rejects_incompatible_vector_inventory():
     op = pick(ops(case), GATE)
     with pytest.raises(ValueError, match="two_physical_aivs_per_aic"):
         graph_costs(case, [op], external_inputs={dep: 0 for dep in op.deps})
+
+
+def test_splitk_quantized_epilogue_conserves_scale_hbm_with_reuse_disabled():
+    from mindie_sim.prediction.operators.matrix.matrix_mapping import matrix_geometry
+    from mindie_sim.prediction.operators.matrix.matrix_splitk import splitk_program
+    from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+
+    m, n, k = 64, 288, 4096
+    quant = QuantSpec("w8a8", weight_format="int8", activation_format="int8")
+    op = gemm_op(
+        op_id="q_sk", deps=(), stage=0, layer=0, requests=(), m=m, n=n, k=k,
+        quant=quant, category="dense_mlp", phase="prefill",
+    )
+    recipe = SteadyMatmul(
+        candidates=((64, 64, 128),), underfilled_candidates=(), narrow_candidates=(),
+        reuse_inputs=False, reuse_weights=False,
+    )
+    raw = json.loads((Path(__file__).resolve().parents[2] / "examples/calls/quantized-grouped-small.json").read_text())
+    die = parse_case(raw).machine.dies[0]
+    roles = ("hbm", "l2", "mte2_aic", "mte2_aiv", "mte1", "mte3", "fixpipe", "vector")
+    rates = {r: float(dict(die.rates)[r]) / 1000.0 for r in roles if r in dict(die.rates)}
+    rates["cube"] = 1.0
+    units = {r: die.units(r) for r in rates if r != "cube"}
+    units["cube"] = die.aic_count
+    pools = {p: int(sz) for p, sz in dict(die.buffers).items()}
+    work = {
+        "cube": 1000.0 * op.flops / die.peak("int8"),
+        "hbm": float(op.hbm_bytes), "mte2_aic": float(op.mte2_bytes),
+        "mte3": float(op.mte3_bytes), "vector": float(op.vector_ops),
+    }
+    ctx = RecipeContext(
+        op, work, {r: r for r in rates}, rates, die.aic_count,
+        pool_names={p: p for p in pools}, pool_capacities=pools,
+        pool_units={p: die.pool_units(p) for p in pools},
+        resource_units=units, compute_peaks=dict(die.compute_peaks),
+        service_modes=dict(die.service_modes), work_units=dict(die.work_units),
+    )
+    selected, _ = recipe.select(ctx)
+    geom = matrix_geometry(ctx, selected)
+    record = {}
+    prog = splitk_program(ctx, 4, recipe=selected, geometry=geom, record=record)
+    eng = Engine(
+        [Resource(r, rates[r], units=units[r]) for r in rates],
+        pools=pools, pool_units={p: die.pool_units(p) for p in pools},
+    )
+    done = prog.start(eng, "q_sk", eng.submit("ready"))
+    eng.advance(until=(done,))
+    # 5 column tiles re-read A + row scales (4B/row) from HBM; B + col scales + output once.
+    row_scales = float(dict(op.metadata)["matrix_epilogue"]["row_scale_bytes"])
+    col_scales = float(dict(op.metadata)["matrix_epilogue"]["column_scale_bytes"])
+    expected_hbm = 5 * (m * k + row_scales) + (n * k + col_scales) + 2 * m * n
+    assert eng.serviced["hbm"] == pytest.approx(expected_hbm)
+    assert record["split_k_traffic"]["issued_hbm_work"] == pytest.approx(expected_hbm)
+    assert not any(eng.allocated.values())

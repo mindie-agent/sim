@@ -588,17 +588,27 @@ def resolve_fia_host_plan(
     is_arch35: bool,
     page_size: int = 0,
     paged: bool = False,
+    s2_tile: int | None = None,
 ) -> _FiaHostPlan:
     """Replay CANN Arch22/Arch35 FIA MLA tiling, SplitCore, and SplitFD reducer mapping."""
     batch = len(sequences)
     max_s1 = max((q for q, _ in sequences), default=1)
     if is_arch35:
-        m_tile, s2_tile, tol = FIA_ARCH35_M_TILE, FIA_ARCH35_S2_TILE, FIA_ARCH35_FD_TOLERANCE_BLOCKS
+        resolved_s2 = (
+            min(FIA_ARCH35_S2_TILE, int(s2_tile))
+            if s2_tile is not None and int(s2_tile) > 0
+            else FIA_ARCH35_S2_TILE
+        )
+        m_tile, s2_tile_width, tol = FIA_ARCH35_M_TILE, resolved_s2, FIA_ARCH35_FD_TOLERANCE_BLOCKS
     else:
-        s2_tile = FIA_ARCH22_S2_TILE
+        s2_tile_width = (
+            min(FIA_ARCH22_S2_TILE, int(s2_tile))
+            if s2_tile is not None and int(s2_tile) > 0
+            else FIA_ARCH22_S2_TILE
+        )
         # fia_tiling_nonquant_mla.cpp:277-282 rounds S2 down to a multiple of PA blockSize.
-        if paged and page_size > 0 and s2_tile > page_size and s2_tile % page_size != 0:
-            s2_tile = (s2_tile // page_size) * page_size
+        if paged and page_size > 0 and s2_tile_width > page_size and s2_tile_width % page_size != 0:
+            s2_tile_width = (s2_tile_width // page_size) * page_size
         m_tile = FIA_ARCH22_M_TILE
         same_kv = len({kv for _, kv in sequences}) == 1
         s1_g = max_s1 * physical_heads
@@ -618,11 +628,11 @@ def resolve_fia_host_plan(
             continue
         total_m = q_len * physical_heads
         m_blocks = ceil_div(total_m, m_tile)
-        tiles = ceil_div(kv_len, s2_tile)
-        tail_s2 = kv_len - (tiles - 1) * s2_tile
+        tiles = ceil_div(kv_len, s2_tile_width)
+        tail_s2 = kv_len - (tiles - 1) * s2_tile_width
         for m_idx in range(m_blocks):
             m_rows = min(m_tile, total_m - m_idx * m_tile)
-            n_cost = _fia_block_cost(m_rows, s2_tile)
+            n_cost = _fia_block_cost(m_rows, s2_tile_width)
             t_cost = _fia_block_cost(m_rows, tail_s2)
             rows_list.append(_FiaRowSpec(seq, m_idx, m_rows, tiles, n_cost, t_cost, (tiles - 1) * n_cost + t_cost))
         batch_ends.append(len(rows_list))
@@ -630,7 +640,7 @@ def resolve_fia_host_plan(
     b_ends = tuple(batch_ends)
     total_blocks = sum(r.tiles for r in rows)
     if total_blocks <= 0:
-        return _FiaHostPlan(m_tile, s2_tile, 1, False, 1, ((),), {}, ())
+        return _FiaHostPlan(m_tile, s2_tile_width, 1, False, 1, ((),), {}, ())
 
     max_core = min(aic_count, total_blocks)
     root = isqrt(total_blocks * FIA_MIN_CORE_OFFSET_DEN + FIA_MIN_CORE_OFFSET_NUM)
@@ -646,7 +656,7 @@ def resolve_fia_host_plan(
     fd_on = max(best_splits, default=1) > 1
     if fd_on and tol > 0:
         no_used, no_cost, no_slices, no_splits = _eval_fia_split_core(rows, b_ends, best_used, stream_k=False)
-        full_cost = _fia_block_cost(min(max_s1 * physical_heads, m_tile), s2_tile)
+        full_cost = _fia_block_cost(min(max_s1 * physical_heads, m_tile), s2_tile_width)
         if not ((no_cost - tol * full_cost) > best_cost):
             best_used, best_slices, best_splits, fd_on = no_used, no_slices, no_splits, False
 
@@ -657,7 +667,7 @@ def resolve_fia_host_plan(
     )
     fd_reducers = _assign_fia_fd_reducers(fd_tasks, best_used, aiv_per_aic, is_arch35=is_arch35)
     return _FiaHostPlan(
-        m_tile, s2_tile, best_used, fd_on, max(best_splits, default=1),
+        m_tile, s2_tile_width, best_used, fd_on, max(best_splits, default=1),
         best_slices, row_splits, fd_reducers,
     )
 
