@@ -452,7 +452,7 @@ def test_g2_zero_demand_fractal_m16_and_m2b_m2_abi_activations():
     )
     cfg_a3_fused = MoeCommConfig.from_features(feats_a3_fused, ep=8, top_k=8, experts=64)
     assert cfg_a3_fused is not None and cfg_a3_fused.select(33, phase="decode") == FUSED_MC2
-    assert cfg_a3_fused.select(33, phase="prefill") == ALLTOALL
+    assert cfg_a3_fused.select(33, phase="prefill") == FUSED_MC2
 
     # megamoe.allow_abi_extension honors normalized stack_track=='target'.
     assert allow_abi_extension(SimpleNamespace(metadata=(("stack_track", "target"),))) is True

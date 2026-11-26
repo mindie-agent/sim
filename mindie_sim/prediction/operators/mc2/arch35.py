@@ -250,8 +250,10 @@ STRATEGY: ArchStrategy = _Strategy()
 
 
 def validate_native_protocol(raw):
-    if "global_bs" in raw:
-        raise ModelingError("arch22_v2_global_bs_requires_nonnegative_integer")
+    if "global_bs" in raw and (type(raw["global_bs"]) is not int or raw["global_bs"] < 0):
+        raise ModelingError("arch35_fullmesh_global_bs_requires_nonnegative_integer")
+    if "enable_group_send" in raw and type(raw["enable_group_send"]) is not bool:
+        raise ModelingError("arch35_fullmesh_enable_group_send_requires_bool")
     validate_native_dispatch_quant(raw)
     native_protocol_peer_transport(raw)
 
@@ -426,16 +428,33 @@ def lower_native_protocol(
         )
     row_format = {"forward_bytes": layouts[0].packet_bytes,
                   "reverse_bytes": layouts[1].packet_bytes}
+    ep_rank = _resolve_lowered_ep_rank(
+        pack, dispatch, unpack, by_id.get(prefix + ".expert_up"), source_routing,
+    )
+    declared_global_bs = selected.get("global_bs") if "global_bs" in selected else None
+    if declared_global_bs is not None:
+        if type(declared_global_bs) is not int or declared_global_bs < 0:
+            raise ModelingError("arch35_fullmesh_global_bs_requires_nonnegative_integer")
+        if declared_global_bs > 0:
+            ep_total_bs = math.ceil(tokens) * int(ep)
+            if declared_global_bs < ep_total_bs or declared_global_bs % int(ep) != 0:
+                raise ModelingError("arch35_fullmesh_global_bs_invalid_for_batch_and_ep")
+            has_active_mask = dict(dispatch.metadata).get("mc2_active_mask_producer") is not None
+            if has_active_mask and declared_global_bs > ep_total_bs:
+                raise ModelingError("arch35_fullmesh_global_bs_incompatible_with_active_mask")
+    declared_group_send = _declared_group_send(selected, runtime)
     forward_raw, backward_raw, payload_basis, source_key = _routing_contracts(
         source_routing, source_rows_by_replica, destination_rows_by_rank,
         ep, width, dtype, tokens, valid_source_tokens, top_k, experts,
         quant, quant_mode, payload_dtype, layouts, send, received_assignments,
+        global_bs=declared_global_bs, enable_group_send=declared_group_send,
     )
     dispatch_op, combine_op = _native_dispatch_combine(
         pack, dispatch, combine, unpack, prefix, dtype, width, ep, selected,
         quant, payload_dtype, layouts, received_assignments, absorbed,
         forward_raw, backward_raw, source_routing, source_key, source_metadata,
         row_format, source_partitions, payload_basis,
+        pack_quant=pack_quant, ep_rank=ep_rank,
     )
     return _replace_protocol_ops(
         ops, by_id, pack, dispatch, combine, unpack, pack_quant,
@@ -535,10 +554,47 @@ def _bind_quantized_expert_input(
         raise ModelingError("mc2_quantized_combine_requires_declared_float_expert_return")
 
 
+def _resolve_lowered_ep_rank(pack, dispatch, unpack, expert_up, source_routing) -> int | None:
+    """Resolve local EP rank from operator metadata or routing realization, even on empty banks."""
+    for candidate in (unpack, expert_up, dispatch, pack):
+        if candidate is None:
+            continue
+        cand_rank = dict(candidate.metadata).get("ep_rank")
+        if isinstance(cand_rank, int) and not isinstance(cand_rank, bool):
+            return cand_rank
+    for candidate in (unpack, pack, dispatch):
+        if candidate is None:
+            continue
+        rr = dict(candidate.metadata).get("routing_realization")
+        if isinstance(rr, Mapping):
+            rep_rank = rr.get("representative_rank")
+            if isinstance(rep_rank, int) and not isinstance(rep_rank, bool):
+                return rep_rank
+    if source_routing is not None:
+        rep_rank = getattr(source_routing, "representative_rank", None)
+        if isinstance(rep_rank, int) and not isinstance(rep_rank, bool):
+            return rep_rank
+    return None
+
+
+def _declared_group_send(selected, runtime) -> bool | None:
+    if "enable_group_send" in selected and selected["enable_group_send"] is not None:
+        return bool(selected["enable_group_send"])
+    rmeta = dict(getattr(runtime, "metadata", ()) or ())
+    if "enable_group_send" in rmeta and rmeta["enable_group_send"] is not None:
+        return bool(rmeta["enable_group_send"])
+    radditional = rmeta.get("additional_config")
+    if isinstance(radditional, Mapping) and "enable_group_send" in radditional:
+        if radditional["enable_group_send"] is not None:
+            return bool(radditional["enable_group_send"])
+    return None
+
+
 def _routing_contracts(
     source_routing, source_rows_by_replica, destination_rows_by_rank,
     ep, width, dtype, tokens, valid_source_tokens, top_k, experts,
     quant, quant_mode, payload_dtype, layouts, send, received_assignments,
+    *, global_bs: int | None = None, enable_group_send: bool | None = None,
 ):
     # An exact source force-EPLB ledger is a whole routed-row matrix.  It is
     # never synthesized from a statistical destination expectation.
@@ -578,6 +634,10 @@ def _routing_contracts(
                "payload_basis": payload_basis}
         if kind == "dispatch" and quant != "none":
             raw.update(dispatch_quant=quant_mode, payload_dtype=payload_dtype)
+        if global_bs is not None:
+            raw["global_bs"] = global_bs
+        if enable_group_send is not None:
+            raw["enable_group_send"] = bool(enable_group_send)
         layout = layouts[0] if kind == "dispatch" else layouts[1]
         if peer_matrix is not None:
             # One representation: the shared source->destination forward
@@ -653,6 +713,7 @@ def _native_dispatch_combine(
     quant, payload_dtype, layouts, received_assignments, absorbed,
     forward_raw, backward_raw, source_routing, source_key, source_metadata,
     row_format, source_partitions, payload_basis,
+    *, pack_quant=None, ep_rank: int | None = None,
 ):
     phase_names = {
         "dispatch": tuple(p.name for p in contract(forward_raw, 2).phases),
@@ -676,6 +737,11 @@ def _native_dispatch_combine(
         }
         if absorbed is None:
             dispatch_returns = tuple(dict.fromkeys((*dispatch_returns, "activation_scales")))
+    combine_logical_rows = math.ceil(backward_raw["source_tokens"])
+    combine_physical_rows = max(combine_logical_rows, math.ceil(forward_raw["source_tokens"]))
+    combine_logical_shape = (combine_logical_rows, width)
+    combine_physical_shape = (combine_physical_rows, width)
+    mask_producer = dict(dispatch.metadata).get("mc2_active_mask_producer")
 
     def native_metadata(kind, raw, kernel, group):
         implementation = (
@@ -713,8 +779,18 @@ def _native_dispatch_combine(
             },
             "coverage": "source_protocol_with_declared_row_grid_and_peer_window",
         }
+        if ep_rank is not None:
+            metadata["ep_rank"] = ep_rank
         if kind == "combine":
             metadata["transpose_of_source_assignments"] = True
+            metadata["output_format"] = dtype
+            metadata["output_shape"] = combine_logical_shape
+            metadata["output_layout"] = {
+                "shape": combine_logical_shape,
+                "storage_shape": combine_physical_shape,
+            }
+        if kind == "dispatch" and mask_producer is not None:
+            metadata["mc2_active_mask_producer"] = mask_producer
         if kind == "dispatch" and absorbed is not None:
             # ``MoeDistributeDispatchV3`` owns the permutation *and* the
             # ``aclnnMoeInitRoutingV3`` dynamic quantization (``quant_mode=1``)
@@ -724,8 +800,11 @@ def _native_dispatch_combine(
                                               absorbed["native_kind"])
         return tuple(metadata.items())
 
-    dispatch_op = declared_floor_work(forward_raw).apply(replace(
-        dispatch, op_id=dispatch.op_id, deps=pack.deps,
+    absorbed_ids = {pack.op_id, *((pack_quant.op_id,) if pack_quant is not None else ())}
+    dispatch_extra_deps = tuple(dep for dep in dispatch.deps if dep not in absorbed_ids)
+    dispatch_deps = tuple(dict.fromkeys(pack.deps + dispatch_extra_deps))
+    dispatch_op = declared_floor_work(forward_raw, ep_rank=ep_rank).apply(replace(
+        dispatch, op_id=dispatch.op_id, deps=dispatch_deps,
         family="mc2_protocol", recipe=RECIPE, source_boundary="kernel",
         dtype=dtype, returns=dispatch_returns,
         metadata=native_metadata(
@@ -736,10 +815,12 @@ def _native_dispatch_combine(
     final_deps = (dispatch.op_id,) + tuple(
         d for d in unpack.deps if d not in {pack.op_id, combine.op_id})
     combine_deps = tuple(dict.fromkeys(combine.deps + final_deps))
-    combine_op = declared_floor_work(backward_raw).apply(replace(
+    combine_op = declared_floor_work(backward_raw, ep_rank=ep_rank).apply(replace(
         combine, op_id=unpack.op_id, deps=combine_deps,
         family="mc2_protocol", recipe=RECIPE, source_boundary="kernel",
         dtype=dtype,
+        local_shape=combine_logical_shape, semantic_shape=combine_logical_shape,
+        padded_shape=combine_physical_shape, launch_shape=combine_physical_shape,
         metadata=native_metadata(
             "combine", backward_raw, "MoeDistributeCombineV3",
             prefix + ".mc2_combine")))
@@ -756,7 +837,7 @@ def _replace_protocol_ops(
     redirect = {pack.op_id: dispatch.op_id, combine.op_id: unpack.op_id}
     result = []
     for op in ops:
-        if op.op_id == pack.op_id:
+        if op.op_id == dispatch.op_id:
             result.append(dispatch_op)
             if received_quant is not None:
                 result.append(received_quant)
@@ -764,7 +845,7 @@ def _replace_protocol_ops(
         if op.op_id == unpack.op_id:
             result.append(combine_op)
             continue
-        if (op.op_id in {dispatch.op_id, combine.op_id}
+        if (op.op_id in {pack.op_id, combine.op_id}
                 or (pack_quant is not None and op.op_id == pack_quant.op_id)):
             continue
         current = by_id[op.op_id]

@@ -59,11 +59,6 @@ def select_common(runtime, features=None, *, tokens, top_k, experts, ep, phase="
     chosen = config.select(max(0, int(tokens)), phase=phase)
     if chosen not in {MC2, FUSED_MC2}:
         return None
-    if (chosen in {MC2, FUSED_MC2} and phase == "prefill"
-            and not bool(radditional.get("enable_prefill_mc2"))
-            and not config.enable_prefill_mc2
-            and not (chosen == FUSED_MC2 and config.arch_family == "A5" and config.mega_moe_supported)):
-        return None
     fused_level = int(radditional.get("enable_fused_mc2", 0) or 0)
     arch_family = str(
         config.arch_family or rmeta.get("arch_family") or ""

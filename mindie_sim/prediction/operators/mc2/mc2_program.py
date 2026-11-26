@@ -31,8 +31,12 @@ from typing import Any, Mapping
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.parallel import RankCoord
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.program import KernelProgram
+from .mc2_fullmesh import (
+    resolve_ep_group, resolve_ep_local_rank, resolve_group_send_enabled,
+)
 
 TARGET_BACKEND = "ascend"
 _OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
@@ -93,7 +97,7 @@ def _as_fraction(value: Any) -> Fraction:
     raise ModelingError(f"expression_non_numeric:{value!r}")
 
 
-def _link_work(plan, ep: int, node_ranks: int = 0):
+def _link_work(plan, ep: int, node_ranks: int = 0, rank_nodes=(), rank: int = 0):
     """Add source-directed peer wire on the real intra/inter link classes.
 
     A fullmesh source sends to every peer.  When the EP group spans nodes, the
@@ -103,8 +107,13 @@ def _link_work(plan, ep: int, node_ranks: int = 0):
     """
     phases = []
     peers = max(0, int(ep) - 1)
-    local_peers = (max(0, min(int(ep), int(node_ranks)) - 1)
-                   if node_ranks and int(node_ranks) >= 1 else peers)
+    node_map = dict(rank_nodes or ())
+    if peers and int(rank) in node_map and all(p in node_map for p in range(int(ep))):
+        my_node = node_map[int(rank)]
+        local_peers = sum(1 for p in range(int(ep)) if p != int(rank) and node_map[p] == my_node)
+    else:
+        local_peers = (max(0, min(int(ep), int(node_ranks)) - 1)
+                       if node_ranks and int(node_ranks) >= 1 else peers)
     remote_peers = peers - local_peers
     for phase in plan.phases:
         work = dict(phase.work)
@@ -113,8 +122,9 @@ def _link_work(plan, ep: int, node_ranks: int = 0):
             # the same record outside this rank; the diagonal stays local.
             remote = _as_fraction(work.get("mte3", 0)) * Fraction(peers, ep)
             if remote_peers:
-                work["link_hccs"] = (work.get("link_hccs", Fraction(0))
-                                     + remote * Fraction(local_peers, peers))
+                if local_peers:
+                    work["link_hccs"] = (work.get("link_hccs", Fraction(0))
+                                         + remote * Fraction(local_peers, peers))
                 work["link_roce"] = (work.get("link_roce", Fraction(0))
                                      + remote * Fraction(remote_peers, peers))
             else:
@@ -237,7 +247,7 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
     from .mc2_program_launch import _Mc2Program
     raw = dict(raw_items)
     plan = contract(raw, aiv)
-    phases = _link_work(plan, max(1, int(raw["ep"])), int(node_ranks))
+    phases = _link_work(plan, max(1, int(raw["ep"])), int(node_ranks), rank_nodes=rank_nodes, rank=int(rank))
     base_roles = {"vector", "mte2_aiv", "mte3", "hbm", "link"}
     all_roles = (set(dict(rates_items)) | set(dict(units_items)) | base_roles
                  | {str(name) for name, _mode in service_items})
@@ -415,22 +425,36 @@ def _transport_latencies(context, ep: int) -> tuple[Fraction, Fraction]:
     return intra, inter
 
 
-def _transport_rank_nodes(context) -> tuple[tuple[int, int], ...]:
+def _transport_rank_nodes(
+    context, ep: int = 1, *, ep_group: tuple[int, ...] = (),
+) -> tuple[tuple[int, int], ...]:
+    """Project the ordered EP group through physical placements into ``(ordinal, node)``."""
     transport = _transport_identity(context)
     placements = transport.get("placements") or ()
-    nodes: dict[int, int] = {}
+    physical_nodes: dict[int, int] = {}
     for placement in placements:
         if not isinstance(placement, Mapping):
             continue
         try:
-            nodes[int(placement["rank"])] = int(placement.get("node", 0))
+            physical_nodes[int(placement["rank"])] = int(placement.get("node", 0))
         except (KeyError, TypeError, ValueError):
             continue
-    return tuple(sorted(nodes.items()))
+    if not physical_nodes:
+        return ()
+    group = ep_group or resolve_ep_group(context, ep)
+    if group:
+        projected = tuple(
+            (ordinal, physical_nodes[phys_rank])
+            for ordinal, phys_rank in enumerate(group)
+            if phys_rank in physical_nodes
+        )
+        if projected:
+            return projected
+    return tuple(sorted(physical_nodes.items()))
 
 
-def _transport_peer_classes(context, rank, ep):
-    nodes = dict(_transport_rank_nodes(context))
+def _transport_peer_classes(rank_nodes: tuple[tuple[int, int], ...], rank: int, ep: int):
+    nodes = dict(rank_nodes)
     if rank not in nodes:
         return None
     return tuple(sorted(
@@ -438,7 +462,10 @@ def _transport_peer_classes(context, rank, ep):
         for peer in range(ep) if peer != rank and peer in nodes))
 
 
-def native_program_from_contract(raw, context):
+def native_program_from_contract(
+    raw, context, *, rank: int | None = None, rank_coord: RankCoord | None = None,
+    physical_rank: int | None = None,
+):
     """Reuse the real MC2 program construction for an ordinary public graph.
 
     Returns without starting an Engine or running a private estimate; the
@@ -447,7 +474,25 @@ def native_program_from_contract(raw, context):
     """
     data = dict(raw)
     ep = max(1, int(data["ep"]))
-    rank = int(data.get("route_rank", 0))
+    op_metadata = dict(getattr(getattr(context, "op", None), "metadata", ()) or ())
+    phys_hint = physical_rank
+    if phys_hint is None and isinstance(rank_coord, RankCoord):
+        phys_hint = int(rank_coord.global_rank)
+    if phys_hint is None:
+        ctx_rank = getattr(context, "rank", None)
+        if isinstance(ctx_rank, int) and not isinstance(ctx_rank, bool):
+            phys_hint = ctx_rank
+    if phys_hint is None and isinstance(rank, int) and not isinstance(rank, bool) and rank >= ep:
+        phys_hint = rank
+    ep_group = resolve_ep_group(context, ep, physical_rank=phys_hint)
+    if "enable_group_send" not in data:
+        if resolve_group_send_enabled(data, ep=ep, context=context, ep_group=ep_group):
+            data["enable_group_send"] = True
+    resolved_rank = resolve_ep_local_rank(
+        data, ep=ep, op_metadata=op_metadata, context=context,
+        rank_coord=rank_coord, explicit_rank=rank, physical_rank=phys_hint,
+    )
+    ep_rank_nodes = _transport_rank_nodes(context, ep, ep_group=ep_group)
     matrix = data.get("route_matrix")
     exact = matrix is not None
     frames = ()
@@ -455,13 +500,13 @@ def native_program_from_contract(raw, context):
     if exact:
         cells = tuple(tuple(int(value) for value in row) for row in matrix)
         reverse = bool(data.get("route_reverse", False))
-        if 0 <= rank < len(cells):
+        if 0 <= resolved_rank < len(cells):
             frames = tuple(sorted(
-                (peer, cells[peer][rank] if reverse else cells[rank][peer])
+                (peer, cells[peer][resolved_rank] if reverse else cells[resolved_rank][peer])
                 for peer in range(len(cells))
-                if peer != rank
-                and (cells[peer][rank] if reverse else cells[rank][peer]) > 0))
-            local_frames = cells[rank][rank]
+                if peer != resolved_rank
+                and (cells[peer][resolved_rank] if reverse else cells[resolved_rank][peer]) > 0))
+            local_frames = cells[resolved_rank][resolved_rank]
     basis = str(data.get("payload_basis") or "unknown")
     if exact and not frames:
         basis = "actual_zero"
@@ -484,7 +529,7 @@ def native_program_from_contract(raw, context):
         dict(units), core_count=int(getattr(context, "core_count", 0) or 0))
     program, _work = _native_program(
         tuple(sorted(data.items())), aiv, rates, units, services, latencies,
-        node_ranks, None, rank, _transport_peer_classes(context, rank, ep),
+        node_ranks, None, resolved_rank, _transport_peer_classes(ep_rank_nodes, resolved_rank, ep),
         resources, frames, basis, local_frames, exact,
-        _transport_rank_nodes(context))
+        ep_rank_nodes)
     return program

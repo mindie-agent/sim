@@ -33,6 +33,7 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
 from ...ownership import read_role, unit_group
 from ...program import KernelProgram, ParallelProgram, Stage
+from ...runtime.l2_residency import RawDieL2Bytes, UsableL2Bytes, resolve_usable_l2_bytes
 from ..grouped_moe.lowering import element_bytes, mx_scale_bytes
 
 TARGET_BACKEND = "ascend"
@@ -69,6 +70,8 @@ EXTENDED_ABI_ACTIVATIONS = frozenset({
 SUPPORTED_ACTIVATIONS = SHIPPING_SUPPORTED_ACTIVATIONS
 ALL_ACTIVATIONS = SHIPPING_SUPPORTED_ACTIVATIONS | EXTENDED_ABI_ACTIVATIONS
 _ELEMENTWISE_ACTIVATIONS = frozenset({"gelu", "gelu_tanh"})
+_SHARED_COLLECTIVE_FAMILIES = frozenset({"allgather", "reduce_scatter", "allreduce", "alltoall", "alltoallv"})
+_GEMM_SHAPE_RANK = 3
 FUSED_MC2_ROUTED_MODE = 2
 FUSED_MC2_SHARED_MODE = 3
 SUPPORTED_FUSED_MC2_MODES = frozenset({0, FUSED_MC2_ROUTED_MODE, FUSED_MC2_SHARED_MODE})
@@ -121,19 +124,21 @@ def _activation_ops(activation: str) -> int:
     return SWIGLU_OPS_PER_ELEM + MX_QUANT_OPS_PER_ELEM
 
 
-def _effective_l2(geometry: Geometry) -> float:
+def _effective_l2(geometry: Geometry) -> UsableL2Bytes:
     view = getattr(geometry, "admission_memory_view", None)
     if view is not None:
         die = int(getattr(geometry, "rank", 0) or 0)
-        cap_map = getattr(view, "_l2_capacity", None)
-        if isinstance(cap_map, Mapping) and cap_map:
-            cap = cap_map.get(die, next(iter(cap_map.values())))
-            return float(cap)
+        raw_l2 = getattr(
+            geometry, "raw_l2_bytes",
+            RawDieL2Bytes(max(0, int((getattr(geometry, "buffers", None) or {}).get("l2", 0)))),
+        )
+        return resolve_usable_l2_bytes(view, die, fallback_raw_l2=raw_l2)
     mechanisms = getattr(geometry, "physical_mechanisms", None)
     hierarchy = getattr(mechanisms, "memory_hierarchy", None)
     if hierarchy is not None:
-        return float(hierarchy.effective_l2_bytes)
-    return L2_EFFECTIVE_SHARE * float((geometry.buffers or {}).get("l2", 0))
+        return UsableL2Bytes(max(0, int(hierarchy.effective_l2_bytes)))
+    fallback = RawDieL2Bytes(max(0, int(L2_EFFECTIVE_SHARE * float((geometry.buffers or {}).get("l2", 0)))))
+    return resolve_usable_l2_bytes(None, 0, fallback_raw_l2=fallback)
 
 
 _UNQUANTIZED_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
@@ -591,7 +596,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     aic_read_total = aic_act_read + aic_weight_read
 
     has_l2 = bool((geometry.rates or {}).get("l2", 0.0) or (geometry.resource_units or {}).get("l2", 0))
-    l2_cap = _effective_l2(geometry) if has_l2 else 0.0
+    l2_cap = float(_effective_l2(geometry)) if has_l2 else 0.0
     # Dispatched MX activations land in L2/UB on-chip and are consumed by GMM1 only.
     gmm1_read_total = aic_act_read + w13 + sh_w13
     gmm2_read_total = w2 + sh_w2
@@ -790,6 +795,36 @@ def _matrix_int8_eligible(meta: Mapping[str, Any]) -> bool:
     return afmt == "int8" and wfmt in {"int8", "int4", "w4a8"}
 
 
+def _shared_expert_fusable(
+    *, sh_ops, sh_up, sh_down, join_op, unpack_id: str,
+    tokens: int, width: int, act_kind: str,
+    shared_precision_compatible: bool,
+) -> tuple[bool, int]:
+    """Validate that the shared expert runs locally on ``tokens`` with no TP collectives."""
+    if not (shared_precision_compatible and sh_ops and sh_up is not None and sh_down is not None and join_op is not None):
+        return False, 0
+    if len(join_op.deps) != 2 or unpack_id not in join_op.deps or sh_down.op_id not in join_op.deps:
+        return False, 0
+    if any(
+        float(item.link_bytes or 0.0) > 0.0
+        or str(item.family or "").lower() in _SHARED_COLLECTIVE_FAMILIES
+        for item in sh_ops
+    ):
+        return False, 0
+    if len(sh_up.local_shape) != _GEMM_SHAPE_RANK or len(sh_down.local_shape) != _GEMM_SHAPE_RANK:
+        return False, 0
+    if (int(sh_up.local_shape[0]) != int(tokens) or int(sh_down.local_shape[0]) != int(tokens)
+            or int(sh_up.local_shape[2]) != int(width) or int(sh_down.local_shape[1]) != int(width)):
+        return False, 0
+    sh_up_n, sh_down_k = int(sh_up.local_shape[1]), int(sh_down.local_shape[2])
+    if sh_up_n < 2 or sh_up_n % 2 != 0:
+        return False, 0
+    expected_down_k = sh_up_n if act_kind in _ELEMENTWISE_ACTIVATIONS else (sh_up_n // 2)
+    if sh_down_k != expected_down_k:
+        return False, 0
+    return True, sh_up_n // 2
+
+
 def try_lower_fused_frame(
     ops, by_id, selected, runtime, prefix, tokens, width, top_k, received_assignments,
     ep, dtype, pack, dispatch, combine, unpack, pack_quant,
@@ -824,12 +859,27 @@ def try_lower_fused_frame(
             and combine.deps == (e_down.op_id,)
             and (mxfp_eligible or int8_eligible)):
         return None
+    if len(e_up.local_shape) != _GEMM_SHAPE_RANK or len(e_down.local_shape) != _GEMM_SHAPE_RANK:
+        return None
+    up_n, down_k = int(e_up.local_shape[1]), int(e_down.local_shape[-1])
     act_meta = dict(e_act.metadata)
     act_kind = str(act_meta.get("activation_kind") or e_act.family or "swiglu").lower()
+    if act_kind in _ELEMENTWISE_ACTIVATIONS and (
+        str(e_act.family or "").lower() == "geglu" or up_n == 2 * down_k
+    ):
+        act_kind = "geglu"
     act_limit = float(act_meta.get("activation_limit", 0.0) or 0.0)
     allow_ext = allow_abi_extension(runtime)
     if (act_limit > 0.0 and not allow_ext) or act_kind not in (ALL_ACTIVATIONS if allow_ext else SUPPORTED_ACTIVATIONS):
         return None
+    if act_kind in _ELEMENTWISE_ACTIVATIONS:
+        if up_n != down_k or up_n < 2 or up_n % 2 != 0:
+            return None
+        moe_inter = down_k // 2
+    else:
+        if down_k < 1 or up_n != 2 * down_k:
+            return None
+        moe_inter = down_k
 
     fused_lvl = int(selected.get("fused_mc2_level") or FUSED_MC2_ROUTED_MODE)
     fused_lvl = (
@@ -837,8 +887,6 @@ def try_lower_fused_frame(
         if (fused_lvl >= FUSED_MC2_SHARED_MODE and not allow_int8_arch22)
         else FUSED_MC2_ROUTED_MODE
     )
-    down_k = int(e_down.local_shape[-1])
-    moe_inter = max(1, down_k // 2) if act_kind in _ELEMENTWISE_ACTIVATIONS else down_k
     w13_b = float(up_meta.get("packed_weight_bytes") or max(0.0, e_up.mte2_bytes - received_assignments * width))
     w2_b = float(down_meta.get("packed_weight_bytes") or max(0.0, e_down.mte2_bytes - received_assignments * down_k))
     sh_ops = [item for item in ops if item.op_id.startswith(prefix + ".shared.")]
@@ -856,14 +904,15 @@ def try_lower_fused_frame(
         == str(down_meta.get("activation_format") or "").lower()
     )
     has_latent_moe = (by_id.get(prefix + ".latent_down") is not None or by_id.get(prefix + ".latent_up") is not None)
-    fuse_shared = (
-        fused_lvl == FUSED_MC2_SHARED_MODE and not has_latent_moe
-        and shared_precision_compatible
-        and bool(sh_ops) and sh_up is not None and sh_down is not None and join_op is not None
-        and len(join_op.deps) == 2 and unpack.op_id in join_op.deps
-        and any(dep.startswith(prefix + ".shared.") for dep in join_op.deps)
+    fuse_shared, sh_inter = (
+        _shared_expert_fusable(
+            sh_ops=sh_ops, sh_up=sh_up, sh_down=sh_down, join_op=join_op,
+            unpack_id=unpack.op_id, tokens=int(tokens), width=int(width),
+            act_kind=act_kind, shared_precision_compatible=shared_precision_compatible,
+        )
+        if (fused_lvl == FUSED_MC2_SHARED_MODE and not has_latent_moe)
+        else (False, 0)
     )
-    sh_inter = int(sh_up.local_shape[1] // 2) if fuse_shared else 0
     sh_w13 = float(dict(sh_up.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
     sh_w2 = float(dict(sh_down.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
     removed_ids = {

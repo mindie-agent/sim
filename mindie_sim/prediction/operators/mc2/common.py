@@ -66,6 +66,9 @@ FLOAT_ROWS = frozenset({"bf16", "fp16"})
 FP8_ROWS = frozenset({"fp8_e4m3", "fp8_e5m2"})
 FP4_ROWS = frozenset({"fp4_e2m1", "fp4"})
 _FLOAT_DTYPE_ALIASES = {"bfloat16": "bf16", "float16": "fp16"}
+_MX_LINEAR_METHODS = frozenset({"mx_fp4", "mxfp4", "mx_fp8", "mxfp8"})
+_MX_SCALE_FORMATS = frozenset({"fp8_e8m0", "e8m0"})
+_MX_OPERAND_FORMATS = frozenset({"fp4", "fp4_e2m1", "mxfp4", "mx_fp4", "mxfp8", "mx_fp8"})
 AGMM = "all_gather_matmul"
 MMRS = "matmul_reduce_scatter"
 MMAR = "matmul_all_reduce"
@@ -617,15 +620,23 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
     handles = fields.get("independent_handles", False)
     if chunks > MAX_MC2_INTERNAL_CHUNKS or type(buffers) is not bool or type(handles) is not bool:
         raise ModelingError("mc2_invalid_chunk_binding")
-    raw_dtype = fields.get("compute_dtype", op.dtype or "bf16")
-    raw_out = fields.get("output_dtype", op.dtype or "bf16")
+    pabi = getattr(op, "precision_abi", None)
+    pabi_in = str(getattr(pabi, "input_dtype", "") or "").strip().lower() if pabi is not None else ""
+    pabi_comp = str(getattr(pabi, "compute_dtype", "") or "").strip().lower() if pabi is not None else ""
+    pabi_method = str(getattr(pabi, "linear_method", "") or "").strip().lower() if pabi is not None else ""
+    pabi_out = str(getattr(pabi, "output_dtype", "") or "").strip().lower() if pabi is not None else ""
+    pabi_dtype = (
+        pabi_in if (pabi_method in _MX_LINEAR_METHODS and pabi_in)
+        else (pabi_comp if pabi_comp and pabi_comp != "fp32" else pabi_in)
+    )
+    raw_dtype = fields.get("compute_dtype") or (pabi_dtype or None) or op.dtype or "bf16"
+    raw_out = fields.get("output_dtype") or (pabi_out or None) or op.dtype or "bf16"
     dtype = _FLOAT_DTYPE_ALIASES.get(str(raw_dtype).lower(), raw_dtype) if isinstance(raw_dtype, str) else raw_dtype
     out_dtype = _FLOAT_DTYPE_ALIASES.get(str(raw_out).lower(), raw_out) if isinstance(raw_out, str) else raw_out
     contract = Mc2Contract(abi, transport, algorithm, ranks, rank, chunks, buffers, handles, dtype, output_dtype=out_dtype)
     dtype_bytes(dtype)
     dtype_bytes(out_dtype)
     if abi in COLLECTIVES:
-        pabi = getattr(op, "precision_abi", None)
         raw_weight = fields.get("weight_format") or (getattr(pabi, "weight_dtype", None) if pabi is not None else "")
         raw_act = fields.get("activation_format") or (getattr(pabi, "input_dtype", None) if pabi is not None else "")
         weight_fmt = _FLOAT_DTYPE_ALIASES.get(str(raw_weight or "").strip().lower(), str(raw_weight or "").strip().lower())
@@ -646,20 +657,42 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
         row_bytes = (k if abi == AGMM else n) * dtype_bytes(operand)
         scale_bytes: int | float = 0
         w_scale_bytes: int | float = 0
-        if abi == AGMM:
-            scale_fmt = str(fields.get("activation_scale_format", "")).lower()
-            is_mx_agmm = (
-                fields.get("quant_mode") == "mx"
-                or scale_fmt in {"fp8_e8m0", "e8m0"}
-                or fields.get("activation_group_size") == MX_GROUP_SIZE
+        if abi in {AGMM, MMRS}:
+            scale_fmt = str(
+                fields.get("activation_scale_format")
+                or (getattr(pabi, "act_scale_dtype", "") if pabi is not None else "")
+            ).strip().lower()
+            w_scale_fmt = str(
+                fields.get("weight_scale_format")
+                or (getattr(pabi, "weight_scale_dtype", "") if pabi is not None else "")
+            ).strip().lower()
+            act_group = fields.get("activation_group_size") or (
+                getattr(pabi, "act_group_size", 0) if pabi is not None else 0
             )
-            if is_mx_agmm:
+            pabi_quant_mode = str(
+                getattr(pabi, "activation_quant_mode", "") if pabi is not None else ""
+            ).strip().lower()
+            is_mx_collective = (
+                fields.get("quant_mode") == "mx"
+                or scale_fmt in _MX_SCALE_FORMATS
+                or w_scale_fmt in _MX_SCALE_FORMATS
+                or act_group == MX_GROUP_SIZE
+                or pabi_quant_mode == "dynamic_mx32"
+                or pabi_method in _MX_LINEAR_METHODS
+                or act_fmt in _MX_OPERAND_FORMATS
+                or weight_fmt in _MX_OPERAND_FORMATS
+                or str(dtype).lower() in FP4_ROWS
+            )
+            if is_mx_collective:
                 if "activation_scale_bytes" in fields and fields["activation_scale_bytes"] is not None:
                     scale_bytes = fields["activation_scale_bytes"]
                 elif k > 0:
                     scale_bytes = m * align_up(math.ceil(k / MX_GROUP_SIZE), 2)
+                pabi_w_scale = getattr(pabi, "weight_scale_bytes", 0) if pabi is not None else 0
                 if "weight_scale_bytes" in fields and fields["weight_scale_bytes"] is not None:
                     w_scale_bytes = fields["weight_scale_bytes"]
+                elif isinstance(pabi_w_scale, int) and not isinstance(pabi_w_scale, bool) and pabi_w_scale > 0:
+                    w_scale_bytes = pabi_w_scale
                 elif k > 0 and n > 0:
                     w_scale_bytes = n * align_up(math.ceil(k / MX_GROUP_SIZE), 2)
             if (
@@ -669,11 +702,17 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
                 or (not m and scale_bytes)
             ):
                 raise ModelingError("mc2_invalid_activation_scale_bytes")
+            if (
+                type(w_scale_bytes) not in {int, float}
+                or not math.isfinite(w_scale_bytes)
+                or w_scale_bytes < 0
+            ):
+                raise ModelingError("mc2_invalid_weight_scale_bytes")
             if isinstance(scale_bytes, float) and scale_bytes.is_integer():
                 scale_bytes = int(scale_bytes)
             if isinstance(w_scale_bytes, float) and w_scale_bytes.is_integer():
                 w_scale_bytes = int(w_scale_bytes)
-        default_gathered = m * row_bytes + scale_bytes
+        default_gathered = m * row_bytes + (scale_bytes if abi == AGMM else 0)
         if isinstance(default_gathered, float) and default_gathered.is_integer():
             default_gathered = int(default_gathered)
         gathered = fields.get("gathered_bytes", fields.get("operand_bytes", default_gathered))
@@ -767,8 +806,11 @@ def build_cohort_transport_stages(
 def _matrix_fragment(contract: Mc2Contract, name: str, after: tuple[str, ...], rows: int,
                      *, b_bytes: int | float, slot: tuple = (), ub_output: bool = False,
                      has_l2: bool = True) -> Phase:
-    a_bytes = (contract.gathered_bytes * rows / contract.m if contract.abi == AGMM and contract.m
-               else rows * contract.k * dtype_bytes(contract.dtype))
+    if contract.abi == AGMM and contract.m:
+        a_bytes = contract.gathered_bytes * rows / contract.m
+    else:
+        a_scale = contract.activation_scale_bytes * rows / contract.m if contract.m else 0
+        a_bytes = rows * contract.k * dtype_bytes(contract.dtype) + a_scale
     load = read_work(a_bytes + b_bytes, aic=True, l2=has_l2)
     partial = rows * contract.n * dtype_bytes(contract.output_dtype)
     write = Work(resources={"fixpipe": partial}) if ub_output else store_work(partial, fixpipe=True, l2=has_l2)
@@ -873,7 +915,7 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
         comm_deps = (comm_gate, *previous)
         b_bytes = (
             contract.k * contract.n * dtype_bytes(contract.dtype)
-            + (contract.weight_scale_bytes if gathering else 0)
+            + (contract.weight_scale_bytes if contract.abi in {AGMM, MMRS} else 0)
         ) if rows else 0
         if all_reducing:
             previous_gemm = (f"gemm_chunk{index - 1}",) if index else ()

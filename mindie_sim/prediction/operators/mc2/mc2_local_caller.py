@@ -46,7 +46,7 @@ SOURCE = {
 
 def recipes(selected):
     return {LOCAL: PlannedRecipe(build), NETWORK: DirectPeerCollective(
-        max_inflight_per_rank=selected["max_inflight_per_rank"])}
+        max_inflight_per_rank=selected.get("max_inflight_per_rank"))}
 
 
 def build(op, geometry):
