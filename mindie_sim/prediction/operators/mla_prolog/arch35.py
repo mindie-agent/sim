@@ -444,8 +444,11 @@ def _supports(c: PrologContract) -> bool:
             and not c.query_quant_mode
             and c.num_heads in DSL_SUPPORTED_HEADS
         )
+    # CANN restricts the Dr==0 (W8A8 + C8 per-tile) V3 exception to DAV_2201
+    # (mla_prolog_tiling_check.cpp:253); Arch35 ACLNN requires a positive RoPE dim.
     return (
-        (c.weight_quant_mode != WEIGHT_QUANT_MXFP8 or c.abi in {ABI_V3_NZ, UPSTREAM_ABI})
+        c.qk_rope_head_dim > 0
+        and (c.weight_quant_mode != WEIGHT_QUANT_MXFP8 or c.abi in {ABI_V3_NZ, UPSTREAM_ABI})
         and aclnn_contract_supported(c)[0]
     )
 

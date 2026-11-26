@@ -200,7 +200,8 @@ def test_sparse_attention_roles_masks_and_layouts():
                              ("key_shape", (1, 2, 256, 128)), ("value_shape", (1, 2, 256, 128)),
                              ("block_mask", (1, 1)), ("return_softmax_lse", True)))
     bnsd_low = sd_lower_op(bnsd, op_name="rainfusion", sparsity_ratio=0.0, block_size=128)
-    assert bnsd_low.flops == 67_108_864 and _write(_sd_contract(bnsd_low), "softmax_lse")["bytes"] == 2048
+    bnsd_lse = _write(_sd_contract(bnsd_low), "softmax_lse")
+    assert bnsd_low.flops == 67_108_864 and (bnsd_lse["shape"], bnsd_lse["dtype"], bnsd_lse["bytes"]) == ((1, 4, 128), "bf16", 1024)
     tnd = replace(_make_op("indexed_attention", local_shape=(128, 4, 128)),
                   metadata=(("layout", "TND"), ("query_shape", (128, 4, 128)),
                             ("key_shape", (256, 2, 128)), ("value_shape", (256, 2, 128)),
@@ -497,3 +498,124 @@ def test_feedforward_shared_overlap_tp_pack_situ_quant_and_padding_selection():
         work = Frontend()(plan, sel_case.model, sel_case.runtime, sel_case.machine)
         assert plan.valid_tokens == 1
         assert any(op.family == "add_rmsnorm" for op in work.ops)
+
+
+def test_padded_eagle_sparse_attention_preserves_physical_output_and_lse_extents():
+    bnsd = replace(
+        _make_op("eagle_bsa", local_shape=(2, 4, 64, 128)),
+        metadata=(("layout", "BNSD"), ("query_shape", (2, 4, 64, 128)),
+                  ("key_shape", (2, 4, 64, 128)), ("value_shape", (2, 4, 64, 128)),
+                  ("query_lengths", (16, 20)), ("key_lengths", (16, 20)), ("value_lengths", (16, 20)),
+                  ("block_mask", (1, 1)), ("return_softmax_lse", True)),
+    )
+    bnsd_contract = _sd_contract(sd_lower_op(bnsd, soc_family="A3", sparsity_ratio=0.0, block_size=64))
+    bnsd_out = _write(bnsd_contract, "attention_out")
+    bnsd_lse = _write(bnsd_contract, "softmax_lse")
+    assert bnsd_out["shape"] == (2, 4, 64, 128) and int(bnsd_out["bytes"]) == (16 + 20) * 4 * 128 * 2
+    assert (bnsd_lse["shape"], bnsd_lse["dtype"], int(bnsd_lse["bytes"])) == ((2, 4, 64, 1), "fp32", (16 + 20) * 4 * 4)
+
+    # Padded BNSD accepts physical (B, H, ceil(S_phys/bq), ceil(S_kv_phys/bkv)) rectangular masks.
+    phys_head = ((1, 0), (0, 0), (0, 0), (0, 0))
+    padded_mask = replace(
+        _make_op("eagle_bsa", local_shape=(1, 2, 256, 64)),
+        metadata=(("layout", "BNSD"), ("query_shape", (1, 2, 256, 64)),
+                  ("key_shape", (1, 2, 256, 64)), ("value_shape", (1, 2, 256, 64)),
+                  ("query_lengths", (64,)), ("key_lengths", (64,)), ("value_lengths", (64,)),
+                  ("block_shape", (64, 128)), ("block_mask", ((phys_head, phys_head),)),
+                  ("mask_dtype", "int8")),
+    )
+    padded_low = sd_lower_op(padded_mask, soc_family="A3", sparsity_ratio=0.0, block_size=128)
+    assert padded_low.flops == 4 * 2 * 64 * 64 * 64
+    assert int(_write(_sd_contract(padded_low), "attention_out")["bytes"]) == 64 * 2 * 64 * 2
+
+    tnd = replace(
+        _make_op("eagle_bsa", local_shape=(36, 4, 128)),
+        metadata=(("layout", "TND"), ("query_shape", (36, 4, 128)),
+                  ("key_shape", (36, 4, 128)), ("value_shape", (36, 4, 128)),
+                  ("query_lengths", (16, 20)), ("key_lengths", (16, 20)), ("value_lengths", (16, 20)),
+                  ("block_mask", (1, 1)), ("return_softmax_lse", True)),
+    )
+    tnd_contract = _sd_contract(sd_lower_op(tnd, soc_family="A3", sparsity_ratio=0.0, block_size=64))
+    assert _write(tnd_contract, "attention_out")["shape"] == (36, 4, 128)
+    assert (_write(tnd_contract, "softmax_lse")["shape"], _write(tnd_contract, "softmax_lse")["dtype"]) == ((36, 4, 1), "fp32")
+
+    bad_tnd = replace(
+        _make_op("eagle_bsa", local_shape=(100, 4, 128)),
+        metadata=(("layout", "TND"), ("query_shape", (100, 4, 128)),
+                  ("key_shape", (100, 4, 128)), ("value_shape", (100, 4, 128)),
+                  ("query_lengths", (16, 20)), ("key_lengths", (16, 20)), ("value_lengths", (16, 20)),
+                  ("block_mask", (1, 1))),
+    )
+    with pytest.raises(ModelingError, match="mindie_sd_sparse_query_TND_lengths_invalid"):
+        sd_lower_op(bad_tnd, soc_family="A3", sparsity_ratio=0.0, block_size=64)
+
+
+def test_eagle_qbsa_enforces_pinned_qmode1_dtypes_and_kv_block_alignment():
+    q = (1, 2, 128, 64)
+    head = ((1,), (1,), (1,), (1,))
+    meta = (("layout", "BNSD"), ("query_shape", q), ("key_shape", q), ("value_shape", q),
+            ("block_mask", ((((1,),), ((1,),)),)), ("mask_dtype", "int8"))
+    for dt in ("bf16", "fp16"):
+        op = replace(_make_op("eagle_qbsa", local_shape=q, dtype=dt), metadata=meta)
+        with pytest.raises(ModelingError, match="mindie_sd_eagle_qbsa_cache_dtype_unsupported"):
+            sd_lower_op(op, soc_family="A5", sparsity_ratio=0.0, block_size=128, kv_dtype=dt)
+    for v_dt in ("fp8_e4m3", "int8"):
+        qmode1 = replace(
+            _make_op("eagle_qbsa", local_shape=q, dtype="int8"),
+            metadata=(("layout", "BNSD"), ("query_shape", q), ("key_shape", q), ("value_shape", q),
+                      ("q_dtype", "int8"), ("k_dtype", "int8"), ("v_dtype", v_dt),
+                      ("block_shape", (32, 128)), ("block_mask", ((head, head),)), ("mask_dtype", "int8")),
+        )
+        lowered = sd_lower_op(qmode1, soc_family="A5", sparsity_ratio=0.0, block_size=128)
+        assert lowered.flops == 4 * 2 * 128 * 128 * 64
+    bad_block = replace(
+        _make_op("eagle_qbsa", local_shape=q, dtype="int8"),
+        metadata=(("layout", "BNSD"), ("query_shape", q), ("key_shape", q), ("value_shape", q),
+                  ("q_dtype", "int8"), ("k_dtype", "int8"), ("v_dtype", "fp8_e4m3"),
+                  ("block_shape", (32, 64)), ("block_mask", (1,)), ("mask_dtype", "int8")),
+    )
+    with pytest.raises(ModelingError, match="mindie_sd_sparse_block_shape_invalid"):
+        sd_lower_op(bad_block, soc_family="A5", sparsity_ratio=0.0, block_size=64)
+
+
+def test_sparse_attention_rectangular_block_shape_overrides_scalar_block_size():
+    q = (1, 2, 128, 64)
+    head = ((1,), (1,), (1,), (1,))
+    op = replace(
+        _make_op("eagle_bsa", local_shape=q),
+        metadata=(("layout", "BNSD"), ("query_shape", q), ("key_shape", q), ("value_shape", q),
+                  ("block_shape", (32, 128)), ("block_mask", ((head, head),)), ("mask_dtype", "int8")),
+    )
+    for scalar_side in (32, 128):
+        lowered = sd_lower_op(op, soc_family="A3", sparsity_ratio=0.0, block_size=scalar_side)
+        attrs = _sd_contract(lowered)["attributes"]
+        assert lowered.flops == 4 * 2 * 128 * 128 * 64
+        assert attrs["block_shape"] == (32, 128) and attrs["active_block_pairs"] == 8
+
+
+def test_rainfusion_tnd_lse_tracks_query_dtype_and_rank_three_shape():
+    q = (128, 2, 128)
+    op = replace(
+        _make_op("rainfusion", local_shape=q, dtype="fp16"),
+        metadata=(("layout", "TND"), ("query_shape", q), ("key_shape", q), ("value_shape", q),
+                  ("query_lengths", (128,)), ("key_lengths", (128,)), ("value_lengths", (128,)),
+                  ("block_mask", (1,))),
+    )
+    lowered = sd_lower_op(op, soc_family="A3", sparsity_ratio=0.0, block_size=128)
+    assert "softmax_lse" in lowered.returns
+    lse = _write(_sd_contract(lowered), "softmax_lse")
+    assert (lse["shape"], lse["dtype"], int(lse["bytes"])) == ((128, 2, 128), "fp16", 128 * 2 * 128 * 2)
+
+
+def test_eager_eagle_ffn_swiglu_emits_separate_silu_and_mul_pointwise_ops():
+    m, k, h = 64, 128, 256
+    op = replace(
+        _make_op("eagle_ffn", local_shape=(m, k), flops=0.0, mte2_bytes=0.0, mte3_bytes=0.0),
+        metadata=(("weight1_shape", (2 * h, k)), ("weight2_shape", (k, h)), ("activation", "swiglu")),
+    )
+    ops = sd_lower_op(op, soc_family="A3")
+    pointwise = [item for item in ops if item.family != "gemm"]
+    assert len(pointwise) == 2
+    assert int(sum(item.hbm_bytes for item in pointwise)) == 5 * m * h * 2
+    assert int(sum(item.vector_ops for item in pointwise)) == 6 * m * h
+    assert pointwise[1].deps == (ops[0].op_id, pointwise[0].op_id)

@@ -55,6 +55,7 @@ SOURCES: tuple[SourceRef, ...] = (
 
 _SWIGLU_OPS_PER_ELEMENT = 6.0
 _DEFAULT_FFN_ACTIVATION_OPS_PER_ELEMENT = 5.0
+_EAGER_MUL_OPS_PER_ELEMENT = 1.0
 _ADA_NORM_OPS_PER_ELEMENT = 5
 _MXFP4_SCALE_GROUP_SIZE = 32
 _MXFP4_QUANT_OPS_PER_ELEMENT = 4
@@ -143,7 +144,6 @@ def _eagle_ffn_unfused_ops(op: OpSpec, meta: dict, dtype: str, soc_family: str) 
         "activation": activation,
     }
     l1_id = f"{op.op_id}.linear1"
-    act_id = f"{op.op_id}.activation"
     l1_shape = (m, h_total, k)
     l2_shape = (m, n, h_act)
     l1_op = replace(
@@ -158,17 +158,50 @@ def _eagle_ffn_unfused_ops(op: OpSpec, meta: dict, dtype: str, soc_family: str) 
             "output_shape": geom["up_shape"], "output_format": dtype,
         }.items()),
     )
-    act_family = activation if activation in {"silu", "swiglu"} else "activation"
-    act_op = replace(
-        op,
-        op_id=act_id, deps=(l1_id,), family=act_family, recipe=activation,
-        dtype=dtype, flops=0.0, vector_ops=act_vec,
-        mte2_bytes=up_bytes, mte3_bytes=act_bytes, hbm_bytes=up_bytes + act_bytes,
-        matrix_flops=(), returns=(),
-        semantic_shape=geom["act_shape"], local_shape=geom["act_shape"],
-        padded_shape=geom["act_shape"], launch_shape=geom["act_shape"],
-        metadata=tuple({**shared_meta, "output_format": dtype}.items()),
-    )
+    if activation == "swiglu":
+        # eagle_ffn_linear.py:29-31 executes eager F.silu(gate) followed by mul with up_half.
+        silu_id = f"{op.op_id}.silu"
+        mul_id = f"{op.op_id}.mul"
+        silu_hbm = act_bytes + act_bytes
+        mul_mte2 = act_bytes + act_bytes
+        mul_hbm = mul_mte2 + act_bytes
+        silu_op = replace(
+            op,
+            op_id=silu_id, deps=(l1_id,), family="silu", recipe="silu",
+            dtype=dtype, flops=0.0, vector_ops=float(m * h_act * _DEFAULT_FFN_ACTIVATION_OPS_PER_ELEMENT),
+            mte2_bytes=act_bytes, mte3_bytes=act_bytes, hbm_bytes=silu_hbm,
+            matrix_flops=(), returns=(),
+            semantic_shape=geom["act_shape"], local_shape=geom["act_shape"],
+            padded_shape=geom["act_shape"], launch_shape=geom["act_shape"],
+            metadata=tuple({**shared_meta, "output_format": dtype}.items()),
+        )
+        mul_op = replace(
+            op,
+            op_id=mul_id, deps=(l1_id, silu_id), family="elementwise", recipe="mul",
+            dtype=dtype, flops=0.0, vector_ops=float(m * h_act * _EAGER_MUL_OPS_PER_ELEMENT),
+            mte2_bytes=mul_mte2, mte3_bytes=act_bytes, hbm_bytes=mul_hbm,
+            matrix_flops=(), returns=(),
+            semantic_shape=geom["act_shape"], local_shape=geom["act_shape"],
+            padded_shape=geom["act_shape"], launch_shape=geom["act_shape"],
+            metadata=tuple({**shared_meta, "output_format": dtype}.items()),
+        )
+        pointwise_ops: tuple[OpSpec, ...] = (silu_op, mul_op)
+        l2_dep = mul_id
+    else:
+        act_id = f"{op.op_id}.activation"
+        act_family = activation if activation == "silu" else "activation"
+        act_op = replace(
+            op,
+            op_id=act_id, deps=(l1_id,), family=act_family, recipe=activation,
+            dtype=dtype, flops=0.0, vector_ops=act_vec,
+            mte2_bytes=up_bytes, mte3_bytes=act_bytes, hbm_bytes=up_bytes + act_bytes,
+            matrix_flops=(), returns=(),
+            semantic_shape=geom["act_shape"], local_shape=geom["act_shape"],
+            padded_shape=geom["act_shape"], launch_shape=geom["act_shape"],
+            metadata=tuple({**shared_meta, "output_format": dtype}.items()),
+        )
+        pointwise_ops = (act_op,)
+        l2_dep = act_id
     out_returns = tuple(op.returns) if op.returns else ("y",)
     primary_out = out_returns[0]
     l2_meta = {
@@ -192,14 +225,14 @@ def _eagle_ffn_unfused_ops(op: OpSpec, meta: dict, dtype: str, soc_family: str) 
     )
     l2_op = replace(
         op,
-        op_id=op.op_id, deps=(act_id,), family="gemm", recipe="gemm",
+        op_id=op.op_id, deps=(l2_dep,), family="gemm", recipe="gemm",
         dtype=dtype, flops=l2_flops, vector_ops=0.0,
         mte2_bytes=l2_read, mte3_bytes=out_bytes, hbm_bytes=l2_read + out_bytes,
         matrix_flops=((dtype, l2_flops),), returns=out_returns,
         semantic_shape=l2_shape, local_shape=l2_shape, padded_shape=l2_shape, launch_shape=l2_shape,
         metadata=tuple(l2_meta.items()),
     )
-    return (l1_op, act_op, l2_op)
+    return (l1_op, *pointwise_ops, l2_op)
 
 
 def _eagle_ffn_contract(op, meta, dtype, returns):

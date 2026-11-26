@@ -210,19 +210,24 @@ def compressor(b, *, name, source, tokens, padded_tokens, valid_rows, width, pla
         state_rows = _ring_update_rows(tokens, plan.compressor_state_rows, tokens_by_view)
         state_bytes = state_rows * KV_SCORE_PAIR_STREAMS * expansion * width * FP32_BYTES
         if c2_gated_ring:
+            completed_rows = max(0, int(valid_rows))
             pool_read_bytes = (
-                valid_rows * plan.compress_ratio * KV_SCORE_PAIR_STREAMS * expansion * width * FP32_BYTES
-                if valid_rows > 0 else 0
+                completed_rows * plan.compress_ratio * KV_SCORE_PAIR_STREAMS * expansion * width * FP32_BYTES
+                if completed_rows > 0 else 0
             )
-            pool_write_bytes = (tokens + valid_rows) * width * act_bytes
-            pool_ops = POOL_VECTOR_OPS_PER_ELEMENT if valid_rows > 0 else ZERO_FILL_VECTOR_OPS_PER_ELEMENT
+            pool_write_bytes = (tokens + completed_rows) * width * act_bytes
+            pool_vec_ops = (
+                tokens * width * ZERO_FILL_VECTOR_OPS_PER_ELEMENT
+                + completed_rows * plan.compress_ratio * expansion * width * POOL_VECTOR_OPS_PER_ELEMENT
+            )
             pooled = b.vector(
                 name + "_pool", (projection, gates), tokens * expansion * width,
-                pool_ops,
+                0,
+                vector_ops_override=pool_vec_ops,
                 read_bytes_override=pool_read_bytes,
                 write_bytes_override=pool_write_bytes,
                 metadata=(("state_dtype", "fp32"),
-                          ("valid_completed_rows", valid_rows),
+                          ("valid_completed_rows", completed_rows),
                           ("token_aligned_rows", tokens),
                           ("native_kinds", ("ZerosLike", "_pool_kernel")),
                           ("kernel", "_pool_kernel")),

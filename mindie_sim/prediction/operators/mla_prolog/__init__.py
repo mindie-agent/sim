@@ -105,7 +105,7 @@ _PROLOG_INT8_PORTS: tuple[str, ...] = (
     *_PROLOG_BF16_TAIL_PORTS,
 )
 _PROLOG_MXFP8_PORTS: tuple[str, ...] = (
-    "token_x:bf16:ND:dense::none",
+    "token_x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0",
     "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
     "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
     _PROLOG_WEIGHT_UK_PORT,
@@ -179,28 +179,43 @@ def _parse_prolog_port(
     rope_d = max(1, int(qk_rope_head_dim))
     n_heads = max(1, int(num_q_heads) if int(num_q_heads) > 0 else DEFAULT_PROLOG_HEADS)
     nope_d = max(1, int(qk_nope_head_dim) if int(qk_nope_head_dim) > 0 else DEFAULT_QK_NOPE_DIM)
-    if name == "token_x":
-        shape: tuple[int, ...] = (t, h)
-    elif name == "weight_dq":
-        shape = (h, q_r)
-    elif name == "weight_uq_qr":
-        shape = (q_r, n_heads * (nope_d + rope_d))
-    elif name == "weight_uk":
-        shape = (n_heads, nope_d, kv_r)
-    elif name == "weight_dkv_kr":
-        shape = (h, kv_r + rope_d)
-    elif name == "rmsnorm_gamma_cq":
-        shape = (q_r,)
-    elif name == "rmsnorm_gamma_ckv":
-        shape = (kv_r,)
-    elif name in {"rope_sin", "rope_cos"}:
-        shape = (t, rope_d)
-    elif name == "kv_cache_ref":
-        shape = (1, C8_BLOCK_SIZE, 1, kv_r)
-    elif name == "kr_cache_ref":
-        shape = (1, C8_BLOCK_SIZE, 1, rope_d)
-    else:
+    q_out_w = n_heads * (nope_d + rope_d)
+    kv_out_w = kv_r + rope_d
+    shapes: dict[str, tuple[int, ...]] = {
+        "token_x": (t, h),
+        "weight_dq": (h, q_r),
+        "weight_uq_qr": (q_r, q_out_w),
+        "weight_uk": (n_heads, nope_d, kv_r),
+        "weight_dkv_kr": (h, kv_out_w),
+        "rmsnorm_gamma_cq": (q_r,),
+        "rmsnorm_gamma_ckv": (kv_r,),
+        "rope_sin": (t, rope_d),
+        "rope_cos": (t, rope_d),
+        "kv_cache_ref": (1, C8_BLOCK_SIZE, 1, kv_r),
+        "kr_cache_ref": (1, C8_BLOCK_SIZE, 1, rope_d),
+    }
+    if name not in shapes:
         raise ModelingError(f"mla_prolog_unknown_port:{name}")
+    shape = shapes[name]
+    scale_shape: tuple[int, ...] = ()
+    if quant_mode == "mx_fp8" and group_shape:
+        grp = group_shape[0]
+        mx_scales: dict[str, tuple[int, ...]] = {
+            "token_x": (t, max(1, h // grp)),
+            "weight_dq": (q_r, max(1, h // grp)),
+            "weight_uq_qr": (q_out_w, max(1, q_r // grp)),
+            "weight_dkv_kr": (kv_out_w, max(1, h // grp)),
+        }
+        scale_shape = mx_scales.get(name, ())
+    elif quant_mode == "per_token_int8" and name == "token_x":
+        scale_shape = (t, 1)
+    elif quant_mode == "per_channel_int8":
+        ch_scales: dict[str, tuple[int, ...]] = {
+            "weight_dq": (1, q_r),
+            "weight_uq_qr": (1, q_out_w),
+            "weight_dkv_kr": (1, kv_out_w),
+        }
+        scale_shape = ch_scales.get(name, ())
     return OperandPortSig(
         role=name,
         dtype=dtype,
@@ -210,7 +225,7 @@ def _parse_prolog_port(
         quant_mode=quant_mode,
         group_shape=group_shape,
         scale_dtype=scale_dtype,
-        scale_shape=(),
+        scale_shape=scale_shape,
     )
 
 
@@ -407,7 +422,8 @@ def resolve_mla_preprocess_mode(
     wq_norm = str(weight_quant).strip().lower() if weight_quant is not None else ""
     if not wq_norm:
         raise ModelingError("mla_preprocess_weight_quant_required")
-    if (not has_rope or int(qk_rope_head_dim) <= 0
+    if ((not has_rope and not (has_learned_rope_tail and arch_norm == "A5"))
+            or int(qk_rope_head_dim) <= 0
             or qkv_a_gate_fused or is_w4a8
             or int(q_lora_rank) <= 0 or int(kv_lora_rank) <= 0
             or act_norm not in _PROLOG_ALLOWED_ACT_DTYPES):

@@ -520,7 +520,7 @@ def test_compressor_prunes_gate_at_unit_ratio_and_fuses_valid_rows(ratio):
         pool_meta = dict(builder.ops[3].metadata)
         assert pool_meta["native_kinds"] == ("ZerosLike", "_pool_kernel")
         assert sum(op.flops for op in builder.ops) == 4 * 8 * 576 * 4096
-        assert sum(op.vector_ops for op in builder.ops) == 8 * 4096 + 6 * 8 * 576 + 5 * 8 * 576 + 6 * 8 * 64
+        assert sum(op.vector_ops for op in builder.ops) == 8 * 4096 + (8 + 6 * 8) * 576 + 5 * 8 * 576 + 6 * 8 * 64
 def test_native_indexer_epilogs_keep_parameters_and_remove_intermediate_bytes():
     model = parse_case(_caller_case()).model
     plan = model.layer_plans[3]
@@ -675,3 +675,195 @@ def test_draft_mla_prolog_accepts_bf16_kv_with_target_packed_layout_and_v4_mxfp8
 
     gov = _prolog(tokens=4)
     assert gov.hbm_bytes > 0 and gov.mte2_bytes > 0 and gov.mte3_bytes > 0 and gov.vector_ops > 0
+
+
+def test_mxfp8_prolog_token_port_uses_e8m0_scales_and_admits_v3_v4():
+    from mindie_sim.backends.abi_registry import default_abi_registry
+
+    mxfp8_tuple = governed._PROLOG_JOINT_DTYPE_TUPLES["mxfp8"]
+    token_port = governed._parse_prolog_port(
+        mxfp8_tuple[0],
+        num_tokens=4, hidden_size=5120, q_lora_rank=1536, kv_lora_rank=512,
+        qk_rope_head_dim=64, num_q_heads=16, qk_nope_head_dim=128,
+    )
+    assert (token_port.dtype, token_port.quant_mode, token_port.group_shape, token_port.scale_dtype, token_port.scale_shape) == (
+        "fp8_e4m3fn", "mx_fp8", (32,), "fp8_e8m0", (4, 160),
+    )
+    reg = default_abi_registry()
+    kwargs = dict(
+        num_tokens=4, input_size=5120, q_lora_rank=1536, kv_lora_rank=512,
+        qk_rope_head_dim=64, num_q_heads=16, qk_nope_head_dim=128,
+        is_sparse_sfa=False, is_int8_kv=False, dcp_size=1, pcp_size=1,
+    )
+    assert governed._prolog_v3_abi_available(reg, "A5", "mxfp8", mxfp8_tuple, **kwargs) is True
+    stale_bf16 = ("token_x:bf16:ND:dense::none",) + mxfp8_tuple[1:]
+    assert governed._prolog_v3_abi_available(reg, "A5", "mxfp8", stale_bf16, **kwargs) is False
+    assert governed.resolve_mla_preprocess_mode(
+        arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512,
+        qk_rope_head_dim=64, is_sparse_sfa=True, weight_quant="mxfp8",
+        input_size=5120, num_q_heads=16, qk_nope_head_dim=128,
+    ) == "prolog_v3"
+    # Learned-tail NoPE layers (has_rope=False, has_learned_rope_tail=True) dispatch on A5.
+    assert governed.resolve_mla_preprocess_mode(
+        arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512,
+        qk_rope_head_dim=64, has_rope=False, has_learned_rope_tail=True,
+        is_sparse_sfa=True, weight_quant="int8", input_size=5120, num_q_heads=16, qk_nope_head_dim=128,
+    ) == "prolog_v3_learned_rope_tail"
+
+
+def test_zero_rope_quantized_prolog_rejected_on_split_m_arch():
+    op = _prolog(tokens=4, num_heads=8, qk_nope_head_dim=256, qk_rope_head_dim=0,
+                 weight_quant_mode=WEIGHT_QUANT_INT8, kv_cache_quant_mode=3)
+    assert governed.build(op, _context(SPLIT_N_SKU, op)).work.matrix
+    with pytest.raises(UnmodeledCapabilityError):
+        governed.build(op, _context(SPLIT_M_SKU, op))
+
+
+def test_draft_masked_prefill_rows_follow_store_dcp_degree():
+    from mindie_sim.schema.workload import RequestView
+
+    parallel = ParallelSpec(cp=4, dcp=4)
+    views = (RequestView("p0", 8, 0, True, "prefill"),)
+    flags = (True,) * 8
+    masked = draft_context._owned_masked_rows(flags, (8,), views, (0,), parallel, 1)
+    expected = draft_context.owned_scatter_rows(8, (8,), views, (0,), parallel, 1)
+    assert masked == expected == 2
+
+
+def test_draft_gqa_per_layer_projection_respects_layer_plan_precision():
+    from mindie_sim.catalog.draft import draft_quant
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.catalog.ops import barrier_op
+    from mindie_sim.prediction.operators.mla_prolog.draft_context_gqa import prepare_gqa_context
+
+    plans = tuple(
+        LayerPlan(i, num_heads=8, num_kv_heads=2, head_dim=128, native_layer_id=i, scope="draft")
+        for i in range(2)
+    )
+    quant = replace(quant_preset("w8a8"), layer_quant_overrides={"native_layers": {"1": {"exclusions": ["attn.qkv"]}}})
+    proj = barrier_op(op_id="x", deps=(), stage=0, layer=0, requests=("r",), phase="draft", recipe="input", shape=(1, 1024))
+    for weight_cat in ("attn.qkv", "mtp"):
+        cat_quant = replace(quant, exclusions=tuple(e for e in quant.exclusions if e != weight_cat))
+        draft = DraftSpec(
+            "dspark", 2, 1024, 2048, 8, 2, 128, 1024, 256, markov_rank=64, qk_norm=True,
+            weight_category=weight_cat, independent_context=True,
+            context_projection_mode="per_layer_qkv", layer_plans=plans,
+        )
+        draft.validate()
+        model = ModelSpec("draft", 2, 1024, 8, 128, 2048, 4096, num_kv_heads=2, quant=cat_quant, layer_plans=plans)
+        model = replace(model, quant=draft_quant(model, draft))
+        ops = []
+        prepare_gqa_context(ops, projection=proj, model=model, draft=draft, rows=1, query_rows=0, prefix="dg:", stage=0, requests=("r",))
+        qkv = {op.layer: dict(op.metadata) for op in ops if op.recipe == "draft_context_qkv_proj"}
+        assert (qkv[0]["weight_format"], qkv[0]["activation_format"]) == ("int8", "int8")
+        assert (qkv[1]["weight_format"], qkv[1]["activation_format"]) == ("bf16", "bf16")
+        assert int(qkv[1]["packed_weight_bytes"]) == 2 * 1024 * 1536
+
+
+def test_compressor_pooling_vector_ops_track_completed_groups_and_zero_fill():
+    plan = _layer(compress_ratio=4)
+    model = ModelSpec("contract", 1, 4096, 8, 576, 1024, 1024, attention="mla", ffn="dense",
+                      layer_plans=(plan,), quant=QuantSpec("bf16"))
+    pools = {}
+    for valid_rows in (0, 1, 2):
+        builder = Builder("s0.l0", plan, 0, (), model, "decode")
+        compressor(builder, name="compress", source="hidden", tokens=8, padded_tokens=8,
+                   valid_rows=valid_rows, width=576, plan=plan, model=model,
+                   fused=False, return_latent=True)
+        pools[valid_rows] = next(op.vector_ops for op in builder.ops if op.recipe == "compress_pool")
+    assert pools[0] == pytest.approx(8 * 576)
+    assert pools[1] == pytest.approx(8 * 576 + 1 * 4 * 576 * 6)
+    assert pools[2] == pytest.approx(8 * 576 + 2 * 4 * 576 * 6)
+
+
+def test_packed_mla_cache_writer_preserves_declared_int8_vs_fp8_cache_dtype():
+    from mindie_sim.prediction.operators.mla_prolog import mla_prolog_packed
+
+    int8_view = mla_prolog_packed.view(512, 64, query_format="fp8_e4m3", cache_dtype="int8")
+    fp8_view = mla_prolog_packed.view(512, 64, query_format="fp8_e4m3", cache_dtype="fp8_e4m3")
+    assert int8_view["latent_dtype"] == "int8" and fp8_view["latent_dtype"] == "fp8_e4m3"
+    with pytest.raises(ModelingError, match="mla_prolog_v3_cache_layout_dtype_mismatch"):
+        mla_prolog_packed.view(512, 64, query_format="int8", cache_dtype="fp8_e4m3")
+
+    case = parse_case(_caller_case())
+    plan = replace(case.model.layer_plans[3], scope="body", mla_variant="latent_mla",
+                   cache_kind="dense", q_lora_rank=1536, kv_lora_rank=512,
+                   qk_nope_head_dim=128, qk_rope_head_dim=64)
+    for kv_dt in ("int8", "fp8_e4m3"):
+        model = replace(case.model, quant=replace(quant_preset("w8a8_mxfp8"), kv_dtype=kv_dt))
+        builder = Builder("s0.l0", plan, 0, (), model, "decode")
+        store_id = mla_prolog_packed.store(
+            builder, name="kv_store", deps=("kv_a",), rows=4, plan=plan,
+            query_format="fp8_e4m3", cache_dtype=kv_dt,
+        )
+        store_op = next(op for op in builder.ops if op.op_id == store_id)
+        assert store_op.dtype == kv_dt
+        assert dict(store_op.metadata)["packed_cache"]["latent_dtype"] == kv_dt
+
+
+def test_int8_nope_mla_prolog_selects_v4_without_mxfp8_scales():
+    from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog
+
+    case = parse_case(_caller_case())
+    quant = replace(quant_preset("w8a8_int8"), kv_dtype="int8")
+    plan = replace(case.model.layer_plans[3], scope="body", mla_variant="latent_mla",
+                   cache_kind="dense", q_lora_rank=1536, kv_lora_rank=512,
+                   qk_nope_head_dim=128, qk_rope_head_dim=64,
+                   mla_use_nope=True, indexer=True)
+    model = replace(case.model, quant=quant)
+    ops = [
+        OpSpec("q_a", "gemm", "decode", 0, 0, (), (4, 1536, 5120), (4, 1536, 5120), (4, 1536, 5120), (4, 1536, 5120),
+               dtype="int8", metadata=(("weight_format", "int8"), ("activation_format", "int8"))),
+        OpSpec("q_b", "gemm", "decode", 0, 0, (), (4, 3072, 1536), (4, 3072, 1536), (4, 3072, 1536), (4, 3072, 1536),
+               dtype="int8", metadata=(("weight_format", "int8"), ("activation_format", "int8"))),
+        OpSpec("kv_a", "gemm", "decode", 0, 0, (), (4, 576, 5120), (4, 576, 5120), (4, 576, 5120), (4, 576, 5120),
+               dtype="int8", metadata=(("weight_format", "int8"), ("activation_format", "int8"))),
+        OpSpec("q_absorb", "gemm", "decode", 0, 0, (), (4, 512, 128), (4, 512, 128), (4, 512, 128), (4, 512, 128),
+               dtype="bf16", metadata=(("weight_format", "bf16"), ("activation_format", "bf16"))),
+    ]
+    family_mla_prolog.declare(
+        ops, prefix="s0.l0", plan=plan, model=model, parallel=ParallelSpec(), quant=quant,
+        tokens=4, members=("q_a", "q_b", "kv_a", "q_absorb"),
+        q_a="q_a", q_b="q_b", kv_a="kv_a", q_absorb="q_absorb", cache_layout=PACKED_LAYOUT,
+    )
+    sg = dict(ops[-1].metadata)["structure_subgraphs"][0]
+    impl = sg["implementation"]
+    view = sg["tensor_view"]
+    assert impl["native_kind"] == ABI_V4_NZ
+    assert "mxfp8_query" not in impl["conditions"]
+    assert view["do_rope"] is False
+    assert (view["query_norm_scale_dtype"], view["query_norm_scale_shape"]) == ("fp32", (4, 1))
+    sem_ops = list(ops)
+    family_mla_prolog.declare_semantic(
+        sem_ops, prefix="s0.l0", plan=plan, model=model, parallel=ParallelSpec(), quant=quant,
+        tokens=4, members=("q_a", "q_b", "kv_a", "q_absorb"),
+        q_a="q_a", q_b="q_b", kv_a="kv_a", q_absorb="q_absorb",
+    )
+    sem_sg = dict(sem_ops[-1].metadata)["structure_subgraphs"][-1]
+    assert sem_sg["implementation"]["native_kind"] == ABI_V4_NZ
+
+    # Plain block-128 FP8 with FP32 scales must not acquire MXFP8 group-32 E8M0 metadata.
+    fp8_fp32_quant = QuantSpec(
+        name="fp8_dynamic", weight_format="fp8_e4m3", activation_format="fp8_e4m3",
+        weight_block=(128, 128), scale_format="fp32", scale_bytes=4.0,
+        activation_group_size=128, activation_scale_format="fp32", kv_dtype="bf16",
+    )
+    rope_plan = replace(plan, mla_use_nope=False)
+    fp8_ops = [
+        OpSpec("q_a", "gemm", "decode", 0, 0, (), (4, 1536, 5120), (4, 1536, 5120), (4, 1536, 5120), (4, 1536, 5120),
+               dtype="fp8_e4m3", metadata=(("weight_format", "fp8_e4m3"), ("activation_format", "fp8_e4m3"))),
+        OpSpec("q_b", "gemm", "decode", 0, 0, (), (4, 3072, 1536), (4, 3072, 1536), (4, 3072, 1536), (4, 3072, 1536),
+               dtype="fp8_e4m3", metadata=(("weight_format", "fp8_e4m3"), ("activation_format", "fp8_e4m3"))),
+        OpSpec("kv_a", "gemm", "decode", 0, 0, (), (4, 576, 5120), (4, 576, 5120), (4, 576, 5120), (4, 576, 5120),
+               dtype="fp8_e4m3", metadata=(("weight_format", "fp8_e4m3"), ("activation_format", "fp8_e4m3"))),
+        OpSpec("q_absorb", "gemm", "decode", 0, 0, (), (4, 512, 128), (4, 512, 128), (4, 512, 128), (4, 512, 128),
+               dtype="bf16", metadata=(("weight_format", "bf16"), ("activation_format", "bf16"))),
+    ]
+    family_mla_prolog.declare(
+        fp8_ops, prefix="s0.l0", plan=rope_plan, model=replace(case.model, quant=fp8_fp32_quant),
+        parallel=ParallelSpec(), quant=fp8_fp32_quant, tokens=4,
+        members=("q_a", "q_b", "kv_a", "q_absorb"), q_a="q_a", q_b="q_b", kv_a="kv_a", q_absorb="q_absorb",
+    )
+    fp8_sg = dict(fp8_ops[-1].metadata)["structure_subgraphs"][0]
+    assert fp8_sg["implementation"]["native_kind"] == ABI_V3_NZ
+    assert "mxfp8_query" not in fp8_sg["implementation"]["conditions"]

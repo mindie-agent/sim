@@ -35,6 +35,7 @@ from dataclasses import replace
 from mindie_sim.catalog.attention_common import store_dcp_degree
 from mindie_sim.catalog.cache import local_kv_heads
 from mindie_sim.catalog.ops import barrier_op, cache_store_op, gemm_op, vector_op
+from mindie_sim.catalog.quant import projection_quant
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 NORM_OPS_PER_ELEMENT: int = 5
@@ -379,6 +380,34 @@ def _emit_fused_bank_kv(
     return tuple(ready_ids)
 
 
+def _layer_quant(model, draft, layer: int):
+    """Resolve per-layer checkpoint precision for one draft GQA context layer."""
+    layer_plans = getattr(draft, "layer_plans", ()) or ()
+    plan = layer_plans[layer] if layer < len(layer_plans) else None
+    if plan is None:
+        model_plans = getattr(model, "layer_plans", ()) or ()
+        if layer < len(model_plans) and getattr(model_plans[layer], "scope", "") == "draft":
+            plan = model_plans[layer]
+    return projection_quant(model.quant, plan) if plan is not None else model.quant
+
+
+_FLOAT_WEIGHT_FORMATS = frozenset({"bf16", "fp16", "fp32"})
+
+
+def _layer_qkv_category(layer_quant, proj_category: str) -> str:
+    """Honor per-layer ``attn.qkv`` exclusions/overrides even when draft declares ``weight_category='mtp'``."""
+    if proj_category == "attn.qkv" or layer_quant is None:
+        return proj_category
+    base_fmt = str(layer_quant.format_for(proj_category)).strip().lower()
+    if base_fmt in _FLOAT_WEIGHT_FORMATS:
+        return proj_category
+    exclusions = set(getattr(layer_quant, "exclusions", ()) or ())
+    overrides = dict(getattr(layer_quant, "category_overrides", ()) or ())
+    if "attn.qkv" in exclusions or "attn" in exclusions or "attn.qkv" in overrides or "attn" in overrides:
+        return "attn.qkv"
+    return proj_category
+
+
 def _emit_per_layer_qkv(
     ops, draft, model, norm, prefix, rows, num_layers, kv_heads_local,
     local_q_width, local_kv_width, proj_category, common, tp, layer_rotary_dims,
@@ -389,14 +418,16 @@ def _emit_per_layer_qkv(
     for layer in range(num_layers):
         name = prefix + f"context_kv{layer}"
         layer_common = {**common, "layer": layer}
+        layer_quant = _layer_quant(model, draft, layer)
+        layer_category = _layer_qkv_category(layer_quant, proj_category)
         qkv_proj = gemm_op(
             op_id=name + ".qkv_proj",
             deps=(norm.op_id,),
             m=rows,
             n=qkv_width,
             k=int(draft.hidden_size),
-            quant=model.quant,
-            category=proj_category,
+            quant=layer_quant,
+            category=layer_category,
             family="gemm",
             recipe="draft_context_qkv_proj",
             **layer_common,
