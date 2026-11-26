@@ -524,14 +524,26 @@ def test_sparse_mla_a3_situ_wo_a_w4a16_parity_and_gemma4_decode_read_conservatio
     assert g53_c8_ops["s0.l3.unpack"].ascend_kernel == "aclnnMoeTokenUnpermute"
     assert g53_c8_ops["s0.l3.unpack"].is_shipping_abi is True
 
-    # 2. DeepSeek-V4 grouped_output_a projects verified probed CANN ABI symbol read-only.
-    raw_v4, _ = compose_export_case(
+    # 2. DeepSeek-V4 grouped_output_a obeys CANN 9.3 BF16/FP16-only aclnnTransposeBatchMatMul ABI:
+    #    BF16 -> shipping aclnnTransposeBatchMatMul (is_shipping_abi=True);
+    #    block-128 FP8 -> honest non-shipping abi_precision_unsupported (is_shipping_abi=False).
+    raw_v4_bf16, _ = compose_export_case(
+        "deepseek-v4-flash-0731", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        tp=2, ep=2, dp=1, quant="none",
+    )
+    b_v4_bf16 = build_export_bundle(raw_v4_bf16, request=req)
+    v4_bf16_ops = {o.op_id: o for o in b_v4_bf16.operators}
+    assert v4_bf16_ops["s0.l0.grouped_output_a"].ascend_kernel == "aclnnTransposeBatchMatMul"
+    assert v4_bf16_ops["s0.l0.grouped_output_a"].is_shipping_abi is True
+
+    raw_v4_fp8, _ = compose_export_case(
         "deepseek-v4-flash-0731", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod", tp=2, ep=2, dp=1,
     )
-    b_v4 = build_export_bundle(raw_v4, request=req)
-    v4_ops = {o.op_id: o for o in b_v4.operators}
-    assert v4_ops["s0.l0.grouped_output_a"].ascend_kernel == "aclnnTransposeBatchMatMul"
-    assert v4_ops["s0.l0.grouped_output_a"].is_shipping_abi is True
+    b_v4_fp8 = build_export_bundle(raw_v4_fp8, request=req)
+    v4_fp8_ops = {o.op_id: o for o in b_v4_fp8.operators}
+    assert v4_fp8_ops["s0.l0.grouped_output_a"].is_shipping_abi is False
+    assert v4_fp8_ops["s0.l0.grouped_output_a"].needs_new_kernel is True
+    assert "abi_precision_unsupported" in v4_fp8_ops["s0.l0.grouped_output_a"].new_kernel_spec
 
     # 3. W4A16 EP=8 kimi-k2-thinking includes BF16 weight_offset (+7.38 GiB/die) with exact ledger parity.
     raw_k2_ep8, _ = compose_export_case(

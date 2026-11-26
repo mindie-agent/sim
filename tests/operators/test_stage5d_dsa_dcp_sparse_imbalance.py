@@ -278,25 +278,48 @@ def test_end_to_end_kimi_and_qwen_dcp_sparse_imbalance_and_latency():
     assert sum(meta_a5["cp_per_rank_pairs"]) == pytest.approx(64.0 * 2048.0)
     assert _attention_elapsed_ms(r_a5_s) > _attention_elapsed_ms(r_a5_u) * 2.0
 
-    # 2) kimi-k3.1 on A3 (dcp=16, B=768, packed INT8 C8 QSFA) at 8K and 128K.
-    kimi_a3_s = compose_case(
+    # 2a) kimi-k3.1 on A3 default checkpoint BF16 KV (dcp=16, PAIRED_SFA_DOC_BLOCK_SIZE=544):
+    #     at 8K all 16 ranks are active (rank 15 holds 8193 - 15*544 = 33 pairs);
+    #     at 4K (L < dcp*544) ranks 8..15 have 0 pairs & 0 sweeps.
+    kimi_a3_bf16 = compose_case(
         "kimi-k3.1", hardware="a3", tp=16, dp=1, ep=16, dcp=16, num_devices=16,
         layers=4, max_model_len=140000,
+    )
+    assert kimi_a3_bf16["runtime"]["kv_block_size"] == 544
+    g_a3_bf16_8k = target_graphs(
+        parse_case(kimi_a3_bf16), phase="decode", tokens=1, context=8192,
+        sequences=1, scope="body",
+    )[0]
+    m_bf16_8k = dict(next(op for op in g_a3_bf16_8k if op.family == "attention").metadata)
+    assert m_bf16_8k["cp_per_rank_pairs"][-1] == pytest.approx(33.0)
+    assert m_bf16_8k["cp_per_rank_sweeps"][-1] == 33
+    g_a3_bf16_4k = target_graphs(
+        parse_case(kimi_a3_bf16), phase="decode", tokens=1, context=4096,
+        sequences=1, scope="body",
+    )[0]
+    m_bf16_4k = dict(next(op for op in g_a3_bf16_4k if op.family == "attention").metadata)
+    assert m_bf16_4k["cp_per_rank_pairs"][8:] == (0.0,) * 8
+    assert m_bf16_4k["cp_per_rank_sweeps"][8:] == (0,) * 8
+
+    # 2b) kimi-k3.1 on A3 (dcp=16, B=624 minimum KDA-fit block, packed INT8 C8 QSFA) at 8K and 128K.
+    kimi_a3_s = compose_case(
+        "kimi-k3.1", hardware="a3", tp=16, dp=1, ep=16, dcp=16, num_devices=16,
+        layers=4, max_model_len=140000, kv_cache_dtype="int8",
     )
     kimi_a3_u = compose_case(
         "kimi-k3.1", hardware="a3", tp=16, dp=1, ep=16, dcp=16, num_devices=16,
-        layers=4, max_model_len=140000,
+        layers=4, max_model_len=140000, kv_cache_dtype="int8",
     )
     kimi_a3_u["runtime"]["metadata"]["dcp_sparse_imbalance"] = 1.0
-    # 8K context: L < dcp * B -> ranks 11..15 have 0 pairs & 0 sweeps.
+    # 8K context: L < dcp * 624 -> ranks 14..15 have 0 pairs & 0 sweeps.
     g_a3_8k = target_graphs(
         parse_case(kimi_a3_s), phase="decode", tokens=1, context=8192,
         sequences=1, scope="body",
     )[0]
     attn_a3_8k = next(op for op in g_a3_8k if op.family == "attention")
     meta_a3_8k = dict(attn_a3_8k.metadata)
-    assert meta_a3_8k["cp_per_rank_pairs"][11:] == (0.0,) * 5
-    assert meta_a3_8k["cp_per_rank_sweeps"][11:] == (0,) * 5
+    assert meta_a3_8k["cp_per_rank_pairs"][14:] == (0.0,) * 2
+    assert meta_a3_8k["cp_per_rank_sweeps"][14:] == (0,) * 2
     assert meta_a3_8k["indexed_attention_geometry"]["topk"] > 2048 // 16
     assert meta_a3_8k["cp_sparse_imbalance"] == pytest.approx(
         meta_a3_8k["indexed_attention_geometry"]["cp_sparse_imbalance"],
@@ -336,29 +359,37 @@ def test_end_to_end_kimi_and_qwen_dcp_sparse_imbalance_and_latency():
     assert c8_geom["cp_sparse_imbalance"] == pytest.approx(2.5, rel=1e-6)
     assert c8_geom["topk"] == math.ceil(2.5 * (2048 / 16))
 
-    # 3) qwen3.8-flash-next on A5 (sparse GQA with dcp=4) at 32K context.
-    qwen_s = compose_case(
-        "qwen3.8-flash-next", hardware="a5", tp=8, dp=1, ep=8, dcp=4, num_devices=8,
-        layers=4, max_model_len=140000, va_recommended=False,
+    # 3) qwen3.8-flash-next (Regime-2 shared_slab_private_aux) enforces dcp=1;
+    #    sparse GQA DCP straggler imbalance is verified on minimax-m3.1-flash (dcp=2) at 32K context.
+    from mindie_sim.schema.common import ModelingError
+
+    with pytest.raises(ModelingError, match="shared_slab_requires_dcp_1_pcp_1"):
+        compose_case(
+            "qwen3.8-flash-next", hardware="a5", tp=8, dp=1, ep=8, dcp=4, num_devices=8,
+            layers=4, max_model_len=140000, va_recommended=False,
+        )
+    sparse_gqa_s = compose_case(
+        "minimax-m3.1-flash", hardware="a5", tp=8, dp=1, ep=8, dcp=2, num_devices=8,
+        layers=4, max_model_len=140000,
     )
-    qwen_u = compose_case(
-        "qwen3.8-flash-next", hardware="a5", tp=8, dp=1, ep=8, dcp=4, num_devices=8,
-        layers=4, max_model_len=140000, va_recommended=False,
+    sparse_gqa_u = compose_case(
+        "minimax-m3.1-flash", hardware="a5", tp=8, dp=1, ep=8, dcp=2, num_devices=8,
+        layers=4, max_model_len=140000,
     )
-    qwen_u["runtime"]["metadata"]["dcp_sparse_imbalance"] = 1.0
-    g_qwen, _, r_qwen_s = _lower_and_run_graph(
-        parse_case(qwen_s), phase="decode", tokens=1, context=32768,
+    sparse_gqa_u["runtime"]["metadata"]["dcp_sparse_imbalance"] = 1.0
+    g_sparse, _, r_sparse_s = _lower_and_run_graph(
+        parse_case(sparse_gqa_s), phase="decode", tokens=1, context=32768,
         sequences=64, scope="body", include_submission=False, fast_span_only=False,
     )
-    _, _, r_qwen_u = _lower_and_run_graph(
-        parse_case(qwen_u), phase="decode", tokens=1, context=32768,
+    _, _, r_sparse_u = _lower_and_run_graph(
+        parse_case(sparse_gqa_u), phase="decode", tokens=1, context=32768,
         sequences=64, scope="body", include_submission=False, fast_span_only=False,
     )
-    attn_qwen = next(op for op in g_qwen[0] if op.family == "attention")
-    meta_qwen = dict(attn_qwen.metadata)
-    assert meta_qwen["cp_sparse_imbalance"] > 1.0
-    assert sum(meta_qwen["cp_per_rank_pairs"]) == pytest.approx(64.0 * 2048.0)
-    assert _attention_elapsed_ms(r_qwen_s) > _attention_elapsed_ms(r_qwen_u)
+    attn_sparse = next(op for op in g_sparse[0] if op.family == "attention")
+    meta_sparse = dict(attn_sparse.metadata)
+    assert meta_sparse["cp_sparse_imbalance"] > 1.0
+    assert sum(meta_sparse["cp_per_rank_pairs"]) == pytest.approx(64.0 * 2048.0)
+    assert _attention_elapsed_ms(r_sparse_s) > _attention_elapsed_ms(r_sparse_u)
 
 
 def test_g1_sp_padding_p_eq_w_sharded_sort_m1_m1b_m5_and_m10():

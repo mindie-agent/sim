@@ -30,6 +30,7 @@ import math
 from typing import Any
 
 from mindie_sim.backends.abi_registry import default_abi_registry
+from mindie_sim.catalog.context_parallel import is_v41_replicated_cache_model
 from mindie_sim.catalog.draft_spec import (
     canonical_speculative_method,
     is_supported_speculative_method,
@@ -1402,7 +1403,10 @@ def _select_mqsmla_binding(
         and str(getattr(p, "mla_variant", "") or "") == "latent_mqa"
         and str(getattr(p, "cache_kind", "") or "") == "window_compressed"
     )
-    if not v41_layers or not any(p.compressor_kind == "gated_ring" for p in v41_layers):
+    if not v41_layers or not (
+        any(p.compressor_kind == "gated_ring" for p in v41_layers)
+        or is_v41_replicated_cache_model(model)
+    ):
         return None
     if str(model.activation_dtype).strip().lower() != "bf16":
         return None

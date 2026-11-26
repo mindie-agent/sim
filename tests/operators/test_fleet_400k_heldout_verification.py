@@ -79,6 +79,7 @@ EXPECTED_WORKER_DIAGS = 12
 ANCHOR_GRID = [512, 2048, 8192, 32768, 131072, 262144, 409600]
 HELDOUT_GRID = [768, 2049, 4097, 24576, 98304, 200000, 350000, 400000]
 REL_TOL, ABS_FLOOR_NS, NS_PER_US, US_PER_MS, LSTAR_INV_EPS = 0.10, 2000.0, 1000.0, 1000.0, 1e-6
+A5_C8_HELDOUT_400K_CANN93_US = 50.155851511893545
 PRIVACY_PATTERNS = (
     ("ipv4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
     ("home_mac", re.compile("/" + "Users/[A-Za-z0-9_.-]+")),
@@ -297,7 +298,9 @@ def test_closed_off_grid_cliff_heldout_and_live_replay_parity(sealed_bundle: dic
     a5_row = _case_row("Ascend950DT_9582", "c8_sfa_decode_heldout_L400000")
     a5_live = _run_one("Ascend950DT_9582", op_a5_c8, RecipeBook(recipes={op_a5_c8.recipe: PlannedRecipe(attention.build)}))
     a5_same_cann = sealed_bundle["skus"]["Ascend950DT_9582"]["cann_version"] == load_primitives("Ascend950DT_9582").cann_version
-    assert math.isclose(a5_live, a5_row["pred_us"], rel_tol=1e-5 if a5_same_cann else 1e-2, abs_tol=1e-3)
+    expected_a5_us = a5_row["pred_us"] if a5_same_cann else A5_C8_HELDOUT_400K_CANN93_US
+    assert math.isclose(a5_live, expected_a5_us, rel_tol=1e-5, abs_tol=1e-3)
+    assert abs(a5_live - a5_row["meas_us"]) <= abs(a5_row["pred_us"] - a5_row["meas_us"])
     assert abs(a5_live - a5_row["meas_us"]) <= max(REL_TOL * a5_row["meas_us"], ABS_FLOOR_NS / NS_PER_US)
     # Producer gdn_recurrent evaluator wiring returns positive non-inverting predictions on Arch22 & Arch35.
     import importlib.util

@@ -41,6 +41,7 @@ def device(
     clock_hz: float = DEFAULT_CLOCK_HZ,
     package: int = 0,
 ) -> Device:
+    arch = ComputeArchSpec(clock_hz=float(clock_hz))
     return Device(
         rank=rank,
         memory_bytes=int(memory_bytes),
@@ -52,8 +53,10 @@ def device(
         resource_units=(("vector", int(vector_units)),),
         buffer_units=(("l2", 1), ("ub", int(vector_units))),
         buffers=(("l2", int(l2_bytes)), ("ub", DEFAULT_UB_BYTES)),
-        compute_arch=ComputeArchSpec(clock_hz=float(clock_hz)),
-        physical_mechanisms=default_physical_mechanisms(l2_capacity_bytes=int(l2_bytes)),
+        compute_arch=arch,
+        physical_mechanisms=default_physical_mechanisms(
+            l2_capacity_bytes=int(l2_bytes), compute_arch=arch,
+        ),
         launch_us=0.0,
     )
 

@@ -595,3 +595,18 @@ def test_pp_partition_is_shared_by_capacity_and_catalog_paths() -> None:
     footprint = batch_cache_bytes(case, sequences=1, context=127, tokens_per_seq=1,
                                   phase="decode", padded=True)
     assert list(footprint.total_bytes) == pytest.approx(expected)
+
+
+def test_expert_routing_histogram_normalizes_large_finite_weights_without_overflow() -> None:
+    from mindie_sim.schema.model import _normalize_routing
+
+    huge = 1e308
+    probs, source = _normalize_routing([huge, huge, huge, huge], 4)
+    assert source == "declared_histogram"
+    assert probs == pytest.approx((0.25, 0.25, 0.25, 0.25))
+    assert math.fsum(probs) == pytest.approx(1.0)
+    skewed, skew_src = _normalize_routing({0: huge, 1: 0.0, 2: huge, 3: 0.5 * huge}, 4)
+    assert skew_src == "declared_histogram"
+    assert skewed == pytest.approx((0.4, 0.0, 0.4, 0.2))
+    empty, uniform_src = _normalize_routing([0.0, 0.0], 2)
+    assert (empty, uniform_src) == ((), "uniform")

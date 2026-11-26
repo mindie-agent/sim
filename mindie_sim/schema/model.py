@@ -643,10 +643,12 @@ def _normalize_routing(value: Any, experts: int) -> tuple[tuple[float, ...], str
         raise ModelingError("model.expert_routing_invalid")
     if len(entries) != experts or any(not math.isfinite(v) or v < 0 for v in entries):
         raise ModelingError("model.expert_routing_invalid")
-    total = sum(entries)
-    if total <= 0:
+    peak = max(entries, default=0.0)
+    if peak <= 0.0:
         return (), "uniform"
-    return tuple(v / total for v in entries), "declared_histogram"
+    scaled = [v / peak for v in entries]
+    total = sum(scaled)
+    return tuple(v / total for v in scaled), "declared_histogram"
 
 @dataclass(frozen=True)
 class SloSpec:

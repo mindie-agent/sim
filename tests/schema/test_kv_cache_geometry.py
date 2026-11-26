@@ -98,9 +98,13 @@ def test_paged_view_preserves_logical_attention_work(name, phase, q, heads, kv_h
 
 def test_paged_view_omits_an_unmodeled_context_partition():
     case = paged_case(kv_storage="paged")
-    runtime = replace(case.runtime, parallel=replace(case.runtime.parallel, tp=2, cp=2))
+    runtime = replace(
+        case.runtime,
+        parallel=replace(case.runtime.parallel, tp=8, cp=2, dcp=2, cp_plan="dcp"),
+    )
     die = case.machine.dies[0]
-    ops = attention_ops(replace(case, runtime=runtime, machine=replace(case.machine, dies=(die, replace(die, rank=1)))))
+    dies = tuple(replace(die, rank=rank) for rank in range(8))
+    ops = attention_ops(replace(case, runtime=runtime, machine=replace(case.machine, dies=dies)))
     attention = [op for op in ops if op.family == "attention"]
     assert attention and all("attention_tensor_view" not in dict(op.metadata) for op in attention)
 
@@ -312,8 +316,8 @@ def test_causal_tail_writes_only_owned_ring_slots(query, context, ranges, span):
         inputs = {dep: execution.engine.submit(dep) for dep in tail.deps}
         step = execution.add(work, 0, 0, external_inputs=inputs)
         execution.engine.advance(until=(step.completion,))
-        for tier, factor in (("ddr", .5), ("ssd", .25)):
-            assert execution.engine.serviced[f"offload_{tier}@r0:s0"] == expected * factor
+        assert execution.engine.serviced["offload_ddr_d2h@r0:s0:d0"] == expected * .5
+        assert execution.engine.serviced["offload_ssd@r0:s0"] == expected * .25
 
 def test_sparse_pipeline_compaction_preserves_issued_work_and_readiness():
     ledgers = []
@@ -398,10 +402,14 @@ def test_draft_cache_allocation_and_batch_ledger_conserve_bytes(model, query, to
 
 @pytest.mark.parametrize("layers,tp", [(2, 1), (4, 1), (4, 4)])
 def test_packed_window_rows_survive_layer_slicing_and_select_mixed_attention(layers, tp):
-    case = catalog_case("deepseek-v4.1-flash", tp=tp, ep=tp, layers=layers)
-    assert tuple(dict(cache_row_bytes_by_layer(case.model))[i] for i in (0, 1)) == (544, 544)
-    graph = target_graphs(case, phase="decode", tokens=1, context=2048, scope="model")[0]
-    assert any("mixed_quant_sparse" in op.recipe for op in graph if op.layer == 0 and op.family == "attention")
+    shipping = catalog_case("deepseek-v4.1-flash", tp=tp, ep=tp, layers=layers)
+    assert tuple(dict(cache_row_bytes_by_layer(shipping.model))[i] for i in (0, 1)) == (544, 544)
+    ship_graph = target_graphs(shipping, phase="decode", tokens=1, context=2048, scope="model")[0]
+    assert any(op.recipe == "latent_attention0" for op in ship_graph if op.layer == 0 and op.family == "attention")
+    proposed = catalog_case("deepseek-v4.1-flash", tp=tp, ep=tp, layers=layers, feature_track="proposed")
+    assert tuple(dict(cache_row_bytes_by_layer(proposed.model))[i] for i in (0, 1)) == (544, 544)
+    prop_graph = target_graphs(proposed, phase="decode", tokens=1, context=2048, scope="model")[0]
+    assert any("mixed_quant_sparse" in op.recipe for op in prop_graph if op.layer == 0 and op.family == "attention")
 
 @pytest.mark.parametrize("model,region,elements,row_bytes,layer", [
     ("glm-5.3-flash", "mla_kv", 512, 528, 3), ("gemma-4-31b", "gqa_kv", None, 8192, 5),
