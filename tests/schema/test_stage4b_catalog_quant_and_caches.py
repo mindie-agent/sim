@@ -30,7 +30,7 @@ from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
-from mindie_sim.stacks.vllm_ascend.profiles import VA_RECOMMENDED_PROFILES
+from mindie_sim.stacks.vllm_ascend import profiles as va_profiles
 
 pytestmark = pytest.mark.tier0
 
@@ -111,7 +111,7 @@ def test_curated_checkpoints_preserved_when_quant_is_none():
 
 def test_profile_quant_updates_and_quant_spec_metadata():
     """Profile arch mappings, V4 routed activation group size, and W4A8 scale_only ABI."""
-    assert VA_RECOMMENDED_PROFILES == {}
+    assert not hasattr(va_profiles, "VA_RECOMMENDED_PROFILES")
 
     q30_a5 = parse_case(compose_case("qwen3-30b-a3b", "a5", tp=4, dp=1, ep=4, num_devices=4))
     assert q30_a5.model.quant.weight_format in {"fp8_e4m3", "bf16"}

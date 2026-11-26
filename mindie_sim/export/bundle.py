@@ -2696,7 +2696,7 @@ def _apply_target_envelope_to_rows(
         primitive_table=(None if out_pt is False else out_pt),
     )
     return (
-        out_rows, out_demands, out_archs, (), (), plan_digest, plan_verified,
+        out_rows, out_demands, out_archs, (), plan_digest, plan_verified,
         applied_receipts, "", {}, co_opps, stage_waterfall, receipt,
         reverted_to_native_baseline, out_span_ns, out_idle_ns,
         out_l_star_ns, out_l_star_valid, out_spec_map, out_case,
@@ -3061,7 +3061,6 @@ def build_export_bundle(
         step_l_star_ns, step_cert_valid, step_tight_res = _certify_step_lower_bound(
             prelim_rows, demands_ns, step_span_ns=unfolded_span_ns,
         )
-    synthesis_specs: tuple[Any, ...] = ()
     audit_triggers: tuple[Any, ...] = ()
     plan_digest, plan_verified = "", False
     applied_edit_receipts: tuple[dict[str, Any], ...] = ()
@@ -3073,7 +3072,7 @@ def build_export_bundle(
     if should_synthesize:
         (
             prelim_rows, demands_ns, archetypes,
-            synthesis_specs, audit_triggers, plan_digest, plan_verified,
+            audit_triggers, plan_digest, plan_verified,
             applied_edit_receipts, stream_core_budget_summary, moe_route_summary,
             co_design_opportunities, stage_waterfall,
             engine_step_receipt, reverted_to_native_baseline,
@@ -3132,7 +3131,7 @@ def build_export_bundle(
         peaks_by_stage=peaks_by_stage, weight_quant=weight_quant, cache_dtype=cache_dtype,
         engram_host_offload=engram_host_offload, include_vision_tower=include_vision_tower,
         apply_preset_to_ignored=apply_preset_to_ignored, top_k_radar=top_k_radar,
-        synthesis_specs=synthesis_specs, audit_triggers=audit_triggers,
+        audit_triggers=audit_triggers,
         rewrite_plan_sha256=plan_digest, rewrite_verification_passed=plan_verified,
         allow_unbound_formula=allow_unbound_formula,
         handoff_tpot_ms=handoff_tpot_ms,
@@ -3607,7 +3606,7 @@ def _assemble_export_bundle(
     target_envelope_applied: bool, peaks_by_stage: Mapping[int, dict[str, Any]],
     weight_quant: str | None, cache_dtype: str | None, engram_host_offload: bool | None,
     include_vision_tower: bool | None, apply_preset_to_ignored: bool, top_k_radar: int,
-    synthesis_specs: tuple[Any, ...] = (), audit_triggers: tuple[Any, ...] = (),
+    audit_triggers: tuple[Any, ...] = (),
     rewrite_plan_sha256: str = "", rewrite_verification_passed: bool = False,
     allow_unbound_formula: bool = True,
     handoff_tpot_ms: float | None = None,
@@ -3724,7 +3723,7 @@ def _assemble_export_bundle(
         target_envelope_applied=target_envelope_applied,
         n_tok_per_die=n_tok_per_die, us_per_tok_die=us_per_tok_die,
         sla_regime=sla_regime, sla_slack_ms=sla_slack,
-        kernel_synthesis_specs=synthesis_specs, semantic_audit_triggers=audit_triggers,
+        semantic_audit_triggers=audit_triggers,
         macro_wall_trigger=macro_wall, rewrite_plan_sha256=rewrite_plan_sha256,
         rewrite_verification_passed=rewrite_verification_passed,
         recommended_checkpoint=ckpt_summary, va_serving_rules_summary=va_summary,

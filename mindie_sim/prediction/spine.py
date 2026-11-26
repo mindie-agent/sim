@@ -284,6 +284,20 @@ def _default_phase_policy_binding(
     return leaf
 
 
+def _lowering_origin(existing_origins: Any, selector: str) -> str | None:
+    if not isinstance(existing_origins, Mapping):
+        return None
+    dotted = existing_origins.get(f"lowerings.{selector}")
+    if isinstance(dotted, str):
+        return dotted
+    nested = existing_origins.get("lowerings")
+    if isinstance(nested, Mapping):
+        val = nested.get(selector)
+        if isinstance(val, str):
+            return val
+    return None
+
+
 def _build_injected_base(
     case: Case,
     request: LoweringRequest,
@@ -295,7 +309,9 @@ def _build_injected_base(
     """[Cohesive-Pipeline] Assemble the injected baseline spine workload and operator binding map."""
     from mindie_sim.prediction.implementation_selection import (
         ALLOWED_BINDING_ORIGINS,
+        AUTOMATIC_LOWERINGS_KEY,
         RECIPE_BINDING_ORIGINS_KEY,
+        is_automatic_lowering,
         record_binding_origin,
     )
     from mindie_sim.prediction.program.implementation_registry import IMPLEMENTATIONS
@@ -353,18 +369,38 @@ def _build_injected_base(
             )
     bound_selectors = set(selector_remap.values())
     existing_origins = meta.get(RECIPE_BINDING_ORIGINS_KEY)
-    low_origins = (
-        existing_origins.get("lowerings")
-        if isinstance(existing_origins, Mapping)
-        and isinstance(existing_origins.get("lowerings"), Mapping)
-        else {}
-    )
     for rec_sel in _STACK_OWNED_RECURRENT_SELECTORS:
-        if rec_sel not in bound_selectors and low_origins.get(rec_sel) != "caller":
+        if rec_sel not in bound_selectors and _lowering_origin(existing_origins, rec_sel) != "caller":
             lowerings.pop(rec_sel, None)
+    mqsmla_origin = _lowering_origin(existing_origins, "mqsmla_attention")
+    if (
+        "mqsmla_attention" not in bound_selectors
+        and mqsmla_origin != "caller"
+        and (
+            is_automatic_lowering(meta, "mqsmla_attention")
+            or mqsmla_origin in {"stack_profile", "body_default"}
+        )
+    ):
+        lowerings.pop("mqsmla_attention", None)
+        auto_names = tuple(
+            name for name in (meta.get(AUTOMATIC_LOWERINGS_KEY) or ())
+            if name != "mqsmla_attention"
+        )
+        if auto_names:
+            meta[AUTOMATIC_LOWERINGS_KEY] = auto_names
+        else:
+            meta.pop(AUTOMATIC_LOWERINGS_KEY, None)
+    if stack_lowering_plan.track_spec is not None:
+        meta["abi_track_spec"] = stack_lowering_plan.track_spec
+        meta.pop("abi_pr_track", None)
+        meta.pop("abi_manifest_bindings", None)
+    elif stack_lowering_plan.track:
+        meta["abi_pr_track"] = stack_lowering_plan.track
+        meta.pop("abi_track_spec", None)
+        meta.pop("abi_manifest_bindings", None)
     if (
         "kda" not in bound_selectors
-        and low_origins.get("kda") != "caller"
+        and _lowering_origin(existing_origins, "kda") != "caller"
         and any(str(p.attention).lower() == "kda" for p in case.model.layer_plans)
     ):
         analytical = list(meta.get("analytical_implementations") or ())

@@ -1032,23 +1032,7 @@ def _project_module_hierarchy(raw: Any) -> list[dict[str, Any]]:
     return groups
 
 
-def _project_synthesis_and_triggers(raw: Mapping[str, Any], out: dict[str, Any]) -> None:
-    if isinstance(raw.get("kernel_synthesis_specs"), Sequence) and not isinstance(raw["kernel_synthesis_specs"], (str, bytes)):
-        specs_out: list[dict[str, Any]] = []
-        for sp in raw["kernel_synthesis_specs"]:
-            if not isinstance(sp, Mapping):
-                continue
-            srec: dict[str, Any] = {
-                "kernel": sanitize_public_text(sp.get("kernel") or ""),
-                "tier": sanitize_public_text(sp.get("tier") or ""),
-                "sram_ok": bool(_coerce_strict_bool(sp.get("sram_ok"))),
-                "ub_kb": sanitize_public_text(sp.get("ub_kb") or ""),
-                "math": sanitize_public_text(sp.get("math") or ""),
-            }
-            if isinstance(sp.get("backend"), str) and sp["backend"].strip():
-                srec["backend"] = sanitize_public_text(sp["backend"])
-            specs_out.append(srec)
-        out["kernel_synthesis_specs"] = specs_out
+def _project_semantic_audit_triggers(raw: Mapping[str, Any], out: dict[str, Any]) -> None:
     if isinstance(raw.get("semantic_audit_triggers"), Sequence) and not isinstance(raw["semantic_audit_triggers"], (str, bytes)):
         tr_out: list[dict[str, Any]] = []
         for tr in raw["semantic_audit_triggers"]:
@@ -1112,7 +1096,7 @@ def project_agent_brief_mapping(raw: Mapping[str, Any]) -> dict[str, Any]:
         out["action_plan_3_tracks"] = _project_action_plan_block(raw["action_plan_3_tracks"])
     if "codesign_opportunities" in raw:
         out["codesign_opportunities"] = project_codesign_opportunities(raw.get("codesign_opportunities"))
-    _project_synthesis_and_triggers(raw, out)
+    _project_semantic_audit_triggers(raw, out)
     if "macro_wall_trigger" in raw:
         mw = raw.get("macro_wall_trigger")
         if isinstance(mw, Mapping):

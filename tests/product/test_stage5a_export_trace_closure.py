@@ -326,7 +326,6 @@ def test_trace_view_sanitizes_feature_track_and_conserves_mtp_and_recoverssm_spa
         assert op.needs_new_kernel is False
 
     # 2. BF16 draft GMM1 + SwiGLU fusion never emits K1_shipping aclnnSwiGluQuant.
-    # TODO(W3/W2): replace expected_ideal/kernel_synthesis assertion once P-A04/P-A07 land.
     draft_gmm = [op for op in b_aft.operators if op.archetype_id == "draft_arch_0" and op.op_id.endswith("expert_up")]
     assert draft_gmm
     assert draft_gmm[0].dtype == "bf16"
@@ -336,10 +335,6 @@ def test_trace_view_sanitizes_feature_track_and_conserves_mtp_and_recoverssm_spa
         if draft_gmm[0].needs_new_kernel
         else draft_gmm[0].ascend_kernel == "aclnnGroupedMatmulV4"
     )
-    for spec in b_aft.kernel_synthesis_specs:
-        src_joined = " ".join(str(s) for s in (getattr(spec, "constituent_op_ids", ()) or ()))
-        if "expert_up" in src_joined:
-            assert getattr(spec, "kernel_name", "") != "aclnnSwiGluQuant"
 
     # 3. Projected trace sanitizes Feature Track AND conserves MTP x3 + RecoverSSM x36 spans.
     trace_path = tmp_path / "qwen38_mtp3_trace.json"

@@ -79,7 +79,6 @@ from .topology import (
     TopologyCommunicationWork,
     _is_cross_node_link,
     _link_scope,
-    _link_text,
 )
 from .transport import (
     DEFAULT_MAX_PHYSICAL_CHUNKS,
@@ -133,7 +132,6 @@ __all__ = [
     "_is_cross_node_link",
     "_joint_complete",
     "_link_scope",
-    "_link_text",
     "_peer_declared_volume",
     "_peer_totals_match",
     "_ready_by_rank",

@@ -137,9 +137,7 @@ def _build_factual_action_note(
     if relation == "N->1" and after_ops:
         a_op = after_ops[0]
         parts = [f"N->1 融合 ({len(before_ops)} ops -> {a_op.ascend_kernel})"]
-        if a_op.kernel_synthesis_spec is not None:
-            parts.append(a_op.kernel_synthesis_spec.format_formula_block())
-        elif a_op.kernel_status:
+        if a_op.kernel_status:
             parts.append(a_op.kernel_status)
         if a_op.stream_core_budget:
             parts.append(f"Cores={a_op.stream_core_budget}")
@@ -228,9 +226,6 @@ def _match_verified_fusions_first(
         sources: list[str] = []
         if a_op.op_id in receipt_inputs_by_out:
             sources.extend(sorted(receipt_inputs_by_out[a_op.op_id]))
-        kspec = a_op.kernel_synthesis_spec
-        if kspec is not None and getattr(kspec, "constituent_op_ids", ()):
-            sources.extend(str(x) for x in kspec.constituent_op_ids if x)
         if len(a_op.absorbed_source_ops) >= MIN_GROUP_SIZE:
             sources.extend(str(x) for x in a_op.absorbed_source_ops if x)
         if not sources:
