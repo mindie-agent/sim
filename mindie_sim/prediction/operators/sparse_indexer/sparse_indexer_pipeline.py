@@ -184,6 +184,7 @@ def _indexer_kernel_binding(
         reg = default_abi_registry()
         if reg.is_shipping_available(kernel_id, arch) or (
             recipe_id in {"sparse_indexer", "index_scores"}
+            and not (kernel_id == "npu_indexer_region_score" and arch in {"A2", "A3"})
             and reg.is_shipping_available("aclnnLightningIndexer", arch)
         ):
             readiness = "shipping"

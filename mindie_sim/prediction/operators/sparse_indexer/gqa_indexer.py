@@ -48,7 +48,10 @@ from mindie_sim.prediction.operators.mla.generic_latent_attention import (
     visible_parts,
 )
 from mindie_sim.prediction.implementation_selection import is_caller_pinned_binding
-from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import emit_index_cache_write
+from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import (
+    _is_arch22_target,
+    emit_index_cache_write,
+)
 from mindie_sim.prediction.structure_groups import declare_group
 
 INDEX_SCORE_VECTOR_OPS_PER_ROW: int = 3
@@ -68,6 +71,121 @@ MSA_SCORE_ALIGN_COLS: int = 16
 MSA_SUPPORTED_ABIS: frozenset[str] = frozenset({
     "legacy_triton_prefill", "legacy_triton_decode", "fp8_triton", "ascendc",
 })
+_UNQUANTIZED_INDEX_DTYPES: frozenset[str] = frozenset({"bf16", "bfloat16", "fp16", "float16"})
+_REGION_SCORE_NATIVE_DTYPES: frozenset[str] = frozenset({"fp16", "bf16", "fp8_e4m3"})
+_DTYPE_ALIASES: dict[str, str] = {
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "fp8": "fp8_e4m3",
+}
+
+
+def _canonical_dtype(raw: str | None, default: str = "bf16") -> str:
+    token = str(raw or "").strip().lower()
+    if not token:
+        return default
+    return _DTYPE_ALIASES.get(token, token)
+
+
+def _resolve_stage_rank(
+    machine,
+    physical_rank: int | None,
+    stage: int | None,
+    parallel,
+) -> int | None:
+    """Map a replica's stage-0 or explicit physical rank onto the die executing ``stage``."""
+    if machine is None or stage is None or parallel is None or not hasattr(machine, "validate_placement"):
+        return int(physical_rank) if physical_rank is not None else None
+    pp = int(getattr(parallel, "pp", 1) or 1)
+    if pp <= 1 and physical_rank is not None:
+        return int(physical_rank)
+    stage_idx = int(stage)
+    if not (0 <= stage_idx < pp):
+        return int(physical_rank) if physical_rank is not None else None
+    try:
+        placement = machine.validate_placement(parallel)
+    except ModelingError:
+        return int(physical_rank) if physical_rank is not None else None
+    if physical_rank is None:
+        ranks = placement.stage_ranks(0, stage_idx)
+        return ranks[0] if ranks else None
+    rank_int = int(physical_rank)
+    total_replicas = int(getattr(parallel, "external_dp", 1) or 1) * int(getattr(parallel, "dp", 1) or 1)
+    for rep in range(total_replicas):
+        rep_stage = placement.stage_ranks(rep, stage_idx)
+        if rank_int in rep_stage:
+            return rank_int
+        for other_stage in range(pp):
+            if other_stage == stage_idx:
+                continue
+            other_ranks = placement.stage_ranks(rep, other_stage)
+            if rank_int in other_ranks:
+                lane = other_ranks.index(rank_int)
+                return rep_stage[lane] if lane < len(rep_stage) else (rep_stage[0] if rep_stage else rank_int)
+    return rank_int
+
+
+def _target_device_for_rank(
+    machine,
+    physical_rank: int | None,
+    *,
+    stage: int | None = None,
+    parallel=None,
+):
+    """Resolve the physical die for ``(physical_rank, stage)`` on heterogeneous multi-die machines."""
+    if machine is None:
+        return None
+    dies = tuple(getattr(machine, "dies", ()) or ())
+    if not dies:
+        return machine
+    resolved_rank = _resolve_stage_rank(machine, physical_rank, stage, parallel)
+    if resolved_rank is None:
+        return machine
+    die = next((d for d in dies if getattr(d, "rank", None) == resolved_rank), None)
+    if die is None and 0 <= resolved_rank < len(dies) and all(getattr(d, "rank", None) is None for d in dies):
+        die = dies[resolved_rank]
+    if die is not None and (getattr(die, "compute_arch", None) is not None or getattr(die, "arch_family", "")):
+        return die
+    return machine
+
+
+def _machine_supports_fp8(runtime, machine) -> bool:
+    """True unless target is Arch22 (A2/A3) or declares a ComputeArchSpec without native FP8."""
+    if _is_arch22_target(runtime, machine):
+        return False
+    if machine is not None:
+        compute_arch = getattr(machine, "compute_arch", None)
+        if compute_arch is None:
+            dies = tuple(getattr(machine, "dies", ()) or ())
+            if dies:
+                compute_arch = getattr(dies[0], "compute_arch", None)
+        if compute_arch is not None and compute_arch.has_native_modes():
+            return bool(compute_arch.supports_native("matrix", "fp8_e4m3"))
+    return True
+
+
+def _region_csa_precision(quant, runtime, machine) -> tuple[str, str]:
+    """Resolve ``(cache_dtype, scale_dtype)`` for Step-5 region-CSA indexers.
+
+    On FP8-capable targets (A5 / Arch35), Step-5 region-CSA stores unscaled
+    ``fp8_e4m3`` summaries and scores with ``npu_indexer_region_score`` (which
+    accepts only FP16/BF16/FP8 E4M3FN). On Arch22 (A2/A3) or non-FP8 targets,
+    honor ``quant.index_dtype`` (default ``bf16``; an explicit ``fp8_e4m3`` is
+    preserved so ``index_cache_writer`` rejects it).
+    """
+    if _machine_supports_fp8(runtime, machine):
+        return "fp8_e4m3", "none"
+    raw_dtype = str((getattr(quant, "index_dtype", "") if quant is not None else "") or "").strip().lower()
+    raw_scale = str((getattr(quant, "index_scale_dtype", "") if quant is not None else "") or "").strip().lower()
+    norm_dtype = _DTYPE_ALIASES.get(raw_dtype, raw_dtype)
+    eff_dtype = norm_dtype or "bf16"
+    if eff_dtype in _UNQUANTIZED_INDEX_DTYPES:
+        eff_scale = "none"
+    elif raw_scale:
+        eff_scale = raw_scale
+    else:
+        eff_scale = "fp32"
+    return eff_dtype, eff_scale
 
 
 def owned_compressed_group_count(
@@ -324,6 +442,7 @@ def lower_gqa_indexer(
     topk_ids=None,
     index_cache_ids=None,
     machine=None,
+    physical_rank: int | None = None,
 ) -> tuple[int, int, int, str | None, str | None, str | None]:
     """Lower GQA sparse indexer ops; return ``(eff_topk, sel_topk, block_size, index_store_id, topk_id, candidate_id)``."""
     plans = model.layer_plans
@@ -381,15 +500,29 @@ def lower_gqa_indexer(
             max(1, int(getattr(parallel, "cp", 1) or 1))
             if dcp_indexer_sharded(model, runtime) else 1
         )
+        target_hw = _target_device_for_rank(
+            machine, physical_rank, stage=stage, parallel=parallel,
+        )
+        is_region = _is_region_csa_indexer(plan)
+        region_dtype, region_scale_dtype = (
+            _region_csa_precision(quant, runtime, target_hw)
+            if is_region else (None, None)
+        )
+        native_region_supported = (
+            _machine_supports_fp8(runtime, target_hw)
+            and region_dtype in _REGION_SCORE_NATIVE_DTYPES
+        ) if is_region else False
         (row_bytes, idx_heads, idx_dim, new_idx_rows, rows_by_view,
          shared_idx_by_view, scored_rows, pairs_by_view) = _index_view_work(
             model, plan, views, idx_ratio, valid, block_size,
             local_idx_kv_heads=local_idx_kv_heads, parallel=parallel, eff_dcp=eff_dcp,
-            tp=tp, runtime=runtime)
+            tp=tp, runtime=runtime,
+            region_dtype=region_dtype, region_scale_dtype=region_scale_dtype)
         prep_ops, q_ready_id, weights_ready_id, store_ops, pcp_idx_ops, idx_store_id, idx_ready = _index_cache_inputs(
             prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim,
-            model, quant, mode, valid, new_idx_rows, row_bytes, runtime, machine,
-            pcp_prefill, views, idx_ratio, parallel, local_idx_kv_heads=local_idx_kv_heads)
+            model, quant, mode, valid, new_idx_rows, row_bytes, runtime, target_hw,
+            pcp_prefill, views, idx_ratio, parallel, local_idx_kv_heads=local_idx_kv_heads,
+            region_dtype=region_dtype, region_scale_dtype=region_scale_dtype)
         tail_ops, scores_anchor, topk_anchor, fused_flag = _build_index_score_and_topk_ops(
             prefix=prefix,
             plan=plan,
@@ -416,6 +549,8 @@ def lower_gqa_indexer(
             pairs_by_view=pairs_by_view,
             eff_dcp=eff_dcp,
             cp_stride=(cp_interleave(runtime) if runtime is not None else block_size),
+            region_dtype=region_dtype,
+            native_region_supported=native_region_supported,
         )
         ops.extend((*prep_ops, *store_ops, *pcp_idx_ops, *tail_ops))
         _declare_gqa_indexer_group(
@@ -424,6 +559,8 @@ def lower_gqa_indexer(
             idx_heads=idx_heads, idx_dim=idx_dim, sel_topk=sel_topk,
             idx_ratio=idx_ratio, scores_id=scores_anchor, topk_id=topk_anchor,
             fused_topk=fused_flag,
+            region_dtype=region_dtype, region_scale_dtype=region_scale_dtype,
+            native_region_supported=native_region_supported,
         )
         index_store_id, topk_id = idx_store_id, topk_anchor
     elif idx_owner >= 0:
@@ -772,11 +909,12 @@ def _build_region_csa_score_op(
     l2_bounded_index_read: float,
     topk_write_bytes: float,
     shape: tuple[int, int, int],
+    region_dtype: str = "fp8_e4m3",
+    native_region_supported: bool = True,
 ) -> tuple[tuple[OpSpec, ...], str, str, bool]:
     # Upstream indexer_region_score.cpp:52-70 + select.h:474-503 allocates a
     # minimum 8-float stride workspace, writes FP32 scores, and reloads for
     # radix TopK only on rows with history > topk (FillUnderKIds otherwise).
-    region_dtype = "fp8_e4m3"
     region_q_bytes = float(valid * idx_heads * idx_dim) * dtype_bytes(region_dtype) if scored_rows else 0.0
     weights_read_bytes = float(valid * idx_heads * FP32_SCORE_BYTES) if scored_rows else 0.0
     max_req_regions, reload_score_rows = _region_csa_reload_rows(
@@ -788,6 +926,11 @@ def _build_region_csa_score_op(
     score_reload_bytes = float(reload_score_rows * FP32_SCORE_BYTES)
     score_flops = float(2 * scored_rows * idx_heads * idx_dim)
     score_deps = tuple(dep for dep in (idx_wq_id, idx_weights_id, idx_ready) if dep)
+    abi_meta: tuple[tuple[str, object], ...] = (
+        (("native_kind", "npu_indexer_region_score"),)
+        if native_region_supported
+        else (("readiness", "synthesized_target"),)
+    )
     fused_meta: tuple[tuple[str, object], ...] = (
         ("score_materialization", "gm_score_workspace_then_radix_topk"),
         ("gm_score_workspace_bytes", score_ws_capacity),
@@ -795,7 +938,7 @@ def _build_region_csa_score_op(
         ("selection_output_dtype", "int32"),
         ("fused_topk", True),
         ("indexer_kind", "region_csa_score"),
-        ("native_kind", "npu_indexer_region_score"),
+        *abi_meta,
     )
     idx_scores = OpSpec(
         op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
@@ -856,6 +999,8 @@ def _build_index_score_and_topk_ops(
     pairs_by_view: Sequence[int] | None = None,
     eff_dcp: int = 1,
     cp_stride: int = 1,
+    region_dtype: str | None = None,
+    native_region_supported: bool = True,
 ) -> tuple[tuple[OpSpec, ...], str, str, bool]:
     """Construct the sparse indexer score sweep and TopK selection OpSpecs."""
     q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
@@ -927,6 +1072,8 @@ def _build_index_score_and_topk_ops(
             idx_weights_id=idx_weights_id,
             l2_bounded_index_read=l2_bounded_index_read,
             topk_write_bytes=topk_write_bytes, shape=shape,
+            region_dtype=region_dtype or quant.index_dtype or "bf16",
+            native_region_supported=native_region_supported,
         )
     score_bytes = float(scored_rows * FP32_SCORE_BYTES)
     topk_read_bytes = score_bytes
@@ -972,11 +1119,16 @@ def _declare_gqa_indexer_group(
     ops, *, prefix, plan, parallel, model, quant, views, padded_tokens,
     idx_heads, idx_dim, sel_topk, idx_ratio, scores_id, topk_id,
     fused_topk: bool = False,
+    region_dtype: str | None = None,
+    region_scale_dtype: str | None = None,
+    native_region_supported: bool = True,
 ):
     """Unconditionally declare the GQA sparse indexer semantic subgraph."""
     quantized = quant.index_dtype not in {"bf16", "fp16"}
-    if _is_region_csa_indexer(plan):
-        role, family, native_kind = "pool_key_indexer", "pooled_indexer", "IndexerRegionScore"
+    is_region = _is_region_csa_indexer(plan)
+    if is_region:
+        role, family = "pool_key_indexer", "pooled_indexer"
+        native_kind = "IndexerRegionScore" if native_region_supported else "AnalyticalRegionScore"
     elif _is_block_msa_indexer(plan):
         role, family, native_kind = "lightning_indexer", "dsa", "MsaIndexScore"
     elif _is_qsa_pooled_indexer(plan):
@@ -994,9 +1146,13 @@ def _declare_gqa_indexer_group(
     )
     members = (scores_id,) if scores_id == topk_id else (scores_id, topk_id)
     single_op = fused_topk and scores_id == topk_id
-    is_region = _is_region_csa_indexer(plan)
     is_qsa = _is_qsa_pooled_indexer(plan)
-    eff_query_dtype = "fp8_e4m3" if is_region else quant.index_dtype
+    eff_query_dtype = (region_dtype or quant.index_dtype) if is_region else quant.index_dtype
+    eff_scale_dtype = (
+        region_scale_dtype
+        if (is_region and region_scale_dtype is not None)
+        else quant.index_scale_dtype
+    )
     eff_weight_dtype = (
         "fp32" if (is_region or is_qsa)
         else ("fp16" if quant.index_dtype == "int8" else model.activation_dtype)
@@ -1013,7 +1169,7 @@ def _declare_gqa_indexer_group(
             "weight_dtype": eff_weight_dtype,
             "cache_dtype": eff_query_dtype,
             "selection_output_dtype": "int32",
-            "scale_dtype": quant.index_scale_dtype,
+            "scale_dtype": eff_scale_dtype,
         },
         implementation={
             "native_kind": native_kind,
@@ -1028,26 +1184,32 @@ def _declare_gqa_indexer_group(
                 "module": "mindie_sim.prediction.operators.sparse_indexer.gqa_indexer"},
         fusion_status="fused_single_op" if single_op else "unfused_decomposed",
         fusion_reason=(
-            "region_csa_single_op" if (single_op and is_region)
+            ("region_csa_single_op" if native_region_supported else "region_csa_analytical_arch22")
+            if (single_op and is_region)
             else ("qsa_lightning_indexer_v2_fused_topk_then_pack" if fused_topk else "gqa_indexer_separate_score_and_topk")
         ),
-        native_fusion_eligible=single_op,
+        native_fusion_eligible=(single_op and (native_region_supported or not is_region)),
     )
 
 
 def _index_view_work(
     model, plan, views, idx_ratio, valid, block_size, *,
     local_idx_kv_heads: int = 1, parallel=None, eff_dcp: int = 1, tp: int = 1,
-    runtime=None,
+    runtime=None, region_dtype: str | None = None, region_scale_dtype: str | None = None,
 ):
     cost = index_selection_cost(
         model, plan, max((v.kv_len for v in views), default=0)
     )
     idx_dim = max(1, int(plan.index_dim or DEFAULT_INDEX_DIM))
     if _is_region_csa_indexer(plan):
-        scale_dt = str(getattr(model.quant, "index_scale_dtype", "none") or "none").strip().lower()
+        eff_region_dt = region_dtype or str(getattr(model.quant, "index_dtype", "bf16") or "bf16")
+        scale_dt = (
+            region_scale_dtype
+            if region_scale_dtype is not None
+            else str(getattr(model.quant, "index_scale_dtype", "none") or "none")
+        ).strip().lower()
         scale_b = float(dtype_bytes(scale_dt)) if scale_dt not in {"", "none"} else 0.0
-        row_bytes_per_head = float(idx_dim) * float(dtype_bytes("fp8_e4m3")) + scale_b
+        row_bytes_per_head = float(idx_dim) * float(dtype_bytes(eff_region_dt)) + scale_b
     else:
         row_bytes_per_head = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
     row_bytes = row_bytes_per_head * max(1, int(local_idx_kv_heads))
@@ -1181,8 +1343,9 @@ def _region_csa_prep_ops(
     *, prefix: str, deps: str, stage: int, plan, requests: tuple[str, ...],
     padded_tokens: int, idx_heads: int, idx_dim: int, local_k_heads: int,
     idx_wq: OpSpec, idx_wk: OpSpec, model, quant, mode: str,
+    region_dtype: str = "fp8_e4m3",
 ) -> tuple[tuple[OpSpec, ...], str, str, tuple[str, ...]]:
-    """Emit Step-5 region CSA Z/weight projections, Q/K norms, RoPE, and FP8 query quant."""
+    """Emit Step-5 region CSA Z/weight projections, Q/K norms, RoPE, and query quant/cast."""
     act_dtype = str(getattr(model, "activation_dtype", "bf16") or "bf16")
     act_bytes = float(dtype_bytes(act_dtype))
     idx_wz = gemm_op(
@@ -1293,31 +1456,39 @@ def _region_csa_prep_ops(
         write_bytes_override=float(qk_elems) * act_bytes,
         shape=(padded_tokens, idx_heads + local_k_heads, idx_dim),
     )
-    q_quant = vector_op(
-        op_id=prefix + ".index_q_quant",
-        deps=(qk_rope.op_id,),
-        stage=stage,
-        layer=plan.index,
-        requests=requests,
-        elements=q_elems,
-        ops_per_element=INDEX_QUANT_OPS,
-        dtype="fp8_e4m3",
-        family="quantize",
-        phase=mode,
-        recipe="index_q_quant",
-        read_bytes_override=float(q_elems) * act_bytes,
-        write_bytes_override=float(q_elems) * float(dtype_bytes("fp8_e4m3")),
-        shape=(padded_tokens, idx_heads, idx_dim),
-        metadata=(("input_format", act_dtype), ("output_format", "fp8_e4m3")),
-    )
-    prep.extend((q_norm, k_norm, qk_rope, q_quant))
-    return tuple(prep), q_quant.op_id, weights_ready_op.op_id, (qk_rope.op_id, idx_wz.op_id)
+    prep.extend((q_norm, k_norm, qk_rope))
+    q_ready_id = qk_rope.op_id
+    eff_region_dt = _canonical_dtype(region_dtype, default=_canonical_dtype(act_dtype))
+    if eff_region_dt != _canonical_dtype(act_dtype):
+        is_quant = eff_region_dt not in _UNQUANTIZED_INDEX_DTYPES
+        q_convert = vector_op(
+            op_id=prefix + (".index_q_quant" if is_quant else ".index_q_cast"),
+            deps=(qk_rope.op_id,),
+            stage=stage,
+            layer=plan.index,
+            requests=requests,
+            elements=q_elems,
+            ops_per_element=INDEX_QUANT_OPS if is_quant else 1.0,
+            dtype=eff_region_dt,
+            family="quantize" if is_quant else "cast",
+            phase=mode,
+            recipe="index_q_quant" if is_quant else "index_q_cast",
+            read_bytes_override=float(q_elems) * act_bytes,
+            write_bytes_override=float(q_elems) * float(dtype_bytes(eff_region_dt)),
+            shape=(padded_tokens, idx_heads, idx_dim),
+            metadata=(("input_format", act_dtype), ("output_format", eff_region_dt)),
+        )
+        prep.append(q_convert)
+        q_ready_id = q_convert.op_id
+    return tuple(prep), q_ready_id, weights_ready_op.op_id, (qk_rope.op_id, idx_wz.op_id)
 
 
 def _index_cache_inputs(
     prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim, model, quant, mode,
     valid, new_idx_rows, row_bytes, runtime, machine, pcp_prefill, views, idx_ratio, parallel,
     *, local_idx_kv_heads: int = 1,
+    region_dtype: str | None = None,
+    region_scale_dtype: str | None = None,
 ):
     local_k_heads = max(1, int(local_idx_kv_heads))
     idx_wq = gemm_op(
@@ -1352,15 +1523,20 @@ def _index_cache_inputs(
     )
     is_region = _is_region_csa_indexer(plan)
     if is_region:
+        eff_region_dt, eff_region_scale = (
+            (region_dtype, region_scale_dtype)
+            if (region_dtype is not None and region_scale_dtype is not None)
+            else _region_csa_precision(quant, runtime, machine)
+        )
         prep_ops, q_ready_id, weights_ready_id, store_deps = _region_csa_prep_ops(
             prefix=prefix, deps=deps, stage=stage, plan=plan, requests=requests,
             padded_tokens=padded_tokens, idx_heads=idx_heads, idx_dim=idx_dim,
             local_k_heads=local_k_heads, idx_wq=idx_wq, idx_wk=idx_wk,
-            model=model, quant=quant, mode=mode,
+            model=model, quant=quant, mode=mode, region_dtype=eff_region_dt,
         )
         k_ready_id = store_deps[0]
-        store_cache_dtype: str | None = "fp8_e4m3"
-        store_scale_dtype: str | None = quant.index_scale_dtype
+        store_cache_dtype: str | None = eff_region_dt
+        store_scale_dtype: str | None = eff_region_scale
     else:
         prep_ops = (idx_wq, idx_wk)
         q_ready_id = idx_wq.op_id

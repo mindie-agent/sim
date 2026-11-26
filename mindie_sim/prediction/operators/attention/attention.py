@@ -523,6 +523,7 @@ def _lower_gqa_frontend(
             model=model, parallel=parallel, quant=quant, mode=mode, padded_tokens=padded_tokens,
             valid=valid, pcp_prefill=pcp_prefill, runtime=runtime, topk_ids=topk_ids,
             index_cache_ids=index_cache_ids, machine=machine,
+            physical_rank=physical_rank,
         )
         proj = (qkv, rope, separate_gate, split_views, split_copies, normalized)
         query_producer = rope.op_id
