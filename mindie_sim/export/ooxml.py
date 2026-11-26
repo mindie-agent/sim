@@ -197,6 +197,10 @@ class Worksheet:
         """Attach a native OOXML line chart rendered via ``xl/charts/chart*.xml``."""
         if not chart.series:
             raise ValueError("line_chart_requires_at_least_one_series")
+        c1, r1 = int(chart.anchor_from[0]), int(chart.anchor_from[1])
+        c2, r2 = int(chart.anchor_to[0]), int(chart.anchor_to[1])
+        if c1 < 0 or r1 < 0 or c2 <= c1 or r2 <= r1:
+            raise ValueError(f"invalid_line_chart_anchor:{chart.anchor_from}->{chart.anchor_to}")
         self._charts.append(chart)
 
     @property
@@ -603,7 +607,8 @@ def _drawing_xml(chart_pairs: Sequence[tuple[int, LineChartSpec]]) -> str:
     for rel_idx, (_chart_idx, spec) in enumerate(chart_pairs, start=1):
         c1, r1 = int(spec.anchor_from[0]), int(spec.anchor_from[1])
         c2, r2 = int(spec.anchor_to[0]), int(spec.anchor_to[1])
-        name = xml_escape(_sanitize_xml_text(spec.title or f"Chart {rel_idx}"), {'"': "&quot;", "'": "&apos;"})
+        raw_name = f"Chart {rel_idx}: {spec.title}" if spec.title else f"Chart {rel_idx}"
+        name = xml_escape(_sanitize_xml_text(raw_name), {'"': "&quot;", "'": "&apos;"})
         anchors.append(
             "<xdr:twoCellAnchor>"
             f"<xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff>"
@@ -686,6 +691,7 @@ def _line_chart_xml(spec: LineChartSpec) -> str:
         "</c:plotArea>"
         '<c:legend><c:legendPos val="b"/><c:overlay val="0"/></c:legend>'
         '<c:plotVisOnly val="1"/>'
+        '<c:dispBlanksAs val="gap"/>'
         "</c:chart></c:chartSpace>"
     )
 

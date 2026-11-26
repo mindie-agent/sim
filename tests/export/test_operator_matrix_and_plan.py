@@ -37,6 +37,8 @@ from mindie_sim.cli import _main as cli_main
 from mindie_sim.compose import compose_case
 from mindie_sim.export.matrix_writer import (
     HW_NOMINAL_COLUMNS,
+    OPERATOR_CATALOG_INDEX_COLUMNS,
+    OPERATOR_SCALING_CURVE_COLUMNS,
     OUTWARD_OP_COLUMNS,
     assert_zero_internal_jargon,
     export_operator_matrix,
@@ -46,6 +48,7 @@ from mindie_sim.export.operator_matrix import (
     BUILDERS,
     COLLECTIVE_BUILDERS,
     build_bench_plan,
+    build_bench_plans_by_sku,
     build_operator_matrix,
     derive_physical_seq_cliffs,
     enumerate_parallel_arms,
@@ -595,3 +598,321 @@ def test_nominal_cube_vector_peak_columns_ooxml_formulas_and_builder_lock(tmp_pa
         op_probe_xml = zf.read("xl/worksheets/sheet3.xml").decode("utf-8")
     assert f"Hardware_Nominal_Specs!${hf32_col}$2:${hf32_col}$3" in op_probe_xml
     assert f"Hardware_Nominal_Specs!${sio_col}$2:${sio_col}$3" in op_probe_xml
+
+
+def _build_synthetic_sealed_campaign(
+    tmp_path: Path,
+    manifest: object,
+    sku: str,
+) -> Path:
+    """Create a cryptographically sealed synthetic ``mindie-bench-campaign/1`` covering model + fabric cases."""
+    import hashlib
+    from mindie_sim.schema.bench_matrix import (
+        BENCH_CAMPAIGN_V1_SCHEMA,
+        BenchEnvFingerprint,
+        CampaignCaseRecord,
+        CampaignManifest,
+        RunShardDescriptor,
+        compute_case_raw_sha256,
+    )
+
+    plan = build_bench_plans_by_sku(manifest, include_fabric=True)[sku]  # type: ignore[arg-type]
+    nom_spec = manifest.nominal_specs[sku]  # type: ignore[attr-defined]
+    rows_by_cid = {r.bench_case_id: r for r in manifest.rows if r.sku == sku}  # type: ignore[attr-defined]
+    camp_dir = tmp_path / "synthetic_campaign"
+    camp_dir.mkdir(parents=True, exist_ok=True)
+    shard_rel = "observations.jsonl"
+    shard_path = camp_dir / shard_rel
+
+    shard_lines: list[str] = []
+    camp_cases: list[CampaignCaseRecord] = []
+    for idx, pcase in enumerate(plan.cases, start=1):
+        row = rows_by_cid.get(pcase.case_id)
+        base_us = max(float(row.per_call_stage0_us), float(row.l_star_us), 5.0) if row is not None else max(
+            12.0, float(pcase.work_bytes) / 1e6,
+        )
+        p50_us = round(base_us * 1.03, 4)
+        p99_us = round(base_us * 1.12, 4)
+        shard_lines.append(json.dumps({
+            "case_id": pcase.case_id,
+            "canonical_key_digest": pcase.canonical_key_digest,
+            "acquisition_uid": pcase.acquisition_uid,
+            "duration_ms": round(p50_us / 1000.0, 6),
+        }, sort_keys=True))
+        ranks = tuple(pcase.canonical_key.ordered_rank_placement or (0,))
+        t_nodes = tuple(row.timed_nodes) if row is not None else ("n0",)
+        base_rec = {
+            "acquisition_uid": pcase.acquisition_uid,
+            "case_id": pcase.case_id,
+            "canonical_key_digest": pcase.canonical_key_digest,
+            "boundary": pcase.boundary,
+            "split": pcase.split,
+            "status": "ok",
+            "qualified": True,
+            "timing_mode": "eager",
+            "capture_mode": pcase.capture_mode,
+            "clock_operator": pcase.clock_operator,
+            "residency": pcase.residency,
+            "rank": ranks[0],
+            "participating_ranks": list(ranks),
+            "timed_nodes": list(t_nodes),
+            "p50_us": p50_us,
+            "p99_us": p99_us,
+            "samples_count": 5,
+            "observed_clock_mhz": float(nom_spec.nominal_clock_mhz),
+            "capture_uri": f"capture://synthetic-campaign/{sku}/case-{idx:04d}",
+            "cache_status": "miss",
+            "measured_in_run_id": "run-syn-01",
+            "run_shard": shard_rel,
+            "cold_coverage_verified": True,
+            "traced_interval_verified": True,
+            "family": row.family if row is not None else "collective",
+            "geometry_key": f"{pcase.split}-geom-{idx:04d}",
+            "upstream_abi": pcase.canonical_key.upstream_abi,
+            "abi_backend": pcase.canonical_key.abi_backend,
+            "bench_builder": pcase.canonical_key.bench_builder,
+        }
+        draft_rec = CampaignCaseRecord.from_mapping({**base_rec, "raw_sha256": "0" * 64})
+        raw_sha = compute_case_raw_sha256(draft_rec.to_dict())
+        camp_cases.append(CampaignCaseRecord.from_mapping({**draft_rec.to_dict(), "raw_sha256": raw_sha}))
+
+    shard_bytes = ("\n".join(shard_lines) + "\n").encode("utf-8")
+    shard_path.write_bytes(shard_bytes)
+    shard_sha = hashlib.sha256(shard_bytes).hexdigest()
+    env_fp = BenchEnvFingerprint(
+        sku=sku,
+        soc_arch=nom_spec.soc_arch,
+        hw_geometry={"aic": nom_spec.aic_count, "aiv": nom_spec.aiv_count},
+        driver_version="25.0.0",
+        cann_version="8.5.0",
+        cann_innerversion="V100R001C25",
+        cann_packages={"ops": "8.5.0"},
+        torch_version="2.6.0",
+        torch_npu_version="2.6.0",
+        va_commit="0123456789abcdef",
+        triton_version="3.2.0",
+        custom_op_libs={},
+        profiler_version="1.0.0",
+        timing_protocol_id="msprof-v2",
+        cache_partition=plan.cache_partition,
+    )
+    camp = CampaignManifest(
+        schema=BENCH_CAMPAIGN_V1_SCHEMA,
+        campaign_id="camp-syn-opcurves",
+        env_fingerprint_id=env_fp.env_fingerprint_id,
+        cache_partition=plan.cache_partition,
+        plan_id=plan.plan_id,
+        plan_sha256=plan.plan_sha256,
+        version_fingerprint=env_fp,
+        clock_operator="elapsed_span",
+        observations_jsonl=shard_rel,
+        observations_sha256=shard_sha,
+        cases=tuple(camp_cases),
+        run_shards=(RunShardDescriptor(
+            run_id="run-syn-01",
+            path=shard_rel,
+            observations_sha256=shard_sha,
+            record_count=len(shard_lines),
+        ),),
+    ).with_computed_seal()
+    camp_path = camp_dir / "campaign_manifest.json"
+    camp_path.write_text(json.dumps(camp.to_dict(include_seal=True), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return camp_path
+
+
+def _extract_js_const_json(html: str, name: str) -> list[dict[str, object]]:
+    import re
+    match = re.search(rf"const {name} = (\[.*?\]);\n", html)
+    assert match is not None, f"missing JS payload {name}"
+    return json.loads(match.group(1))
+
+
+def _assert_ooxml_charts_valid_and_non_overlapping(
+    xlsx_path: Path,
+    *,
+    expected_sheets: tuple[str, ...],
+    expected_ref_prefix: str,
+    min_charts: int,
+) -> int:
+    import xml.etree.ElementTree as ET
+    ns_xdr = {"xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
+    ns_c = {"c": "http://schemas.openxmlformats.org/drawingml/2006/chart"}
+    with zipfile.ZipFile(xlsx_path, "r") as zf:
+        names = set(zf.namelist())
+        for member in names:
+            if member.endswith((".xml", ".rels")):
+                ET.fromstring(zf.read(member))
+        wb_xml = zf.read("xl/workbook.xml").decode("utf-8")
+        for s_name in expected_sheets:
+            assert s_name in wb_xml, (xlsx_path.name, s_name)
+        drawing_files = sorted(n for n in names if n.startswith("xl/drawings/drawing") and n.endswith(".xml"))
+        assert drawing_files, f"no drawings in {xlsx_path.name}"
+        for df in drawing_files:
+            d_root = ET.fromstring(zf.read(df))
+            boxes: list[tuple[int, int, int, int]] = []
+            for anc in d_root.findall("xdr:twoCellAnchor", ns_xdr):
+                frm = anc.find("xdr:from", ns_xdr)
+                to = anc.find("xdr:to", ns_xdr)
+                assert frm is not None and to is not None
+                c1 = int(frm.findtext("xdr:col", default="0", namespaces=ns_xdr))
+                r1 = int(frm.findtext("xdr:row", default="0", namespaces=ns_xdr))
+                c2 = int(to.findtext("xdr:col", default="0", namespaces=ns_xdr))
+                r2 = int(to.findtext("xdr:row", default="0", namespaces=ns_xdr))
+                assert c2 > c1 and r2 > r1
+                for oc1, or1, oc2, or2 in boxes:
+                    assert c2 <= oc1 or c1 >= oc2 or r2 <= or1 or r1 >= or2, (df, (c1, r1, c2, r2), (oc1, or1, oc2, or2))
+                boxes.append((c1, r1, c2, r2))
+        chart_files = sorted(n for n in names if n.startswith("xl/charts/chart") and n.endswith(".xml"))
+        matched_charts = 0
+        for cf in chart_files:
+            c_root = ET.fromstring(zf.read(cf))
+            assert c_root.find(".//c:lineChart", ns_c) is not None
+            blanks = c_root.find(".//c:dispBlanksAs", ns_c)
+            assert blanks is not None and blanks.attrib.get("val") == "gap"
+            formulas = [f.text or "" for f in c_root.findall(".//c:f", ns_c)]
+            if any(f.startswith(expected_ref_prefix) for f in formulas):
+                matched_charts += 1
+        assert matched_charts >= min_charts, (xlsx_path.name, matched_charts, min_charts)
+        return matched_charts
+
+
+def test_all_operator_scaling_curves_ooxml_charts_explorer_and_campaign_parity(tmp_path: Path) -> None:
+    """Lock per-operator OOXML charts, standalone curves package, fabric ladder, explorer modes, and campaign P50/P99."""
+    dense_hf = _write_synthetic_hf_config(tmp_path, name="syn-dense-1l", moe=False)
+    moe_hf = _write_synthetic_hf_config(tmp_path, name="syn-moe-1l", moe=True)
+    spec = MatrixSpec(
+        models=(str(dense_hf), str(moe_hf)),
+        skus=("Ascend950DT_9582", "Ascend910_9362"),
+        phases=("prefill", "decode"),
+        seq_min=512,
+        seq_max=2048,
+        anchor_ladder=(512, 2048),
+        auto_physical_cliffs=False,
+        concurrencies=(1, 4),
+        parallel_arms=(ParallelArmSpec(arm_id="tp1", dp=1, tp=1, ep=1, num_devices=1),),
+        stages=("before",),
+    )
+    base_manifest = build_operator_matrix(spec, layers=1)
+    camp_path = _build_synthetic_sealed_campaign(tmp_path, base_manifest, "Ascend950DT_9582")
+
+    out_dir = tmp_path / "all_op_bundle"
+    receipt = export_operator_matrix(
+        spec,
+        out_dir,
+        campaign=camp_path,
+        include_fabric=True,
+        tar_gz=True,
+        layers=1,
+    )
+    assert receipt.sanitization_passed is True
+    assert receipt.unique_operator_count >= 10
+    assert receipt.fabric_curve_point_count >= 45
+    assert_zero_internal_jargon(out_dir)
+
+    # 1. Verify manifest.json & README.md index standalone operator curves + explorer catalog mode
+    manifest_doc = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest_doc["operators"]["operator_scaling_curves_xlsx"] == "operators/Operator_Scaling_Curves.xlsx"
+    assert manifest_doc["operators"]["operator_scaling_curves_csv"] == "operators/operator_scaling_curves.csv"
+    assert "All Operators Catalog" in manifest_doc["charts"]["modes"]
+    assert "By Model -> Operator" in manifest_doc["charts"]["modes"]
+    assert manifest_doc["campaign_attached"] is True
+    readme = (out_dir / "README.md").read_text(encoding="utf-8")
+    for tok in ("Operator_Scaling_Curves.xlsx", "operator_scaling_curves.csv", "All Operators Catalog", "Operator_Scaling_Charts"):
+        assert tok in readme
+
+    # 2. Verify operators/operator_scaling_curves.csv completeness, deduplication, fabric ladder & campaign P50/P99
+    op_csv = out_dir / "operators" / "operator_scaling_curves.csv"
+    op_xlsx = out_dir / "operators" / "Operator_Scaling_Curves.xlsx"
+    assert op_csv.is_file() and op_xlsx.is_file()
+    with op_csv.open(encoding="utf-8") as fh:
+        csv_reader = list(csv.reader(fh))
+    assert tuple(csv_reader[0]) == OPERATOR_SCALING_CURVE_COLUMNS
+    c_idx = {name: i for i, name in enumerate(OPERATOR_SCALING_CURVE_COLUMNS)}
+    csv_records = csv_reader[1:]
+    assert csv_records
+    seen_dedup_keys: set[tuple[str, ...]] = set()
+    by_series_xs: dict[tuple[str, ...], list[int]] = {}
+    for rec in csv_records:
+        dkey = (
+            rec[c_idx["OP Type"]], rec[c_idx["Kernel Name"]], rec[c_idx["Ascend SKU"]],
+            rec[c_idx["Model"]], rec[c_idx["Phase"]], rec[c_idx["Parallel Config"]],
+            rec[c_idx["Fixed Slice"]], rec[c_idx["X Axis"]], rec[c_idx["X Value"]],
+        )
+        assert dkey not in seen_dedup_keys, f"duplicate curve point: {dkey}"
+        seen_dedup_keys.add(dkey)
+        by_series_xs.setdefault(dkey[:-1], []).append(int(rec[c_idx["X Value"]]))
+    for skey, xs in by_series_xs.items():
+        assert xs == sorted(xs) and len(xs) == len(set(xs)), (skey, xs)
+
+    model_ops_expected = {(r.op_type or r.family, r.kernel_name or r.upstream_abi) for r in base_manifest.rows}
+    csv_ops = {(rec[c_idx["OP Type"]], rec[c_idx["Kernel Name"]]) for rec in csv_records}
+    assert model_ops_expected <= csv_ops
+    fabric_ops_present = {
+        rec[c_idx["OP Type"]] for rec in csv_records if rec[c_idx["Phase"]] == "Fabric" and rec[c_idx["X Axis"]] == "Message Bytes"
+    }
+    assert {"all_reduce", "all_gather", "reduce_scatter", "all_to_all", "all_to_all_v"} <= fabric_ops_present
+    measured_model_rows = [
+        rec for rec in csv_records
+        if rec[c_idx["Ascend SKU"]] == "Ascend950DT_9582" and rec[c_idx["Phase"]] != "Fabric"
+        and rec[c_idx["msprof P50(us)"]] != "" and rec[c_idx["msprof P99(us)"]] != ""
+    ]
+    measured_fabric_rows = [
+        rec for rec in csv_records
+        if rec[c_idx["Ascend SKU"]] == "Ascend950DT_9582" and rec[c_idx["Phase"]] == "Fabric"
+        and rec[c_idx["msprof P50(us)"]] != "" and rec[c_idx["msprof P99(us)"]] != ""
+    ]
+    assert measured_model_rows and measured_fabric_rows
+    for rec in measured_model_rows[:10] + measured_fabric_rows[:10]:
+        assert float(rec[c_idx["msprof P99(us)"]]) >= float(rec[c_idx["msprof P50(us)"]]) > 0.0
+
+    # 3. Verify native OOXML <c:lineChart> charts in Executive_Summary.xlsx, Operator_Breakdown.xlsx & Operator_Scaling_Curves.xlsx
+    _assert_ooxml_charts_valid_and_non_overlapping(
+        out_dir / "summary" / "Executive_Summary.xlsx",
+        expected_sheets=("Executive_Summary", "Hardware_Nominal_Specs", "Unique_Kernel_Catalog", "Operator_Scaling_Charts"),
+        expected_ref_prefix="Operator_Scaling_Charts!",
+        min_charts=len(csv_ops),
+    )
+    _assert_ooxml_charts_valid_and_non_overlapping(
+        op_xlsx,
+        expected_sheets=("Operator_Catalog_Index", "All_Operator_Curves", "Operator_Charts"),
+        expected_ref_prefix="All_Operator_Curves!",
+        min_charts=len(csv_ops),
+    )
+    for model_subdir in sorted((out_dir / "models").iterdir()):
+        _assert_ooxml_charts_valid_and_non_overlapping(
+            model_subdir / "Operator_Breakdown.xlsx",
+            expected_sheets=("Hardware_Nominal_Specs", "Step_Summary", "Op_Breakdown", "Scaling_Curves", "Operator_Scaling_Charts"),
+            expected_ref_prefix="Operator_Scaling_Charts!",
+            min_charts=5,
+        )
+
+    # 4. Verify charts/scaling_explorer.html controls, All Operators Catalog mode, zero sawtooth & campaign timings
+    html = (out_dir / "charts" / "scaling_explorer.html").read_text(encoding="utf-8")
+    for token in (
+        'id="selArm"', 'id="selFixedSlice"', 'id="btnModeModel"', 'id="btnModeCatalog"',
+        'id="opSearch"', 'id="catOp"', 'id="catSku"', 'id="catPhase"', 'id="catModelArm"',
+        'id="catSlice"', 'id="catSummaryBody"', "All Operators Catalog",
+        "All Batches (Multi-Series)", "All Seq Lengths (Multi-Series)", "All Models Overlay",
+    ):
+        assert token in html, token
+    model_js_rows = _extract_js_const_json(html, "ROWS")
+    op_js_rows = _extract_js_const_json(html, "OP_ROWS")
+    op_js_idx = _extract_js_const_json(html, "OP_INDEX")
+    assert len(op_js_idx) == len(csv_ops) and len(OPERATOR_CATALOG_INDEX_COLUMNS) >= 15
+    model_js_keys = [
+        (r["model"], r["sku"], r["phase"], r["arm"], r["op"], r["seq"], r["batch"]) for r in model_js_rows
+    ]
+    assert len(model_js_keys) == len(set(model_js_keys)), "duplicate model curve points cause sawtooth!"
+    assert any(r["p50"] is not None and r["p99"] is not None for r in model_js_rows)
+    assert any(r["phase"] == "Fabric" and r["xAxis"] == "Message Bytes" and r["p50"] is not None for r in op_js_rows)
+    assert any(r["phase"] != "Fabric" and r["p50"] is not None and r["p99"] is not None for r in op_js_rows)
+    assert any(int(item["measCount"]) > 0 and item["meanApe"] is not None for item in op_js_idx)
+
+    # 5. Verify .tar.gz includes standalone operator curves + manifest.json and zero internal bench_plan files
+    assert receipt.tar_gz_path and Path(receipt.tar_gz_path).is_file()
+    with tarfile.open(receipt.tar_gz_path, "r:gz") as tf:
+        tar_names = tf.getnames()
+        assert any(n.endswith("/manifest.json") for n in tar_names)
+        assert any(n.endswith("/operators/Operator_Scaling_Curves.xlsx") for n in tar_names)
+        assert any(n.endswith("/operators/operator_scaling_curves.csv") for n in tar_names)
+        assert all("bench_plan" not in n.lower() for n in tar_names)

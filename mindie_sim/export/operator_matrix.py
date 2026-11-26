@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from itertools import accumulate
 import json
@@ -64,6 +64,7 @@ from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.abi import HARDWARE_USABLE_ABI_BACKENDS
 from mindie_sim.schema.bench_matrix import (
     BENCH_PLAN_V2_SCHEMA,
+    BYTES_PER_GB,
     DEFAULT_ANCHOR_LADDER,
     DEFAULT_CLIFF_BUDGET_PER_ARM,
     DEFAULT_SEQ_MAX,
@@ -145,6 +146,34 @@ FABRIC_PARTICIPANTS: Mapping[str, int] = {
     "intra_node_hccs": 4,
     "inter_node_roce": 8,
 }
+FABRIC_ROUTE_LINK_TIERS: Mapping[str, str] = {
+    "intra_package_die": "d2d_intra_package",
+    "intra_node_hccs": "d2d_intra_node",
+    "inter_node_roce": "d2d_inter_node",
+}
+RING_ALLREDUCE_PHASES = 2
+
+
+@dataclass(frozen=True, slots=True)
+class FabricOperatorCurvePoint:
+    """Physics-grounded fabric collective scaling point aligned with ``BenchPlanV2`` fabric cases."""
+
+    case_id: str
+    op_type: str
+    kernel_name: str
+    sku: str
+    soc_arch: str
+    route: str
+    participants: int
+    payload_bytes: int
+    algo_wire_bytes: int
+    nominal_theo_us: float
+    predicted_us: float
+    measured_p50_us: float | None
+    measured_p99_us: float | None
+    bound_type: str
+    achieved_bw_gb_s: float
+    comm_bw_util_pct: float
 DEFAULT_HISPARSE_DRAM_GB = 128.0
 DEFAULT_HISPARSE_TOPK_BUFFER = 2048
 DEFAULT_HISPARSE_MISS_RATE = 0.15
@@ -3483,7 +3512,8 @@ def _build_step_summary(
     )
 
 
-def _load_campaign_manifest(campaign: CampaignManifest | Mapping[str, Any] | str | Path) -> CampaignManifest:
+def load_campaign_manifest(campaign: CampaignManifest | Mapping[str, Any] | str | Path) -> CampaignManifest:
+    """Load and cryptographically verify a ``mindie-bench-campaign/1`` manifest."""
     if isinstance(campaign, CampaignManifest):
         return verify_campaign_integrity(campaign.to_dict(include_seal=True), verify_case_raw_sha256=True)
     if isinstance(campaign, (str, Path)):
@@ -3499,6 +3529,24 @@ def _load_campaign_manifest(campaign: CampaignManifest | Mapping[str, Any] | str
         raw_map = json.loads(raw_bytes.decode("utf-8"))
         return verify_campaign_integrity(raw_map, base_dir=p.parent, verify_case_raw_sha256=True)
     return verify_campaign_integrity(campaign, verify_case_raw_sha256=True)
+
+
+_load_campaign_manifest = load_campaign_manifest
+
+
+def _match_campaign_plan(
+    manifest: OperatorMatrixManifest,
+    camp_manifest: CampaignManifest,
+) -> BenchPlanV2:
+    sku = camp_manifest.version_fingerprint.sku
+    for include_fab in (False, True):
+        plans = build_bench_plans_by_sku(manifest, include_fabric=include_fab)
+        sku_plan = plans.get(sku)
+        if sku_plan is not None and camp_manifest.plan_sha256 == sku_plan.plan_sha256:
+            return sku_plan
+    raise ModelingError(
+        f"campaign_plan_mismatch:sku={sku}:plan_sha256={camp_manifest.plan_sha256}"
+    )
 
 
 def _evaluate_matrix_cell(
@@ -3567,20 +3615,36 @@ def _evaluate_matrix_cell(
     return receipt, step_sum, cell_rows, cell_rev, _build_cell_dag(bundle.operators)
 
 
+def _sku_scoped_manifest(manifest: OperatorMatrixManifest, sku: str) -> OperatorMatrixManifest:
+    if len(manifest.nominal_specs) <= 1 and all(r.sku == sku for r in manifest.rows):
+        return manifest
+    sku_rows = tuple(r for r in manifest.rows if r.sku == sku)
+    sku_steps = tuple(s for s in manifest.step_summaries if s.sku == sku)
+    sku_rev = {
+        cid: tuple(e for e in entries if e.sku == sku)
+        for cid, entries in manifest.reverse_index.items()
+        if any(e.sku == sku for e in entries)
+    }
+    sku_nom = {sku: manifest.nominal_specs[sku]} if sku in manifest.nominal_specs else manifest.nominal_specs
+    return replace(
+        manifest,
+        nominal_specs=sku_nom,
+        rows=sku_rows,
+        step_summaries=sku_steps,
+        reverse_index=sku_rev,
+    )
+
+
 def _apply_verified_campaign(
     manifest: OperatorMatrixManifest,
     campaign: CampaignManifest | Mapping[str, Any] | str | Path,
     step_dags: Mapping[str, tuple[tuple[str, ...], tuple[tuple[str, str], ...]]],
 ) -> OperatorMatrixManifest:
     """Reconcile campaign against per-SKU plan before enriching; require 100% cell coverage for step replay."""
-    camp_manifest = _load_campaign_manifest(campaign)
-    plans = build_bench_plans_by_sku(manifest, include_fabric=False)
-    sku_plan = plans.get(camp_manifest.version_fingerprint.sku)
-    if sku_plan is None or camp_manifest.plan_sha256 != sku_plan.plan_sha256:
-        raise ModelingError(
-            f"campaign_plan_mismatch:sku={camp_manifest.version_fingerprint.sku}:plan_sha256={camp_manifest.plan_sha256}"
-        )
-    report = reconcile_campaign(camp_manifest, plan=sku_plan, matrix=manifest, strict=False)
+    camp_manifest = load_campaign_manifest(campaign)
+    sku_plan = _match_campaign_plan(manifest, camp_manifest)
+    sku_matrix = _sku_scoped_manifest(manifest, camp_manifest.version_fingerprint.sku)
+    report = reconcile_campaign(camp_manifest, plan=sku_plan, matrix=sku_matrix, strict=False)
     qual_cids = {c.case_id for c in camp_manifest.cases if c.status == "ok" and c.qualified}
     rows_by_cell: dict[str, list[OperatorMatrixRow]] = defaultdict(list)
     for row in manifest.rows:
@@ -3590,6 +3654,20 @@ def _apply_verified_campaign(
         if rows_by_cell.get(cid) and all(r.bench_case_id in qual_cids for r in rows_by_cell[cid])
     }
     return enrich_operator_matrix(manifest, camp_manifest, report, step_dags=covered_dags)
+
+
+def enrich_manifest_with_campaign(
+    manifest: OperatorMatrixManifest,
+    campaign: CampaignManifest | Mapping[str, Any] | str | Path,
+) -> tuple[OperatorMatrixManifest, CampaignManifest]:
+    """Verify and attach a ``mindie-bench-campaign/1`` manifest onto a pre-built ``OperatorMatrixManifest``."""
+    camp_manifest = load_campaign_manifest(campaign)
+    if manifest.campaign_id == camp_manifest.campaign_id:
+        return manifest, camp_manifest
+    sku_plan = _match_campaign_plan(manifest, camp_manifest)
+    sku_matrix = _sku_scoped_manifest(manifest, camp_manifest.version_fingerprint.sku)
+    report = reconcile_campaign(camp_manifest, plan=sku_plan, matrix=sku_matrix, strict=False)
+    return enrich_operator_matrix(manifest, camp_manifest, report, step_dags=None), camp_manifest
 
 
 def _evaluate_arm_grid(
@@ -3842,6 +3920,68 @@ def _fabric_v2_cases_for_sku(sku: str, soc_arch: str) -> list[BenchPlanCaseV2]:
             identities={},
         ))
     return out
+
+
+def build_fabric_operator_curve_rows(
+    nominal_specs: Mapping[str, HardwareNominalSpec],
+    *,
+    measured_by_case_id: Mapping[str, tuple[float, float]] | None = None,
+) -> list[FabricOperatorCurvePoint]:
+    """Compute physics-grounded collective scaling curves across realized interconnect routes per SKU."""
+    meas_map = measured_by_case_id or {}
+    points: list[FabricOperatorCurvePoint] = []
+    for sku, nom_spec in sorted(nominal_specs.items()):
+        machine, _die = _hardware_machine_direct(sku)
+        link_by_channel = {str(lnk.channel): lnk for lnk in machine.links}
+        hw_view = build_hardware_view(sku)
+        raw_cases = build_fabric_cases(hw_view)
+        v2_cases = _fabric_v2_cases_for_sku(sku, nom_spec.soc_arch)
+        for fab, v2_case in zip(raw_cases, v2_cases):
+            op_type = str(fab["recipe"])
+            route = str(fab["route"])
+            participants = max(2, int(fab["participants"]))
+            payload_b = max(1, int(fab["fabric_bytes"]))
+            channel = FABRIC_ROUTE_LINK_TIERS.get(route, "d2d_intra_node")
+            ring_mult = RING_ALLREDUCE_PHASES if op_type == "all_reduce" else 1
+            ring_steps = ring_mult * (participants - 1)
+            algo_wire_f = float(payload_b) * float(ring_steps) / float(participants)
+            algo_wire_b = max(1, int(round(algo_wire_f)))
+            theo_us = nom_spec.nominal_theo_us(link_bytes=algo_wire_f, link_tier=channel)
+            link_obj = link_by_channel.get(channel)
+            peak_b_s = nom_spec.link_peak_for_tier(channel)
+            sustained_b_s = (
+                float(link_obj.capacity_bytes_per_ms) * 1000.0
+                if (link_obj is not None and float(link_obj.capacity_bytes_per_ms) > 0.0)
+                else peak_b_s
+            )
+            hop_lat_us = float(link_obj.latency_us) if link_obj is not None else 0.0
+            lat_part_us = float(ring_steps) * hop_lat_us
+            bw_part_us = (algo_wire_f / max(sustained_b_s, MIN_POSITIVE_DENOM)) * US_PER_SECOND
+            pred_us = max(theo_us, lat_part_us + bw_part_us, MIN_POSITIVE_DENOM)
+            dur_s = pred_us / US_PER_SECOND
+            achieved_bw = (algo_wire_f / dur_s) / BYTES_PER_GB
+            comm_bu = (algo_wire_f / (dur_s * max(peak_b_s, MIN_POSITIVE_DENOM))) * PCT_SCALE
+            bound = "Latency Bound" if lat_part_us > bw_part_us else "Communication Bound"
+            meas_pair = meas_map.get(v2_case.case_id)
+            points.append(FabricOperatorCurvePoint(
+                case_id=v2_case.case_id,
+                op_type=op_type,
+                kernel_name=str(v2_case.canonical_key.upstream_abi),
+                sku=sku,
+                soc_arch=nom_spec.soc_arch,
+                route=route,
+                participants=participants,
+                payload_bytes=payload_b,
+                algo_wire_bytes=algo_wire_b,
+                nominal_theo_us=round(theo_us, ROUND_US_DIGITS),
+                predicted_us=round(pred_us, ROUND_US_DIGITS),
+                measured_p50_us=round(float(meas_pair[0]), ROUND_US_DIGITS) if meas_pair is not None else None,
+                measured_p99_us=round(float(meas_pair[1]), ROUND_US_DIGITS) if meas_pair is not None else None,
+                bound_type=bound,
+                achieved_bw_gb_s=round(achieved_bw, ROUND_PCT_DIGITS),
+                comm_bw_util_pct=round(comm_bu, ROUND_PCT_DIGITS),
+            ))
+    return points
 
 
 def build_bench_plans_by_sku(
@@ -4121,6 +4261,8 @@ __all__ = [
     "SUPPORTED_FABRIC_ROUTES",
     "BenchGeometryError",
     "BenchTopologyError",
+    "FABRIC_ROUTE_LINK_TIERS",
+    "FabricOperatorCurvePoint",
     "PlanError",
     "UnmodeledCapabilityError",
     "attention_shape_dims",
@@ -4128,6 +4270,7 @@ __all__ = [
     "build_bench_plans_by_sku",
     "build_canonical_kernel_key",
     "build_fabric_cases",
+    "build_fabric_operator_curve_rows",
     "build_hardware_view",
     "build_operator_formula",
     "build_operator_matrix",
@@ -4137,6 +4280,7 @@ __all__ = [
     "declared_implementation",
     "derive_physical_seq_cliffs",
     "display_name",
+    "enrich_manifest_with_campaign",
     "enumerate_parallel_arms",
     "evaluate_hbm_admissibility",
     "expert_bank_bytes",
@@ -4144,6 +4288,7 @@ __all__ = [
     "fabric_route_ranks",
     "is_ladder_kv_node",
     "is_onboarding_family",
+    "load_campaign_manifest",
     "parse_parallel_arm_tokens",
     "parse_seq_range",
     "render_subgraph_plan_v1_compat",
