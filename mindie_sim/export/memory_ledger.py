@@ -32,6 +32,7 @@ from mindie_sim.catalog.npu_checkpoints import (
     validate_quant_for_hardware,
 )
 from mindie_sim.catalog.quant import quant_preset
+from mindie_sim.catalog.speculative_state import resolve_speculative_query_tokens
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import (
     WeightTerm,
@@ -167,6 +168,7 @@ _W4A16_SCALE_BYTES = 2 * BF16_BYTES
 _HW_FAMILY_A5 = "a5"
 _HW_FAMILY_A23 = frozenset({"a2", "a3"})
 _DEFAULT_CONCURRENCY = 1
+_MAX_HBM_CONCURRENCY_SEARCH_CAP = 1_000_000
 
 
 def _is_ple_category(cat: str) -> bool:
@@ -324,11 +326,12 @@ def _resolve_ledger_workspace_tokens(
     rt = case.runtime
     if str(phase) == "prefill":
         return max(1, int(rt.max_num_batched_tokens or resolved_seq))
+    q_tokens = resolve_speculative_query_tokens(rt, phase=str(phase))
     meta = dict(rt.metadata)
-    prop = int(meta.get("draft_proposal_tokens", 0) or 0)
-    if rt.dspark is not None:
-        prop = max(prop, int(rt.dspark.speculative_tokens))
-    return max(1, int(resolved_conc) * (1 + max(0, prop)))
+    declared = int(meta.get("draft_proposal_tokens", 0) or 0)
+    if dict(case.model.metadata).get("cache_allocator") == "paired_sfa" and declared > 0:
+        q_tokens = declared + 1
+    return max(1, int(resolved_conc) * max(1, int(q_tokens)))
 
 
 def _case_with_weight_quant(
@@ -908,13 +911,14 @@ def _project_cache_ledger_rows(
 
 
 def _bottleneck_die_for_stage(receipt: Any, stage: int, fallback_rank: int = 0) -> Any:
-    """Select bottleneck die across all replicas and ranks for ``stage`` by peak then live HBM."""
+    """Select bottleneck die across all replicas and ranks for ``stage`` by headroom then peak HBM."""
     dies_list = tuple(getattr(receipt, "dies", ()) or ())
     st_dies = [d for d in dies_list if int(getattr(d, "stage", -1)) == int(stage)]
     if st_dies:
         return max(
             st_dies,
             key=lambda d: (
+                -int(getattr(d, "free_hbm_headroom_bytes", 0) or 0),
                 int(getattr(d, "simultaneous_peak_hbm_bytes", 0) or 0),
                 int(getattr(d, "simultaneous_live_hbm_bytes", 0) or 0),
             ),
@@ -987,29 +991,148 @@ def _build_stage_budgets_from_receipt(
     return tuple(budgets)
 
 
-def _compute_max_hbm_concurrency(
-    stage_budgets: Sequence[StageBudgetRow],
-    proj: CacheLedgerProjection,
+def _binary_search_concurrency(
+    fits_fn: Any,
+    *,
+    lo: int,
+    hi: int,
 ) -> int:
-    """Closed-form max per-DP concurrency honoring fixed per-die overhead."""
-    limits: list[int] = []
-    for st in stage_budgets:
-        fixed_c8 = int(proj.per_stage_component_batch_bytes[st.stage].get("c8_static_channel_scale", 0))
-        fixed_hbm = (
-            st.weight_payload_bytes
-            + st.weight_scale_aux_bytes
-            + st.engram_ple_hbm_bytes
-            + st.workspace_peak_bytes
-            + st.reserve_bytes
-            + float(fixed_c8)
+    """Exact integer binary search for max ``b`` in ``[lo, hi]`` satisfying ``fits_fn(b)``."""
+    low, high = int(lo), int(hi)
+    while low + 1 < high:
+        mid = (low + high) // 2
+        if fits_fn(mid):
+            low = mid
+        else:
+            high = mid
+    return low
+
+
+def _anchored_die_headrooms(
+    ref_dies: Sequence[Any],
+    base_ref_by_key: Mapping[tuple[int, int, int], Any],
+    base_cand_by_key: Mapping[tuple[int, int, int], Any],
+) -> list[int]:
+    """Project caller-anchored per-die headroom at a candidate batch using canonical receipt deltas."""
+    headrooms: list[int] = []
+    for d_ref in ref_dies:
+        key = (int(d_ref.replica), int(d_ref.stage), int(d_ref.rank))
+        b_ref = base_ref_by_key.get(key)
+        b_cand = base_cand_by_key.get(key)
+        if b_ref is None or b_cand is None:
+            headrooms.append(int(d_ref.free_hbm_headroom_bytes))
+            continue
+        ref_non_ws = int(b_ref.simultaneous_peak_hbm_bytes) - int(b_ref.workspace_bytes)
+        cand_non_ws = int(b_cand.simultaneous_peak_hbm_bytes) - int(b_cand.workspace_bytes)
+        delta_non_ws = cand_non_ws - ref_non_ws
+        d_ws = int(d_ref.workspace_bytes)
+        b_ref_ws = int(b_ref.workspace_bytes)
+        b_cand_ws = int(b_cand.workspace_bytes)
+        if d_ws == 0 and b_ref_ws > 0:
+            delta_ws = 0
+        elif d_ws > b_ref_ws:
+            delta_ws = max(0, b_cand_ws - d_ws)
+        else:
+            delta_ws = max(-d_ws, b_cand_ws - b_ref_ws)
+        headrooms.append(int(d_ref.free_hbm_headroom_bytes) - delta_non_ws - delta_ws)
+    return headrooms
+
+
+def _compute_max_hbm_concurrency(
+    case: Case,
+    stage_budgets: Sequence[StageBudgetRow],
+    stage_per_req_cache: Sequence[float] | None = None,
+    fallback_conc: int = 0,
+    *,
+    phase: str = "decode",
+    resolved_seq: int = 0,
+    proj: CacheLedgerProjection | None = None,
+    prepared_weights: Sequence[PreparedWeightSpec] = (),
+    caller_anchored: bool = False,
+    caller_receipt: Any = None,
+) -> int:
+    """Solve exact per-DP HBM concurrency via ``Memory.resident_memory_receipt``."""
+    del proj
+    if not stage_budgets or int(resolved_seq) <= 0:
+        return 0
+    seq_i = int(resolved_seq)
+    phase_s = str(phase)
+    mem_cache: dict[int, Memory] = {}
+
+    def _receipt_at(cand_b: int) -> Any:
+        ws_tok = _resolve_ledger_workspace_tokens(
+            case, phase=phase_s, resolved_seq=seq_i, resolved_conc=cand_b,
         )
-        avail = st.usable_hbm_budget_bytes - fixed_hbm
-        if avail <= 0.0:
+        cand_mem = mem_cache.get(ws_tok)
+        if cand_mem is None:
+            cand_mem = Memory(case, workspace_tokens=ws_tok)
+            if prepared_weights:
+                cand_mem.register_prepared_weights(prepared_weights)
+            if len(mem_cache) < 2:
+                mem_cache[ws_tok] = cand_mem
+        return cand_mem.resident_memory_receipt(
+            phase=phase_s,
+            sequence_tokens=seq_i,
+            batch_per_dp=int(cand_b),
+            vision_accounting=cand_mem.vision_accounting,
+            prepared_weights=prepared_weights,
+        )
+
+    ref_dies = tuple(getattr(caller_receipt, "dies", ()) or ()) if caller_anchored and caller_receipt is not None else ()
+    base_ref_by_key: dict[tuple[int, int, int], Any] = {}
+    if ref_dies:
+        ref_conc = max(1, int(fallback_conc))
+        base_ref = _receipt_at(ref_conc)
+        base_ref_by_key = {(int(d.replica), int(d.stage), int(d.rank)): d for d in base_ref.dies}
+
+    def _headrooms(cand_b: int) -> list[int]:
+        rec = _receipt_at(cand_b)
+        if not ref_dies:
+            return [int(d.free_hbm_headroom_bytes) for d in rec.dies]
+        cand_by_key = {(int(d.replica), int(d.stage), int(d.rank)): d for d in rec.dies}
+        return _anchored_die_headrooms(ref_dies, base_ref_by_key, cand_by_key)
+
+    def _fits(cand_b: int) -> bool:
+        return all(h >= 0 for h in _headrooms(cand_b))
+
+    h1 = _headrooms(1)
+    if any(h < 0 for h in h1):
+        return 0
+    h2 = _headrooms(2)
+    if any(h < 0 for h in h2):
+        return 1
+    est_limits: list[int] = []
+    for free1, free2 in zip(h1, h2):
+        delta = max(0, free1 - free2)
+        if delta > 0:
+            est_limits.append(1 + (free1 // delta))
+    if not est_limits:
+        # Handle slab/pool quantization where b=1->2 did not cross a slab boundary.
+        per_req_vals = [
+            float(stage_per_req_cache[i])
+            if stage_per_req_cache is not None and i < len(stage_per_req_cache)
+            else float(st.per_request_cache_bytes)
+            for i, st in enumerate(stage_budgets)
+        ]
+        if not any(v > MIN_DENOM_EPS for v in per_req_vals):
             return 0
-        per_req = float(st.per_request_cache_bytes)
-        if per_req > MIN_DENOM_EPS:
-            limits.append(int(math.floor(avail / per_req)))
-    return min(limits) if limits else 0
+        lo = 2
+        hi = lo * 2
+        while hi < _MAX_HBM_CONCURRENCY_SEARCH_CAP and _fits(hi):
+            lo = hi
+            hi = min(_MAX_HBM_CONCURRENCY_SEARCH_CAP, hi * 2)
+        return hi if _fits(hi) else _binary_search_concurrency(_fits, lo=lo, hi=hi)
+    b_est = min(_MAX_HBM_CONCURRENCY_SEARCH_CAP, max(2, min(est_limits)))
+    if _fits(b_est):
+        if b_est >= _MAX_HBM_CONCURRENCY_SEARCH_CAP or not _fits(b_est + 1):
+            return b_est
+        lo = b_est + 1
+        hi = min(_MAX_HBM_CONCURRENCY_SEARCH_CAP, lo * 2)
+        while hi < _MAX_HBM_CONCURRENCY_SEARCH_CAP and _fits(hi):
+            lo = hi
+            hi = min(_MAX_HBM_CONCURRENCY_SEARCH_CAP, hi * 2)
+        return hi if _fits(hi) else _binary_search_concurrency(_fits, lo=lo, hi=hi)
+    return _binary_search_concurrency(_fits, lo=2, hi=b_est)
 
 
 def _resolve_case_overrides(
@@ -1477,23 +1600,16 @@ def compute_memory_quant_ledger(
     prepared_weights: Sequence[PreparedWeightSpec] = (),
     memory_receipt: Any = None,
 ) -> MemoryCalculatorLedger:
-    """Project canonical ``Memory`` / ``DieResidentReceipt`` into ``MemoryCalculatorLedger``."""
+    """[Cohesive-Pipeline] Project canonical ``Memory`` / ``DieResidentReceipt`` into ``MemoryCalculatorLedger``."""
     hw_sku = str(getattr(case.machine, "sku", "") or getattr(case.machine, "name", ""))
     hw_family = normalize_hw_family(hw_sku or str(getattr(case.machine, "arch_family", "")))
     has_case_override = any((
-        weight_quant is not None,
-        cache_dtype is not None,
-        engram_host_offload is not None,
-        include_vision_tower is not None,
-        bool(apply_preset_to_ignored),
+        weight_quant is not None, cache_dtype is not None, engram_host_offload is not None,
+        include_vision_tower is not None, bool(apply_preset_to_ignored),
     ))
     resolved_case, resolved_wq, resolved_cd = _resolve_case_overrides(
-        case,
-        hw_family=hw_family,
-        weight_quant=weight_quant,
-        cache_dtype=cache_dtype,
-        engram_host_offload=engram_host_offload,
-        include_vision_tower=include_vision_tower,
+        case, hw_family=hw_family, weight_quant=weight_quant, cache_dtype=cache_dtype,
+        engram_host_offload=engram_host_offload, include_vision_tower=include_vision_tower,
         apply_preset_to_ignored=apply_preset_to_ignored,
     )
     rt = resolved_case.runtime
@@ -1539,7 +1655,8 @@ def compute_memory_quant_ledger(
         prepared_weights=prepared_weights,
     )
     peak_w_override: int | None = None
-    if memory_receipt is not None and not has_case_override:
+    caller_anchored = bool(memory_receipt is not None and not has_case_override)
+    if caller_anchored:
         proj, alt_projections, peak_w_override = _anchor_projection_to_caller_receipt(
             resolved_case, proj, alt_projections, memory_receipt,
             pp=int(p.pp), concurrency=resolved_conc,
@@ -1565,17 +1682,20 @@ def compute_memory_quant_ledger(
     offload_engram = bool(rt.engram_cpu_offload)
     hbm_w_rows = [
         r for r in weight_rows
-        if not (r.is_engram_or_ple and offload_engram)
-        and not (r.is_vision and not include_vit)
+        if not (r.is_engram_or_ple and offload_engram) and not (r.is_vision and not include_vit)
     ]
     expert_offload_b = float(
-        mem.expert_hbm_saved[peak_w_stage]
-        if 0 <= peak_w_stage < len(mem.expert_hbm_saved) else 0.0
+        mem.expert_hbm_saved[peak_w_stage] if 0 <= peak_w_stage < len(mem.expert_hbm_saved) else 0.0
     )
     w_footprint = max(0.0, float(sum(r.per_die_bytes for r in hbm_w_rows)) - expert_offload_b)
     native_bf16_w = float(sum(r.native_bf16_bytes for r in hbm_w_rows))
     vis_w = float(sum(r.per_die_bytes for r in weight_rows if r.is_vision)) if include_vit else 0.0
     pcp_deg = max(1, int(getattr(p, "pcp", 1) or 1))
+    max_conc = _compute_max_hbm_concurrency(
+        resolved_case, stage_budgets, None, resolved_conc, phase=str(phase), resolved_seq=resolved_seq,
+        proj=proj, prepared_weights=prepared_weights, caller_anchored=caller_anchored,
+        caller_receipt=memory_receipt if caller_anchored else None,
+    )
     return MemoryCalculatorLedger(
         model_name=str(resolved_case.model.name),
         hardware_sku=hw_sku,
@@ -1609,7 +1729,7 @@ def compute_memory_quant_ledger(
         quant_exclusions=tuple(sorted(set(require_model_quant(resolved_case.model).exclusions))),
         weight_footprint_per_die_bytes=w_footprint,
         per_request_cache_bytes_max_stage=max((sb.per_request_cache_bytes for sb in stage_budgets), default=0.0),
-        max_hbm_concurrency_per_dp=_compute_max_hbm_concurrency(stage_budgets, proj),
+        max_hbm_concurrency_per_dp=max_conc,
         include_vision_tower=include_vit,
         apply_preset_to_ignored=bool(apply_preset_to_ignored),
         native_bf16_weight_footprint_per_die_bytes=native_bf16_w,

@@ -1657,7 +1657,8 @@ def _dp_catalog_recipe_id(
         read_obligations=tuple(replace(item, die=0) for item in summary.read_obligations),
         write_obligations=tuple(replace(item, die=0) for item in summary.write_obligations),
     )
-    digest = _recipe_content_digest((norm_summary, work, template, _norm_catalog_datapath(path), limits))
+    norm_template = replace(template, replica=0) if hasattr(template, "replica") else template
+    digest = _recipe_content_digest((norm_summary, work, norm_template, _norm_catalog_datapath(path), limits))
     return f"rewrite_template:{op.op_id}:{digest}"
 
 

@@ -124,8 +124,8 @@ def declared_case(*, dp=1, tp=1, pp=1, ep=1, prompt=4, output=3, requests=None) 
     }
 
 
-def mla_case(*, splits: int = 3) -> dict:
-    """Compact tuple-query MLA decode case with configurable KV splits."""
+def mla_case() -> dict:
+    """Compact analytical MLA decode case for structural and capacity tests."""
     raw = declared_case(prompt=4, output=3)
     raw["model"].update(
         layers=1,
@@ -140,14 +140,7 @@ def mla_case(*, splits: int = 3) -> dict:
             "v_head_dim": 16,
         },
     )
-    raw["runtime"]["kernels"] = {
-        "lowerings": {
-            "mla_decode": {
-                "implementation": "vllm_triton_mla_decode_tuple",
-                "options": {"num_kv_splits": splits},
-            }
-        }
-    }
+    raw["runtime"]["kernels"] = {}
     return raw
 
 

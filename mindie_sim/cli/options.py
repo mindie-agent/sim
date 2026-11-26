@@ -224,7 +224,7 @@ def compose_case_kwargs(namespace: argparse.Namespace) -> dict[str, Any]:
         "block_size": getattr(namespace, "block_size", None),
         "runtime_stack": (getattr(namespace, "stack_manifest", None)
                           or getattr(namespace, "stack", None)),
-        "feature_track": getattr(namespace, "feature_track", None) or "merged",
+        "feature_track": getattr(namespace, "feature_track", None) or "shipping",
         "optimizations": tuple(getattr(namespace, "enable_opt", ()) or ()),
         "exclude_optimizations": tuple(getattr(namespace, "disable_opt", ()) or ()),
     }
