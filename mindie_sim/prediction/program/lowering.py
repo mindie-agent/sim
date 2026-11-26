@@ -128,14 +128,15 @@ def _merge_allocations(groups):
         for item in items:
             row = merged.get(item.name)
             if row is None:
-                merged[item.name] = [item.pool, item.size, list(item.units)]
+                merged[item.name] = [item.pool, item.size, list(item.units), set(item.units)]
                 order.append(item.name)
                 continue
             if row[0] != item.pool or row[1] != item.size:
                 return None
-            if any(unit in row[2] for unit in item.units):
+            if any(unit in row[3] for unit in item.units):
                 return None
             row[2].extend(item.units)
+            row[3].update(item.units)
     return tuple(
         Allocation(name, merged[name][0], merged[name][1], tuple(merged[name][2]))
         for name in order
@@ -485,6 +486,38 @@ def _footprints_conflict(
     return False
 
 
+_MISSING_FOOTPRINT = object()
+
+
+def _merge_footprint_into(
+    acc: dict[tuple[str, str], set[int] | None],
+    fp: dict[tuple[str, str], set[int] | None] | None,
+) -> bool:
+    """Fold ``fp`` into ``acc`` in place; return False iff ``fp`` is opaque (``None``)."""
+    if fp is None:
+        return False
+    for res, units in fp.items():
+        if units is None:
+            acc[res] = None
+        elif res not in acc:
+            acc[res] = set(units)
+        elif acc[res] is not None:
+            acc[res].update(units)
+    return True
+
+
+def _last_signature_positions(sigs: list) -> dict | None:
+    """Map each hashable non-None signature to its last index, or None if unhashable."""
+    last: dict = {}
+    try:
+        for idx, sig in enumerate(sigs):
+            if sig is not None:
+                last[sig] = idx
+    except TypeError:
+        return None
+    return last
+
+
 def coalesce_programs(programs, *, widen_pipelines: bool = False):
     """Combine symmetric owners into cohort programs; keep the exact fallback."""
     programs = tuple(programs)
@@ -492,27 +525,53 @@ def coalesce_programs(programs, *, widen_pipelines: bool = False):
     if n < 2:
         return programs
     sigs = [program_signature(p, widen_pipelines=widen_pipelines) for p in programs]
-    footprints: list[dict[str, set[int] | None] | None] | None = None
+    sig_last = _last_signature_positions(sigs)
+    footprints: list | None = None
     consumed = [False] * n
     result = []
+
+    def _footprint_at(idx: int):
+        nonlocal footprints
+        if footprints is None:
+            footprints = [_MISSING_FOOTPRINT] * n
+        fp = footprints[idx]
+        if fp is _MISSING_FOOTPRINT:
+            fp = _program_footprint(programs[idx])
+            footprints[idx] = fp
+        return fp
+
     for i in range(n):
         if consumed[i]:
             continue
         sig_i = sigs[i]
-        if sig_i is None:
+        if sig_i is None or (sig_last is not None and sig_last[sig_i] <= i):
             consumed[i] = True
             result.append(programs[i])
             continue
         indices = [i]
-        for j in range(i + 1, n):
-            if consumed[j] or sigs[j] != sig_i:
+        pending_intervening: list[int] = []
+        intervening_fp: dict[tuple[str, str], set[int] | None] = {}
+        intervening_has_any = False
+        intervening_opaque = False
+        stop = sig_last[sig_i] + 1 if sig_last is not None else n
+        for j in range(i + 1, stop):
+            if consumed[j]:
                 continue
-            intervening = [k for k in range(i + 1, j) if not consumed[k] and k not in indices]
-            if intervening:
-                if footprints is None:
-                    footprints = [_program_footprint(p) for p in programs]
-                if any(_footprints_conflict(footprints[j], footprints[k]) for k in intervening):
-                    continue
+            if sigs[j] != sig_i:
+                pending_intervening.append(j)
+                continue
+            if pending_intervening:
+                intervening_has_any = True
+                for k in pending_intervening:
+                    if not _merge_footprint_into(intervening_fp, _footprint_at(k)):
+                        intervening_opaque = True
+                        break
+                pending_intervening.clear()
+            if intervening_opaque:
+                break
+            if intervening_has_any and _footprints_conflict(_footprint_at(j), intervening_fp):
+                pending_intervening.append(j)
+                continue
             indices.append(j)
         if len(indices) > 1:
             merged = merge_programs(

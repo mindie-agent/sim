@@ -906,3 +906,30 @@ def test_vector_groups_causal_span_lower_bound_and_zero_count_raw_dependencies()
         e_zero.advance(until=(d_zero,))
         assert b_zero.raw_latency_ms == 0.0
         assert round(b_zero.span_ms * 1e6) == round(d_zero.time * 1e6) == 5
+
+
+def test_coalesce_programs_linear_intervening_conflict_parity():
+    """Incremental intervening-footprint union keeps coalesce_programs O(N) and conflict-exact."""
+    import time
+    from mindie_sim.prediction.program.lowering import coalesce_programs
+
+    # 2,048 identical contiguous programs (128K GDN/KDA chunk regime) coalesce in O(N).
+    t0 = time.perf_counter()
+    same = tuple(KernelProgram((Stage("k", {"vec": 1.0}, placement={"vec": (i,)}),)) for i in range(2048))
+    merged = coalesce_programs(same)
+    assert len(merged) == 1
+    assert merged[0].stages[0].cohort_size == 2048
+    assert time.perf_counter() - t0 < 1.5
+
+    # Interleaved disjoint B(u1) permits coalescing A(u0)+A(u2); conflicting B(u2) or unplaced B blocks A(u2).
+    a0 = KernelProgram((Stage("a", {"vec": 1.0}, placement={"vec": (0,)}),))
+    a2 = KernelProgram((Stage("a", {"vec": 1.0}, placement={"vec": (2,)}),))
+    b_disjoint = KernelProgram((Stage("b", {"vec": 2.0}, placement={"vec": (1,)}),))
+    b_conflict = KernelProgram((Stage("b", {"vec": 2.0}, placement={"vec": (2,)}),))
+    b_unplaced = KernelProgram((Stage("b", {"vec": 2.0}),))
+
+    res_disjoint = coalesce_programs((a0, b_disjoint, a2))
+    assert len(res_disjoint) == 2 and res_disjoint[0].stages[0].cohort_size == 2
+    assert len(coalesce_programs((a0, b_conflict, a2))) == 3
+    assert len(coalesce_programs((a0, b_unplaced, a2))) == 3
+
