@@ -658,7 +658,17 @@ def test_resident_memory_ledger_peak_rank_validation_aliases_and_paired_allocati
     die0 = receipt.die_receipt(0, 0, 0)
     assert die0.prepared_weight_bytes == KIMI_PREPARED_F_TP4_BYTES
     assert die0.prepared_load_peak_bytes == (1024 * 1024 // 2) + 8192
-    assert die0.load_peak_hbm_bytes == die0.simultaneous_peak_hbm_bytes + die0.prepared_load_peak_bytes
+    load_fixed_bytes = (
+        die0.checkpoint_weight_bytes
+        + die0.vision_weight_bytes
+        + die0.prepared_weight_bytes
+        + die0.workspace_bytes
+    )
+    assert die0.load_peak_hbm_bytes == load_fixed_bytes + die0.prepared_load_peak_bytes
+    assert die0.load_peak_hbm_bytes == (
+        die0.simultaneous_peak_hbm_bytes - die0.dynamic_grant_bytes - die0.kv_cache_allocated_bytes
+        + die0.prepared_load_peak_bytes
+    )
     # Aliased buffer billed ONCE (65,536 B, not 131,072 B).
     billed_extra = [g.billed_once_bytes for g in die0.grants if g.grant_id in {"shared_buf", "alias_buf"}]
     assert billed_extra == [65_536, 0]
@@ -709,9 +719,15 @@ def test_resident_memory_ledger_peak_rank_validation_aliases_and_paired_allocati
         machine=replace(paired_cp.machine, dies=paired_cp.machine.dies[:4]),
     )
     tp4_mem = Memory(tp4_paired)
-    # 8 kv_heads / tp4 = 2 local heads, kv_dtype=fp8_e4m3 (1 B) -> 2*2*16*1 = 64 B/row * 2 layers * 128 tok = 16,384 B.
+    # 8 kv_heads / tp4 = 2 local heads, default checkpoint kv_dtype=bf16 (2 B) -> 2*2*16*2 = 128 B/row * 2 layers * 128 tok = 32,768 B.
     # dcp_sharded=False keeps draft_cp=1 (never divides by target cp=2 or defaults to tp=1).
-    assert tp4_mem._paired_draft_bytes(128, padded=False) == 16_384
+    assert tp4_mem._paired_draft_bytes(128, padded=False) == 32_768
+    fp8_model = replace(tp4_paired.model, quant=replace(tp4_paired.model.quant, kv_dtype="fp8_e4m3"))
+    fp8_tp4_block = max(tp4_paired.runtime.kv_block_size, minimum_block_size(fp8_model, tp=4, proposals=4))
+    fp8_tp4_mem = Memory(replace(
+        tp4_paired, model=fp8_model, runtime=replace(tp4_paired.runtime, kv_block_size=fp8_tp4_block),
+    ))
+    assert fp8_tp4_mem._paired_draft_bytes(128, padded=False) == 16_384
 
 
 def test_resize_per_request_verify_width_and_recover_ssm_snapshot_ring_headroom():
@@ -739,7 +755,16 @@ def test_resize_per_request_verify_width_and_recover_ssm_snapshot_ring_headroom(
 
     # RecoverSSM Snapshot Ring exact bytes & SpaceTimeTradeoffSpec evaluation on full Kimi-K3.1 TP8.
     kimi_full = _load_full_case("kimi-k3.1", tp=8, dp=4, ep=32, num_devices=32)
-    kimi_full = replace(kimi_full, model=replace(kimi_full.model, quant=_kimi_mixed_quant()))
+    kimi_fp8_model = replace(kimi_full.model, quant=_kimi_mixed_quant())
+    fp8_block = max(
+        kimi_full.runtime.kv_block_size,
+        minimum_block_size(kimi_fp8_model, tp=8, proposals=0),
+    )
+    kimi_full = replace(
+        kimi_full,
+        model=kimi_fp8_model,
+        runtime=replace(kimi_full.runtime, kv_block_size=fp8_block),
+    )
     ring_bytes = estimate_recover_ssm_snapshot_ring_bytes(kimi_full, batch_per_dp=16, k_proposals=5)
     assert ring_bytes == KIMI_TP8_B16_K5_RING_BYTES
     bd = recover_ssm_snapshot_ring_breakdown(kimi_full, batch_per_dp=16, k_proposals=5)

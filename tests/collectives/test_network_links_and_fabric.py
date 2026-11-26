@@ -335,7 +335,7 @@ def test_peak_and_calibration_overrides_survive_materialization():
 
 def test_placement_changes_route_and_sharing_domain():
     def machine(node_of, split):
-        devices = [{"rank": rank, "node": node_of(rank), "package": rank // 2} for rank in range(8)]
+        devices = [{"rank": rank, "node": node_of(rank), "package": rank} for rank in range(8)]
         intra = [{"name": f"d2d_intra_node:{index}", "members": [4 * index + offset for offset in range(4)],
                   "capacity_bytes_per_ms": 800e6, "latency_us": 1.5,
                   "channel": "d2d_intra_node", "semantics": "per_port"}
@@ -490,9 +490,13 @@ def test_sweep_resize_rebuilds_declared_channels_for_requested_dies(hardware):
     parsed = parse_case(raw)
     resized = materialize_machine_for_devices(parsed, raw, 16)
     assert (len(resized.dies), resized.ranks_per_node) == (
-        16, min(16, parsed.machine.ranks_per_node))
+        16, min(16, parsed.machine.physical_ranks_per_node))
     assert all(member < 16 for link in resized.links for member in link.members)
     assert Hardware.from_mapping(resized.to_dict()) == resized
+    explicit_raw = compose_case(TINY_MODEL, hardware=hardware, tp=8, dp=1, ep=8, ranks_per_node=8,
+                                layers=1, prompt_tokens=8, output_tokens=1, concurrency=1)
+    explicit_resized = materialize_machine_for_devices(parse_case(explicit_raw), explicit_raw, 16)
+    assert (len(explicit_resized.dies), explicit_resized.ranks_per_node) == (16, 8)
 
 def test_channel_projection_keeps_declared_peak_and_drops_placeholders():
     projected = project_transfer_channel_input({

@@ -483,7 +483,8 @@ def test_store_source_scope_row_abi_and_line_rounded_write():
     lowering.store("kv_store", (), 5, 64, "window", identity="W",
                    source_residency="unresolved")
     expected = 5 * 64 * dtype_bytes(model.activation_dtype)
-    assert lowering.requests[0][1].source_bytes == expected != int(custom.ops[-1].mte2_bytes)
+    assert lowering.requests[0][1].source_bytes == expected == int(custom.ops[-1].mte2_bytes)
+    assert int(custom.ops[-1].mte3_bytes) < expected
     built, case, plan = builder(PLAIN); legacy_store(built, "kv_store", ("rotary",), 2, plan.cache_row_elements, "window")
     op = built.ops[-1]
     assert dict(op.metadata)["cache_resolution"] == "legacy_no_cache_declaration"; assert op.local_shape == (2, 1024) and op.padded_shape == (8, 1024); assert op.hbm_bytes == 2 * (2 * 1024); assert op.mte2_bytes == op.mte3_bytes == 2 * 1024 and op.vector_ops == 2 * 1024

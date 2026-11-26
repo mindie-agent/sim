@@ -563,7 +563,11 @@ def test_collective_algorithm_and_hccs_k8_alltoall_staging_independent_of_calibr
     for ev in (None, ev_cal):
         serviced = operator_costs(raw_ep4, [op_a2a], evaluation=ev)["operators"][0]["serviced"]
         links = {k: v for k, v in serviced.items() if k.startswith("link:")}
-        assert len(links) == 3 and all(v == pytest.approx(1048576.0) for v in links.values())
+        expected_links = {
+            f"link:d2d_intra_node:0:pair{src}>{dst}"
+            for peer in (1, 2, 3) for src, dst in ((0, peer), (peer, 0))
+        }
+        assert set(links) == expected_links and all(v == pytest.approx(1048576.0) for v in links.values())
         assert serviced.get("memory@r0:s0", 0.0) == pytest.approx(16 * 1048576.0)
 
 

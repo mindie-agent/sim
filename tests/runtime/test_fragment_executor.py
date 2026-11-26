@@ -526,7 +526,9 @@ def test_offload_obeys_per_reader_readiness_and_producer_owned_tails(mode, physi
             _operation("proposal", family="token_commit", deps=("draft",)))
     step = execution.add(_work(*ops), 0, 0)
     engine.advance(until=(step.completion,), first=False)
-    assert tuple(engine.serviced[f"{role}@r0:s0"] for role in ("offload_ddr", "offload_ssd", "memory")) == pytest.approx(
+    ddr_role, idle_role = ("offload_ddr_h2d", "offload_ddr_d2h") if mode == "readers" else ("offload_ddr_d2h", "offload_ddr_h2d")
+    assert engine.serviced[f"{idle_role}@r0:s0"] == 0.0
+    assert tuple(engine.serviced[f"{role}@r0:s0"] for role in (ddr_role, "offload_ssd", "memory")) == pytest.approx(
         (physical / 2, physical / 4, physical * .75))
     starts = {r["task"]: r["start_ms"] for r in engine.trace}
     if mode == "readers":
