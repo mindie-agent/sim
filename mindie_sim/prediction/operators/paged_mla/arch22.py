@@ -105,7 +105,7 @@ class _FiaStrategy:
             raise capability_gap("paged_mla_unsupported_abi", c.abi, ctx.compute_arch.arch_id)
         validate_dense_cann_geometry(c, self.arch_id)
         elem = int(dtype_bytes(op.dtype or "bf16"))
-        l2_cap = int(ctx.geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0)))
+        l2_cap = ctx.usable_l2_bytes
         max_m = max((q * c.physical_heads for q, _ in c.sequences if q), default=c.physical_heads)
         native_tile = c.s2_base_size >= NATIVE_S2_MIN
         native_mla = c.splits == 1 and native_tile

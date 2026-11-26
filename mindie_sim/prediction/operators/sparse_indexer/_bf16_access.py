@@ -10,79 +10,9 @@ import math
 from typing import Literal
 
 from mindie_sim.catalog.attention_common import _floor_sum
+from mindie_sim.prediction.runtime.l2_residency import LineSegmentLruCache
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
-
-
-class _LineSegmentCache:
-    """Exact access-order LRU cache over disjoint line intervals per physical stream."""
-
-    __slots__ = ("capacity_lines", "line_bytes", "_segments", "_total_lines")
-
-    def __init__(self, capacity_bytes: int, line_bytes: int) -> None:
-        self.line_bytes = max(1, int(line_bytes))
-        self.capacity_lines = max(0, int(capacity_bytes)) // self.line_bytes
-        self._segments: list[tuple[object, int, int]] = []
-        self._total_lines = 0
-
-    def access_lines(
-        self, stream_key: object, start_line: int, end_line: int,
-    ) -> tuple[tuple[int, int], ...]:
-        """Look up ``[start_line, end_line)``, return missed line spans, and update LRU."""
-        if end_line <= start_line:
-            return ()
-        if self.capacity_lines <= 0:
-            return ((start_line, end_line),)
-        hits: list[tuple[int, int]] = []
-        updated: list[tuple[object, int, int]] = []
-        for seg_key, seg_start, seg_end in self._segments:
-            if seg_key != stream_key or seg_end <= start_line or seg_start >= end_line:
-                updated.append((seg_key, seg_start, seg_end))
-                continue
-            ov_start = max(seg_start, start_line)
-            ov_end = min(seg_end, end_line)
-            hits.append((ov_start, ov_end))
-            self._total_lines -= ov_end - ov_start
-            if seg_start < ov_start:
-                updated.append((seg_key, seg_start, ov_start))
-            if ov_end < seg_end:
-                updated.append((seg_key, ov_end, seg_end))
-        hits.sort()
-        misses: list[tuple[int, int]] = []
-        cursor = start_line
-        for h_start, h_end in hits:
-            if h_start > cursor:
-                misses.append((cursor, h_start))
-            if h_end > cursor:
-                cursor = h_end
-        if cursor < end_line:
-            misses.append((cursor, end_line))
-        req_lines = end_line - start_line
-        if req_lines >= self.capacity_lines:
-            keep_start = end_line - self.capacity_lines
-            self._segments = [(stream_key, keep_start, end_line)]
-            self._total_lines = self.capacity_lines
-            return tuple(misses)
-        updated.append((stream_key, start_line, end_line))
-        self._total_lines += req_lines
-        excess = self._total_lines - self.capacity_lines
-        if excess > 0:
-            trimmed: list[tuple[object, int, int]] = []
-            for seg_key, seg_start, seg_end in updated:
-                if excess <= 0:
-                    trimmed.append((seg_key, seg_start, seg_end))
-                    continue
-                seg_len = seg_end - seg_start
-                if seg_len <= excess:
-                    excess -= seg_len
-                    self._total_lines -= seg_len
-                else:
-                    trimmed.append((seg_key, seg_start + excess, seg_end))
-                    self._total_lines -= excess
-                    excess = 0
-            updated = trimmed
-        self._segments = updated
-        return tuple(misses)
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 SOURCES: tuple[SourceRef, ...] = (
@@ -223,9 +153,9 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
         panel_rows)
     l2_retained = (l2_capacity is not None and l2_capacity > 0
                    and total_visible <= l2_capacity)
-    l1_state = (_LineSegmentCache(k_allocation, line)
+    l1_state = (LineSegmentLruCache(k_allocation, line)
                 if retained and k_allocation > 0 else None)
-    l2_state = (_LineSegmentCache(l2_capacity, line)
+    l2_state = (LineSegmentLruCache(l2_capacity, line)
                 if l2_capacity is not None and l2_capacity > 0 else None)
     (tiles, score_bytes, key_gm, key_hbm, key_logical, q_bytes_total,
      pairs_total, panels_total) = _key_tiles(

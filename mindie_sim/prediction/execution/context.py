@@ -547,6 +547,18 @@ def _admission_l2_cache_key(
     return (eff, fp)
 
 
+def _live_residency_op_scope(view: Any, die_id: int, op: Any) -> Any:
+    """Distinguish absolute producer bindings when ``view`` has live resident tensors on ``die_id``."""
+    resident = getattr(view, "_resident", None)
+    if not resident or not any(
+        entry.key.die == die_id and not entry.evicted for entry in resident.values()
+    ):
+        return None
+    from ..program.implementation_audit import input_ports
+
+    return (op.stage, op.layer, op.deps, _freeze_key(input_ports(op)))
+
+
 class _ContextMixin:
     """Operator preparation, stage context binding, and program lowering."""
 
@@ -689,9 +701,11 @@ class _ContextMixin:
         startup_mode = self.case.runtime.collective_startup_mode
         die_id = 0 if getattr(geom, "rank", None) is None else int(geom.rank)
         l2_state_key = _admission_l2_cache_key(admission_view, die_id)
+        l2_op_scope = _live_residency_op_scope(admission_view, die_id, op)
         view_token = self._admission_view_identity(admission_view)
         prep_key = (
-            id(self.recipes), frozen_geom, view_token, l2_state_key, stream_owners, startup_mode, op.stage,
+            id(self.recipes), frozen_geom, view_token, l2_state_key, l2_op_scope,
+            stream_owners, startup_mode, op.stage,
             op.family, op.recipe, op.phase, op.dtype, op.layout, op.requests,
             op.semantic_shape, op.local_shape, op.padded_shape,
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,

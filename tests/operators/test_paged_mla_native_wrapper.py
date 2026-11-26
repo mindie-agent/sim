@@ -611,3 +611,90 @@ def test_indexed_attention_cast_ratio_and_paired_sync_helpers():
     assert _indexed_phase_sync_ms(cal, "scores", 512) == pytest.approx((560.0 + 4 * 170.0) / 1e6)
     assert _indexed_phase_sync_ms(cal, "partial", 512) == pytest.approx((560.0 + 4 * 170.0) / 1e6)
     assert _indexed_phase_sync_ms(cal, "gather", 512) == 0.0
+
+
+def test_keypool_row_shard_propagates_physical_rank_and_noncausal_horizon():
+    from mindie_sim import compose_case, target_graphs
+
+    raw = compose_case(
+        "glm-5.3-flash", "a5", tp=2, dp=1, ep=1, layers=4,
+        prompt_tokens=128, output_tokens=2,
+    )
+    lowerings = raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})
+    lowerings["pool_key_indexer"] = "vllm_ascend_cann_keypool_caller"
+    raw["runtime"].setdefault("metadata", {})["keypool_row_shard_tp"] = 2
+    causal_case = parse_case(raw)
+    for rank in range(2):
+        ops = target_graphs(
+            causal_case, scope="body", phase="prefill", tokens=128,
+            sequences=1, context=0, physical_rank=rank,
+        )[0]
+        meta = dict(next(o for o in ops if o.recipe == "cann_pool_key_indexer").metadata)
+        expected = sum(pos // meta["pool_size"] for pos in range(64 * rank + 1, 64 * (rank + 1) + 1))
+        assert meta["scanned_pools"] == expected
+
+    raw["model"]["layer_plans"][3]["noncausal_attention"] = True
+    noncausal_case = parse_case(raw)
+    for rank in range(2):
+        ops = target_graphs(
+            noncausal_case, scope="body", phase="prefill", tokens=128,
+            sequences=1, context=0, physical_rank=rank,
+        )[0]
+        meta = dict(next(o for o in ops if o.recipe == "cann_pool_key_indexer").metadata)
+        assert meta["scanned_pools"] == meta["valid_query_rows"] * (128 // meta["pool_size"]) == 2048
+
+    dp_raw = compose_case(
+        "glm-5.3-flash", "a5", tp=1, dp=2, ep=1, layers=4,
+        prompt_tokens=128, output_tokens=2,
+    )
+    dp_raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})[
+        "pool_key_indexer"
+    ] = "vllm_ascend_cann_keypool_caller"
+    dp_raw["runtime"].setdefault("metadata", {})["keypool_row_shard_tp"] = 2
+    dp_case = parse_case(dp_raw)
+    dp_scans = [
+        dict(next(
+            o for o in target_graphs(
+                dp_case, scope="body", phase="prefill", tokens=128,
+                sequences=1, context=0, physical_rank=rank,
+            )[0]
+            if o.recipe == "cann_pool_key_indexer"
+        ).metadata)["scanned_pools"]
+        for rank in range(2)
+    ]
+    assert dp_scans == [496, 1520]
+
+    from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import resolve_row_shard_rank
+    from mindie_sim.prediction.sharding.local_tp import local_tp_groups
+
+    pcp_raw = compose_case(
+        "glm-5.3-flash", "a5", tp=1, dp=4, ep=1, layers=4,
+        prompt_tokens=128, output_tokens=2,
+    )
+    pcp_raw["runtime"]["parallel"].update(dp=2, pcp=2)
+    pcp_case = parse_case(pcp_raw)
+    groups = local_tp_groups(pcp_case.machine, pcp_case.runtime.parallel, stage=0, width=2)
+    assert groups == ((0, 2), (1, 3))
+    for grp in groups:
+        assert tuple(
+            resolve_row_shard_rank({}, 2, physical_rank=r, parallel=pcp_case.runtime.parallel, machine=pcp_case.machine)
+            for r in grp
+        ) == (0, 1)
+
+
+def test_analytic_index_pool_zero_l2_charges_full_hbm_reads():
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.prediction.operators.sparse_indexer.index_pool import selection
+    from mindie_sim.prediction.runtime.l2_residency import UsableL2Bytes
+
+    model = load_model("glm-5.3-flash")
+    plan = next(p for p in model.layer_plans if p.index_kpool > 1)
+    views = (RequestView("r", 32, 8192, False, "prefill"),)
+    builder = Builder("s0.l3", plan, 0, views, model, "prefill")
+    selection(
+        builder, query="q", weights="w", cache="k", views=views, plan=plan,
+        quant=model.quant, padded_tokens=32, l2_bytes=UsableL2Bytes(0),
+    )
+    op = next(o for o in builder.ops if o.recipe == "index_pool_scores")
+    assert int(dict(op.metadata)["score_l2_hit_bytes"]) == 0
+    assert int(op.hbm_bytes) == int(op.mte2_bytes) == 16_824_320

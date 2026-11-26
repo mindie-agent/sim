@@ -691,7 +691,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         cache_padded_tokens=idx_q,
         skip_pcp_index_gather=(v4_hidden_gathered or kpool_gathered is not None
                                or v41_comp_gathered),
-        machine=machine, store_rank_candidates=store_dcp_ranks)
+        machine=machine, store_rank_candidates=store_dcp_ranks,
+        physical_rank=physical_rank)
     attn_topk, q_local, rotary_local, q_dcp, rotary_dcp = _finalize_mla_index_and_head_inputs(
         b, prefix=prefix, stage=stage, mode=mode, plan=plan, q=q, valid=valid,
         cp=cp, decode_dcp=decode_dcp, sharded_indexer=sharded_indexer,

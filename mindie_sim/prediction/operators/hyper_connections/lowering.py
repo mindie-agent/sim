@@ -19,12 +19,16 @@ from ...mechanism import OperatorPlan, Work
 from ...ownership import unit_group
 from ...program import KernelProgram, RecipeContext, Stage
 from ...results import FusedPipelineSpec, PipelinePhase, WorkItem
+from ...runtime.l2_residency import (
+    AdmissionMemoryView,
+    RawDieL2Bytes,
+    resolve_engine_admission_view,
+)
 from ...runtime.memory_physics import (
     DEFAULT_L2_GRANULE_BYTES,
     DEFAULT_SECTOR_BYTES,
     AddressRun,
     AddressRunPlan,
-    AdmissionMemoryView,
     HbmBusSpec,
     MemoryAccessPattern,
     VisibilityContract,
@@ -73,6 +77,14 @@ def _copy_rates(ctx: RecipeContext, access: MemoryAccessPattern) -> tuple[str, i
     )
 
 
+def _row_pool_namespace(row_name: str) -> str:
+    """Extract explicit pool namespace prefix (e.g. ``'prefill:'`` / ``'decode:'``), or ``''``."""
+    head = row_name.split("@", 1)[0]
+    if ":" not in head:
+        return ""
+    return head.rsplit(":", 1)[0] + ":"
+
+
 @dataclass(frozen=True, slots=True)
 class TokenProgram:
     """Execute one token per owner, admitting each reload access as it starts."""
@@ -83,20 +95,53 @@ class TokenProgram:
     context: RecipeContext
     l2_capacity: int
     l2_units: int
+    die: int = 0
+
+    def _resolve_token_memory(self, engine: Engine, die_row: str) -> tuple[AdmissionMemoryView, int]:
+        attached = getattr(engine, "admission_memory_view", None)
+        ctx_view = getattr(self.context, "admission_memory_view", None)
+        die_id = self.die
+        if isinstance(ctx_view, AdmissionMemoryView) and ctx_view is not attached:
+            if not ctx_view.has_die(die_id) and ctx_view.has_die(0):
+                die_id = 0
+            return ctx_view, die_id
+        pool_ns = _row_pool_namespace(die_row)
+        try:
+            resolved = resolve_engine_admission_view(
+                engine,
+                die=die_id,
+                raw_l2=RawDieL2Bytes(self.l2_capacity),
+                l2_units=self.l2_units,
+                pool_namespace=pool_ns,
+            )
+        except ModelingError:
+            if not (isinstance(attached, AdmissionMemoryView) and attached.has_die(0)):
+                raise
+            die_id = 0
+            resolved = resolve_engine_admission_view(
+                engine,
+                die=die_id,
+                raw_l2=RawDieL2Bytes(self.l2_capacity),
+                l2_units=self.l2_units,
+                pool_namespace=pool_ns,
+            )
+        if resolved is attached:
+            return resolved, die_id
+        pool_views = vars(engine).setdefault("_pool_admission_views", {})
+        cached = pool_views.get(die_row)
+        if isinstance(cached, AdmissionMemoryView) and cached.has_die(die_id):
+            return cached, die_id
+        pool_views[die_row] = resolved
+        return resolved, die_id
 
     def start(self, engine: Engine, name: str, ready: Event, *, owner: str = "") -> Event:
         rows = self.context.resource_names
         hbm_row = rows["hbm"]
-        # The scoped L2 resource denotes one physical die in this Engine.
+        # The scoped L2 resource denotes one physical die and pool namespace in this Engine.
         die_row = rows.get("l2", hbm_row)
-        views = vars(engine).setdefault("_l2_admission_views", {})
-        if die_row not in views:
-            views[die_row] = AdmissionMemoryView(
-                {0: self.l2_capacity}, l2_buffer_units_by_die={0: self.l2_units},
-            )
-        memory = views[die_row]
+        memory, die_id = self._resolve_token_memory(engine, die_row)
         # The standard HBM row takes byte demand and already owns the bus rate.
-        bus = HbmBusSpec(0, 1, 1, 0, row_r=hbm_row, row_w=hbm_row, ctr_r=hbm_row, ctr_w=hbm_row)
+        bus = HbmBusSpec(die_id, 1, 1, 0, row_r=hbm_row, row_w=hbm_row, ctr_r=hbm_row, ctr_w=hbm_row)
         complete = engine.future(f"{name}:complete")
         invocation = f"{name}:{complete.sequence}"
 
@@ -123,8 +168,8 @@ class TokenProgram:
                 else:
                     pipe, _, hit, miss = _copy_rates(self.context, access)
                     copy_owner, = stage.placement[rows[pipe]]
-                    key = replace(access.reuse_key, reuse_stream=invocation)
-                    access = replace(access, owner=copy_owner, reuse_key=key)
+                    key = replace(access.reuse_key, die=die_id, reuse_stream=invocation)
+                    access = replace(access, die=die_id, owner=copy_owner, reuse_key=key)
                     bound = self.context.bind_access(
                         access, memory, hbm_bus=bus, copy_hit_bytes_per_ms=hit,
                         copy_miss_bytes_per_ms=miss,
@@ -157,12 +202,15 @@ class PhaseProgram:
     l2_capacity: int
     l2_units: int
     token_ranges: tuple[tuple[int, int], ...]
+    die: int = 0
+    usable_l2: int | None = None
 
     @property
     def reference_l2_capacity(self) -> int:
         granule = DEFAULT_L2_GRANULE_BYTES
         owners = len({self.phases[begin].owners[0] for begin, _ in self.token_ranges}) or 1
-        return granule * (self.l2_capacity // (granule * owners))
+        cap = self.l2_capacity if self.usable_l2 is None else self.usable_l2
+        return granule * (cap // (granule * owners))
 
     def __call__(self, ctx: RecipeContext) -> KernelProgram | TokenProgram:
         stages = []
@@ -198,7 +246,10 @@ class PhaseProgram:
             stages.append(Stage(phase.name, demand, after=phase.after, placement=placement,
                                 coupled=access is not None, metadata=metadata))
         if any(phase.final_reuse_read for phase in self.phases):
-            return TokenProgram(tuple(stages), self.phases, self.token_ranges, ctx, self.l2_capacity, self.l2_units)
+            return TokenProgram(
+                tuple(stages), self.phases, self.token_ranges, ctx,
+                self.l2_capacity, self.l2_units, self.die,
+            )
         return KernelProgram(tuple(stages))
 
 
@@ -256,12 +307,26 @@ class PhaseGraph:
 
     def finish(self, implementation, dtype, sources, metadata) -> OperatorPlan:
         buffers = dict(self.ctx.datapath.buffers)
-        l2 = buffers.get("l2", self.ctx.geometry.buffers.get("l2", 0))
+        l2 = int(self.ctx.geometry.buffers.get("l2", buffers.get("l2", 0)))
         units = self.ctx.geometry.buffer_units.get("l2", 1)
         if l2 and units != 1:
             raise ModelingError("shared_l2_buffer_requires_one_die_owner")
-        program = PhaseProgram(tuple(self.phases), self.ctx.datapath.aic_count,
-                               self.ctx.datapath.aiv_count, l2, units, tuple(self.token_ranges))
+        die = (
+            int(self.ctx.occurrence.rank)
+            if self.ctx.occurrence.rank is not None
+            else (int(self.ctx.geometry.rank) if self.ctx.geometry.rank is not None else 0)
+        )
+        view = (
+            self.ctx.admission_memory_view
+            if self.ctx.admission_memory_view is not None
+            else self.ctx.geometry.admission_memory_view
+        )
+        usable_l2 = int(self.ctx.usable_l2_bytes) if (view is None or view.has_die(die)) else l2
+        program = PhaseProgram(
+            tuple(self.phases), self.ctx.datapath.aic_count,
+            self.ctx.datapath.aiv_count, l2, units, tuple(self.token_ranges),
+            die=die, usable_l2=usable_l2,
+        )
         total = Work()
         phases = []
         reference_l2 = program.reference_l2_capacity

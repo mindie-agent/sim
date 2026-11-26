@@ -24,7 +24,7 @@ from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.implementations import select
 from mindie_sim.prediction.instructions import InstructionInventory
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe, Work
-from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import Config, activation_l2_fraction, columns, effective_l2_bytes, geometry_ledger, owner_tiles, panel_sizes, tile_inventory, tile_work, weight_l2_fraction
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import Config, activation_l2_fraction, columns, device_bandwidths_tbs, geometry_ledger, owner_tiles, panel_sizes, tile_inventory, tile_work, weight_l2_fraction
 from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_panels import compiled_panels, panel_parts
 from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_pipeline import Dependencies, Panel, Slots, SourcePipeline, pipeline_cycle
 from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_source_refill import source_panel
@@ -119,8 +119,13 @@ def test_panels_conserve_tails_periodic_refills_and_issued_work(mx4_source, rows
         assert all(mx4_meta(row)["producer_mode"] == "dynamic_buffer4" for row in (a, b))
         assert all(mx4_meta(row)["valid_rows"] == sum(rows) for row in (a, b))
         return
-    cfg, l2 = Config(k, n, rows), int(effective_l2_bytes(geometry(raw)))
-    l2_shares = dict(activation_l2=activation_l2_fraction(cfg, 32, l2), weight_l2=weight_l2_fraction(cfg, 32, l2))
+    geom = geometry(raw)
+    hbm_bw, l2_bw = device_bandwidths_tbs(geom)
+    cfg, l2 = Config(k, n, rows), int(geom.physical_mechanisms.memory_hierarchy.effective_l2_bytes)
+    l2_shares = dict(
+        activation_l2=activation_l2_fraction(cfg, 32, l2, hbm_bw_tbs=hbm_bw, l2_bw_tbs=l2_bw),
+        weight_l2=weight_l2_fraction(cfg, 32, l2, hbm_bw_tbs=hbm_bw, l2_bw_tbs=l2_bw),
+    )
     work = sum((tile_work(cfg, m, w, cores=32, **l2_shares) for o in range(32) for *_, m, w in owner_tiles(cfg, o, 32)),
                Work(resources={"hbm":64*256, "mte2_aiv":64*256}))
     assert b["operator"]["flops"] == work.matrix["fp8_e4m3"]
@@ -574,7 +579,11 @@ def test_geometry_cache_bounds_and_immutable_work():
     assert geometry_ledger.cache_info().currsize == 128 and geometry_ledger(cfg, 32) == saved and geometry_ledger(cfg, 32) is not saved
     cfg = Config(5120, 4608, (1, 0, 2)+(0,)*45)
     assert [n for _, n in columns(cfg, 32)] == [128]*16+[160]*16 and Counter(t[0] for o in range(32) for t in owner_tiles(cfg, o, 32)) == {0:32, 2:32}
-    assert effective_l2_bytes(Geometry(1, {}, {"l2":1024}, {})) == 768
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView, RawDieL2Bytes, UsableL2Bytes, resolve_usable_l2_bytes
+    assert resolve_usable_l2_bytes(None, 0, fallback_raw_l2=RawDieL2Bytes(1024)) == UsableL2Bytes(1024)
+    full_res = AdmissionMemoryView({0: 1024})
+    full_res.grant_reservation(0, "pinned", 1024)
+    assert resolve_usable_l2_bytes(full_res, 0, fallback_raw_l2=RawDieL2Bytes(1024)) == UsableL2Bytes(0)
 
 def test_source_pipeline_cadence_slots_and_cycle_jump():
     p = Panel(None, None, ((0, 0, 0, 3, 4, 2), (0, 0, 0, 0, 0, 0)), (False, False), ((0, 0),))
@@ -616,3 +625,127 @@ def test_situ_runtime_keeps_owners_buffer_reuse_and_kernel_minimum(situ_case, ki
         for e in transfers:
             assert e["end_ms"]-e["start_ms"] == pytest.approx(e["serviced"]["dma@r0:s0"]/(4e9/64))
         assert work["dma@r0:s0"] == 3864
+
+
+def test_mxfp4_cold_activation_avoids_first_pass_l2_and_conserves_resplit(mx4_source):
+    from mindie_sim.catalog.ops import gemm_op
+    from mindie_sim.prediction.implementations import set_input_ports
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+    from mindie_sim.prediction.runtime.memory_physics import (
+        AddressRun, AddressRunPlan, MemoryAccessPattern, ReuseKey,
+    )
+
+    raw_src, (gate, _), _ = mx4_source
+    base_raw = json.loads((Path(__file__).resolve().parents[2] / "examples/calls/quantized-grouped-small.json").read_text())
+    base_raw["machine"]["device"] = {"physical_mechanisms": {"memory_hierarchy": {"write_allocate": False}}}
+    base_raw["runtime"]["kernels"] = {"families": {"grouped_gemm": {"kind": "ascend_mxa8w4_nznk"}}}
+    case = parse_case(base_raw)
+    quant = parse_case(raw_src).model.quant
+
+    # Single output-column tile with cold activation must charge full activation payload to HBM, 0 to L2.
+    m, n, k = 128, 64, 4096
+    op_single = gemm_op(
+        op_id="g_single", deps=(), stage=0, layer=0, requests=(), m=m, n=n, k=k, quant=quant,
+        category="routed_expert", phase="prefill", family="grouped_gemm", recipe="grouped_gate_up",
+        metadata=(("matrix_group_rows", (m,)), ("matrix_groups", 1)),
+    )
+    rep_single = graph_costs(case, (op_single,), isolated=False)
+    svc_single = rep_single["execution"]["serviced"]
+    assert svc_single.get("l2@r0:s0", 0.0) == pytest.approx(0.0)
+    assert svc_single["memory@r0:s0"] == pytest.approx(m * k + 188_416)
+
+    # Multi-column tiles keep first pass cold HBM and remaining passes in L2:
+    # n=256 splits into 2x128 (hit 1/2 = 0.5), n=512 splits into 4x128 (hit 3/4 = 0.75).
+    base_geom = geometry(base_raw)
+    l2_cap = int(base_geom.physical_mechanisms.memory_hierarchy.effective_l2_bytes)
+    assert activation_l2_fraction(Config(k, n, (m,)), 32, l2_cap) == 0.0
+    assert activation_l2_fraction(Config(k, 256, (m,)), 32, l2_cap) == pytest.approx(0.5)
+    assert activation_l2_fraction(Config(k, 512, (m,)), 32, l2_cap) == pytest.approx(0.75)
+
+    # Already-admitted producer payload in live AdmissionMemoryView honors first-pass L2 hit only when write_allocate=True.
+    warm_op = set_input_ports(replace(op_single, deps=("producer",)), ({"op": "producer", "output": "payload"},))
+    view = AdmissionMemoryView({0: 8 << 20})
+    key = ReuseKey(0, "producer:payload", 0)
+    write_pat = MemoryAccessPattern(
+        "producer:payload", 0, 0, 0, "write", "mte3", m * k,
+        AddressRunPlan((AddressRun(0, 1, m * k, m * k),)), key,
+    )
+    view.admit_access(write_pat, m * k)
+    warm_plan = mxfp4_grouped.build(warm_op, replace(geometry(raw_src), admission_memory_view=view))
+    assert warm_plan.work.resources.get("l2", 0.0) == pytest.approx(m * k)
+    assert warm_plan.work.resources["hbm"] == pytest.approx(188_416)
+    no_wa_plan = mxfp4_grouped.build(warm_op, replace(base_geom, admission_memory_view=view))
+    assert no_wa_plan.work.resources.get("l2", 0.0) == pytest.approx(0.0)
+    assert no_wa_plan.work.resources["hbm"] == pytest.approx(m * k + 188_416)
+
+    # Full L2 reservation zeroes L2 credits even on multi-column shapes.
+    zero_view = AdmissionMemoryView({0: 8 << 20})
+    zero_view.grant_reservation(0, "other", 8 << 20)
+    zero_plan = mxfp4_grouped.build(grouped_op(gate, (128,), 512, 4096), replace(geometry(raw_src), admission_memory_view=zero_view))
+    assert zero_plan.work.resources.get("l2", 0.0) == pytest.approx(0.0)
+
+    # Bandwidth-resplit shape where columns(..., hbm_bw_tbs, l2_bw_tbs) differs from columns(...):
+    # declared plan work (geometry_ledger) and executed program (mxfp4_grouped) must match identically.
+    op_resplit = grouped_op(gate, (256, 256), 3072, 4096)
+    row = mx4(raw_src, op_resplit)
+    for role, delta in row["service_delta"].items():
+        assert abs(delta) <= max(1e-6, abs(row["serviced"].get(role, 0.0)) * 1e-9)
+    drained(row)
+
+    # Non-activation producer ports (e.g. group_list) never grant activation first-pass L2 residency.
+    gl_op = set_input_ports(
+        replace(op_single, deps=("gl_prod",)),
+        ({"op": "gl_prod", "output": "group_list"},),
+    )
+    gl_view = AdmissionMemoryView({0: 8 << 20})
+    gl_key = ReuseKey(0, "gl_prod:group_list", 0)
+    gl_view.admit_access(
+        MemoryAccessPattern(
+            "gl_prod:group_list", 0, 0, 0, "write", "mte3", m * k,
+            AddressRunPlan((AddressRun(0, 1, m * k, m * k),)), gl_key,
+        ),
+        m * k,
+    )
+    gl_plan = mxfp4_grouped.build(gl_op, replace(geometry(raw_src), admission_memory_view=gl_view))
+    assert gl_plan.work.resources.get("l2", 0.0) == pytest.approx(0.0)
+
+    # Cross-stream producer residency (e.g. stream="quant") resolves through AdmissionMemoryView.
+    qs_view = AdmissionMemoryView({0: 8 << 20})
+    qs_key = ReuseKey(0, "producer:payload", 0, reuse_stream="quant")
+    qs_view.admit_access(
+        MemoryAccessPattern(
+            "producer:payload", 0, 0, 0, "write", "mte3", m * k,
+            AddressRunPlan((AddressRun(0, 1, m * k, m * k),)), qs_key,
+        ),
+        m * k,
+    )
+    qs_plan = mxfp4_grouped.build(warm_op, replace(geometry(raw_src), admission_memory_view=qs_view))
+    assert qs_plan.work.resources.get("l2", 0.0) == pytest.approx(m * k)
+
+    # Execution.prepare cache separates layers with distinct producer bindings when live L2 entries exist.
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution import Execution
+
+    wa_raw = deepcopy(base_raw)
+    wa_raw["machine"]["device"] = {"physical_mechanisms": {"memory_hierarchy": {"write_allocate": True}}}
+    wa_case = parse_case(wa_raw)
+    ex = Execution(wa_case, CostModel(wa_case), include_submission=False)
+    l0_op = set_input_ports(
+        replace(op_single, op_id="s0.l0.g", layer=0, deps=("s0.l0.x",)),
+        ({"op": "s0.l0.x", "output": "payload"},),
+    )
+    l1_op = set_input_ports(
+        replace(op_single, op_id="s0.l1.g", layer=1, deps=("s0.l1.x",)),
+        ({"op": "s0.l1.x", "output": "payload"},),
+    )
+    ex.admission_memory_view.admit_access(
+        MemoryAccessPattern(
+            "s0.l0.x:payload", 0, 0, 0, "write", "mte3", m * k,
+            AddressRunPlan((AddressRun(0, 1, m * k, m * k),)), ReuseKey(0, "s0.l0.x:payload", 0),
+        ),
+        m * k,
+    )
+    _, l0_plan = ex.prepare(l0_op)
+    _, l1_plan = ex.prepare(l1_op)
+    assert l0_plan.work.resources.get("l2", 0.0) == pytest.approx(m * k)
+    assert l1_plan.work.resources.get("l2", 0.0) == pytest.approx(0.0)

@@ -607,3 +607,73 @@ def test_manifest_prepares_source_work_and_preserves_public_consumers(phase):
     with pytest.raises(ModelingError, match="cannot_export_internal_intermediate"):
         hc.build(replace(fused, recipe=PRE, local_shape=(m, c, h)), geom)
     assert tuple(op.to_dict() for op in members) == before_members
+
+
+def test_attnres_token_program_honors_engine_live_l2_reservations():
+    from mindie_sim import compose_case
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.schema.operators import IterationWork
+    from mindie_sim.schema.workload import IterationPlan
+
+    case = parse_case(compose_case("qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], layers=1, tp=1, ep=1))
+    shape = (8, 1024)
+    op = OpSpec(
+        "mix", "hyper_connections", "decode", 0, 0, ("r",), shape, shape, shape, shape,
+        dtype="bf16", recipe=ATTN, source_boundary="kernel",
+        metadata=(("capacity", 105), ("valid_history", 104), ("cached_rows", 0), ("fuse_add", True)),
+    )
+    batch = IterationPlan((RequestView("r", 8, 128, True, "decode"),))
+
+    ex_free = Execution(case, CostModel(case), include_submission=False)
+    done_free = ex_free.add(IterationWork((op,), batch, 1, 0, 0, None, "body", "audit"), 0, 0).completion
+    ex_free.engine.advance(until=(done_free,))
+    assert ex_free.engine.serviced["l2@r0:s0"] > 0
+
+    ex_full = Execution(case, CostModel(case), include_submission=False)
+    live = ex_full.engine.admission_memory_view
+    live.grant_reservation(0, "other", live.available_l2_bytes(0))
+    done_full = ex_full.add(IterationWork((op,), batch, 1, 0, 0, None, "body", "audit"), 0, 0).completion
+    ex_full.engine.advance(until=(done_full,))
+    assert live.available_l2_bytes(0) == 0
+    assert ex_full.engine.serviced["l2@r0:s0"] == 0.0
+
+    # Disaggregated PD pools sharing one Engine keep separate per-namespace L2 views.
+    pd_l2 = []
+    for reserve_prefill in (False, True):
+        eng = Engine([])
+        p_ex, d_ex = (
+            Execution(case, CostModel(case), engine=eng, namespace=ns, include_submission=False)
+            for ns in ("prefill:", "decode:")
+        )
+        if reserve_prefill:
+            p_live = p_ex.admission_memory_view
+            p_live.grant_reservation(0, "prefill_live", p_live.available_l2_bytes(0))
+        done_pd = d_ex.add(IterationWork((op,), batch, 1, 0, 0, None, "body", "audit"), 0, 0).completion
+        eng.advance(until=(done_pd,))
+        pd_l2.append(eng.serviced["decode:l2@r0:s0"])
+    assert pd_l2[0] == pytest.approx(pd_l2[1]) and pd_l2[0] > 0
+
+    # Bare unnamespaced Engine ("l2" resource row) honors its live AdmissionMemoryView.
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+
+    bare_geom = _geometry(REGBASE, l2=4 << 20)
+    bare_op = _op(ATTN, shape, capacity=105, valid_history=104, cached_rows=0, fuse_add=True)
+    bare_ctx = _context(bare_op, bare_geom)
+    bare_plan = hc.build(bare_op, bare_geom)
+    bare_view = AdmissionMemoryView({0: 4 << 20})
+    bare_view.grant_reservation(0, "peer", 4 << 20)
+    bare_eng = _engine(bare_ctx)
+    bare_eng.attach_admission_memory_view(bare_view)
+    bare_ready = bare_eng.submit("input", release=0)
+    bare_done = bare_plan.program(bare_ctx).start(bare_eng, "bare", bare_ready)
+    bare_eng.advance(until=(bare_done,))
+    assert bare_eng.serviced.get("l2", 0.0) == 0.0
+
+    # Heterogeneous PD pool sizes: 1-die prefill + 2-die decode prepares replica=1 without die-id mismatch.
+    dec_case = parse_case(compose_case("qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], layers=1, tp=1, dp=2, ep=1))
+    het_eng = Engine([])
+    Execution(case, CostModel(case), engine=het_eng, namespace="prefill:", include_submission=False)
+    het_dec = Execution(dec_case, CostModel(dec_case), engine=het_eng, namespace="decode:", include_submission=False)
+    _, het_plan = het_dec.prepare(op, replica=1)
+    assert het_plan.work.resources.get("l2", 0.0) > 0.0

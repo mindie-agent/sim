@@ -15,6 +15,7 @@ from mindie_sim.catalog.cache import index_row_bytes
 from mindie_sim.catalog.index_pool import PoolSelection, pool_selection
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.prediction.runtime.l2_residency import UsableL2Bytes
 
 from .indexer_representation import index_representation
 from mindie_sim.prediction.operators.mla.mla_native import index_layer_norm
@@ -157,8 +158,15 @@ def row_slice(views, start, stop):
                 result.append(replace(view, q_len=hi-lo, query_ranges=tuple(ranges),
                                       global_q_len=view.global_q_len or view.q_len))
             else:
-                result.append(replace(view, q_len=hi-lo, context=view.context + lo-pos,
-                                      global_q_len=0))
+                shift = lo - pos
+                new_context = view.context + shift
+                new_q_len = hi - lo
+                new_global_q = max(new_q_len, view.kv_len - new_context)
+                result.append(replace(
+                    view, q_len=new_q_len, context=new_context,
+                    global_q_len=new_global_q,
+                    prefix_tokens=min(view.prefix_tokens, view.context),
+                ))
         pos = end
     return tuple(result)
 
@@ -612,7 +620,9 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens,
 
 def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               score_mode="linear_weighted_query",
-              score_implementation="declared", l2_bytes=None, runtime=None):
+              score_implementation="declared",
+              l2_bytes: UsableL2Bytes | float | None = None,
+              runtime=None):
     """Use source linear scoring; per-head MMA is an explicit alternative."""
     if score_mode not in {"per_head_relu", "linear_weighted_query"}:
         raise ModelingError("index_pool_unknown_score_mode")
@@ -629,9 +639,12 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     row_bytes = float(index_row_bytes(b.model, width))
     unique_pool_rows = _visited_pool_rows(views, plan, runtime=runtime)
     l2_bounded_pool_read = float(unique_pool_rows) * row_bytes
-    if l2_bytes is not None and float(l2_bytes) > 0.0:
-        if l2_bounded_pool_read > float(l2_bytes):
-            spill = max(0.0, 1 - float(l2_bytes) / l2_bounded_pool_read)
+    if l2_bytes is not None:
+        cap = max(0.0, float(l2_bytes))
+        if cap <= 0.0:
+            l2_bounded_pool_read = float(scanned) * row_bytes
+        elif l2_bounded_pool_read > cap:
+            spill = max(0.0, 1.0 - cap / l2_bounded_pool_read)
             l2_bounded_pool_read += (
                 max(0.0, float(scanned) * row_bytes - l2_bounded_pool_read)
                 * spill)

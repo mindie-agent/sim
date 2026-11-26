@@ -20,6 +20,7 @@ from .mxfp4_registers import (
     B8_BITWISE_OPS_PER_ELEMENT, CLASSES, TRANSPOSE_INDEX_BYTES, transpose, widen,
 )
 from mindie_sim.prediction.instructions import InstructionInventory
+from mindie_sim.prediction.runtime.l2_residency import UsableL2Bytes
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 SOURCE_REFS: tuple[SourceRef, ...] = (
@@ -283,25 +284,6 @@ def panel_sizes(m, n):
 
 GEOMETRY_CACHE_SIZE = 128
 M_TILE_ROWS = 256
-#: Declared arch3510 L2 efficiency used only when a caller supplies no typed
-#: physical declaration; it is the same profile default as the mechanism spec.
-L2_EFFECTIVE_FRACTION = 0.75
-
-
-def effective_l2_bytes(geometry):
-    """Typed effective L2 capacity bounded by live AdmissionMemoryView headroom."""
-    mechanisms = getattr(geometry, "physical_mechanisms", None)
-    hierarchy = getattr(mechanisms, "memory_hierarchy", None)
-    if hierarchy is not None:
-        base = float(hierarchy.effective_l2_bytes)
-    else:
-        buffers = getattr(geometry, "buffers", {}) or {}
-        base = L2_EFFECTIVE_FRACTION * float(buffers.get("l2", 0))
-    view = getattr(geometry, "admission_memory_view", None)
-    if view is not None:
-        die = int(getattr(geometry, "rank", None) or 0)
-        return min(base, float(view.effective_l2_bytes(die)))
-    return base
 
 
 def activation_bank_bytes(config):
@@ -374,21 +356,31 @@ def weight_l2_fraction(
     return retention * repeats / passes
 
 
-def activation_l2_fraction(config, cores, l2_bytes):
+def activation_l2_fraction(
+    config, cores, l2_bytes: UsableL2Bytes | int | float, *,
+    hbm_bw_tbs: float | None = None,
+    l2_bw_tbs: float | None = None,
+    first_pass_hit: float = 0.0,
+):
     """Share of a column pass whose activation slice is served by resident L2.
 
     ``CalcResplitTiling`` reads one ``[m_e, K]`` slice per output column tile;
-    the first pass fills L2 and the remaining passes hit it while the full
-    slice fits the declared effective capacity.
+    without an already-admitted producer slice in L2, the first pass streams
+    from off-chip memory to fill L2 and the remaining ``column_tiles - 1``
+    passes hit resident L2 while the slice fits the declared effective capacity.
     """
     _require_positive_cores(cores)
     if l2_bytes <= 0:
         return 0.0
+    column_tiles = len(columns(config, cores, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs))
+    if column_tiles <= 0:
+        return 0.0
     slice_bytes = activation_bank_bytes(config)
     retention = min(1.0, float(l2_bytes) / slice_bytes) if slice_bytes else 0.0
-    # The producer writes the slice through L2 with declared write allocation,
-    # so a resident slice serves the first consumer pass as well.
-    return retention
+    first_hit = min(retention, max(0.0, float(first_pass_hit)))
+    if column_tiles == 1:
+        return first_hit
+    return (first_hit + retention * float(column_tiles - 1)) / float(column_tiles)
 
 
 def activation_scale_bytes(config, m, offset):
@@ -494,9 +486,10 @@ class GeometryLedger:
 @lru_cache(maxsize=GEOMETRY_CACHE_SIZE)
 def geometry_ledger(config: Config, cores: int, compact: bool = True,
                     directional_mte1: bool = False,
-                    l2_bytes: int | None = None,
+                    l2_bytes: UsableL2Bytes | int | None = None,
                     hbm_bw_tbs: float | None = None,
-                    l2_bw_tbs: float | None = None) -> GeometryLedger:
+                    l2_bw_tbs: float | None = None,
+                    first_pass_hit: float = 0.0) -> GeometryLedger:
     """Reuse exact source work for repeated layer geometry, independent of rates.
 
     The source has two AIVs per AIC. InitMx reads its 256-byte permutation on
@@ -515,7 +508,9 @@ def geometry_ledger(config: Config, cores: int, compact: bool = True,
     work = Work(resources={"hbm": init_bytes, "mte2_aiv": init_bytes})
     inventory = InstructionInventory({})
     counts, runs = [], []
-    activation_l2 = activation_l2_fraction(config, cores, resolved_l2)
+    activation_l2 = activation_l2_fraction(
+        config, cores, resolved_l2, hbm_bw_tbs=hbm_bw_tbs,
+        l2_bw_tbs=l2_bw_tbs, first_pass_hit=first_pass_hit)
     weight_l2 = weight_l2_fraction(
         config, cores, resolved_l2, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs)
     for owner in range(cores):

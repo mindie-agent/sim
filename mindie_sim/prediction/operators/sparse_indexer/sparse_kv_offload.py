@@ -235,7 +235,7 @@ def sparse_kv_offload_memory_budget(
             layer_plan.kv_lora_rank + layer_plan.qk_rope_head_dim
         )
         kv_row_bytes_by_layer[layer_plan.index] = int(
-            packed_region_row_bytes(model, "mla_kv", kv_elements)
+            packed_region_row_bytes(model, "mla_kv", kv_elements, plan=layer_plan)
         )
         index_row_bytes_by_layer[layer_plan.index] = (
             int(index_row_bytes(model, layer_plan.index_dim))
@@ -312,8 +312,13 @@ def sparse_kv_offload_memory_budget(
 
     independent_layers = model.layers - len(offload_layers)
     num_shared_layers = int(opts["num_shared_layers"])
+    offload_by_stage: list[list[int]] = [[] for _ in range(p.pp)]
+    for layer_idx in offload_layers:
+        stage_idx = layer_stage[layer_idx] if 0 <= layer_idx < len(layer_stage) else p.pp - 1
+        offload_by_stage[stage_idx].append(layer_idx)
+    offload_layers_by_stage = tuple(tuple(stage_layers) for stage_layers in offload_by_stage)
     active_npu_kv_layers = (
-        independent_layers + min(num_shared_layers, len(offload_layers))
+        independent_layers + sum(min(num_shared_layers, len(stage_layers)) for stage_layers in offload_layers_by_stage)
         if layerwise else (model.layers if opts["keep_device_kv_cache"] else 0)
     )
 
@@ -361,6 +366,7 @@ def sparse_kv_offload_memory_budget(
     return {
         "implementation": IMPLEMENTATION, "options": opts, "tp": int(p.tp),
         "tp_groups": tp_groups, "offload_layers": offload_layers,
+        "offload_layers_by_stage": offload_layers_by_stage,
         "full_indexer_layers": full_indexer_layers, "shared_indexer_layers": shared_indexer_layers,
         "kv_row_bytes": kv_row_bytes, "index_row_bytes": idx_row_bytes,
         "kv_row_bytes_by_layer": kv_row_bytes_by_layer,
@@ -408,11 +414,21 @@ def prepare_case(model: Any, runtime: Any, machine: Any, workload: Any, binding:
     )
     existing_groups = list(base_groups)
     row_by_layer = budget.get("kv_row_bytes_by_layer") or {}
-    target_zero_layers = (
-        offload_layers
-        if (not opts["keep_device_kv_cache"] and not opts["layerwise_kv_offload"])
-        else (offload_layers[max(0, int(opts["num_shared_layers"])):] if opts["layerwise_kv_offload"] else ())
-    )
+    num_shared = max(0, int(opts["num_shared_layers"]))
+    if not opts["keep_device_kv_cache"] and not opts["layerwise_kv_offload"]:
+        target_zero_layers = offload_layers
+    elif opts["layerwise_kv_offload"]:
+        stage_groups = budget.get("offload_layers_by_stage") or (offload_layers,)
+        target_zero_layers = tuple(
+            layer_idx
+            for stage_layers in stage_groups
+            for layer_idx in sorted(
+                stage_layers,
+                key=lambda lid: (-int(row_by_layer.get(lid, budget["kv_row_bytes"])), lid),
+            )[num_shared:]
+        )
+    else:
+        target_zero_layers = ()
     grouped_by_page_bytes: dict[int, list[int]] = {}
     for layer_idx in target_zero_layers:
         page_b = budget["block_size"] * int(row_by_layer.get(layer_idx, budget["kv_row_bytes"]))

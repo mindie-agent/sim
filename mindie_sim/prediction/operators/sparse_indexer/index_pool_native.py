@@ -19,6 +19,7 @@ from mindie_sim.catalog.index_pool import pool_selection
 from mindie_sim.catalog.ops import comm_op, compute_dtype_for
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.parallel import GlobalRank, RankCoord
 from mindie_sim.prediction.operators.attention.batch_prefix_attention import annotate_sparse_prefix_unknown
 from .index_pool import (
     _row_shard_value, _selection_for, native_shard_sizes, row_shard_tp, row_slice,
@@ -592,9 +593,45 @@ def _restore_producer_order(b, prepared, query, weights):
     b.ops = remaining[:insert_at] + rewired_producers + pcp_gathers + remaining[insert_at:]
 
 
+def _shard_rank_from_coord(coord: RankCoord, parallel, divisor: int) -> int:
+    """Project a typed ``RankCoord`` onto the active row-shard lane in ``[0, divisor)``."""
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    if tp >= divisor:
+        return coord.tp_lane % divisor
+    dp = max(1, int(getattr(parallel, "dp", 1) or 1))
+    if dp * tp >= divisor:
+        return ((coord.replica % dp) * tp + coord.tp_lane) % divisor
+    return (coord.replica * tp + coord.tp_lane) % divisor
+
+
+def resolve_row_shard_rank(options, divisor, *, physical_rank=None, parallel=None, machine=None) -> int:
+    """Resolve local-TP row-shard rank from explicit override or ``RankCoord`` placement."""
+    if "row_shard_rank" in options:
+        rank = options["row_shard_rank"]
+        if type(rank) is not int or not 0 <= rank < divisor:
+            raise ModelingError("index_pool_row_shard_rank_out_of_range")
+        return rank
+    if divisor <= 1 or physical_rank is None:
+        return 0
+    if type(physical_rank) is not int or physical_rank < 0:
+        raise ModelingError("index_pool_row_shard_rank_out_of_range")
+    if (machine is not None and parallel is not None
+            and hasattr(machine, "validate_placement")
+            and len(getattr(machine, "dies", ())) >= getattr(parallel, "world_size", 0)):
+        placement = machine.validate_placement(parallel)
+        global_rank = GlobalRank(physical_rank)
+        if global_rank in placement.active_ranks:
+            coord = placement.coord_for_physical_rank(global_rank)
+            return _shard_rank_from_coord(coord, parallel, divisor)
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1)) if parallel is not None else 0
+    if tp >= divisor:
+        return (physical_rank % tp) % divisor
+    return physical_rank % divisor
+
+
 def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               score_mode="linear_weighted_query", hierarchy=None, runtime=None,
-              shard_sizes=None, **options):
+              shard_sizes=None, physical_rank=None, parallel=None, machine=None, **options):
     declaration = _contract(b, views, plan, quant)
     if score_mode not in {"linear_weighted_query", "per_head_relu"}:
         raise ModelingError("native_keypool_reference_score_mode_unknown")
@@ -615,9 +652,10 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     pool_row_bytes = _pooled_row_bytes(quant, width)
     sizes = shard_sizes or _row_shard(views, plan, options=options, runtime=runtime)
     divisor = len(sizes)
-    rank = options.get("row_shard_rank", 0)
-    if type(rank) is not int or not 0 <= rank < divisor:
-        raise ModelingError("index_pool_row_shard_rank_out_of_range")
+    eff_parallel = parallel if parallel is not None else getattr(runtime, "parallel", None)
+    rank = resolve_row_shard_rank(
+        options, divisor, physical_rank=physical_rank, parallel=eff_parallel, machine=machine,
+    )
     valid_views = tuple(v for v in views if not v.padding)
     begin = sum(sizes[:rank])
     owned_views = row_slice(valid_views, begin, begin + sizes[rank])

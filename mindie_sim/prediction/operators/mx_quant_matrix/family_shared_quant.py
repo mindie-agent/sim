@@ -24,7 +24,7 @@ from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
 from mindie_sim.prediction.values.typed import rebind_op_precision
-from .mxfp4_geometry import effective_l2_bytes
+from mindie_sim.prediction.runtime.l2_residency import RawDieL2Bytes, resolve_usable_l2_bytes
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 SOURCE_REFS: tuple[SourceRef, ...] = (
@@ -603,10 +603,23 @@ def build(op, geometry):
     scale_bytes = config.weight_scale_bytes
     # Every active AIV loads the full channel-scale vector into its private UB;
     # subsequent cores hit shared L2 when the die has an L2 pipe with capacity.
+    hierarchy = getattr(getattr(geometry, "physical_mechanisms", None), "memory_hierarchy", None)
+    l2_ceiling = (
+        int(hierarchy.effective_l2_bytes)
+        if hierarchy is not None else int(geometry.raw_l2_bytes)
+    )
+    usable_l2 = (
+        int(resolve_usable_l2_bytes(
+            getattr(geometry, "admission_memory_view", None),
+            int(getattr(geometry, "rank", None) or 0),
+            fallback_raw_l2=RawDieL2Bytes(max(0, l2_ceiling)),
+        ))
+        if l2_ceiling > 0 else 0
+    )
     scale_l2_hit = (
         used_cores > 1
         and "l2" in geometry.resource_units
-        and effective_l2_bytes(geometry) >= scale_bytes
+        and usable_l2 >= scale_bytes
     )
     total_read_pipe = row_read + used_cores * scale_bytes
     scale_hbm = scale_bytes if scale_l2_hit else used_cores * scale_bytes

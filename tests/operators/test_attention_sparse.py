@@ -805,3 +805,92 @@ def test_gbsa_aicpu_metadata_4096_bytes_and_uniform_decode_reuse():
     p_full = governed.build(fia_op, replace(a3_geom, admission_memory_view=full_view))
     assert p_free.metadata["ws_l2_resident"] is True and p_full.metadata["ws_l2_resident"] is False
     assert p_full.work.resources["hbm"] > p_free.work.resources["hbm"]
+
+
+def test_paged_mla_reserved_l2_charges_hbm_workspace_reads():
+    from mindie_sim.prediction.operators import paged_mla as m
+
+    geom = Geometry.from_devices(sku_case(VECTOR_SKU).machine.dies[:1])
+    op = m.make_op(
+        sequences=((1, 4096),), logical_heads=64, physical_heads=64,
+        abi=m.arch22.UPSTREAM_ABI, s2_base_size=1024,
+    )
+    state = AdmissionMemoryView({0: geom.buffers["l2"]})
+    state.grant_reservation(0, "peer", geom.buffers["l2"])
+    bound_geom = replace(geom, admission_memory_view=state, requests=(RequestView("r", 1, 4095, False, "decode"),))
+    score_read = next(p for p in m.build(op, bound_geom).pipeline_spec.phases if p.phase_id == "score_read")
+    work = {item.resource: item.amount for item in score_read.work}
+    assert state.effective_l2_bytes(0) == 0
+    assert work.get("hbm", 0.0) == work["mte2_aiv"] == 1_048_576
+
+
+def test_layerwise_offload_retains_shared_kv_budget_per_pp_stage():
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.prediction.structure import parse_case
+
+    raw = compose_case(
+        "deepseek-v3", "a3", tp=1, ep=1, dp=1, pp=2, layers=2,
+        prompt_tokens=128, output_tokens=2,
+    )
+    lower = raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})
+    lower["sparse_kv_offload"] = {
+        "implementation": "vllm_ascend_sparse_kv_offload",
+        "options": {"layerwise_kv_offload": True, "num_shared_layers": 1},
+    }
+    mem = Memory(parse_case(raw))
+    row_bytes = mem.sparse_offload["kv_row_bytes"]
+    assert tuple(map(int, mem.cache_bytes(128))) == (128 * row_bytes, 128 * row_bytes)
+
+    het_raw = compose_case(
+        "deepseek-v3", "a3", tp=1, ep=1, dp=1, pp=1, layers=2,
+        quant="bf16", kv_cache_dtype="bf16", prompt_tokens=128, output_tokens=2,
+    )
+    het_raw["runtime"].get("kernels", {}).get("lowerings", {}).pop("mla_prolog", None)
+    het_raw["model"]["layer_plans"][0].update(kv_lora_rank=512, qk_rope_head_dim=64, kv_cache_elements=576)
+    het_raw["model"]["layer_plans"][1].update(kv_lora_rank=1024, qk_rope_head_dim=64, kv_cache_elements=1088)
+    het_raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})["sparse_kv_offload"] = {
+        "implementation": "vllm_ascend_sparse_kv_offload",
+        "options": {"layerwise_kv_offload": True, "num_shared_layers": 1},
+    }
+    assert int(Memory(parse_case(het_raw)).cache_bytes(128)[0]) == 128 * 2176
+
+    dtype_raw = compose_case(
+        "deepseek-v3", "a3", tp=1, ep=1, dp=1, pp=1, layers=2,
+        quant="bf16", kv_cache_dtype="bf16", prompt_tokens=128, output_tokens=2,
+    )
+    dtype_raw["runtime"].get("kernels", {}).get("lowerings", {}).pop("mla_prolog", None)
+    dtype_raw["model"]["layer_plans"][0].update(kv_lora_rank=512, qk_rope_head_dim=64, kv_cache_elements=576)
+    dtype_raw["model"]["layer_plans"][1].update(kv_lora_rank=576, qk_rope_head_dim=64, kv_cache_elements=640)
+    dtype_raw["model"].setdefault("metadata", {})["layer_cache_representations"] = {
+        "1": {"mla_kv": {"dtype": "int8"}},
+    }
+    dtype_raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})["sparse_kv_offload"] = {
+        "implementation": "vllm_ascend_sparse_kv_offload",
+        "options": {"layerwise_kv_offload": True, "num_shared_layers": 1},
+    }
+    dtype_mem = Memory(parse_case(dtype_raw))
+    assert dtype_mem.sparse_offload["kv_row_bytes_by_layer"] == {0: 1152, 1: 640}
+    assert int(dtype_mem.cache_bytes(128)[0]) == 128 * 1152
+
+
+def test_bf16_lightning_line_cache_matches_sequential_lru_eviction():
+    from functools import lru_cache
+    from mindie_sim.prediction.operators.sparse_indexer import bf16_lightning as li
+
+    geom = Geometry.from_devices(sku_case(VECTOR_SKU).machine.dies[:1])
+    cap = 8192 * 256 - 128
+    op = li.make_op(
+        query_rows=64, context=32768, heads=4, topk=512, compression=4,
+        l2_capacity_bytes=cap,
+    )
+    key_access = li.recipes()[li.RECIPE].build(op, geom).metadata["mechanism"]["key_access"]
+
+    @lru_cache(maxsize=cap // 128)
+    def line(index):
+        return index
+
+    for tile in key_access["tiles"]:
+        for panel in tile["panels"]:
+            for idx in range(2 * panel["key_start"], 2 * panel["key_end"]):
+                line(idx)
+    assert key_access["hbm_bytes"] == line.cache_info().misses * 128 == 8_398_848

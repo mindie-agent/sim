@@ -946,7 +946,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                      shared_topk=None, fused_compressor=False,
                      cache_hidden_dep=None, cache_views=None,
                      cache_padded_tokens=None, skip_pcp_index_gather=False,
-                     machine=None, store_rank_candidates=None):
+                     machine=None, store_rank_candidates=None, physical_rank=None):
     """Produce the index cache and (optionally) its TopK selection."""
     b = builder
     q = padded_tokens
@@ -1006,12 +1006,18 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         shard_sizes, score_q = None, q
         if (plan.index_kpool > 1 and pool_binding
                 and pool_binding.name == NATIVE_KEYPOOL_IMPLEMENTATION):
-            from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import _row_shard, supported
+            from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import (
+                _row_shard, resolve_row_shard_rank, supported,
+            )
             if supported(views=views, plan=plan, model=model, quant=quant):
                 opts = pool_binding.options
                 shard_sizes = _row_shard(views, plan, options=opts, runtime=runtime)
                 if len(shard_sizes) > 1:
-                    score_q = shard_sizes[opts.get("row_shard_rank", 0)]
+                    shard_rank = resolve_row_shard_rank(
+                        opts, len(shard_sizes), physical_rank=physical_rank,
+                        parallel=parallel, machine=machine,
+                    )
+                    score_q = shard_sizes[shard_rank]
         q_index = b.matrix(
             "index_q", (q_norm,), score_q,
             plan.index_heads * plan.index_dim,
@@ -1050,7 +1056,8 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         topk = _select_index_rows(
             b, plan, pool_binding, views, model, quant, q_index, weights, index_store, q,
             runtime, hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard,
-            score_rows, machine=machine, cp_interleave_size=idx_block)
+            score_rows, machine=machine, cp_interleave_size=idx_block,
+            physical_rank=physical_rank)
         if shard > 1 and not dsa_prefill:
             return_local = int(getattr(parallel, "pcp", 1) or 1) <= 1 or not any(
                 v.phase == "prefill" for v in views
@@ -1393,7 +1400,7 @@ def _produce_index_cache(
 def _select_index_rows(
     b, plan, pool_binding, views, model, quant, q_index, weights, index_store, q, runtime,
     hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard, score_rows,
-    *, machine=None, cp_interleave_size=None,
+    *, machine=None, cp_interleave_size=None, physical_rank=None,
 ):
     if plan.index_kpool > 1:
         from mindie_sim.prediction.operators.sparse_indexer import index_pool
@@ -1410,7 +1417,9 @@ def _select_index_rows(
                 b, query=q_index, weights=weights, cache=index_store,
                 views=views, plan=plan, quant=quant, padded_tokens=q,
                 l2_bytes=getattr(b, "l2_bytes", None), runtime=runtime,
-                hierarchy=hierarchy, shard_sizes=shard_sizes, **pool_binding.options)
+                hierarchy=hierarchy, shard_sizes=shard_sizes,
+                physical_rank=physical_rank, parallel=parallel, machine=machine,
+                **pool_binding.options)
         else:
             analytic_options = ({} if native_binding else
                                 (pool_binding.options if pool_binding else {}))

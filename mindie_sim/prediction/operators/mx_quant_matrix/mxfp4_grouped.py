@@ -17,12 +17,22 @@ from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.operators.matrix.matrix_precision import EXPLICIT_ORIGINS
 from .mxfp4_geometry import (
     MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR, MX_SCALE_PUBLISH_K, NZ_N_GRANULE, Config,
-    activation_l2_fraction, align, ceildiv, columns, device_bandwidths_tbs,
-    effective_l2_bytes, geometry_ledger, panel_sizes,
+    activation_bank_bytes, activation_l2_fraction, align, ceildiv, columns,
+    device_bandwidths_tbs, geometry_ledger, panel_sizes,
     resplit_columns, tile_runs, weight_l2_fraction,
 )
 from .mxfp4_registers import CLASSES, TABLES, TRANSPOSE_INDEX_BYTES
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from mindie_sim.prediction.program.implementation_audit import input_ports
+from mindie_sim.prediction.runtime.l2_residency import (
+    RawDieL2Bytes,
+    UsableL2Bytes,
+    l2_write_allocate_enabled,
+    resolve_usable_l2_bytes,
+)
+from mindie_sim.prediction.runtime.memory_physics import (
+    AddressRun, AddressRunPlan, MemoryAccessPattern, ReuseKey,
+)
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
 from .mxfp4_panels import compiled_panels, panel_parts
 
@@ -43,6 +53,9 @@ SOURCE_REFS: tuple[SourceRef, ...] = (
 )
 ACTIVATION_SCALE_RANK = 3
 ACTIVATION_SCALE_PAIR_DIM = 2
+ACTIVATION_INPUT_PORT_NAMES = frozenset({
+    "payload", "output", "activation", "activations", "hidden", "x",
+})
 
 L1_BYTES = 512 * 1024
 L0_OPERAND_BYTES = 64 * 1024
@@ -158,6 +171,82 @@ def config_from_op(op):
     return config
 
 
+def _resolve_mxfp4_usable_l2(geometry, *, die: int) -> UsableL2Bytes:
+    """Resolve live usable L2 bytes bounded by declared hierarchy efficiency and reservations."""
+    if "l2" not in geometry.resource_units:
+        return UsableL2Bytes(0)
+    hierarchy = getattr(getattr(geometry, "physical_mechanisms", None), "memory_hierarchy", None)
+    if hierarchy is not None:
+        ceiling = RawDieL2Bytes(max(0, int(hierarchy.effective_l2_bytes)))
+        if int(ceiling) <= 0:
+            return UsableL2Bytes(0)
+        return resolve_usable_l2_bytes(
+            getattr(geometry, "admission_memory_view", None), die, fallback_raw_l2=ceiling,
+        )
+    return resolve_usable_l2_bytes(
+        getattr(geometry, "admission_memory_view", None), die, fallback_raw_l2=geometry.raw_l2_bytes,
+    )
+
+
+def _activation_payload_candidates(op) -> list[str]:
+    """Collect activation-payload tensor names from declared ``input_ports``, ignoring metadata/scales."""
+    meta = dict(getattr(op, "metadata", ()) or ())
+    group_list_producer = str(meta.get("group_list_producer") or "")
+    activation_deps = {
+        dep for dep in (getattr(op, "deps", ()) or ())
+        if dep and dep != group_list_producer
+    }
+    candidates: list[str] = []
+    for entry in input_ports(op):
+        if isinstance(entry, dict):
+            prod = str(entry.get("op", "") or "")
+            out_port = str(entry.get("output", "") or "")
+            role = str(entry.get("role", "") or "").lower()
+            if role and role not in {"activation", "data", "input"}:
+                continue
+        elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+            prod, raw_port = str(entry[0] or ""), str(entry[1] or "")
+            out_port = raw_port.split(":", 1)[1] if ":" in raw_port else raw_port
+        else:
+            continue
+        if not prod or not out_port or out_port.lower() not in ACTIVATION_INPUT_PORT_NAMES:
+            continue
+        if group_list_producer and prod == group_list_producer and prod not in activation_deps:
+            continue
+        candidates.append(f"{prod}:{out_port}")
+    return candidates
+
+
+def _admitted_activation_first_pass_hit(op, geometry, config: Config, *, die: int) -> float:
+    """First-pass activation L2 hit share confirmed by live ``AdmissionMemoryView``."""
+    view = getattr(geometry, "admission_memory_view", None)
+    if view is None or not hasattr(view, "preview_access"):
+        return 0.0
+    if not l2_write_allocate_enabled(geometry):
+        return 0.0
+    slice_bytes = int(activation_bank_bytes(config))
+    if slice_bytes <= 0:
+        return 0.0
+    candidates = _activation_payload_candidates(op)
+    if not candidates:
+        return 0.0
+    runs = AddressRunPlan((AddressRun(0, 1, slice_bytes, slice_bytes),))
+    best_hit = 0
+    for tensor_name in dict.fromkeys(candidates):
+        fallback_key = ReuseKey(die, tensor_name, 0)
+        key = (
+            view.resolve_reuse_key(fallback_key)
+            if hasattr(view, "resolve_reuse_key") else fallback_key
+        )
+        pattern = MemoryAccessPattern(
+            tensor_name, 0, die, 0, "read", "mte2_aic", slice_bytes, runs, key,
+        )
+        hit_bytes, _ = view.preview_access(pattern, slice_bytes)
+        if hit_bytes > best_hit:
+            best_hit = min(slice_bytes, int(hit_bytes))
+    return float(best_hit) / float(slice_bytes)
+
+
 def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", producer_mode="serial"):
     """[Cohesive-Pipeline] Plan one MXFP4 grouped GEMM operator from validated hardware geometry."""
     config = config_from_op(op)
@@ -180,10 +269,7 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
     # InitMx loads the 256-byte transpose permutation on every AIV, even when
     # that owner receives no expert tile. Scalar group-list caches are unknown.
     l2_die = int(getattr(geometry, "rank", None) or 0)
-    l2_bytes = (
-        int(effective_l2_bytes(geometry))
-        if "l2" in geometry.resource_units else 0
-    )
+    l2_bytes = _resolve_mxfp4_usable_l2(geometry, die=l2_die)
     hbm_bw_tbs, l2_bw_tbs = device_bandwidths_tbs(geometry)
     bw_kwargs = {"hbm_bw_tbs": hbm_bw_tbs, "l2_bw_tbs": l2_bw_tbs}
     # ``N_FIRST_TAIL_RESPLIT`` narrows the 256-column tiling into a 32-owner
@@ -194,11 +280,21 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
     tile_compact = compact and not resplit
     panel_compact = compact_panels and not resplit
     producer = "dynamic_buffer4" if resplit else producer_mode
-    ledger = geometry_ledger(config, cores, tile_compact, directional, l2_bytes, **bw_kwargs)
+    first_pass_hit = (
+        _admitted_activation_first_pass_hit(op, geometry, config, die=l2_die)
+        if int(l2_bytes) > 0 else 0.0
+    )
+    ledger = geometry_ledger(
+        config, cores, tile_compact, directional, int(l2_bytes),
+        first_pass_hit=first_pass_hit, **bw_kwargs,
+    )
     total, inventory, counts, runs = ledger.work, ledger.inventory, ledger.counts, ledger.runs
     # Repeated column passes over one expert's activation rows hit the die's
-    # resident L2; only the first pass streams from off-chip memory.
-    activation_l2 = activation_l2_fraction(config, cores, l2_bytes)
+    # resident L2; only the first pass streams from off-chip memory unless
+    # already admitted in the live AdmissionMemoryView.
+    activation_l2 = activation_l2_fraction(
+        config, cores, l2_bytes, first_pass_hit=first_pass_hit, **bw_kwargs,
+    )
     weight_l2 = weight_l2_fraction(config, cores, l2_bytes, **bw_kwargs)
     owner_signatures = [tuple(tile_runs(config, owner, cores, tile_compact, **bw_kwargs))
                         for owner in range(cores)]
@@ -270,7 +366,7 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             "active_banks": sum(m > 0 for m in config.rows),
             "declared_banks": len(config.rows), "columns": tuple(columns(config, cores, **bw_kwargs)),
             "owner_tiles": counts, "owner_runs": runs,
-            "effective_l2_bytes": l2_bytes,
+            "effective_l2_bytes": int(l2_bytes),
             "activation_l2_fraction": activation_l2,
             "weight_l2_fraction": weight_l2,
             "logical_flops": 2 * sum(config.rows) * config.n * config.k,
