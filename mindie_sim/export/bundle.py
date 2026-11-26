@@ -233,6 +233,7 @@ def compose_export_case(
     runtime_stack: str | Path | Mapping[str, Any] | None = None,
     phase: str | None = None,
     ready_state_source: str = "pre_populated_hbm",
+    exclude_optimizations: Sequence[str] = (),
 ) -> tuple[dict[str, Any], StepRequest]:
     """Compose a 4-mode validated scenario returning ``(case_dict, StepRequest)``."""
     from mindie_sim.compose import compose_case
@@ -311,6 +312,8 @@ def compose_export_case(
         compose_kw["engram_cpu_offload"] = bool(engram_cpu_offload)
     if validated_mode is not None:
         compose_kw["deployment_mode"] = validated_mode
+    if exclude_optimizations:
+        compose_kw["exclude_optimizations"] = tuple(exclude_optimizations)
 
     case_dict = compose_case(model=model, hardware=sku, **compose_kw)
     rt_meta = case_dict.setdefault("runtime", {}).setdefault("metadata", {})
@@ -3560,6 +3563,7 @@ def _build_effective_config_dict(
 ) -> dict[str, Any]:
     p = parsed.runtime.parallel
     meta = dict(parsed.runtime.metadata)
+    add_cfg = meta.get("additional_config") if isinstance(meta.get("additional_config"), Mapping) else {}
     return {
         "hardware_sku": str(parsed.machine.sku or parsed.machine.name),
         "arch_family": resolve_arch_family_tag(parsed),
@@ -3577,9 +3581,17 @@ def _build_effective_config_dict(
         "spec_proposals": int(scen.get("spec_proposals", 0) or 0),
         "multistream_overlap_shared_expert": bool(
             moe_route_summary.get("multistream_overlap_shared_expert")
-            if moe_route_summary else meta.get("multistream_overlap_shared_expert", False)
+            if moe_route_summary
+            else (
+                meta.get("multistream_overlap_shared_expert", False)
+                or bool(getattr(parsed.runtime, "multistream_overlap_shared_expert", False))
+            )
         ),
-        "enable_fused_mc2": int(moe_route_summary.get("enable_fused_mc2", 0) or 0) if moe_route_summary else 0,
+        "enable_fused_mc2": (
+            int(moe_route_summary.get("enable_fused_mc2", 0) or 0)
+            if moe_route_summary
+            else int(add_cfg.get("enable_fused_mc2", 0) or 0)
+        ),
         "moe_route": dict(moe_route_summary) if moe_route_summary else {},
         "stream_core_budget": stream_core_budget_summary,
         "serve_script_supplied": bool(serve_script_supplied),

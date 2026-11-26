@@ -246,12 +246,22 @@ def _bundle_step_and_idle_ns(bundle: ExportBundle) -> tuple[int, int]:
     return step_ns, max(0, step_ns - op_sum_ns)
 
 
+def _row_op_repeats(ops: Sequence[OperatorExportRow], fallback_rep: int) -> tuple[int, ...]:
+    """Match ``xlsx_breakdown``: heterogeneous clusters keep per-op repeats; uniform uses row repeat."""
+    raw = tuple(max(1, int(op.repeat_count)) for op in ops)
+    if len(set(raw)) > 1:
+        return raw
+    rep = max(1, int(fallback_rep)) if fallback_rep else (raw[0] if raw else 1)
+    return (rep,) * len(ops)
+
+
 def _row_exposed_metrics_ns(
     row: AlignedComparisonRow, before_ntok: float, after_ntok: float,
 ) -> tuple[int, int, int, float, float, float, float, float, float]:
-    b_rep, a_rep = row.effective_before_repeat, row.effective_after_repeat
-    b_ns = sum(_op_exposed_ns(b, b_rep) for b in row.before_ops)
-    a_ns = sum(_op_exposed_ns(a, a_rep) for a in row.after_ops)
+    b_reps = _row_op_repeats(row.before_ops, row.effective_before_repeat)
+    a_reps = _row_op_repeats(row.after_ops, row.effective_after_repeat)
+    b_ns = sum(_op_exposed_ns(b, rep) for b, rep in zip(row.before_ops, b_reps))
+    a_ns = sum(_op_exposed_ns(a, rep) for a, rep in zip(row.after_ops, a_reps))
     saved_ns = b_ns - a_ns
     b_ms = float(b_ns) / float(NS_PER_MS)
     a_ms = float(a_ns) / float(NS_PER_MS)
@@ -309,8 +319,9 @@ def _format_formula_eval_receipt(formula_eval: Any) -> str:
 def _after_pre_edit_exposed_ms(row: AlignedComparisonRow) -> float | None:
     if not row.after_ops:
         return None
-    a_rep, vals = row.effective_after_repeat, []
-    for a_op in row.after_ops:
+    a_reps = _row_op_repeats(row.after_ops, row.effective_after_repeat)
+    vals: list[float] = []
+    for a_op, a_rep in zip(row.after_ops, a_reps):
         fe = a_op.formula_eval
         raw = fe.get("after_pre_edit_exposed_us") if isinstance(fe, Mapping) else getattr(fe, "after_pre_edit_exposed_us", None)
         if raw is None:
@@ -485,10 +496,17 @@ def _add_row_to_group(
     b_ms: float, a_ms: float, saved_ms: float, b_upt: float, a_upt: float, saved_upt: float,
     kernel_share_ms: float, kernel_share_upt: float, has_split: bool, is_comparison: bool,
 ) -> None:
-    a_rep, b_rep = row.effective_after_repeat, row.effective_before_repeat
-    rep = a_rep or b_rep or max(1, int(row.repeat_count))
-    lstar_ms = sum(0.0 if a.is_overlapped else (a.l_star_lean_us * a_rep / US_PER_MS) for a in row.after_ops)
-    b_lstar_ms = sum(0.0 if b.is_overlapped else (b.l_star_lean_us * b_rep / US_PER_MS) for b in row.before_ops)
+    a_reps = _row_op_repeats(row.after_ops, row.effective_after_repeat)
+    b_reps = _row_op_repeats(row.before_ops, row.effective_before_repeat)
+    rep = row.effective_after_repeat or row.effective_before_repeat or max(1, int(row.repeat_count))
+    lstar_ms = sum(
+        0.0 if a.is_overlapped else (a.l_star_lean_us * r / US_PER_MS)
+        for a, r in zip(row.after_ops, a_reps)
+    )
+    b_lstar_ms = sum(
+        0.0 if b.is_overlapped else (b.l_star_lean_us * r / US_PER_MS)
+        for b, r in zip(row.before_ops, b_reps)
+    )
     gap_ms = max(0.0, a_ms - lstar_ms)
     gain_ms = saved_ms if is_comparison else gap_ms
     gain_upt = saved_upt if is_comparison else (gap_ms * US_PER_MS / max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS))

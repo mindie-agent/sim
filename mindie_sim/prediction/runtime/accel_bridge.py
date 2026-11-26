@@ -25,6 +25,7 @@ from collections import deque
 import ctypes
 import math
 import os
+import threading
 import weakref
 
 from . import accel_build, accel_cache, accel_loader
@@ -63,6 +64,35 @@ _THRASH_MIN_STEPS_PER_CALL = 8
 _HYBRID_ADOPT_TASK_CAP = 32768
 _HYBRID_PROMOTE_BFS_CAP = 512
 _WINDOW_REARM_STEP_COOLDOWN = 4
+#: Process-local (status, CDLL) memo avoiding per-Engine cross-process lock contention.
+_PROCESS_ATTACH_CACHE: dict[tuple, tuple[dict, object]] = {}
+_PROCESS_ATTACH_LOCK = threading.Lock()
+_DEFAULT_BUILD_ACCEL = accel_build.build_accel
+_DEFAULT_LOAD_LIBRARY = load_library
+_DEFAULT_CDLL = ctypes.CDLL
+_DEFAULT_CACHE_LOCK = accel_cache.cache_lock
+
+
+def _attach_cache_key() -> tuple | None:
+    """Return a process-local memo key when default build/load hooks are unpatched."""
+    if (
+        accel_build.build_accel is not _DEFAULT_BUILD_ACCEL
+        or load_library is not _DEFAULT_LOAD_LIBRARY
+        or ctypes.CDLL is not _DEFAULT_CDLL
+        or accel_cache.cache_lock is not _DEFAULT_CACHE_LOCK
+    ):
+        return None
+    env = os.environ
+    return (
+        str(accel_build.cache_root()),
+        env.get("MINDIE_SIM_CC", ""),
+        env.get("CC", ""),
+        env.get("MINDIE_SIM_CFLAGS", ""),
+        env.get("MINDIE_SIM_ACCEL_FLAGS", ""),
+        env.get("PATH", ""),
+        os.getpid(),
+        accel_build._MEMO_GENERATION,
+    )
 _WINDOW_REARM_MAX_COOLDOWN = 64
 _ACTIVATE_ST_CELLS = 8
 _INITIAL_AUTO_REASONS = frozenset({
@@ -240,32 +270,50 @@ class NativeBackend:
             return False
         reuse_config = False
         if self.arena is None:
-            try:
-                # Keep the cache lock across the hit/build and the in-process
-                # mapping: a concurrent publisher may add a 17th generation
-                # and prune, but it cannot unlink this path before CDLL maps it.
-                with accel_cache.cache_lock(accel_build.cache_root()):
-                    try:
-                        status = accel_build.build_accel()
-                    except TimeoutError:
-                        raise
-                    except (OSError, RuntimeError) as error:
-                        status = {"ok": False,
-                                  "reason": f"build_unavailable:{error}"}
-                    if not status.get("ok"):
-                        self.reason = (status.get("reason")
-                                       or "native_build_unavailable")
+            cache_key = _attach_cache_key()
+            cached_entry = None
+            if cache_key is not None:
+                with _PROCESS_ATTACH_LOCK:
+                    entry = _PROCESS_ATTACH_CACHE.get(cache_key)
+                if entry is not None and entry[0].get("cache_path") in accel_loader._LOADED:
+                    cached_entry = entry
+            if cached_entry is not None:
+                cached_status, cached_lib = cached_entry
+                self.status_dict = dict(cached_status)
+                self.status_dict["cache_hit"] = True
+                self.library = cached_lib
+            else:
+                try:
+                    # Keep the cache lock across the hit/build and the in-process
+                    # mapping: a concurrent publisher may add a 17th generation
+                    # and prune, but it cannot unlink this path before CDLL maps it.
+                    with accel_cache.cache_lock(accel_build.cache_root()):
+                        try:
+                            status = accel_build.build_accel()
+                        except TimeoutError:
+                            raise
+                        except (OSError, RuntimeError) as error:
+                            status = {"ok": False,
+                                      "reason": f"build_unavailable:{error}"}
+                        if not status.get("ok"):
+                            self.reason = (status.get("reason")
+                                           or "native_build_unavailable")
+                            self.status_dict = dict(status)
+                            self.disabled_reason = self.reason
+                            if self.mode == "c":
+                                raise AccelUnavailable(self.reason, status)
+                            return False
                         self.status_dict = dict(status)
-                        self.disabled_reason = self.reason
-                        if self.mode == "c":
-                            raise AccelUnavailable(self.reason, status)
-                        return False
-                    self.status_dict = dict(status)
-                    self.library = load_library(status)
-            except TimeoutError:
-                raise
-            except (AccelUnavailable, OSError, MemoryError, KernelFault) as error:
-                return self._attach_failed(error)
+                        self.library = load_library(status)
+                    if cache_key is not None and status.get("cache_path") in accel_loader._LOADED:
+                        with _PROCESS_ATTACH_LOCK:
+                            if len(_PROCESS_ATTACH_CACHE) >= accel_loader.MAX_LOADED_LIBRARIES:
+                                _PROCESS_ATTACH_CACHE.pop(next(iter(_PROCESS_ATTACH_CACHE)))
+                            _PROCESS_ATTACH_CACHE[cache_key] = (dict(status), self.library)
+                except TimeoutError:
+                    raise
+                except (AccelUnavailable, OSError, MemoryError, KernelFault) as error:
+                    return self._attach_failed(error)
             try:
                 self.arena = Arena(self.library)
                 self._finalizer = weakref.finalize(self, Arena.close, self.arena)

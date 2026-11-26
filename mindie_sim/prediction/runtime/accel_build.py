@@ -71,6 +71,7 @@ _MSVC_FLAGS = ("/nologo", "/std:c11", "/O2", "/fp:precise", "/LD")
 _MSVC_STEM = "cl"
 _STATUS_MEMO: dict[tuple, dict] = {}
 _IDENTITY_MEMO: dict[tuple, str] = {}
+_MEMO_GENERATION = 0
 _MEMO_LOCK = threading.Lock()
 _SUBPROCESS_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 #: Retention and locking live in the small coordinator module; these aliases
@@ -624,6 +625,8 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
 
 def reset_build_memo() -> None:
     """Drop process memoization (tests that change HOME/cache only)."""
+    global _MEMO_GENERATION
     with _MEMO_LOCK:
         _STATUS_MEMO.clear()
         _IDENTITY_MEMO.clear()
+        _MEMO_GENERATION += 1

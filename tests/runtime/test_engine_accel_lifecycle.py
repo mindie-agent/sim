@@ -592,3 +592,37 @@ def test_cold_cache_auto_builds_native_accelerator_and_degrades_without_compiler
                 eng._accel.arena.close()
     accel_build.reset_build_memo()
     accel_loader._LOADED.clear()
+
+
+def test_process_attach_memo_avoids_repeated_cache_lock_across_engines(monkeypatch, tmp_path):
+    """After first native attach in a PID, subsequent Engines reuse the mapped CDLL lock-free."""
+    monkeypatch.setenv("MINDIE_SIM_CC", _compiler())
+    monkeypatch.setenv("MINDIE_CACHE_HOME", str(tmp_path / "cache"))
+    accel_build.reset_build_memo()
+    accel_loader._LOADED.clear()
+    accel_bridge._PROCESS_ATTACH_CACHE.clear()
+
+    first = Engine([Resource("r", 100.0)], backend="c")
+    first.submit("t0", work={"r": 10.0})
+    first.advance()
+    first_lib = first._accel.library
+    assert first._accel.arena is not None
+    first._accel.arena.close()
+
+    # Remove the on-disk .so to prove subsequent attaches never re-stat or re-lock the cache directory.
+    cached_so = Path(first.accel_status()["cache_path"])
+    cached_so.unlink(missing_ok=True)
+
+    for idx in range(5):
+        eng = Engine([Resource("r", 100.0)], backend="c")
+        eng.submit(f"u{idx}", work={"r": 10.0})
+        eng.advance()
+        assert eng._accel.library is first_lib
+        assert eng.accel_status()["cache_hit"] is True
+        eng._accel.arena.close()
+
+    # Resetting the build memo invalidates the process attach memo cleanly.
+    accel_build.reset_build_memo()
+    assert accel_bridge._attach_cache_key() not in accel_bridge._PROCESS_ATTACH_CACHE
+    accel_loader._LOADED.clear()
+
