@@ -442,7 +442,6 @@ class OperatorExportRow:
     framework_action: str = ""
     semantic_atoms: tuple[str, ...] = ()
     comm_domain_tag: str = ""
-    kernel_synthesis_spec: Any = None
     binding_state: str = ""
     is_shipping_abi: bool = False
     stream_core_budget: str = ""
@@ -555,7 +554,6 @@ class NewKernelBacklogItem:
     before_us_per_tok_die: float = 0.0
     after_us_per_tok_die: float = 0.0
     saved_us_per_tok_die: float = 0.0
-    synthesis_spec: Any = None
     math_formula: str = ""
     sram_residency_summary: str = ""
     binding_state: str = ""
@@ -781,7 +779,6 @@ class ExportBundle:
     us_per_tok_die: float = 0.0
     sla_regime: str = "SLA_LATENCY_BOUND"
     sla_slack_ms: float = 0.0
-    kernel_synthesis_specs: tuple[Any, ...] = ()
     semantic_audit_triggers: tuple[Any, ...] = ()
     macro_wall_trigger: Any = None
     rewrite_plan_sha256: str = ""

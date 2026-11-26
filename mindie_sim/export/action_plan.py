@@ -261,13 +261,6 @@ def _row_exposed_metrics_ns(
     return b_ns, a_ns, saved_ns, b_ms, a_ms, saved_ms, b_upt, a_upt, b_upt - a_upt
 
 
-def _row_exposed_metrics(row: AlignedComparisonRow, before_ntok: float, after_ntok: float) -> tuple[float, float, float, float, float, float]:
-    _b_ns, _a_ns, _s_ns, b_ms, a_ms, saved_ms, b_upt, a_upt, saved_upt = _row_exposed_metrics_ns(
-        row, before_ntok, after_ntok,
-    )
-    return b_ms, a_ms, saved_ms, b_upt, a_upt, saved_upt
-
-
 def _extract_clean_equations(raw_eqs: Any) -> list[str]:
     if not isinstance(raw_eqs, (list, tuple)):
         return []
@@ -327,14 +320,9 @@ def _after_pre_edit_exposed_ms(row: AlignedComparisonRow) -> float | None:
 
 
 def _canonical_abi_key(category_tag: str, a_op: OperatorExportRow, arch_tag: str) -> tuple[str, str]:
-    kspec = a_op.kernel_synthesis_spec
-    kernel_name = (str(getattr(kspec, "kernel_name", "") or "").strip() if kspec is not None and category_tag == "new" else "") or (
-        a_op.ascend_kernel or a_op.implementation or a_op.canonical_op_key or a_op.op_id
-    )
-    abi_ext = str(getattr(kspec, "abi_signature_id", "") or "").strip() if kspec is not None else ""
+    kernel_name = a_op.ascend_kernel or a_op.implementation or a_op.canonical_op_key or a_op.op_id
     base_norm = _SLUG_RE.sub("_", kernel_name.lower()).strip("_") or "kernel"
-    ext_norm = _SLUG_RE.sub("_", abi_ext.lower()).strip("_") if abi_ext else ""
-    return f"{category_tag}::{arch_tag}::{base_norm}" + (f"::{ext_norm}" if ext_norm else ""), base_norm[:CARD_SLUG_MAX_LEN].rstrip("_") or "kernel_card"
+    return f"{category_tag}::{arch_tag}::{base_norm}", base_norm[:CARD_SLUG_MAX_LEN].rstrip("_") or "kernel_card"
 
 
 def _assign_deterministic_card_ids(groups: Sequence[Mapping[str, Any]]) -> dict[str, str]:
@@ -378,17 +366,12 @@ def _is_verified_new_fusion(
     fuse_outputs: set[str],
     rewrite_verified: bool = False,
 ) -> bool:
-    """Require real verified FuseRegion receipt, SRAM-verified KernelSynthesisSpec, or N->1 ABI extension."""
+    """Require real verified FuseRegion receipt or N->1 ABI extension."""
     if len(row.after_ops) != 1:
         return False
     a_op = row.after_ops[0]
     if not a_op.needs_new_kernel and a_op.is_shipping_abi:
         return False
-    kspec = a_op.kernel_synthesis_spec
-    if kspec is not None and bool(getattr(kspec, "sram_verified", False)):
-        members = getattr(kspec, "constituent_op_ids", ()) or ()
-        if len(members) >= MIN_FUSION_MEMBERS:
-            return True
     if (
         is_comparison
         and a_op.needs_new_kernel
@@ -509,27 +492,19 @@ def _add_row_to_group(
     gap_ms = max(0.0, a_ms - lstar_ms)
     gain_ms = saved_ms if is_comparison else gap_ms
     gain_upt = saved_upt if is_comparison else (gap_ms * US_PER_MS / max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS))
-    kspec, fe = a_op.kernel_synthesis_spec, a_op.formula_eval
+    fe = a_op.formula_eval
     raw_eqs = (
-        getattr(kspec, "symbolic_equations", ())
-        if kspec is not None
-        else (fe.get("composed_equations") if isinstance(fe, Mapping) else getattr(fe, "composed_equations", ()))
+        (fe.get("composed_equations") if isinstance(fe, Mapping) else getattr(fe, "composed_equations", ()))
         if fe is not None else ()
     )
     math_formula = " ; ".join(_extract_clean_equations(raw_eqs))
-    sram_sum = (
-        sanitize_public_text(kspec.format_formula_block())
-        if kspec is not None else _format_formula_eval_receipt(fe)
-    )
+    sram_sum = _format_formula_eval_receipt(fe)
     occ_tie = (row.archetype_id, a_op.op_id)
     bef_bounds = " / ".join(dict.fromkeys(b.bound_display or b.dominant_bound for b in row.before_ops if b.bound_display or b.dominant_bound)) or (a_op.bound_display or a_op.dominant_bound)
 
     entry = groups.get(key)
     if entry is None:
-        raw_target = (
-            str(getattr(kspec, "kernel_name", "") or "").strip()
-            if kspec is not None and category == PENDING_KIND_TO_IMPLEMENT else ""
-        ) or a_op.ascend_kernel or a_op.implementation
+        raw_target = a_op.ascend_kernel or a_op.implementation
         entry = {
             "kernel_key": key, "stem": stem, "category": category,
             "target_kernel": sanitize_public_text(raw_target),
@@ -548,8 +523,8 @@ def _add_row_to_group(
             "die_summary": sanitize_public_text(after_bundle.hardware_die_summary),
             "core_budget": sanitize_public_text(a_op.stream_core_budget),
             "opt_pillar": a_op.opt_pillar or ("pillar1_fusion" if category == PENDING_KIND_TO_IMPLEMENT else "pillar2_roofline"),
-            "synthesis_spec": kspec, "math_formula": math_formula, "sram_residency_summary": sram_sum,
-            "formula_summary": _format_formula_eval_receipt(fe), "binding_state": a_op.binding_state,
+            "math_formula": math_formula, "sram_residency_summary": sram_sum,
+            "formula_summary": sram_sum, "binding_state": a_op.binding_state,
             "source_row_indices": [], "best_member_rank": (gain_ms, gain_upt), "best_member_occ": occ_tie,
         }
         groups[key] = entry
@@ -593,9 +568,7 @@ def _add_row_to_group(
         entry[name] += delta
     if has_split:
         entry["has_split"] = True
-    if kspec is not None and entry["synthesis_spec"] is None:
-        entry["synthesis_spec"], entry["math_formula"], entry["sram_residency_summary"] = kspec, math_formula, sram_sum
-    elif fe is not None and not entry["formula_summary"]:
+    if fe is not None and not entry["formula_summary"]:
         entry["formula_summary"] = _format_formula_eval_receipt(fe)
         if not entry["sram_residency_summary"]:
             entry["sram_residency_summary"] = entry["formula_summary"]
@@ -628,8 +601,7 @@ def _materialize_card(prio: int, entry: Mapping[str, Any], card_id: str, fw_by_c
         status_txt = f"{status_txt} [实现前置条件 · {'flat' if abs(gain_ms) <= CONSERVATION_EPS_MS else 'regressive'}]".strip()
     fw_receipt = fw_by_card.get(card_id, "")
     if not fw_receipt and is_new:
-        kspec = entry.get("synthesis_spec")
-        n_mem = len(getattr(kspec, "constituent_op_ids", ()) or ()) or len(dict.fromkeys(entry["replaces"]))
+        n_mem = len(dict.fromkeys(entry["replaces"]))
         fw_receipt = f"FuseRegion ({n_mem} ops -> {entry['target_kernel']})"
     accept_receipt = (
         f"Receipt: Before={bef_ms:.3f}ms, After={aft_ms:.3f}ms, Δ={format_signed_gain_text(gain_ms)}, "
@@ -648,7 +620,7 @@ def _materialize_card(prio: int, entry: Mapping[str, Any], card_id: str, fw_by_c
         before_attainment_pct=round(bef_att, 1), target_attainment_pct=round(aft_att, 1),
         opt_pillar=str(entry["opt_pillar"]), before_us_per_tok_die=float(entry["before_upt"]),
         after_us_per_tok_die=float(entry["after_upt"]), saved_us_per_tok_die=gain_upt,
-        synthesis_spec=entry["synthesis_spec"], math_formula=str(entry["math_formula"] or ""),
+        math_formula=str(entry["math_formula"] or ""),
         sram_residency_summary=str(entry["sram_residency_summary"] or ""),
         binding_state=str(entry.get("binding_state") or ""),
         source_row_indices=tuple(sorted(int(i) for i in entry.get("source_row_indices", ()))),

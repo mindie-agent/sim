@@ -57,7 +57,6 @@ QSA_GROUP_KPOOL_RATIO = 4
 _A5_FAMILY_TOKENS = ("a5", "950", "9582", "9581", "9579", "958b", "9599", "3510", "arch35")
 _A3_FAMILY_TOKENS = ("a3", "910c", "910_93", "9392", "9391", "9382", "9362")
 _A2_FAMILY_TOKENS = ("a2", "910b", "310p", "300i")
-_NVIDIA_TOKENS = ("nvidia", "cuda", "h100", "h200", "b200", "gb200", "a100", "hopper", "blackwell")
 
 A2_A3_INT_ONLY_FAMILIES = frozenset({"a2", "a3"})
 A2_A3_ALLOWED_KV_DTYPES = frozenset({"bf16", "fp16", "int8", "c8", "auto", ""})
@@ -70,9 +69,6 @@ _MXFP_SCALE_FORMATS = frozenset({"e8m0", "fp8_e8m0"})
 _FP4_W4A8_EXPERT_FORMATS = frozenset({"mxfp4", "mx_fp4", "fp4", "fp4_e2m1", "int4", "w4a8"})
 _W4A8_EXPERT_FORMATS = frozenset({"int4", "w4a8"})
 _FP8_KV_MODES = frozenset({"fp8", "fp8_e4m3", "mxfp8"})
-
-# Retired model-keyed profile table: kept empty for export compatibility only.
-VA_RECOMMENDED_PROFILES: dict[str, dict[str, Any]] = {}
 
 
 def normalize_hw_family(hw: Hardware | str) -> str:
@@ -99,7 +95,7 @@ def normalize_hw_family(hw: Hardware | str) -> str:
 
 
 def hardware_backend_kind(hardware: Hardware) -> str:
-    """Classify a ``Hardware`` object into ``ascend`` / ``nvidia`` / ``generic``."""
+    """Classify a ``Hardware`` object into ``ascend`` or ``generic``."""
     if normalize_hw_family(hardware) in {"a2", "a3", "a5"}:
         return "ascend"
     probes = " ".join(
@@ -113,8 +109,6 @@ def hardware_backend_kind(hardware: Hardware) -> str:
     ).lower()
     if "ascend" in probes or "npu" in probes or "dav_" in probes:
         return "ascend"
-    if any(tok in probes for tok in _NVIDIA_TOKENS):
-        return "nvidia"
     return "generic"
 
 
@@ -718,7 +712,6 @@ __all__ = [
     "NO_MTP_PROPOSAL_TOKENS",
     "PAIRED_SFA_DOC_BLOCK_SIZE",
     "SINGLE_MTP_PROPOSAL_TOKEN",
-    "VA_RECOMMENDED_PROFILES",
     "VLLM_ASCEND_REPO",
     "VLLM_ASCEND_STACK_ID",
     "ManifestBinding",

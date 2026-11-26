@@ -36,7 +36,6 @@ from .models import (
     AGENT_BRIEF_SCHEMA,
     BINDING_STATE_BOUND,
     GIB_BYTES,
-    KIB_BYTES,
     MACRO_L1_HIERARCHY,
     MODE_MODELING,
     PENDING_KIND_TO_IMPLEMENT,
@@ -67,9 +66,8 @@ from .public_view import (
 BRIEF_MAX_KERNEL_TASKS = 5
 #: Maximum number of framework/config tasks embedded inside ``agent_brief.json``.
 BRIEF_MAX_FRAMEWORK_TASKS = 3
-#: Maximum number of synthesis specs, co-design opportunities & audit triggers embedded.
+#: Maximum number of co-design opportunities & audit triggers embedded.
 BRIEF_MAX_TRIGGERS = 4
-BRIEF_MAX_SPECS = 4
 BRIEF_MAX_CODESIGN_OPPS = 4
 BRIEF_MAX_CAPTURE_SIZES = 8
 #: Maximum character lengths for compact string fields inside ``agent_brief.json``.
@@ -77,7 +75,6 @@ BRIEF_TEXT_LIMIT = 72
 BRIEF_TITLE_LIMIT = 44
 BRIEF_KERNEL_LIMIT = 40
 BRIEF_SUMMARY_LIMIT = 60
-BRIEF_MATH_LIMIT = 88
 BRIEF_CMD_LIMIT = 92
 BRIEF_CODESIGN_LIMIT = 140
 BRIEF_MAX_BLOCKED_OPS = 4
@@ -206,7 +203,7 @@ def _compact_agent_brief_to_budget(brief: dict[str, Any]) -> dict[str, Any]:
     if _brief_utf8_len(brief) < AGENT_BRIEF_MAX_BYTES:
         return brief
     trimmed = dict(brief)
-    for key in ("codesign_opportunities", "kernel_synthesis_specs", "semantic_audit_triggers"):
+    for key in ("codesign_opportunities", "semantic_audit_triggers"):
         val = trimmed.get(key)
         if isinstance(val, list) and len(val) > 2 and _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
             trimmed[key] = val[:2]
@@ -222,7 +219,7 @@ def _compact_agent_brief_to_budget(brief: dict[str, Any]) -> dict[str, Any]:
             for grp in trimmed.get("module_hierarchy", ())
         ]
     if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
-        for key in ("codesign_opportunities", "kernel_synthesis_specs", "semantic_audit_triggers"):
+        for key in ("codesign_opportunities", "semantic_audit_triggers"):
             val = trimmed.get(key)
             if isinstance(val, list) and len(val) > 1:
                 trimmed[key] = val[:1]
@@ -233,7 +230,7 @@ def _compact_agent_brief_to_budget(brief: dict[str, Any]) -> dict[str, Any]:
         sc.pop("recommended_checkpoint", None)
         trimmed["scenario_and_parallelism"] = sc
     for drop_key in (
-        "codesign_opportunities", "va_serving_rules", "kernel_synthesis_specs",
+        "codesign_opportunities", "va_serving_rules",
         "semantic_audit_triggers", "macro_wall_trigger", "generated_files",
     ):
         if _brief_utf8_len(trimmed) < AGENT_BRIEF_MAX_BYTES:
@@ -456,23 +453,6 @@ def build_agent_brief(
     )
     b_kpi, a_kpi = _bundle_kpi_dict(before_bundle), _bundle_kpi_dict(after)
     speedup = round(b_kpi["step_ms"] / a_kpi["step_ms"], 2) if a_kpi["step_ms"] > 0.0 else 1.0
-    synth_brief = [
-        {
-            "kernel": sanitize_public_text(sp.kernel_name),
-            "tier": sanitize_public_text(sp.abi_tier),
-            "sram_ok": bool(sp.sram_verified),
-            "ub_kb": f"{sp.ub_peak_bytes / KIB_BYTES:.1f}/{sp.ub_budget_bytes / KIB_BYTES:.1f}",
-            "math": _trim_text(
-                " ; ".join(
-                    sanitize_public_text(eq)
-                    for eq in (sp.symbolic_equations or ())
-                    if isinstance(eq, str)
-                ),
-                BRIEF_MATH_LIMIT,
-            ),
-        }
-        for sp in list(after.kernel_synthesis_specs)[:BRIEF_MAX_SPECS]
-    ]
     trig_brief = [
         {
             "id": sanitize_public_text(tr.trigger_id),
@@ -510,7 +490,6 @@ def build_agent_brief(
             "parallelism_codesign_note": _trim_text(codesign, BRIEF_CODESIGN_LIMIT),
         },
         "codesign_opportunities": codesign_opps,
-        "kernel_synthesis_specs": synth_brief,
         "semantic_audit_triggers": trig_brief,
         "macro_wall_trigger": _factual_wall_summary(after),
         "va_serving_rules": _factual_serving_facts(after),

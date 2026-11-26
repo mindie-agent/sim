@@ -106,13 +106,6 @@ _DECLARED_CHANNEL_SCOPES: Mapping[str, str] = {
 _PORT_SEMANTICS = {"per_port", "fully_connected", "mesh"}
 
 
-def _link_text(link) -> str:
-    """Retired substring scope-guessing helper kept only for package re-export compatibility."""
-    raise ModelingError(
-        f"link_text_retired_use_explicit_scope:{getattr(link, 'name', '')}"
-    )
-
-
 def _is_cross_node_link(link, channel_decl: Mapping | None = None) -> bool:
     """True iff the link's explicit declared fabric scope is ``cross_node``."""
     return _link_scope(link, channel_decl) == "cross_node"
@@ -1179,7 +1172,6 @@ __all__ = [
     "_declared_peer_traffic",
     "_is_cross_node_link",
     "_link_scope",
-    "_link_text",
     "_peer_declared_volume",
     "_peer_totals_match",
     "_transport_ready",

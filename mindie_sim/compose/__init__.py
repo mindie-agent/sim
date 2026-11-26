@@ -99,7 +99,6 @@ from mindie_sim.schema.stack import STACK_TRACKS, StackTrack
 from mindie_sim.schema.workload import SpeculativeWorkloadPolicy
 from mindie_sim.stacks.registry import resolve_stack_for_scenario
 from mindie_sim.stacks.vllm_ascend.profiles import (
-    VA_RECOMMENDED_PROFILES,
     shipping_collective_policy,
     simulation_config,
 )
@@ -2510,7 +2509,6 @@ def compose_case(
 __all__ = [
     "HARDWARE_ALIASES",
     "HARDWARE_TOPOLOGY_ALIASES",
-    "VA_RECOMMENDED_PROFILES",
     "apply_va_recommended",
     "capture_keys",
     "compose_case",
