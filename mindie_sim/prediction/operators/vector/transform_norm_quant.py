@@ -257,6 +257,7 @@ def _capture_state(op, partition):
 
 
 def norm_quant(ops, _, *, consumers=None, external_output="eliminate", capture_state=None):
+    """[Cohesive-Pipeline] Lower one RMSNorm + dynamic/static quantization vector pipeline."""
     if external_output not in _NORM_QUANT_EXTERNAL_MODES:
         raise ModelingError("norm_quant_external_output_mode_unknown")
     by_id, users = {op.op_id: op for op in ops}, _users(ops)

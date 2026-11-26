@@ -742,6 +742,7 @@ class _PrefillProgram:
         self.spec = spec
 
     def start(self, engine, name, ready, *, owner=""):
+        """[Cohesive-Pipeline] Launch non-FD prefill attention tile waves on the engine."""
         from dataclasses import replace
 
         from mindie_sim.prediction.operators.attention.attention_prefill import (

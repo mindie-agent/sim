@@ -383,7 +383,7 @@ def attribute_stream0_intervals(
     grants: Sequence[ObservedServiceGrant] = (),
     causal_preds: Mapping[str, Sequence[str]] | None = None,
 ) -> StreamExposureResult:
-    """Assign every half-open ``[t0, t1)`` slice once via O((N+G) log(N+G)) sweep-line.
+    """[Cohesive-Pipeline] Assign every half-open ``[t0, t1)`` slice once via O((N+G) log(N+G)) sweep-line.
 
     Clipped grants scale ``delivered`` proportionally via exact ``Fraction(delivered) / orig_span``,
     and contested slices accumulate exact rational exposure before one final Hamilton rounding

@@ -319,7 +319,7 @@ def lower_conv_stage(
     actual: int,
     pcp_rank: int | None = None,
 ) -> str:
-    """Lower PCP-segmented or mixed (decode+prefill) causal convolution."""
+    """[Cohesive-Pipeline] Lower PCP-segmented or mixed (decode+prefill) causal convolution."""
     b = builder
     # Upstream vllm_ascend/ops/gdn.py:572-610 gathers the pre-convolution
     # [n_prefill, conv_kernel - 1, width] input tail once across all PCP peers

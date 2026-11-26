@@ -313,7 +313,7 @@ def state_records(*, targets, lengths, contexts=None, acceptance=None,
 def prefill_records(*, targets, lengths, contexts=None, chunk=PREFILL_DEFAULT_CHUNK_TOKENS, heads=1,
                     dk=PREFILL_DEFAULT_KEY_DIM, dv=PREFILL_DEFAULT_VALUE_DIM, state_dtype="fp32", op_id="kda_fwd_h",
                     layout_producer=None, layout_outputs=None):
-    """Per-head FWD_H stores, internal reads and the public layout publication.
+    """[Cohesive-Pipeline] Per-head FWD_H stores, internal reads and the public layout publication.
 
     The internal FP32 state is per ``(sequence, head)``.  The initialize stage
     reads the actual public ``[V,K]`` subview and writes the first internal

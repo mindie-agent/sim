@@ -196,6 +196,7 @@ class DirectPeerGroup(PairwiseGroup):
         self, engine, name, initial, owner, index, destination_index, payload,
         release_chunk, finish_message,
     ):
+        """[Cohesive-Pipeline] Schedule one direct-peer collective chunk transfer across link resources."""
         source, destination = self.ranks[index], self.ranks[destination_index]
         prefix = f"{name}:rank{source}:peer{destination}"
         capacity = self.receive_capacity_bytes_per_peer

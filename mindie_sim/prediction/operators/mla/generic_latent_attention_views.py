@@ -356,7 +356,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                             shard, prefix, padded_tokens, runtime=None,
                             score_rows=None, l2_bytes=None, machine=None,
                             cp_interleave_size=None):
-    """Declare the indexer score/TopK pair with local sharded row accounting."""
+    """[Cohesive-Pipeline] Declare the indexer score/TopK pair with local sharded row accounting."""
     valid = sum(view.q_len for view in views)
     cand_window = (
         plan.candidate_topk_blocks * plan.candidate_block_size

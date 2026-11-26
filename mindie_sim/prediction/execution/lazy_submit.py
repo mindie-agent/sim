@@ -61,6 +61,7 @@ class _LazyFrontier:
         self, execution, replica, *, scope, schedule, prepared, input_ready,
         physical_ops, prefix, external_inputs, memory_bindings, verified_dag,
     ):
+        """[Cohesive-Pipeline] Initialize bounded lazy-frontier scheduler state and dependency tables."""
         engine = execution.engine
         if execution.offload_policy is not None:
             raise ModelingError("lazy_frontier_requires_no_offload_policy")

@@ -448,6 +448,7 @@ def _declare_gdn_chunk_group(
 def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
           chunk, gate_values=None, qkv_values=None, pcp=1, pcp_rank=None,
           state_slot_indices=None, state_capacity=None, state_slot_source="", **_):
+    """[Cohesive-Pipeline] Build the chunked GDN prefill core computation stages."""
     b = builder
     tokens = sum(view.q_len for view in views)
     dtype = b.model.activation_dtype
@@ -1012,6 +1013,7 @@ def _lower_mixed_decode_branch(
 
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
           padded_tokens, policy, runtime, physical_rank=None):
+    """[Cohesive-Pipeline] Lower one chunked GDN prefill operator into engine phases."""
     if plan.recurrent_state_dtype != "fp32":
         raise ValueError("gdn_prefill_arch35_state_precision_branch_not_implemented:"
                          + plan.recurrent_state_dtype)

@@ -225,7 +225,7 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
                     latencies, node_ranks, peer_weights, rank, peer_classes,
                     resource_names, payload_frames, payload_basis,
                     payload_local_frames, exact_payload, rank_nodes=()):
-    """Build the real native phase program without running a private Engine.
+    """[Cohesive-Pipeline] Build the real native phase program without running a private Engine.
 
     ``raw_items`` is the complete phase contract: source and received
     assignments are already the declared active row ledger, not re-derived

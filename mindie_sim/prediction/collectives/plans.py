@@ -280,7 +280,7 @@ class _TopologyPlansMixin:
                    receive_capacity_bytes_per_peer=None,
                    receive_buffer_id=None,
                    max_physical_chunks=DEFAULT_MAX_PHYSICAL_CHUNKS, transport=None):
-        """Bind complete cross-DP cohorts without inferring a runtime algorithm."""
+        """[Cohesive-Pipeline] Bind complete cross-DP cohorts without inferring a runtime algorithm."""
         if transport is not None:
             options = TransportOptions.from_mapping(transport)
             if (chunk_bytes is not None or receive_capacity_bytes_per_peer is not None

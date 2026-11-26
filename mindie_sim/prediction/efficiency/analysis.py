@@ -815,7 +815,7 @@ def analyze_network_efficiency(
     evaluation_context: Any | None = None, _retain_graph: bool = False,
     timeline_replicas: Any = None,
 ) -> dict[str, Any]:
-    """Compute whole-network 4D MFU/MBU/CV efficiency and bottleneck breakdowns."""
+    """[Cohesive-Pipeline] Compute whole-network 4D MFU/MBU/CV efficiency and bottleneck breakdowns."""
     parsed = parse_case(case)
     scope = resolve_efficiency_scope(parsed, scope)
     _validate_geometry(phase, tokens, context, sequences, scope)

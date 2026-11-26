@@ -223,6 +223,7 @@ def _flash_norm_exchange(lower, name, core, subblocks, head, query_head, row, ta
 
 
 def _lower_flash(lower, p, ready):
+    """[Cohesive-Pipeline] Lower one FlashAttention DSL template into engine stages."""
     plan, spec = lower.plan, lower.spec
     d = KDA_HEAD_DIM
     state_bytes = d * d * FP32_BYTES
@@ -898,6 +899,7 @@ def _qsli_gather_tile(lower, p, n, tile_idx, total_blocks, block_ids, page_table
 
 
 def _lower_qsli(lower, p, ready):
+    """[Cohesive-Pipeline] Lower one Quantized Sparse Lightning Indexer DSL template into stages."""
     spec = lower.spec
     workspace = qsli_workspace_sizes(p, spec.aic_budget)
     meta = lower.access("qsli:metadata_load", "qsli:metadata", QSLI_METADATA_BYTES, after=(ready,), private=True)

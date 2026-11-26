@@ -648,6 +648,7 @@ def _swat_ledger(
 
 
 def build(op, geometry):
+    """[Cohesive-Pipeline] Plan one shared W4A8 matrix operator from validated hardware geometry."""
     _config, (m, n, k) = config_from_op(op)
     cores, aivs = geometry.compute_units, geometry.resource_units.get("vector", 0)
     if aivs != cores * 2:

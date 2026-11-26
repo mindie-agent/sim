@@ -97,6 +97,7 @@ def recipes(kernels):
 
 
 def lower(ops, runtime, source_dtype):
+    """[Cohesive-Pipeline] Lower one HCCL collective op into its physical phase DAG."""
     bindings = runtime.kernels.get('hccl',{})
     analytic = runtime.kernels.get('analytic_hierarchy', {})
     observed_any = any(dict(op.metadata).get('hccl_observed_call') for op in ops)

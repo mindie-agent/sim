@@ -138,6 +138,7 @@ def _append_norm_rope_rotary(
 
 
 def _norm_rope_contract(op, meta, dtype, returns):
+    """[Cohesive-Pipeline] Build the diffusion norm + RoPE operator contract."""
     q_shape = _as_shape(meta.get("query_shape", meta.get("q_shape", _shape(op))),
                         "query")
     k_shape = _as_shape(meta.get("key_shape", q_shape), "key")

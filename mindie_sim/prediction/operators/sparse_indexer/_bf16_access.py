@@ -158,7 +158,7 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
                      l1_capacity, l2_capacity, owner, identity_prefix,
                      gm_capacity=None, exchange_grant=None,
                      score_row_limit=None, span_keys=None):
-    """Resolve one joint plan for Q/K, scores, lists, exchange and output.
+    """[Cohesive-Pipeline] Resolve one joint plan for Q/K, scores, lists, exchange and output.
 
     The plan owns Q tile residency, K panel residency and the causal panel
     order.  It produces logical, GM->L1, L1->L0 and HBM bytes; the executable

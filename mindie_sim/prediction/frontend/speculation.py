@@ -1438,7 +1438,7 @@ def _lower_ar_draft_steps(
     contract: _draft_spec_mod.SpeculativeExecutionContract | None = None,
     physical_rank=None,
 ):
-    """Lower serial MTP/EAGLE/EAGLE3 draft steps (including prefill bootstrap and multi-module MTP)."""
+    """[Cohesive-Pipeline] Lower serial MTP/EAGLE/EAGLE3 draft steps (including prefill bootstrap and multi-module MTP)."""
     meta = dict(getattr(runtime, "metadata", ()) or ())
     if prefill:
         steps = 1

@@ -1028,6 +1028,7 @@ def _recipe_from_bundle(bundle, collective=None, *, world_size=None,
                         allow_unspecified_fallback=False,
                         require_complete_call=False, production=False,
                         **lookup_kwargs):
+    """[Cohesive-Pipeline] Build one communication physical recipe from a validated observation bundle."""
     if production:
         raise ModelingError("measured_call_recipe_is_diagnostic_only")
     parsed_case = (

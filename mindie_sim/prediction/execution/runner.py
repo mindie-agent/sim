@@ -1475,6 +1475,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
     def add(self, work: IterationWork, replica: int, release_ms: float, *,
             external_inputs=None, emitted_tokens=None,
             memory_bindings=None, state_accesses=None) -> ScheduledIteration:
+        """[Cohesive-Pipeline] Validate and register one scheduled task graph into the Execution runner."""
         work = self._prepare_iteration_work(work, replica)
         engine = self.engine
         prefix = f"{self.namespace}r{replica}:i{work.plan.iteration}"

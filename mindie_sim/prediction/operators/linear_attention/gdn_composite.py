@@ -361,7 +361,7 @@ def _lower_triton_pcp_prepare(
     all_lengths, tokens, all_ranges, segment_lengths, heads, key_heads,
     dk, dv, dtype, pcp, native_requests,
 ):
-    """Lower ONE varlen batched Triton prepare sequence for PCP > 1 (chunk.py:53-155)."""
+    """[Cohesive-Pipeline] Lower ONE varlen batched Triton prepare sequence for PCP > 1 (chunk.py:53-155)."""
     req_override = tuple(native_requests) if native_requests is not None else b.common["requests"]
     elem_bytes = int(dtype_bytes(dtype))
     beta_bytes = int(dtype_bytes(beta.dtype))
@@ -547,7 +547,7 @@ def prefill(*, builder, tensors, q, k, v, gate, beta, lengths, heads,
             key_heads, dk, dv, chunk, initial_state_dependency=None,
             external=None, native_requests=None, state_contract=None,
             state_effects=(), state_segments=None, pcp=1):
-    """Append one native prefill call to ``builder``.
+    """[Cohesive-Pipeline] Append one native prefill call to ``builder``.
 
     ``external`` maps logical input names to caller-owned source labels. Those
     inputs have no producer operator in this call, so their materializations

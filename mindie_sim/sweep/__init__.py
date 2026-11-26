@@ -282,7 +282,7 @@ def sweep_topologies_iter(
     _finalist_sink: list | None = None,
     _raw_case: CaseSpec | Mapping[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Stream deterministic candidate rows, optionally checkpointing each row."""
+    """[Cohesive-Pipeline] Stream deterministic candidate rows, optionally checkpointing each row."""
     output_jsonl = _checkpoint_path(output_jsonl, checkpoint_jsonl)
     if lock_program and not lock_parallel:
         raise ModelingError(LOCKED_PROGRAM_ERROR)

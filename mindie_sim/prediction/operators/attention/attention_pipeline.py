@@ -386,6 +386,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                       contribution: _Contribution, core: int, *,
                       peer_counts: tuple[int, ...] | None = None,
                       periodic_specs: list[PeriodicPipelineSpec] | None = None) -> KernelProgram:
+    """[Cohesive-Pipeline] Assemble the streaming attention producer tile program."""
     _query, context_len = spec.requests[output.request]
     dim = spec.head_dim
     v_dim = getattr(spec, "v_head_dim", dim)
@@ -652,6 +653,7 @@ def _decode_tile_stages(
     valid, pairs, active_rows, slot, context, core, spec, cache, rows, dim, max_tile, read,
     write, operand, vector_copy_in, handoff: FixpipeHandoffPolicy = FixpipeHandoffPolicy(),
 ):
+    """[Cohesive-Pipeline] Build paired AIC/AIV decode attention tile stages for one KV slice."""
     copy_in = (read,)
     copy_out = (write,) if write else ()
     operand_role = (operand,) if operand else ()

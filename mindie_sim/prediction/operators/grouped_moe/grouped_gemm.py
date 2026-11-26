@@ -749,6 +749,7 @@ def _allocation(context, pool: str, sizes: Mapping[str, float], core: int):
 
 
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
+    """[Cohesive-Pipeline] Plan one grouped GEMM operator from validated geometry and ABI."""
     meta = dict(op.metadata)
     dispatch = dict(meta.get("dispatch", {}))
     if dispatch.get("implementation") != _IMPLEMENTATION:

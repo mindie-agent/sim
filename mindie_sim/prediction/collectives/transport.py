@@ -500,7 +500,7 @@ class TransportPlan:
 
     def start(self, engine, name, ready_by_rank, *, release_events=None,
               owner="", start_ms=None):
-        """Submit physical chunks with per-ready admission and Engine credits."""
+        """[Cohesive-Pipeline] Submit physical chunks with per-ready admission and Engine credits."""
         required = self.ranks
         initial = _transport_ready(required, ready_by_rank)
         releases = {}

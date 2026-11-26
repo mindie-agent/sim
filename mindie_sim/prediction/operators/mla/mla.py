@@ -2184,6 +2184,7 @@ def _project_mla_output(
     parallel, model, dsa_prefill, *, views=(), runtime=None,
     has_unabsorbed_prefill=False, unabsorbed_outputs=(),
 ):
+    """[Cohesive-Pipeline] Lower MLA output projection (wo_a/wo_b or O-proj) with TP/OTP sharding."""
     heads = logical_heads
     unabsorbed_set = set(unabsorbed_outputs)
     unabsorbed_list = [op_id for op_id in outputs if op_id in unabsorbed_set]

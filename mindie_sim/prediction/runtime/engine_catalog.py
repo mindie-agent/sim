@@ -822,7 +822,7 @@ class _EngineCatalogMixin:
 
     def _submit_finite_catalog(self, catalog, finite, binding, *, name, owner,
                                device_root, cursor, stage_events):
-        """Materialize one bounded live window of a repeated class catalog.
+        """[Cohesive-Pipeline] Materialize one bounded live window of a repeated class catalog.
 
         At most ``finite.slots`` panels carry tasks at any time. Each retired
         panel issues the next absolute index, so the live frontier is

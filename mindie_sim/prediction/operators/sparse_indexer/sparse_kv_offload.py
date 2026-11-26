@@ -210,7 +210,7 @@ def sparse_kv_offload_memory_budget(
     workload: Any = None,
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Derive NPU HBM vs. MemFabric Host DRAM capacity and static buffer budgets."""
+    """[Cohesive-Pipeline] Derive NPU HBM vs. MemFabric Host DRAM capacity and static buffer budgets."""
     opts = _resolve_options(options)
     mla_layers = tuple(
         p for p in model.layer_plans
@@ -1115,7 +1115,7 @@ def lower_decode_offload(
     slot_residency_by_request: Mapping[str, tuple[int, int]] | None = None,
     fuse_copy_sfa_attention: bool = False,
 ) -> tuple[str, str | None, dict[str, Any]]:
-    """Lower Decode Sparse KV Offload (TP0-only D2H writeback + LIM + H2D miss copy)."""
+    """[Cohesive-Pipeline] Lower Decode Sparse KV Offload (TP0-only D2H writeback + LIM + H2D miss copy)."""
     opts = budget["options"]
     valid_tokens = sum(v.q_len for v in views)
     kv_row_bytes = int((budget.get("kv_row_bytes_by_layer") or {}).get(plan.index, budget["kv_row_bytes"]))

@@ -432,6 +432,7 @@ class ExpectedGroupedMatmul:
         ), branch_slots
 
     def lower(self, context):
+        """[Cohesive-Pipeline] Lower expected-value grouped MoE matmul onto tile phases."""
         from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
         from mindie_sim.prediction.program.stages import KernelProgram, Stage
 

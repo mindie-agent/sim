@@ -1006,6 +1006,7 @@ def _visible_pairs(query_tokens: int, key_tokens: int, *, causal: bool, top_left
 
 
 def _attention_geometry(arguments, attrs):
+    """[Cohesive-Pipeline] Compute unified attention tensor and KV geometry for one layer call."""
     raw_layout = attrs.get("input_layout", arguments.get("input_layout"))
     layout = None
     if raw_layout is not None:

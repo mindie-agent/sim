@@ -292,6 +292,7 @@ def _build_injected_base(
     runtime_quant_plan: RuntimeQuantPlan | None,
     stack_lowering_plan: StackLoweringPlan,
 ) -> ResolvedBase:
+    """[Cohesive-Pipeline] Assemble the injected baseline spine workload and operator binding map."""
     from mindie_sim.prediction.implementation_selection import (
         ALLOWED_BINDING_ORIGINS,
         RECIPE_BINDING_ORIGINS_KEY,

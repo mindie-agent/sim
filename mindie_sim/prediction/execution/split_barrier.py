@@ -192,7 +192,7 @@ class EagerSplitBarrier:
         independent_device_events: Iterable[Event] = (),
         owner: str = "",
     ) -> SplitBarrierResult:
-        """Submit the Prefill Eager split-size D2H pipeline onto ``engine``."""
+        """[Cohesive-Pipeline] Submit the Prefill Eager split-size D2H pipeline onto ``engine``."""
         d2h_name, pageable_name, host_name, vec_name = cls.ensure_resources(
             engine, machine, die,
             pinned=spec.pinned,

@@ -159,6 +159,7 @@ def config_from_op(op):
 
 
 def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", producer_mode="serial"):
+    """[Cohesive-Pipeline] Plan one MXFP4 grouped GEMM operator from validated hardware geometry."""
     config = config_from_op(op)
     if producer_mode not in ("serial", "dynamic_buffer4"):
         raise ModelingError("mxa8w4_unknown_producer_mode")

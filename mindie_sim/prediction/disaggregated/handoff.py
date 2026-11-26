@@ -1844,7 +1844,7 @@ def compute_pd_handoff_plan(
     connector_kind: str = "auto",
     strict_connector: bool = False,
 ) -> dict:
-    """Compute exact integer shard-aware PD KV/Indexer/State/Draft handoff plan."""
+    """[Cohesive-Pipeline] Compute exact integer shard-aware PD KV/Indexer/State/Draft handoff plan."""
     from ..capacity import Memory
     from ..structure import parse_case
 

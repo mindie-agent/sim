@@ -1208,7 +1208,7 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
                    k_align: int | None = None,
                    nd_fixpipe_1_2: bool | None = None,
                    arch35_streamk: bool | None = None) -> KernelProgram:
-    """Lower an underfilled output grid (or Arch35 DP+SK tail wave) onto tasks."""
+    """[Cohesive-Pipeline] Lower an underfilled output grid (or Arch35 DP+SK tail wave) onto tasks."""
     count = max(1, int(split_count))
     names = context.resource_names
     hbm, vector, mte3 = names.get("hbm"), names.get("vector"), names.get("mte3")

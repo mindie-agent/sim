@@ -597,6 +597,7 @@ class _StreamingCatlassProgram:
         )
 
     def start(self, engine, name: str, ready, *, owner: str = ""):
+        """[Cohesive-Pipeline] Launch streaming Catlass tile waves with bounded residency tracking."""
         from .catlass_lower import _MatrixLowerer
 
         bus = self.hbm_bus
