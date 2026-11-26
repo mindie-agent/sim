@@ -61,7 +61,7 @@ from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunP
 from mindie_sim.primitives.loader import load_primitives
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
-from tools._fleet_400k_reconcile import (
+from mindie_sim.observations.campaign_reconcile import (
     ABS_FLOOR_NS, DIGEST_PREFIX_LEN, L1_CLIFF_ABS_FLOOR_NS, L1_CLIFF_REL_TOL,
     L1_MEDIAN_APE_MAX_PCT, L1_P90_APE_MAX_PCT, NS_PER_US, PCT_SCALE, REL_TOL,
     apply_sku_observed_clock, dcp_reference_verified, extract_observed_clock_mhz,

@@ -588,6 +588,15 @@ owns = ["mindie_sim/cohort_accuracy.py", "mindie_sim/compose/__init__.py", "mind
 path = "observations/test_model_scoreboards.py"
 tier = "tier0"
 owns = ["mindie_sim/coverage", "mindie_sim/observations/scoreboard.py"]
+[[module]]
+path = "observations/test_campaign_reconciliation.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/schema/bench_matrix.py",
+  "mindie_sim/observations/bench_packets.py",
+  "mindie_sim/observations/campaign_reconcile.py",
+  "mindie_sim/observations/comparison.py",
+]
 # ---------------------------------------------------------------- product
 [[module]]
 path = "product/test_sdk_and_cli.py"

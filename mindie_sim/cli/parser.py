@@ -45,7 +45,7 @@ CLI_HELP_DESCRIPTION = (
     "       quickstart    <45-line golden commands, QuaRot quant defaults & 3-step Agent loop\n"
     "       catalog       List built-in models, hardware SKUs (--hardware), presets (--presets) & quant (--quant)\n"
     "  2. Calibration & Hardware Onboarding (实测对账与接入):\n"
-    "       onboard-sku / onboard-operator / observations / accuracy / validate / obs scoreboard|subgraph-parity / calibrate / bind-profiler / fit-rate / fit-service\n"
+    "       onboard-sku / onboard-operator / observations / accuracy / validate / obs scoreboard|subgraph-parity|bench-packets|reconcile-campaign|diff-campaigns / calibrate / bind-profiler / fit-rate / fit-service\n"
     "  3. Specialized Solvers & Analysis (专项寻优与对比):\n"
     "       sweep / sla / efficiency / feature-tracks / compare skus|study|cohorts / optimize\n"
     "  4. Low-Level Primitives & Diagnostics (底层原语与调试):\n"
@@ -80,6 +80,7 @@ _BOOLEAN_FLAGS = frozenset({
 DELEGATED_COMMANDS = frozenset({
     "structure", "compare-cohorts", "extensions", "profile",
     "scoreboard", "subgraph-parity",
+    "bench-packets", "reconcile-campaign", "diff-campaigns",
 })
 
 
@@ -166,6 +167,9 @@ def resolve_route(argv: Sequence[str], /) -> tuple[CliRoute, tuple[str, ...]]:
             "index": "observations", "rows": "profiler-rows",
             "validate": "validate", "accuracy": "accuracy",
             "scoreboard": "scoreboard", "subgraph-parity": "subgraph-parity",
+            "bench-packets": "bench-packets",
+            "reconcile-campaign": "reconcile-campaign",
+            "diff-campaigns": "diff-campaigns",
         }
         if sub in obs_map:
             return CliRoute(("obs", sub), obs_map[sub]), after
@@ -371,6 +375,12 @@ def _add_eval_and_obs_parsers(sub) -> None:
     scoreboard.add_argument("arguments", nargs=argparse.REMAINDER)
     subgraph_parity = sub.add_parser("subgraph-parity", help="verify causal 3-layer Ascend NPU subgraph parity", add_help=False)
     subgraph_parity.add_argument("arguments", nargs=argparse.REMAINDER)
+    bench_packets = sub.add_parser("bench-packets", help="compile profiler observation JSONL into fit/calibrate/accuracy packets", add_help=False)
+    bench_packets.add_argument("arguments", nargs=argparse.REMAINDER)
+    reconcile_camp = sub.add_parser("reconcile-campaign", help="fail-closed reconciliation of a mindie-bench-campaign/1 manifest", add_help=False)
+    reconcile_camp.add_argument("arguments", nargs=argparse.REMAINDER)
+    diff_camp = sub.add_parser("diff-campaigns", help="cross-version diff between two mindie-bench-campaign/1 manifests", add_help=False)
+    diff_camp.add_argument("arguments", nargs=argparse.REMAINDER)
 
     observations = sub.add_parser("observations")
     observations.add_argument("index")
