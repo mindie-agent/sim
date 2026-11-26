@@ -298,7 +298,7 @@ def test_selected_allocation_preconditions_and_release_wait():
     assert result["status"] == "modeled"
     assert "selected:needs_release" in waiting.selected_items[(0, 0)]
     waiting2 = Memory(parsed)
-    hold = grant_bytes_for_headroom(waiting2, 4096.0)
+    hold = int(grant_bytes_for_headroom(waiting2, 4096.0))
     executable = serving_execution(parsed, waiting2, include_io=True)
     release = executable.engine.submit(
         "release_hold", {}, latency=5,
@@ -316,10 +316,10 @@ def test_selected_allocation_permanent_refusal_issues_zero_model_work():
     raw = case(prompt=1, output=1)
     parsed = parse_case(raw)
     memory = Memory(parsed)
-    hold = grant_bytes_for_headroom(memory, 4096.0)
+    hold = int(grant_bytes_for_headroom(memory, 4096.0))
     executable = serving_execution(parsed, memory, include_io=True)
     release = executable.engine.submit("release_part", {}, latency=5)
-    first = min(2048.0, hold)
+    first = min(2048, hold)
     assert memory.grant_batch(0, [{"name": "hold_a", "bytes": first, "event": release}])
     if hold > first:
         assert memory.grant_batch(0, [{"name": "hold_b", "bytes": hold - first}])
@@ -478,7 +478,7 @@ def test_release_wakeup_uses_five_ms_not_blocked_dp_or_unrelated_timer():
     schedulers = replica_schedulers(parsed, memory)
     execution = serving_execution(parsed, memory, include_io=False)
     timer = execution.engine.submit("unrelated_timer", {}, latency=1000)
-    hold = grant_bytes_for_headroom(memory, 1.0)
+    hold = int(grant_bytes_for_headroom(memory, 1.0))
     release = execution.engine.submit(
         "l0_last_read", {}, latency=5,
         on_complete=lambda _event: memory.release_grants(0, ["l0_hold"]))

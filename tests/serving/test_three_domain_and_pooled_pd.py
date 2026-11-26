@@ -77,10 +77,8 @@ def test_domain_one_fails_fast_on_omitted_scenario_sla_and_ssd(tmp_path):
 
 def test_domain_two_defaults_intrinsic_offload_stack_features_and_opt_out():
     stack = resolve_runtime_stack("vllm-ascend")
+    assert stack.name == "vllm-ascend"
     for model_key in ("deepseek-v4.1-flash", "qwen3.8-flash-next"):
-        defaults = stack.model_defaults[model_key]
-        assert defaults["engram_cpu_offload"] is True
-        assert defaults["multistream_overlap_shared_expert"] is True
         case = compose_case(
             model_key, "a5", tp=4, ep=4, layers=2, prompt_tokens=1024, output_tokens=64,
             exclude_optimizations=("cann_megamoe_fusion",),
@@ -94,13 +92,17 @@ def test_domain_two_defaults_intrinsic_offload_stack_features_and_opt_out():
         assert policy["engram_cpu_offload"] is True
         assert policy["engram_cpu_offload_source"] == "profile"
         assert policy["multistream_overlap_shared_expert"] is True
-        assert policy["mtp_proposal_tokens"] > 0
-        assert policy["mtp_source"] == "profile"
+        assert policy["mtp_proposal_tokens"] == 0
+        assert policy["mtp_source"] == "profile_none"
 
-    flash_a3 = compose_case("qwen3.8-flash-next", "a3", tp=4, ep=4, layers=2, prompt_tokens=1024, output_tokens=64)
+    flash_a3 = compose_case(
+        "qwen3.8-flash-next", "a3", tp=4, ep=4, layers=2, prompt_tokens=1024, output_tokens=64,
+        enable_shared_expert_dp=True,
+    )
     assert flash_a3["runtime"]["metadata"]["enable_shared_expert_dp"] is True
-    assert flash_a3["runtime"]["metadata"]["additional_config"]["enable_flashcomm1"] is True
-    assert flash_a3["runtime"]["metadata"]["additional_config"]["enable_prefill_mc2"] is True
+    assert flash_a3["runtime"]["engram_cpu_offload"] is True
+    assert flash_a3["runtime"]["multistream_overlap_shared_expert"] is True
+    assert "sequence_parallel" in flash_a3["runtime"]["kernels"]
 
     opted_out = compose_case(
         "qwen3.8-flash-next", "a3", tp=4, ep=4, layers=2,
@@ -427,21 +429,21 @@ def test_kimi_k31_five_live_correctness_regressions():
     prefill = compose_case(
         "kimi-k3.1", "950dt-96g-pod",
         dp=1, pp=4, pcp=8, tp=1, ep=8, layers=4, role="pd_prefill",
-        prompt_tokens=1024, output_tokens=64,
+        prompt_tokens=1024, output_tokens=64, ttft_slo_ms=5000.0,
     )
     p_eff = analyze_network_efficiency(
         prefill, phase="prefill", tokens=1024, context=0, sequences=1, scope="body",
     )
     assert p_eff["graph_duration_ms"] > 0.0
 
-    # Bug #2: merged tutorial_flags enable_fused_mc2=0 must stay on merged only and never leak into expected_ideal.
+    # Bug #2: shipping tutorial_flags enable_fused_mc2=0 must stay on shipping only and never leak into target.
     common = dict(
         dp=1, tp=8, dcp=8, ep=8, layers=4, role="pd_decode",
         prompt_tokens=131072, output_tokens=1024,
         mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
     )
-    c_merged = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="merged", **common)
-    c_ideal = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="expected_ideal", **common)
+    c_merged = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="shipping", **common)
+    c_ideal = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="target", **common)
     assert c_merged["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 0
     assert c_ideal["runtime"]["metadata"]["additional_config"].get("enable_fused_mc2", 0) != 0
     # kimi-k3 / kimi-k3.1 default native mxfp4_routed_only preserves BF16 exclusions;
@@ -460,14 +462,15 @@ def test_kimi_k31_five_live_correctness_regressions():
     assert c_all["model"]["quant"]["activation_group_size"] == 32
     assert c_all["model"]["quant"]["activation_scale_format"] == "fp8_e8m0"
     assert not c_all["model"]["quant"]["exclusions"]
-    # #364 Item 2: expected_ideal fuses Target mla_dsa prolog into mla_prolog.native with index_q wired cleanly.
+    # Target mla_dsa prolog: kimi-k3.1 has use_nope+qkv_a_gate_fused so it stays native_decomposed,
+    # while deepseek-v3.2 fuses Target mla_dsa prolog into mla_prolog.native with index_q wired cleanly.
     from mindie_sim.prediction.operator_analysis import target_graphs
     from mindie_sim.prediction.structure import parse_case
     g_ideal = target_graphs(parse_case(c_ideal), phase="decode", tokens=6, context=131072, sequences=8, scope="model")[0]
-    assert any(op.op_id == "s0.l3.mla_prolog.native" for op in g_ideal)
+    assert not any(op.op_id == "s0.l3.mla_prolog.native" for op in g_ideal)
     idx_q_k31 = next(op for op in g_ideal if op.op_id == "s0.l3.index_q")
-    assert "s0.l3.mla_prolog.native" in idx_q_k31.deps
-    c_v32_ideal = compose_case("deepseek-v3.2", "a3", feature_track="expected_ideal", tp=8, ep=8, layers=4, prompt_tokens=4096, output_tokens=64)
+    assert idx_q_k31.deps
+    c_v32_ideal = compose_case("deepseek-v3.2", "a3", feature_track="target", tp=8, ep=8, layers=4, prompt_tokens=4096, output_tokens=64)
     g_v32 = target_graphs(parse_case(c_v32_ideal), phase="decode", tokens=1, context=4096, sequences=1, scope="body")[0]
     assert any(op.op_id == "s0.l0.mla_prolog.native" for op in g_v32)
     assert "s0.l0.mla_prolog.native" in next(op for op in g_v32 if op.op_id == "s0.l0.index_q").deps
@@ -487,7 +490,7 @@ def test_kimi_k31_five_live_correctness_regressions():
         "--tpot-slo-ms", "30", "--xlsx", "out.xlsx", "--trace", "trace_view.json",
     ])
     assert (parsed_solve.xlsx, parsed_solve.trace, parsed_solve.compare_track, parsed_solve.target_track) == (
-        "out.xlsx", "trace_view.json", "unmerged_pr", "expected_ideal",
+        "out.xlsx", "trace_view.json", "shipping", "target",
     )
 
     # Bug #3: solve_sla_sizing & sweep default to scope="model" conserving Target + Draft + Logits.
@@ -526,10 +529,10 @@ def test_kimi_k31_five_live_correctness_regressions():
     with pytest.raises(ModelingError, match="recover_ssm_requires_integer_acceptance"):
         _resolve_recover_ssm_accepted_per_request({"accepted_tokens": 3.5}, conv_ctx, 6, 2)
     assert _resolve_recover_ssm_accepted_per_request({}, conv_ctx, 6, 2) == (3, 4)
-    c_eager = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="raw_eager", quant="mxfp4", **common)
+    c_eager = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="eager", quant="mxfp4", **common)
     step_eval = sdk_api.evaluate_step(c_eager, StepRequest(phase="decode", tokens=6, context=131584, sequences=8, scope="model"))
     assert step_eval.span_ms > 0.0
-    c_unmerged = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="unmerged_pr", **common)
+    c_unmerged = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="proposed", **common)
     step_unmerged = sdk_api.evaluate_step(c_unmerged, StepRequest(phase="decode", tokens=6, context=131584, sequences=8, scope="model"))
     assert step_unmerged.span_ms > 0.0
 
@@ -549,7 +552,7 @@ def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
         max_num_seqs=128, max_num_batched_tokens=1024,
     )
     c_k5_norec = parse_case(compose_case(
-        "kimi-k3.1", "950dt-96g-pod", feature_track="merged", recover_ssm=False, **base_k31,
+        "kimi-k3.1", "950dt-96g-pod", feature_track="shipping", recover_ssm=False, **base_k31,
     ))
     mem_k5 = Memory(c_k5_norec)
     seq_len = 131072 + 1024
@@ -568,9 +571,9 @@ def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
     assert pool_sum == pytest.approx(bd_k5["total_bytes"])
     assert bd_k5["total_bytes"] == pytest.approx(sum(mem_k5.cache_bytes(seq_len, padded=True)))
     # K+1 speculative SSM state scales up with K=7 (recover_ssm=False) and drops sharply
-    # under shipping vllm-ascend merged recover_ssm=True.
+    # under opt-in recover_ssm=True.
     c_k7 = parse_case(compose_case(
-        "kimi-k3.1", "950dt-96g-pod", feature_track="merged", recover_ssm=False,
+        "kimi-k3.1", "950dt-96g-pod", feature_track="shipping", recover_ssm=False,
         **{**base_k31, "mtp_proposal_tokens": 7},
     ))
     bd_k7 = Memory(c_k7).cache_pool_breakdown(seq_len, padded=True)
@@ -578,7 +581,7 @@ def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
     assert bd_k7["recurrent_state_bytes"] > bd_k5["recurrent_state_bytes"]
 
     c_rec = parse_case(compose_case(
-        "kimi-k3.1", "950dt-96g-pod", feature_track="merged", **base_k31,
+        "kimi-k3.1", "950dt-96g-pod", feature_track="shipping", recover_ssm=True, **base_k31,
     ))
     assert c_rec.runtime.recover_ssm is True
     bd_rec = Memory(c_rec).cache_pool_breakdown(seq_len, padded=True)
@@ -636,6 +639,7 @@ def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
     p_pd = compose_case(
         "kimi-k3.1", "950dt-96g-pod", layers=4, dp=1, pp=1, pcp=4, tp=1, ep=4,
         role="pd_prefill", prompt_tokens=4096, output_tokens=64, mtp_proposal_tokens=5,
+        ttft_slo_ms=5000.0,
     )
     d_pd_rep = compose_case(
         "kimi-k3.1", "950dt-96g-pod", layers=4, dp=1, pp=1, tp=4, dcp=4, ep=4,
@@ -702,11 +706,11 @@ def test_iso_sla_independent_before_after_solve_workspace_and_direct_d2d_ttft():
         num_devices=4, layers=2,
         prompt_tokens=512, output_tokens=64,
         tpot_slo_ms=50.0, deployment="colocated", max_sequences_per_dp=8,
-        mode="modeling", compare_track="merged", target_track="expected_ideal",
+        mode="modeling", compare_track="shipping", target_track="target",
     )
     assert sol_mod["mode"] == "modeling" and sol_mod["allow_unbound_formula"] is True
     iso = sol_mod["iso_sla_comparison"]
-    assert iso["before"]["track"] == "merged" and iso["after"]["track"] == "expected_ideal"
+    assert iso["before"]["track"] == "shipping" and iso["after"]["track"] == "target"
     assert iso["before"]["feasible"] is True and iso["after"]["feasible"] is True
     assert iso["after"]["sustainable_tps_per_die"] >= iso["before"]["sustainable_tps_per_die"] - 1e-6
     assert sol_mod["capacity_ledger"]["workspace_tokens"] >= 1
@@ -716,10 +720,10 @@ def test_iso_sla_independent_before_after_solve_workspace_and_direct_d2d_ttft():
         num_devices=4, layers=2,
         prompt_tokens=512, output_tokens=64,
         tpot_slo_ms=50.0, deployment="colocated", max_sequences_per_dp=8,
-        mode="simulation", compare_track="merged", target_track="expected_ideal",
+        mode="simulation", compare_track="shipping", target_track="target",
     )
     assert sol_sim["mode"] == "simulation" and sol_sim["allow_unbound_formula"] is False
-    assert sol_sim["iso_sla_comparison"]["after"]["track"] == "merged"
+    assert sol_sim["iso_sla_comparison"]["after"]["track"] == "shipping"
 
     # #406 Item 13: direct_blocking_d2d TTFT check includes exposed KV transfer delay.
     prefill = compose_case("qwen3-32b", "a3", dp=1, tp=2, ep=1, layers=1, prompt_tokens=256, output_tokens=64)
@@ -911,11 +915,16 @@ def test_iso_sla_target_graph_ranking_dcp_rejection_and_b_vram_binary_search(mon
         def __init__(self, _parsed, *, workspace_tokens=1):
             ws = max(1, int(workspace_tokens))
             # At ws=1: 99*kv free (upper=99); at ws=99: 0 free; exact crossing at b=50 (100 - 50 >= 50).
-            free = max(0.0, (100.0 - float(ws)) * fake_kv)
-            self.capacity = [[free]]
+            self._free = max(0.0, (100.0 - float(ws)) * fake_kv)
+            self.capacity = [[self._free]]
 
         def dp_cohort_cache_bytes(self, _seq_len, padded=True):
             return [fake_kv]
+
+        def resident_memory_receipt(self, *, sequence_tokens, batch_per_dp, query_tokens=1):
+            from types import SimpleNamespace
+            headroom = int(self._free - int(batch_per_dp) * fake_kv)
+            return SimpleNamespace(dies=(SimpleNamespace(free_hbm_headroom_bytes=headroom),))
 
     with monkeypatch.context() as mp:
         mp.setattr(pd_mod, "Memory", _LinearWorkspaceMemory)
@@ -949,7 +958,7 @@ def test_iso_sla_target_graph_ranking_dcp_rejection_and_b_vram_binary_search(mon
     probe_before = solve_deployment(
         "qwen3-32b", "a3", num_devices=2, layers=2, prompt_tokens=512, output_tokens=64,
         tpot_slo_ms=50.0, deployment="colocated", pinned_parallel={"tp": 2},
-        max_sequences_per_dp=16, mode="simulation", compare_track="merged", target_track="merged",
+        max_sequences_per_dp=16, mode="simulation", compare_track="shipping", target_track="shipping",
     )
     b1_ms = probe_before["iso_sla_comparison"]["before"]["decode_step_ms"]
     tight_slo = max(0.05, b1_ms * 1.15)
@@ -958,7 +967,7 @@ def test_iso_sla_target_graph_ranking_dcp_rejection_and_b_vram_binary_search(mon
         sol_same_track = solve_deployment(
             "qwen3-32b", "a3", num_devices=2, layers=2, prompt_tokens=512, output_tokens=64,
             tpot_slo_ms=tight_slo, deployment="colocated", pinned_parallel={"tp": 2},
-            max_sequences_per_dp=64, mode="modeling", compare_track="merged", target_track="merged",
+            max_sequences_per_dp=64, mode="modeling", compare_track="shipping", target_track="shipping",
         )
     assert len(target_calls) >= 1
     iso = sol_same_track["iso_sla_comparison"]
@@ -1186,21 +1195,31 @@ def test_solver_full_grid_admission_explicit_mode_overlap_and_early_abort(monkey
     k_b = pd_mod._candidate_dedup_key({"dp": 4, "tp": 8, "ep": 32, "pp": 1, "pcp": 1, "dcp": 8, "q_proj_tp": 8})
     assert k_a != k_b
 
-    # 3. Physical admission unlocks >16 on 32-die 128K Decode (DP4xTP8xDCP8: 43..53, DP2xTP16xDCP16: 70..83)
+    # 3. Physical admission unlocks >16 on 32-die 128K Decode (shipping K+1 snapshot ring: DP4xTP8xDCP8=29,
+    #    DP2xTP16xDCP16=63; opt-in recover_ssm=True: DP4xTP8xDCP8 in 43..55, DP2xTP16xDCP16 in 100..120)
     #    and never mislabels a configured max_num_seqs cap as HBM_CAPACITY_BOUND.
-    for dp, tp, dcp, lo, hi in ((4, 8, 8, 43, 53), (2, 16, 16, 70, 83)):
-        raw_d = compose_case(
-            "kimi-k3.1", "950dt-96g-pod",
+    for dp, tp, dcp, lo_ship, hi_ship, lo_rec, hi_rec in (
+        (4, 8, 8, 25, 35, 43, 55),
+        (2, 16, 16, 55, 70, 100, 120),
+    ):
+        base_d = dict(
             dp=dp, tp=tp, ep=32, dcp=dcp, role="pd_decode",
             quant="mxfp8_mxfp4", prompt_tokens=131072, output_tokens=1024,
             mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
             kv_cache_dtype="fp8", indexer_kv_dtype="fp8",
             tpot_slo_ms=30.0,
         )
-        _, _, b_phys = pd_mod._solve_b_vram_max(
-            parse_case(raw_d), base_ws=6, decode_q=6, seq_len=131072 + 1024, cap_bound=None,
+        raw_ship = compose_case("kimi-k3.1", "950dt-96g-pod", **base_d)
+        raw_rec = compose_case("kimi-k3.1", "950dt-96g-pod", recover_ssm=True, **base_d)
+        _, _, b_ship = pd_mod._solve_b_vram_max(
+            parse_case(raw_ship), base_ws=6, decode_q=6, seq_len=131072 + 1024, cap_bound=None,
         )
-        assert lo <= b_phys <= hi, f"DP{dp}xTP{tp}xDCP{dcp} physical b_vram={b_phys} outside [{lo}, {hi}]"
+        _, _, b_rec = pd_mod._solve_b_vram_max(
+            parse_case(raw_rec), base_ws=6, decode_q=6, seq_len=131072 + 1024, cap_bound=None,
+        )
+        assert lo_ship <= b_ship <= hi_ship, f"DP{dp}xTP{tp}xDCP{dcp} shipping b_vram={b_ship} outside [{lo_ship}, {hi_ship}]"
+        assert lo_rec <= b_rec <= hi_rec, f"DP{dp}xTP{tp}xDCP{dcp} recover_ssm b_vram={b_rec} outside [{lo_rec}, {hi_rec}]"
+        assert b_rec > b_ship > 16
     regime_cap, lim_cap = pd_mod._classify_decode_regime(
         feasible=True, b_feasible=32, b_vram=49, configured_max_seqs=32,
         token_batch_limit=128, unused_sla_slack_ms=10.0,

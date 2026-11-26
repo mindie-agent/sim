@@ -405,9 +405,13 @@ def test_cohort_reuse_rebinds_nested_commit_request_identities():
 def test_physical_key_groups_identical_fused_layer_occurrences():
     raw = compose_case("deepseek-v4-pro", hardware="a5", tp=8, ep=8, num_devices=8, layers=61, prompt_tokens=8, output_tokens=2)
     graphs = target_graphs(parse_case(raw), phase="decode", tokens=1, context=4096, sequences=1, scope="model")
-    assert len(by_recipe(graphs[0], "cann_indexer_quant_cache_c8")) == 30
-    rows = [row for row in operator_costs(parse_case(raw), graphs)["operators"] if row["operator"].get("family") == "indexer_quant_cache"]
-    assert len(rows) == 1 and rows[0]["occurrences"] == 30
+    assert len(by_recipe(graphs[0], "index_key_quantize")) == 30
+    assert len(by_recipe(graphs[0], "kv_store")) == 61
+    operators = operator_costs(parse_case(raw), graphs)["operators"]
+    iq_rows = [row for row in operators if row["operator"].get("recipe") == "index_key_quantize"]
+    kv_rows = [row for row in operators if row["operator"].get("family") == "kv_compress_epilog" and row["operator"].get("recipe") == "kv_store"]
+    assert len(iq_rows) == 1 and iq_rows[0]["occurrences"] == 30
+    assert len(kv_rows) == 1 and kv_rows[0]["occurrences"] == 61
 def test_independent_bf16_draft_strips_target_packed_prolog():
     quant = quant_preset("w8a8").to_dict() | {"kv_dtype": "int8"}
     parsed = parse_case(compose_case("kimi-k3.1", hardware="a5", tp=4, ep=4, num_devices=4, layers=4, quant=quant, mtp_proposal_tokens=2, prompt_tokens=64, output_tokens=8))
@@ -523,6 +527,8 @@ def test_pd_handoff_intersects_token_spans_before_charging_rows():
     raw["model"].update(layers=1, hidden_size=64, num_heads=4, num_kv_heads=1, head_dim=16, intermediate_size=64, vocab_size=128)
     bind_pd_pool(raw, "prefill", (0, 1), tp=2, cp=2)
     bind_pd_pool(raw, "decode", (2,), tp=1, cp=1)
+    for pool in raw["pools"].values():
+        pool["runtime"]["kv_block_size"] = 2
     raw["connector"] = {"link": {"name": "handoff", "capacity_bytes_per_ms": 64, "latency_us": 0, "semantics": "per_pair"}, "chunk_bytes": 64}
     result = predict_pd(raw, lower=linear_work, event_limit=100000)
     transfers = result["execution"]["pd_handoffs"][0]["transfers"]
@@ -586,10 +592,11 @@ def test_alltoallv_receive_buffers_follow_incoming_uniform_assignments():
         dispatch = next(op for op in graphs[replica] if op.recipe == "expert_dispatch")
         metadata = dict(dispatch.metadata)
         assert dispatch.local_shape[0] == outgoing
-        assert (metadata["output_shape"], metadata["capacity_rows"], metadata["payload_rows"]) == ((20, 2048), 20, 20)
-        assert metadata["capacity_rows"] * metadata["payload_row_bytes"] == pytest.approx(40960.0)
+        # Default uniform random routing charges the hypergeometric max-order straggler bound (20 -> 22).
+        assert (metadata["output_shape"], metadata["capacity_rows"], metadata["payload_rows"]) == ((22, 2048), 22, 22)
+        assert metadata["capacity_rows"] * metadata["payload_row_bytes"] == pytest.approx(22 * 2048 * 2)
         experts = [op for op in graphs[replica] if op.recipe in {"grouped_gate_up", "grouped_down"}]
-        assert [op.local_shape[0] for op in experts] == [20, 20]
+        assert [op.local_shape[0] for op in experts] == [22, 22]
 def test_local_tp_packed_views_use_the_parent_row_stride():
     graph = target_graphs(parse_case(compose_case( "glm-5.3-flash", hardware="a5", tp=1, dp=8, ep=8, num_devices=8, layers=4, o_proj_tp=8, linear_proj_tp=8, lm_head_tp=8, quant="w8a8_mxfp8", prompt_tokens=8, output_tokens=2)), phase="decode", tokens=6, context=0, sequences=1, scope="body")[0]
     packed = next(op for op in graph if op.op_id.endswith(".linear_qkvbfg_a:local_tp:gemm"))
