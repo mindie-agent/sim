@@ -343,28 +343,40 @@ class _MemoryWorkspaceMixin:
         runtime = self.case.runtime
         if tokens is None:
             max_batched = int(runtime.max_num_batched_tokens)
+            max_input = int(getattr(runtime, "max_num_input_tokens", 0) or 0)
+            prefill_cap = min(max_batched, max_input) if max_input > 0 else max_batched
+            max_seqs = max(1, int(getattr(runtime, "max_num_seqs", 1) or 1))
             requests = self.case.workload.requests
-            prefill_tokens = min(max_batched, sum(
-                max(1, min(r.prompt_tokens, max_batched)) for r in requests))
+            prefill_per_req = sorted(
+                (max(1, min(int(r.prompt_tokens), prefill_cap)) for r in requests),
+                reverse=True,
+            )[:max_seqs]
+            prefill_tokens = min(prefill_cap, sum(prefill_per_req))
             proposal = self._max_speculative_proposals()
             if proposal <= 0:
                 return prefill_tokens
-            max_seqs = max(1, int(getattr(runtime, "max_num_seqs", 1) or 1))
-            per_req_max = sorted(
+            decode_toks = sorted(
                 (
-                    max(
-                        max(1, min(int(r.prompt_tokens), max_batched)),
-                        (
-                            1 + min(proposal, max(0, int(r.output_tokens) - 2), max(0, max_batched - 1))
-                            if int(r.output_tokens) > 1 else 0
-                        ),
-                    )
-                    for r in requests
+                    1 + min(proposal, max(0, int(r.output_tokens) - 2), max(0, max_batched - 1))
+                    for r in requests if int(r.output_tokens) > 1
                 ),
                 reverse=True,
             )[:max_seqs]
-            mixed_tokens = min(max_batched, sum(per_req_max))
-            return max(prefill_tokens, mixed_tokens)
+            if not decode_toks:
+                return prefill_tokens
+            pref_prefix = [0]
+            for pt in prefill_per_req:
+                pref_prefix.append(min(prefill_cap, pref_prefix[-1] + pt))
+            best_mixed = prefill_tokens
+            dec_sum = 0
+            n_req = len(requests)
+            for k in range(len(decode_toks) + 1):
+                if k > 0:
+                    dec_sum += decode_toks[k - 1]
+                p_slots = min(max_seqs - k, n_req - k, len(prefill_per_req))
+                p_contrib = pref_prefix[p_slots] if p_slots > 0 else 0
+                best_mixed = max(best_mixed, min(max_batched, dec_sum + p_contrib))
+            return best_mixed
         if type(tokens) is not int or tokens < 0:
             raise ValueError("memory_workspace_tokens_require_nonnegative_integer")
         return tokens

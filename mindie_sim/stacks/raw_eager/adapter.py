@@ -48,6 +48,7 @@ from mindie_sim.schema.stack import (
     WaitForEvent,
     resolve_checkpoint_cache_abis,
     resolve_checkpoint_tensor_abi,
+    resolve_synthetic_preset_tag,
 )
 from mindie_sim.schema.workload import IterationPlan, RequestView
 
@@ -101,6 +102,34 @@ _MLA_DIRECT_ATTN_ROLES: tuple[str, ...] = (
     "self_attn.q_proj",
     "self_attn.kv_a_proj_with_mqa",
     "self_attn.kv_b_proj",
+    "self_attn.o_proj",
+)
+_GDN_ATTN_ROLES: tuple[str, ...] = (
+    "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_z",
+    "linear_attn.in_proj_b",
+    "linear_attn.in_proj_a",
+    "linear_attn.out_proj",
+)
+_KDA_ATTN_ROLES: tuple[str, ...] = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.b_proj",
+    "self_attn.f_a_proj",
+    "self_attn.f_b_proj",
+    "self_attn.g_proj",
+    "self_attn.o_proj",
+)
+_KDA_GATED_ATTN_ROLES: tuple[str, ...] = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.b_proj",
+    "self_attn.f_a_proj",
+    "self_attn.g_a_proj",
+    "self_attn.f_b_proj",
+    "self_attn.g_b_proj",
     "self_attn.o_proj",
 )
 _DENSE_MLP_ROLES: tuple[str, ...] = (
@@ -182,25 +211,18 @@ def _resolve_tag_and_rule(
 ) -> tuple[str, TensorQuantRule | None]:
     raw = str(tensor_path or "").strip()
     mod_path = raw[:-len(".weight")] if raw.endswith(".weight") else raw
-    exc_or_ign = checkpoint.resolve_exception_or_ignored(
-        mod_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
-    )
-    if exc_or_ign is not None:
-        return exc_or_ign, None
-    for rule in checkpoint.rules:
-        if rule.matches(
-            mod_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
-        ):
-            return rule.raw_tag, rule
-    if mod_path != raw:
-        exc_raw = checkpoint.resolve_exception_or_ignored(
-            raw, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+    weight_path = f"{mod_path}.weight"
+    probe_paths = (mod_path, weight_path) if mod_path != weight_path else (mod_path,)
+    for path in probe_paths:
+        exc_or_ign = checkpoint.resolve_exception_or_ignored(
+            path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
         )
-        if exc_raw is not None:
-            return exc_raw, None
+        if exc_or_ign is not None:
+            return exc_or_ign, None
+    for path in probe_paths:
         for rule in checkpoint.rules:
             if rule.matches(
-                raw, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+                path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
             ):
                 return rule.raw_tag, rule
     if checkpoint.source_format == "unquantized_native":
@@ -214,10 +236,20 @@ def _resolve_tag_and_rule(
         for rule in checkpoint.rules:
             if rule.pattern == "*":
                 return rule.raw_tag, rule
-    tag = resolve_checkpoint_tensor_tag(
-        checkpoint, tensor_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
-    )
-    return (tag if tag is not None else (checkpoint.model_quant_type or "FLOAT")), None
+    for path in probe_paths:
+        tag = resolve_checkpoint_tensor_tag(
+            checkpoint, path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+        )
+        if tag is not None:
+            return tag, None
+    if checkpoint.source_format == "explicit_synthetic_preset" and checkpoint.model_quant_type:
+        return (
+            resolve_synthetic_preset_tag(
+                checkpoint.model_quant_type, is_routed_expert=(expert_id is not None),
+            ),
+            None,
+        )
+    return (checkpoint.model_quant_type or "FLOAT"), None
 
 
 def _expert_boundary_ids(checkpoint: CheckpointQuantMap, num_experts: int) -> tuple[int, ...]:
@@ -268,11 +300,15 @@ def _layer_roles_for(
 ) -> list[tuple[str, int | None]]:
     if is_diffusion:
         return [(role, None) for role in _DIT_LAYER_ROLES]
-    attn_roles = (
-        (_MLA_Q_LORA_ATTN_ROLES if int(plan.q_lora_rank or 0) > 0 else _MLA_DIRECT_ATTN_ROLES)
-        if str(plan.attention or "").lower() == "mla"
-        else _GQA_ATTN_ROLES
-    )
+    attn = str(plan.attention or "").lower()
+    if attn == "mla":
+        attn_roles = _MLA_Q_LORA_ATTN_ROLES if int(plan.q_lora_rank or 0) > 0 else _MLA_DIRECT_ATTN_ROLES
+    elif attn == "gdn":
+        attn_roles = _GDN_ATTN_ROLES
+    elif attn == "kda":
+        attn_roles = _KDA_GATED_ATTN_ROLES if int(plan.gate_rank or 0) > 0 else _KDA_ATTN_ROLES
+    else:
+        attn_roles = _GQA_ATTN_ROLES
     roles: list[tuple[str, int | None]] = [(role, None) for role in attn_roles]
     if str(plan.ffn or "").lower() == "moe" and int(plan.num_experts or 0) > 0:
         for eid in _expert_boundary_ids(checkpoint, int(plan.num_experts)):
@@ -300,10 +336,20 @@ def _eager_cache_abis(
     role: str,
     phase: str,
     kv_block_size: int = DEFAULT_KV_BLOCK_SIZE,
+    pp_layer_partition: tuple[int, ...] | None = None,
+    total_layers: int | None = None,
+    default_kv_tag: str = "",
+    default_index_tag: str = "",
+    kv_tag_override_explicit: bool = False,
+    index_tag_override_explicit: bool = False,
 ) -> tuple[tuple[CacheStateABI, ...], tuple[CacheStateABI, ...], tuple[CacheStateABI, ...]]:
     return resolve_checkpoint_cache_abis(
         layers, checkpoint, parallel, native_dtype,
         role=role, phase=phase, kv_block_size=kv_block_size,
+        pp_layer_partition=pp_layer_partition, total_layers=total_layers,
+        default_kv_tag=default_kv_tag, default_index_tag=default_index_tag,
+        kv_tag_override_explicit=kv_tag_override_explicit,
+        index_tag_override_explicit=index_tag_override_explicit,
     )
 
 
@@ -379,6 +425,21 @@ class RawEagerStackAdapter:
             "kv_block_size": kv_block_size,
             "role": role,
         }
+        if req.get("kv_cache_dtype"):
+            effective["kv_cache_dtype"] = str(req["kv_cache_dtype"]).strip()
+        if req.get("kv_cache_dtype_explicit"):
+            effective["kv_cache_dtype_explicit"] = bool(req["kv_cache_dtype_explicit"])
+        if req.get("indexer_kv_dtype"):
+            effective["indexer_kv_dtype"] = str(req["indexer_kv_dtype"]).strip()
+        if req.get("indexer_kv_dtype_explicit"):
+            effective["indexer_kv_dtype_explicit"] = bool(req["indexer_kv_dtype_explicit"])
+        if req.get("pp_layer_partition"):
+            part_vals: list[int] = []
+            for v in req["pp_layer_partition"]:
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                    raise ModelingError(f"raw_eager_pp_partition_invalid:{v!r}")
+                part_vals.append(int(v))
+            effective["pp_layer_partition"] = tuple(part_vals)
         if any(k in req for k in ("latent_patches", "cfg_branches", "text_encode_tokens")):
             patches = _positive_option_int(req.get("latent_patches", DEFAULT_LATENT_PATCHES), "diffusion_latent_patches_invalid")
             cfg = _positive_option_int(req.get("cfg_branches", DEFAULT_CFG_BRANCHES), "diffusion_cfg_branches_invalid")
@@ -436,7 +497,10 @@ class RawEagerStackAdapter:
                     source_native_layer_id=native_id,
                     expert_id=expert_id,
                 )
-                abi = _abi_for_raw_tag(raw_tag, native_dtype, matched_rule)
+                abi = _abi_for_raw_tag(
+                    raw_tag, native_dtype, matched_rule,
+                    role=role, is_routed_expert=(expert_id is not None),
+                )
                 port_abis.append((("target", plan.index, logical_role), abi))
                 dispositions.append((tensor_path, raw_tag, "raw_eager_unfused_checkpoint_precision"))
         for rule in checkpoint.rules:
@@ -451,9 +515,16 @@ class RawEagerStackAdapter:
         else:
             eff = dict(options.effective_mechanisms)
             kv_block = int(eff.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)
+            raw_pp_part = eff.get("pp_layer_partition")
+            pp_part = tuple(int(v) for v in raw_pp_part) if raw_pp_part else None
             kv_abis, idx_abis, rec_abis = _eager_cache_abis(
                 layers, checkpoint, parallel, native_dtype,
                 role=role, phase=phase, kv_block_size=kv_block,
+                pp_layer_partition=pp_part, total_layers=model.layers,
+                default_kv_tag=str(eff.get("kv_cache_dtype") or ""),
+                default_index_tag=str(eff.get("indexer_kv_dtype") or ""),
+                kv_tag_override_explicit=bool(eff.get("kv_cache_dtype_explicit", False)),
+                index_tag_override_explicit=bool(eff.get("indexer_kv_dtype_explicit", False)),
             )
         return RuntimeQuantPlan(
             checkpoint_digest=checkpoint.digest(),

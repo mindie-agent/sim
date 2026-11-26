@@ -146,7 +146,6 @@ MXFP_KV_NZ_DIM_FRAG = 32
 MXFP_K_SCALE_NZ_TOKEN_FRAG = 16
 MXFP_V_SCALE_NZ_DIM_FRAG = 16
 
-W4A8_SCALE_BIAS_DIM = 16
 W8A16_WEIGHT_BITS = 8
 _EXPERT_ID_RE = re.compile(r"\bexperts\.(\d+)\.")
 
@@ -1287,17 +1286,21 @@ def _detect_kv_mode(
 ) -> tuple[str, str, bool, list[tuple[str, str, str]]]:
     """Resolve effective KV cache mode, scale dtype, FAQuant active flag, and dispositions."""
     disps: list[tuple[str, str, str]] = []
-    raw_source = (
-        kv_tag_override
-        if kv_tag_override is not None
-        else (checkpoint.cache_rule.kv_tag or effective_opts.get("kv_cache_dtype") or "")
-    )
+    explicit_kv = bool(effective_opts.get("kv_cache_dtype_explicit", False))
+    opt_kv_raw = str(effective_opts.get("kv_cache_dtype") or "").strip().upper()
+    use_explicit_kv = explicit_kv and bool(opt_kv_raw) and opt_kv_raw not in {"AUTO", "NONE"}
+    if kv_tag_override is not None:
+        raw_source = kv_tag_override
+    elif use_explicit_kv:
+        raw_source = opt_kv_raw
+    else:
+        raw_source = checkpoint.cache_rule.kv_tag or effective_opts.get("kv_cache_dtype") or ""
     raw_kv = str(raw_source or effective_opts.get("kv_cache_dtype") or "").strip().upper()
     aux_low = " ".join(checkpoint.auxiliary_buffers).lower()
     has_faquant = (
         ("FAQUANT" in raw_kv)
         or ("FAKQUANT" in raw_kv)
-        or any(tok in aux_low for tok in _FAQUANT_BUFFER_TOKENS)
+        or ((not use_explicit_kv) and any(tok in aux_low for tok in _FAQUANT_BUFFER_TOKENS))
     )
     is_mxfp_gqa = (not is_mla) and (
         (raw_kv in _MXFP8_KV_TAGS)
@@ -1822,8 +1825,14 @@ def _collect_delegated_cache_rules(
 ]:
     plans = model.layer_plans
     has_mla = any(str(p.attention).lower() == "mla" for p in plans)
-    has_layer_kv = bool(checkpoint.cache_rule.layer_scoped_kv)
-    has_layer_idx = bool(checkpoint.cache_rule.layer_scoped_index)
+    explicit_kv = bool(effective_opts.get("kv_cache_dtype_explicit", False))
+    opt_kv_raw = str(effective_opts.get("kv_cache_dtype") or "").strip().upper()
+    use_explicit_kv = explicit_kv and bool(opt_kv_raw) and opt_kv_raw not in {"AUTO", "NONE"}
+    explicit_idx = bool(effective_opts.get("indexer_kv_dtype_explicit", False))
+    opt_idx_raw = str(effective_opts.get("indexer_kv_dtype") or "").strip().upper()
+    use_explicit_idx = explicit_idx and bool(opt_idx_raw) and opt_idx_raw not in {"AUTO", "NONE"}
+    has_layer_kv = bool(checkpoint.cache_rule.layer_scoped_kv) and not use_explicit_kv
+    has_layer_idx = bool(checkpoint.cache_rule.layer_scoped_index) and not use_explicit_idx
     c8_producer_recorded = False
     any_faquant = has_faquant
     any_mxfp_gqa = (kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
@@ -2160,6 +2169,7 @@ def _resolve_draft_kv_tag(
     kv_mode: str,
     speculative_k: int,
     checkpoint: CheckpointQuantMap,
+    effective_opts: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Resolve draft-specific KV dtype override before inheriting target cache rules."""
     dq = getattr(draft_spec, "quant", None)
@@ -2174,6 +2184,10 @@ def _resolve_draft_kv_tag(
             return str(comp.draft_kv_cache_dtype).strip().upper()
     except ModelingError:
         pass
+    if effective_opts is not None and bool(effective_opts.get("kv_cache_dtype_explicit", False)):
+        opt_kv = str(effective_opts.get("kv_cache_dtype") or "").strip().upper()
+        if opt_kv and opt_kv not in {"AUTO", "NONE"}:
+            return opt_kv
     return checkpoint.cache_rule.kv_tag or None
 
 
@@ -2222,7 +2236,8 @@ def _append_draft_cache_abis(
 
     d_tag_override = _resolve_draft_kv_tag(
         model, draft_kind=draft_kind, draft_spec=draft_spec, hw=hw,
-        parallel=parallel, kv_mode=kv_mode, speculative_k=speculative_k, checkpoint=checkpoint,
+        parallel=parallel, kv_mode=kv_mode, speculative_k=speculative_k,
+        checkpoint=checkpoint, effective_opts=effective_opts,
     )
     d_has_mla = any(str(p.attention or model.attention).lower() == "mla" for p in d_plans)
     d_kv_mode, d_kv_scale, d_has_faq, _ = _detect_kv_mode(
@@ -2336,8 +2351,15 @@ def build_cache_state_abis(
     kv_block_size = int(effective_opts.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)
     ckpt_digest = checkpoint.digest()
     engram_offload = bool(effective_opts.get("engram_cpu_offload", False))
+    explicit_idx = bool(effective_opts.get("indexer_kv_dtype_explicit", False))
+    opt_idx_val = str(effective_opts.get("indexer_kv_dtype") or "").strip()
+    idx_source = (
+        opt_idx_val
+        if (explicit_idx and opt_idx_val and opt_idx_val.lower() not in {"auto", "none"})
+        else (checkpoint.cache_rule.index_tag or effective_opts.get("indexer_kv_dtype"))
+    )
     default_idx_dtype = _resolve_index_dtype(
-        checkpoint.cache_rule.index_tag or effective_opts.get("indexer_kv_dtype"),
+        idx_source,
         hw=hw, native_float=native_float, fallback_kv_mode=kv_mode,
     )
     index_scale_dtype, _ = _normalize_scale_dtype(
@@ -2463,18 +2485,20 @@ def _build_prepared_weights(
         if coord[0] == "target" and abi.linear_method == "w4a8"
     })
     if w4a8_layers:
-        n_experts_local = max(1, int(model.num_experts or 1) // max(1, parallel.ep))
-        n_dim = int(model.moe_intermediate_size or model.intermediate_size)
+        n_experts_local = max(1, _ceil_div(int(model.num_experts or 1), max(1, parallel.ep)))
+        moe_inter = int(model.moe_intermediate_size or model.intermediate_size)
+        moe_inter_local = max(1, _ceil_div(moe_inter, max(1, int(parallel.etp or 1))))
+        w4a8_out_channels = 2 * moe_inter_local + int(model.hidden_size)
         prepared.append(PreparedWeightSpec(
             allocation_id="w4a8.post_load_int64_scale_and_bias",
             source_tensors=("weight_scale", "weight_scale_second"),
             transform="w4a8_msd_pack_int64_scale_and_fp32_bias",
             scope="target",
             layer_indices=tuple(w4a8_layers),
-            local_shape=(n_experts_local, n_dim),
+            local_shape=(n_experts_local, w4a8_out_channels),
             dtype="int64",
             layout="ND",
-            extra_metadata_bytes=n_experts_local * W4A8_SCALE_BIAS_DIM * SCALE_BYTES_FP32,
+            extra_metadata_bytes=n_experts_local * w4a8_out_channels * SCALE_BYTES_FP32,
             retains_source_tensors=True,
             lifetime="persistent",
         ))

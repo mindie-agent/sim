@@ -1104,6 +1104,7 @@ def _prepare_stack_binding(
     raw_eager: bool,
     norm_role: str | None,
     mtp_tokens: int,
+    mtp_acceptance_length: float | None = None,
     resolved_max_seqs: int,
     resolved_block_size: int,
     model_options: Mapping[str, Any],
@@ -1149,11 +1150,29 @@ def _prepare_stack_binding(
         kv_dtype = model_options.get("kv_cache_dtype") or getattr(model_spec, "kv_dtype", None)
         if kv_dtype:
             req_opts["kv_cache_dtype"] = str(kv_dtype)
+        explicit_kv = model_options.get("kv_cache_dtype")
+        if explicit_kv and str(explicit_kv).strip().lower() not in {"", "auto"}:
+            req_opts["kv_cache_dtype_explicit"] = True
         idx_dtype = model_options.get("indexer_kv_dtype") or (
             getattr(model_spec.quant, "index_dtype", None) if getattr(model_spec, "quant", None) is not None else None
         )
         if idx_dtype:
             req_opts["indexer_kv_dtype"] = str(idx_dtype)
+        explicit_idx = model_options.get("indexer_kv_dtype")
+        if explicit_idx and str(explicit_idx).strip().lower() not in {"", "auto"}:
+            req_opts["indexer_kv_dtype_explicit"] = True
+        if mtp_tokens > 0 and mtp_acceptance_length is not None:
+            req_opts["mtp_acceptance_length"] = float(mtp_acceptance_length)
+        if runtime_options.get("enable_chunked_prefill") is not None:
+            cp_flag = bool(runtime_options["enable_chunked_prefill"])
+            req_opts["enable_chunked_prefill"] = cp_flag
+            req_opts["chunked_prefill"] = cp_flag
+        if runtime_options.get("async_scheduling") is not None:
+            req_opts["async_scheduling"] = bool(runtime_options["async_scheduling"])
+        if runtime_options.get("draft_enforce_eager") is not None:
+            eager_draft = bool(runtime_options["draft_enforce_eager"])
+            req_opts["draft_enforce_eager"] = eager_draft
+            req_opts["enforce_eager_draft"] = eager_draft
         if runtime_options.get("recover_ssm") is not None:
             req_opts["use_replayssm"] = bool(runtime_options["recover_ssm"])
             req_opts["recover_ssm"] = bool(runtime_options["recover_ssm"])
@@ -2101,7 +2120,11 @@ def _compose_explicit_case(
             target_quant_projection=target_proj, machine=machine, axes=resolved_axes,
             workload_domain=workload_domain, work_unit_kind=work_unit_kind,
             canonical_track=canonical_track, raw_eager=raw_eager, norm_role=norm_role,
-            mtp_tokens=mtp_tokens, resolved_max_seqs=resolved_max_seqs,
+            mtp_tokens=mtp_tokens,
+            mtp_acceptance_length=(
+                resolved_mtp_accept if mtp_options.get("mtp_acceptance_length") is not None else None
+            ),
+            resolved_max_seqs=resolved_max_seqs,
             resolved_block_size=resolved_block_size, model_options=model_options,
             policy_options=single_spine_policy_opts, runtime_options=single_spine_rt_opts,
             scenario_options=scenario_options, stack_options=stack_options,

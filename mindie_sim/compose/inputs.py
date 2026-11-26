@@ -28,6 +28,7 @@ from dataclasses import replace
 import difflib
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from mindie_sim.backends.ascend import (
@@ -50,6 +51,7 @@ from mindie_sim.schema.checkpoint import (
     CheckpointQuantMap,
     LayerQuantException,
 )
+from mindie_sim.schema.stack import resolve_synthetic_preset_tag
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.serialization import apply_model_overrides
@@ -73,6 +75,8 @@ PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
 
 HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
+    "910b4-1": "Ascend910B4-1", "910b4-64g": "Ascend910B4-1",
+    "a2-64g": "Ascend910B4-1", "800i-a2-64g": "Ascend910B4-1",
     "910b1": "Ascend910B1", "910b2": "Ascend910B2", "910b3": "Ascend910B3",
     "a3": "Ascend910_9392", "910c": "Ascend910_9392", "910_9392": "Ascend910_9392",
     "910_9362": "Ascend910_9362", "910_9382": "Ascend910_9382",
@@ -121,6 +125,7 @@ for _canon_dt, _short_dt in (
 
 HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
     "800i-a2": ("Ascend910B4", "a2_standard"),
+    "800i-a2-64g": ("Ascend910B4-1", "a2_standard"),
     "a2-8p": ("Ascend910B4", "a2_standard"),
     "800i-a3": ("Ascend910_9392", "a3_16p"),
     "800i-a3-8p": ("Ascend910_9392", "a3_8p"),
@@ -154,6 +159,13 @@ _SUGGESTION_CUTOFF = 0.35
 _DIFFUSION_DOMAIN_TOKENS = (
     "dit", "diffusion", "hunyuan_video", "hunyuan-video",
     "wan", "flux", "sd3", "cogvideo", "sora",
+)
+_DIFFUSION_DOMAIN_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:"
+    r"(?:mm|st|u)?dit(?:\d+(?:\.\d+)?)?|pixart(?:[-_]?alpha|[-_]?sigma)?|"
+    r"diffusion|hunyuan[-_]?video|wan(?:\d+(?:\.\d+)?)?|"
+    r"flux(?:\d+(?:\.\d+)?)?|sd3(?:\.\d+)?|sdxl|cogvideox?|(?:open[-_]?)?sora"
+    r")(?:$|[^a-z0-9])"
 )
 _CANONICAL_PROJECTION_PRESETS = frozenset({
     "mxfp8", "mxfp8_mxfp4", "mxfp4_routed_only", "mxfp4_all", "mxfp4",
@@ -511,6 +523,25 @@ def _emit_role_exceptions(
     grouped.setdefault((pattern, tag, ()), set()).add(lid)
 
 
+_CAUSAL_LM_ARCH_SUFFIXES = ("forcausallm", "lmheadmodel")
+
+
+def _matches_diffusion_domain(text: str) -> bool:
+    norm = str(text or "").strip().lower()
+    return bool(norm) and (_DIFFUSION_DOMAIN_RE.search(norm) is not None)
+
+
+def _declares_causal_lm_architecture(facts: Mapping[str, Any]) -> bool:
+    raw_arches = facts.get("architectures")
+    if isinstance(raw_arches, str):
+        arches = (raw_arches,)
+    elif isinstance(raw_arches, (tuple, list)):
+        arches = tuple(str(a or "") for a in raw_arches)
+    else:
+        return False
+    return any(arch.strip().lower().endswith(_CAUSAL_LM_ARCH_SUFFIXES) for arch in arches)
+
+
 def _build_override_layer_exceptions(
     qspec: QuantSpec | None,
     model_spec: ModelSpec | None,
@@ -519,22 +550,39 @@ def _build_override_layer_exceptions(
 ) -> tuple[LayerQuantException, ...]:
     if qspec is None or model_spec is None or not getattr(model_spec, "layer_plans", ()):
         return ()
-    wf_low = str(qspec.weight_format or "").strip().lower()
-    ewf_low = str(qspec.expert_weight_format or wf_low).strip().lower()
-    dense_float_mixed_expert = (
-        wf_low in _FLOAT_CANON_MAP
-        and ewf_low not in (_UNQUANTIZED_QUANT_TOKENS | {""})
+    from mindie_sim.catalog.npu_checkpoints import _classify_from_quant_spec
+    from mindie_sim.catalog.quant import lookup_layer_quant_override, projection_quant
+
+    preset = canonical_quant_preset_key(qspec)
+    base_q = replace(
+        qspec,
+        category_overrides=(),
+        layer_quant_overrides=(),
+        expert_quant_overrides=(),
     )
+    preset_dense_tag = (
+        resolve_synthetic_preset_tag(preset, is_routed_expert=False) if preset else "FLOAT"
+    )
+    preset_expert_tag = (
+        resolve_synthetic_preset_tag(preset, is_routed_expert=True) if preset else "FLOAT"
+    )
+    actual_dense_tag = _tag_from_classified_quant(
+        "attn.qkv", base_q, eff_native=eff_native, classify_fn=_classify_from_quant_spec,
+    )
+    actual_expert_tag = _tag_from_classified_quant(
+        "routed_expert", base_q, eff_native=eff_native, classify_fn=_classify_from_quant_spec,
+    )
+    dense_mismatch = actual_dense_tag.upper() != preset_dense_tag.upper()
+    expert_mismatch = actual_expert_tag.upper() != preset_expert_tag.upper()
     has_ov = bool(
         getattr(qspec, "category_overrides", ())
         or getattr(qspec, "layer_quant_overrides", ())
         or getattr(qspec, "expert_quant_overrides", ())
-        or dense_float_mixed_expert
+        or dense_mismatch
+        or expert_mismatch
     )
     if not has_ov:
         return ()
-    from mindie_sim.catalog.npu_checkpoints import _classify_from_quant_spec
-    from mindie_sim.catalog.quant import lookup_layer_quant_override, projection_quant
 
     global_ov_cats = {
         str(k) for k, f in qspec.category_overrides if _override_mapping_affects_quant(f)
@@ -547,14 +595,18 @@ def _build_override_layer_exceptions(
         layer_ov = lookup_layer_quant_override(layer_ov_dict, plan) if layer_ov_dict else None
         all_touched, layer_cats = _layer_override_touched_cats(layer_ov)
         touched = global_ov_cats | layer_cats
-        if not touched and not all_touched and not dense_float_mixed_expert:
+        if not (touched or all_touched or dense_mismatch or expert_mismatch):
             continue
         layer_q = projection_quant(qspec, plan)
         native_id = int(getattr(plan, "native_layer_id", -1))
         lid = native_id if native_id >= 0 else int(plan.index)
         for pattern, cat in _plan_tensor_category_pairs(plan):
             is_dense_role = cat not in _EXPERT_OVERRIDE_CATS
-            if not (all_touched or _category_touched_by_override(cat, touched) or (dense_float_mixed_expert and is_dense_role)):
+            role_mixed = (
+                (dense_mismatch and is_dense_role)
+                or (expert_mismatch and not is_dense_role)
+            )
+            if not (all_touched or _category_touched_by_override(cat, touched) or role_mixed):
                 continue
             _emit_role_exceptions(
                 grouped,
@@ -618,11 +670,12 @@ def infer_workload_domain(model_spec: ModelSpec) -> WorkloadDomain:
         return explicit  # type: ignore[return-value]
     for plan in model_spec.layer_plans:
         arch = str(getattr(plan, "architecture", "") or "").lower()
-        if any(tok in arch for tok in _DIFFUSION_DOMAIN_TOKENS):
+        if _matches_diffusion_domain(arch):
             return "diffusion"
-    model_type = str(facts.get("model_type") or facts.get("family") or "").strip().lower()
-    if any(tok in model_type for tok in _DIFFUSION_DOMAIN_TOKENS):
-        return "diffusion"
+    if not _declares_causal_lm_architecture(facts):
+        model_type = str(facts.get("model_type") or facts.get("family") or "").strip().lower()
+        if _matches_diffusion_domain(model_type):
+            return "diffusion"
     if model_spec.vision is not None or bool(facts.get("vision_present")):
         return "vlm"
     return "llm"
@@ -958,6 +1011,45 @@ def _explicit_checkpoint_quant_map(
                 extra_exc = _build_override_layer_exceptions(diff_q, model_spec, eff_native=eff_native)
                 if extra_exc:
                     curated = replace(curated, layer_exceptions=(*curated.layer_exceptions, *extra_exc))
+            if (
+                quant.kv_dtype != base_cur.kv_dtype
+                or quant.index_dtype != base_cur.index_dtype
+                or quant.index_scale_dtype != base_cur.index_scale_dtype
+            ):
+                eff_native = _explicit_float_dtype(quant, curated.native_float_dtype or native_dtype)
+                cur_rule = curated.cache_rule
+                kv_changed = quant.kv_dtype != base_cur.kv_dtype
+                idx_changed = quant.index_dtype != base_cur.index_dtype
+                kv_raw = str(quant.kv_dtype or "").strip()
+                idx_raw = str(quant.index_dtype or "").strip()
+                kv_ov = (
+                    (eff_native.upper() if kv_raw.lower() in {"", "auto", "none"} else kv_raw.upper())
+                    if kv_changed
+                    else cur_rule.kv_tag
+                )
+                idx_ov = (
+                    (eff_native.upper() if idx_raw.lower() in {"", "auto", "none"} else idx_raw.upper())
+                    if idx_changed
+                    else cur_rule.index_tag
+                )
+                idx_scale_low = str(quant.index_scale_dtype or "").strip().lower()
+                idx_scale_ov = (
+                    ("" if idx_scale_low in {"", "none"} else idx_scale_low)
+                    if quant.index_scale_dtype != base_cur.index_scale_dtype
+                    else cur_rule.index_scale_dtype
+                )
+                curated = replace(
+                    curated,
+                    cache_rule=replace(
+                        cur_rule,
+                        kv_tag=kv_ov,
+                        index_tag=idx_ov,
+                        index_scale_dtype=idx_scale_ov,
+                        layer_scoped_kv=() if kv_changed else cur_rule.layer_scoped_kv,
+                        layer_scoped_index=() if idx_changed else cur_rule.layer_scoped_index,
+                        provenance="cli_override",
+                    ),
+                )
             return curated, quant, "", None, None
         eff_native = _explicit_float_dtype(quant, native_dtype)
         exceptions = _build_override_layer_exceptions(quant, model_spec, eff_native=eff_native)
@@ -987,7 +1079,7 @@ def _explicit_checkpoint_quant_map(
     if isinstance(quant, Mapping):
         eff_native = _explicit_float_dtype(quant, native_dtype)
         exceptions: tuple[LayerQuantException, ...] = ()
-        if model_spec is not None and (quant.get("category_overrides") or quant.get("layer_quant_overrides")):
+        if model_spec is not None:
             parsed_q = apply_model_overrides(model_spec, {"quant": dict(quant)}).quant
             exceptions = _build_override_layer_exceptions(parsed_q, model_spec, eff_native=eff_native)
         preset = canonical_quant_preset_key(quant)
@@ -1124,6 +1216,23 @@ def _resolve_checkpoint_model_spec(key: str, *, hw_family: str = "a5") -> ModelS
     return None
 
 
+def _preserve_declared_architectures(spec: ModelSpec, raw: Mapping[str, Any]) -> ModelSpec:
+    raw_arches = raw.get("architectures")
+    if isinstance(raw_arches, str) and raw_arches.strip():
+        arches: tuple[str, ...] = (raw_arches.strip(),)
+    elif isinstance(raw_arches, (tuple, list)):
+        arches = tuple(str(a).strip() for a in raw_arches if isinstance(a, str) and a.strip())
+    else:
+        return spec
+    if not arches:
+        return spec
+    facts = dict(spec.catalog_facts)
+    if "architectures" in facts:
+        return spec
+    facts["architectures"] = arches
+    return replace(spec, catalog_facts=tuple(sorted(facts.items())))
+
+
 def _resolve_model_spec(
     model: str | Path | Mapping[str, Any], *, hw_family: str = "a5",
 ) -> ModelSpec:
@@ -1132,7 +1241,7 @@ def _resolve_model_spec(
         if "layers" in raw and "hidden_size" in raw and "model_type" not in raw:
             return ModelSpec.from_mapping(raw)
         name = str(raw.get("name") or raw.get("model_type") or "inline-model")
-        spec = build_model_spec(name, raw)
+        spec = _preserve_declared_architectures(build_model_spec(name, raw), raw)
         if _mapping_declares_hf_quant(raw):
             meta = dict(spec.metadata)
             unmodeled = tuple(meta.get("unmodeled_features") or ())
@@ -1167,7 +1276,7 @@ def _resolve_model_spec(
         if "layers" in raw and "hidden_size" in raw and "model_type" not in raw:
             spec = ModelSpec.from_mapping(raw)
         else:
-            spec = build_model_spec(name, raw)
+            spec = _preserve_declared_architectures(build_model_spec(name, raw), raw)
         qspec = _read_companion_quant_spec(resolved_path, raw)
         return _attach_checkpoint_quant(spec, qspec)
     if not isinstance(model, str) or not model.strip():
@@ -1409,11 +1518,18 @@ def _apply_structural_overrides(
     if (layers is None and n_routed_experts is None and num_experts_per_tok is None
             and not promote_dense_to_moe):
         return model_spec
-    return customize_model_spec(
+    orig_body = int(model_spec.body_layers or model_spec.layers)
+    updated = customize_model_spec(
         model_spec, layers=layers, n_routed_experts=n_routed_experts,
         num_experts_per_tok=num_experts_per_tok,
         promote_dense_to_moe=promote_dense_to_moe,
     )
+    if layers is not None and int(updated.body_layers or updated.layers) != orig_body:
+        facts = dict(updated.catalog_facts)
+        if "source_body_layers" not in facts:
+            facts["source_body_layers"] = orig_body
+            updated = replace(updated, catalog_facts=tuple(sorted(facts.items())))
+    return updated
 
 
 _NON_NEURAL_PREPARE_SPEC_METHODS = frozenset({"none", "ngram", "ngram_gpu"})

@@ -17,13 +17,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import lru_cache
 import json
 from pathlib import Path
 import re
 from typing import Any, Literal
 
+from mindie_sim.catalog.cache_ownership import _draft_cache_parallel
 from mindie_sim.catalog.checkpoint_reader import resolve_checkpoint_tensor_tag
+from mindie_sim.catalog.draft import draft_quant, optional_draft_spec
+from mindie_sim.catalog.draft_geometry import draft_layer_plans
+from mindie_sim.catalog.draft_spec import effective_draft_context_cap
+from mindie_sim.catalog.npu_checkpoints import _classify_from_quant_spec
 from mindie_sim.schema.checkpoint import CheckpointQuantMap, TensorQuantRule
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -55,6 +61,7 @@ from mindie_sim.schema.stack import (
     WaitForEvent,
     resolve_checkpoint_cache_abis,
     resolve_checkpoint_tensor_abi,
+    resolve_synthetic_preset_tag,
 )
 from mindie_sim.schema.workload import IterationPlan, RequestView
 
@@ -106,6 +113,34 @@ _MLA_DIRECT_ATTN_ROLES: tuple[str, ...] = (
     "self_attn.q_proj",
     "self_attn.kv_a_proj_with_mqa",
     "self_attn.kv_b_proj",
+    "self_attn.o_proj",
+)
+_GDN_ATTN_ROLES: tuple[str, ...] = (
+    "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_z",
+    "linear_attn.in_proj_b",
+    "linear_attn.in_proj_a",
+    "linear_attn.out_proj",
+)
+_KDA_ATTN_ROLES: tuple[str, ...] = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.b_proj",
+    "self_attn.f_a_proj",
+    "self_attn.f_b_proj",
+    "self_attn.g_proj",
+    "self_attn.o_proj",
+)
+_KDA_GATED_ATTN_ROLES: tuple[str, ...] = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.b_proj",
+    "self_attn.f_a_proj",
+    "self_attn.g_a_proj",
+    "self_attn.f_b_proj",
+    "self_attn.g_b_proj",
     "self_attn.o_proj",
 )
 _DENSE_MLP_ROLES: tuple[str, ...] = (
@@ -187,25 +222,18 @@ def _resolve_tag_and_rule(
 ) -> tuple[str, TensorQuantRule | None]:
     raw = str(tensor_path or "").strip()
     mod_path = raw[:-len(".weight")] if raw.endswith(".weight") else raw
-    exc_or_ign = checkpoint.resolve_exception_or_ignored(
-        mod_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
-    )
-    if exc_or_ign is not None:
-        return exc_or_ign, None
-    for rule in checkpoint.rules:
-        if rule.matches(
-            mod_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
-        ):
-            return rule.raw_tag, rule
-    if mod_path != raw:
-        exc_raw = checkpoint.resolve_exception_or_ignored(
-            raw, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+    weight_path = f"{mod_path}.weight"
+    probe_paths = (mod_path, weight_path) if mod_path != weight_path else (mod_path,)
+    for path in probe_paths:
+        exc_or_ign = checkpoint.resolve_exception_or_ignored(
+            path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
         )
-        if exc_raw is not None:
-            return exc_raw, None
+        if exc_or_ign is not None:
+            return exc_or_ign, None
+    for path in probe_paths:
         for rule in checkpoint.rules:
             if rule.matches(
-                raw, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+                path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
             ):
                 return rule.raw_tag, rule
     if checkpoint.source_format == "unquantized_native":
@@ -219,10 +247,20 @@ def _resolve_tag_and_rule(
         for rule in checkpoint.rules:
             if rule.pattern == "*":
                 return rule.raw_tag, rule
-    tag = resolve_checkpoint_tensor_tag(
-        checkpoint, tensor_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
-    )
-    return (tag if tag is not None else (checkpoint.model_quant_type or "FLOAT")), None
+    for path in probe_paths:
+        tag = resolve_checkpoint_tensor_tag(
+            checkpoint, path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+        )
+        if tag is not None:
+            return tag, None
+    if checkpoint.source_format == "explicit_synthetic_preset" and checkpoint.model_quant_type:
+        return (
+            resolve_synthetic_preset_tag(
+                checkpoint.model_quant_type, is_routed_expert=(expert_id is not None),
+            ),
+            None,
+        )
+    return (checkpoint.model_quant_type or "FLOAT"), None
 
 
 def _expert_boundary_ids(checkpoint: CheckpointQuantMap, num_experts: int) -> tuple[int, ...]:
@@ -273,11 +311,15 @@ def _layer_roles_for(
 ) -> list[tuple[str, int | None]]:
     if is_diffusion:
         return [(role, None) for role in _DIT_LAYER_ROLES]
-    attn_roles = (
-        (_MLA_Q_LORA_ATTN_ROLES if int(plan.q_lora_rank or 0) > 0 else _MLA_DIRECT_ATTN_ROLES)
-        if str(plan.attention or "").lower() == "mla"
-        else _GQA_ATTN_ROLES
-    )
+    attn = str(plan.attention or "").lower()
+    if attn == "mla":
+        attn_roles = _MLA_Q_LORA_ATTN_ROLES if int(plan.q_lora_rank or 0) > 0 else _MLA_DIRECT_ATTN_ROLES
+    elif attn == "gdn":
+        attn_roles = _GDN_ATTN_ROLES
+    elif attn == "kda":
+        attn_roles = _KDA_GATED_ATTN_ROLES if int(plan.gate_rank or 0) > 0 else _KDA_ATTN_ROLES
+    else:
+        attn_roles = _GQA_ATTN_ROLES
     roles: list[tuple[str, int | None]] = [(role, None) for role in attn_roles]
     if str(plan.ffn or "").lower() == "moe" and int(plan.num_experts or 0) > 0:
         for eid in _expert_boundary_ids(checkpoint, int(plan.num_experts)):
@@ -288,6 +330,102 @@ def _layer_roles_for(
     else:
         roles.extend((role, None) for role in _DENSE_MLP_ROLES)
     return roles
+
+
+def _draft_role_aliases(logical_role: str) -> tuple[str, ...]:
+    """Expand canonical unfused draft role names to checkpoint naming conventions."""
+    if logical_role == "self_attn.q_a_proj":
+        return (logical_role, "attn.wq_a")
+    if logical_role == "self_attn.q_b_proj":
+        return (logical_role, "attn.wq_b")
+    if logical_role == "self_attn.kv_a_proj_with_mqa":
+        return (logical_role, "attn.wkv")
+    if logical_role == "self_attn.o_proj":
+        return (logical_role, "attn.wo_a", "attn.wo_b")
+    if logical_role.startswith("mlp.experts."):
+        parts = logical_role.split(".")
+        if len(parts) == 4:
+            eid, proj = parts[2], parts[3]
+            short = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}.get(proj)
+            if short:
+                return (logical_role, f"ffn.experts.{eid}.{short}")
+    if logical_role.startswith("mlp.shared_experts."):
+        proj = logical_role.rsplit(".", 1)[-1]
+        short = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}.get(proj)
+        singular = f"mlp.shared_expert.{proj}"
+        return (
+            (logical_role, singular, f"ffn.shared_experts.{short}")
+            if short else (logical_role, singular)
+        )
+    return (logical_role,)
+
+
+def _draft_native_base_layers(model: ModelSpec) -> int:
+    """Resolve the untrimmed target body layer count for appended-layer MTP lookup."""
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    return max(
+        int(model.body_layers or model.layers),
+        int(facts.get("source_body_layers") or 0),
+        len(facts.get("mlp_layer_types") or ()),
+        len(facts.get("layer_types") or ()),
+    )
+
+
+def _resolve_draft_tag_and_rule(
+    checkpoint: CheckpointQuantMap,
+    *,
+    draft_kind: str,
+    prefix: str,
+    local_idx: int,
+    offset_id: int,
+    logical_role: str,
+    expert_id: int | None,
+    draft_qspec: Any = None,
+    native_dtype: str = "bf16",
+) -> tuple[str, str, TensorQuantRule | None]:
+    """Resolve one neural draft tensor against checkpoint draft/offset paths."""
+    draft_prefix = "dspark.layers" if draft_kind == "dspark" else "mtp.layers"
+    role_aliases = _draft_role_aliases(logical_role)
+    candidates: list[tuple[str, str, int]] = []
+    for role_alias in role_aliases:
+        candidates.append((f"{draft_prefix}.{local_idx}.{role_alias}", "draft", local_idx))
+        candidates.append((f"{draft_kind}.{local_idx}.{role_alias}", "draft", local_idx))
+    for role_alias in role_aliases:
+        candidates.append((f"{draft_prefix}.{offset_id}.{role_alias}", "draft", offset_id))
+        candidates.append((f"{prefix}.{offset_id}.{role_alias}", "draft", offset_id))
+        candidates.append((f"{prefix}.{offset_id}.{role_alias}", "target", offset_id))
+    for tensor_path, scope_try, lid_try in candidates:
+        weight_path = f"{tensor_path}.weight"
+        for probe in (tensor_path, weight_path):
+            exc = checkpoint.resolve_exception_or_ignored(
+                probe, scope=scope_try, source_native_layer_id=lid_try, expert_id=expert_id,  # type: ignore[arg-type]
+            )
+            if exc is not None:
+                return tensor_path, exc, None
+        for probe in (tensor_path, weight_path):
+            for rule in checkpoint.rules:
+                if rule.matches(
+                    probe, scope=scope_try, source_native_layer_id=lid_try, expert_id=expert_id,  # type: ignore[arg-type]
+                ):
+                    return tensor_path, rule.raw_tag, rule
+    primary_path = candidates[0][0]
+    if checkpoint.source_format == "modelslim_description":
+        return primary_path, "FLOAT", None
+    if (
+        checkpoint.source_format in {"explicit_synthetic_preset", "unquantized_native"}
+        and draft_qspec is not None
+    ):
+        role_cat = "routed_expert" if expert_id is not None else "dense"
+        classified = _classify_from_quant_spec(role_cat, draft_qspec, native_format=native_dtype)
+        return primary_path, classified.raw_tag, None
+    raw_tag, matched_rule = _resolve_tag_and_rule(
+        checkpoint,
+        primary_path,
+        scope="draft",
+        source_native_layer_id=local_idx,
+        expert_id=expert_id,
+    )
+    return primary_path, raw_tag, matched_rule
 
 
 def _draft_invocation_count(spec_method: str, spec_k: int) -> int:
@@ -336,10 +474,22 @@ def _build_llm_cache_abis(
     role: str,
     phase: str,
     kv_block_size: int = DEFAULT_KV_BLOCK_SIZE,
+    stage: int | None = None,
+    pp_layer_partition: tuple[int, ...] | None = None,
+    total_layers: int | None = None,
+    default_kv_tag: str = "",
+    default_index_tag: str = "",
+    kv_tag_override_explicit: bool = False,
+    index_tag_override_explicit: bool = False,
 ) -> tuple[tuple[CacheStateABI, ...], tuple[CacheStateABI, ...], tuple[CacheStateABI, ...]]:
     return resolve_checkpoint_cache_abis(
         layers, checkpoint, parallel, native_dtype,
         role=role, phase=phase, kv_block_size=kv_block_size,
+        stage=stage, pp_layer_partition=pp_layer_partition,
+        total_layers=total_layers,
+        default_kv_tag=default_kv_tag, default_index_tag=default_index_tag,
+        kv_tag_override_explicit=kv_tag_override_explicit,
+        index_tag_override_explicit=index_tag_override_explicit,
     )
 
 
@@ -518,7 +668,7 @@ class IdealTargetStackAdapter:
         enforce_eager = bool(req.get("enforce_eager", False)) or track == "eager"
         default_cap: CaptureMode = "none" if enforce_eager else "full_and_piecewise"
         cap_mode = "none" if enforce_eager else _normalize_capture_mode(req.get("capture_mode"), default_cap)
-        spec_k = int(req.get("speculative_k", 0) or 0)
+        spec_k = int(req.get("speculative_k") or req.get("num_speculative_tokens") or 0)
         spec_cfg_req = req.get("speculative_config")
         spec_method = str(
             req.get("spec_method")
@@ -573,6 +723,25 @@ class IdealTargetStackAdapter:
         }
         if spec_method:
             effective["spec_method"] = spec_method
+        if req.get("kv_cache_dtype"):
+            effective["kv_cache_dtype"] = str(req["kv_cache_dtype"]).strip()
+        if req.get("kv_cache_dtype_explicit"):
+            effective["kv_cache_dtype_explicit"] = bool(req["kv_cache_dtype_explicit"])
+        if req.get("indexer_kv_dtype"):
+            effective["indexer_kv_dtype"] = str(req["indexer_kv_dtype"]).strip()
+        if req.get("indexer_kv_dtype_explicit"):
+            effective["indexer_kv_dtype_explicit"] = bool(req["indexer_kv_dtype_explicit"])
+        if req.get("pp_layer_partition"):
+            part_vals: list[int] = []
+            for v in req["pp_layer_partition"]:
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                    raise ModelingError(f"ideal_target_pp_partition_invalid:{v!r}")
+                part_vals.append(int(v))
+            effective["pp_layer_partition"] = tuple(part_vals)
+        if req.get("draft_max_model_len") is not None:
+            effective["draft_max_model_len"] = _positive_option_int(
+                req["draft_max_model_len"], "ideal_target_draft_max_model_len_invalid",
+            )
         if any(k in req for k in ("latent_patches", "cfg_branches", "text_encode_tokens")):
             patches = _positive_option_int(req.get("latent_patches", DEFAULT_LATENT_PATCHES), "diffusion_latent_patches_invalid")
             cfg = _positive_option_int(req.get("cfg_branches", DEFAULT_CFG_BRANCHES), "diffusion_cfg_branches_invalid")
@@ -628,7 +797,10 @@ class IdealTargetStackAdapter:
                     source_native_layer_id=native_id,
                     expert_id=expert_id,
                 )
-                abi = _abi_for_raw_tag(raw_tag, native_dtype, matched_rule)
+                abi = _abi_for_raw_tag(
+                    raw_tag, native_dtype, matched_rule,
+                    role=role, is_routed_expert=(expert_id is not None),
+                )
                 port_abis.append((("target", plan.index, logical_role), abi))
                 dispositions.append((tensor_path, raw_tag, "checkpoint_precision_honored"))
         for rule in checkpoint.rules:
@@ -636,17 +808,123 @@ class IdealTargetStackAdapter:
         for exc in checkpoint.layer_exceptions:
             _abi_for_raw_tag(exc.raw_tag, native_dtype)
 
+        eff = dict(options.effective_mechanisms)
+        spec_k = int(eff.get("speculative_k", 0) or 0)
+        spec_method = str(eff.get("spec_method", "") or "")
+        draft_invocations = _draft_invocation_count(spec_method, spec_k)
+        aux = getattr(model, "auxiliary", None)
+        draft_kind = ""
+        draft_plans: tuple[LayerPlan, ...] = ()
+        draft_spec: Any = None
+        draft_qspec: Any = None
+        if not is_diffusion and draft_invocations > 0 and aux is not None:
+            draft_kind = (
+                "dspark"
+                if (spec_method in _NONCAUSAL_BLOCK_DRAFT_METHODS and aux.dspark is not None)
+                else ("mtp" if aux.mtp is not None else ("dspark" if aux.dspark is not None else ""))
+            )
+            if draft_kind:
+                draft_spec = optional_draft_spec(model, draft_kind)
+                draft_qspec = (
+                    draft_quant(model, draft_spec)
+                    if (draft_spec is not None and model.quant is not None)
+                    else None
+                )
+                draft_plans = draft_layer_plans(model, draft_kind)
+                start_id = _draft_native_base_layers(model)
+                for d_plan in draft_plans:
+                    local_idx = int(d_plan.index)
+                    offset_id = (
+                        int(d_plan.native_layer_id)
+                        if int(d_plan.native_layer_id) >= 0
+                        else (start_id + local_idx)
+                    )
+                    for logical_role, expert_id in _layer_roles_for(d_plan, checkpoint, is_diffusion=False):
+                        d_path, d_tag, d_rule = _resolve_draft_tag_and_rule(
+                            checkpoint,
+                            draft_kind=draft_kind,
+                            prefix=prefix,
+                            local_idx=local_idx,
+                            offset_id=offset_id,
+                            logical_role=logical_role,
+                            expert_id=expert_id,
+                            draft_qspec=draft_qspec,
+                            native_dtype=native_dtype,
+                        )
+                        d_abi = _abi_for_raw_tag(
+                            d_tag, native_dtype, d_rule,
+                            role=role, is_routed_expert=(expert_id is not None),
+                        )
+                        port_abis.append((("draft", local_idx, logical_role), d_abi))
+                        dispositions.append((d_path, d_tag, "checkpoint_precision_honored"))
+
         if is_diffusion:
             kv_abis: tuple[CacheStateABI, ...] = ()
             idx_abis: tuple[CacheStateABI, ...] = ()
             rec_abis: tuple[CacheStateABI, ...] = ()
         else:
-            eff = dict(options.effective_mechanisms)
             kv_block = int(eff.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)
+            raw_pp_part = eff.get("pp_layer_partition")
+            pp_part = tuple(int(v) for v in raw_pp_part) if raw_pp_part else None
+            default_kv_tag = str(eff.get("kv_cache_dtype") or "")
+            default_idx_tag = str(eff.get("indexer_kv_dtype") or "")
             kv_abis, idx_abis, rec_abis = _build_llm_cache_abis(
                 layers, checkpoint, parallel, native_dtype,
                 role=role, phase=phase, kv_block_size=kv_block,
+                pp_layer_partition=pp_part, total_layers=model.layers,
+                default_kv_tag=default_kv_tag, default_index_tag=default_idx_tag,
+                kv_tag_override_explicit=bool(eff.get("kv_cache_dtype_explicit", False)),
+                index_tag_override_explicit=bool(eff.get("indexer_kv_dtype_explicit", False)),
             )
+            if draft_plans:
+                raw_dml = int(eff.get("draft_max_model_len") or 0)
+                cap_hint = (
+                    type("_DraftCapHint", (), {"metadata": (("draft_max_model_len", raw_dml),)})()
+                    if raw_dml > 0 else None
+                )
+                d_cap_val = effective_draft_context_cap(draft_spec, cap_hint)
+                d_cap = d_cap_val if d_cap_val > 0 else None
+                draft_kv_tag = str(getattr(draft_qspec, "kv_dtype", "") or "").strip() if draft_qspec is not None else ""
+                draft_idx_tag = str(getattr(draft_qspec, "index_dtype", "") or "").strip() if draft_qspec is not None else ""
+                target_kv_low = str(getattr(model, "kv_dtype", "") or "").strip().lower()
+                target_idx_low = (
+                    str(getattr(model.quant, "index_dtype", "") or "").strip().lower()
+                    if model.quant is not None else ""
+                )
+                eff_draft_kv = (
+                    draft_kv_tag.upper()
+                    if (draft_kv_tag and (draft_kv_tag.lower() != target_kv_low or not checkpoint.cache_rule.kv_tag))
+                    else checkpoint.cache_rule.kv_tag
+                )
+                eff_draft_idx = (
+                    draft_idx_tag.upper()
+                    if (draft_idx_tag and (draft_idx_tag.lower() != target_idx_low or not checkpoint.cache_rule.index_tag))
+                    else checkpoint.cache_rule.index_tag
+                )
+                draft_cache_rule = replace(
+                    checkpoint.cache_rule,
+                    kv_tag=eff_draft_kv,
+                    index_tag=eff_draft_idx,
+                    layer_scoped_kv=(),
+                    layer_scoped_index=(),
+                )
+                draft_ckpt = replace(checkpoint, cache_rule=draft_cache_rule)
+                draft_parallel = _draft_cache_parallel(model, parallel, draft_kind, interleave=kv_block)
+                orig_digest = checkpoint.digest()
+                last_stage = max(0, int(parallel.pp) - 1)
+                d_kv, d_idx, d_rec = _build_llm_cache_abis(
+                    draft_plans, draft_ckpt, draft_parallel, native_dtype,
+                    role=role, phase=phase, kv_block_size=kv_block,
+                    stage=last_stage,
+                    default_kv_tag=draft_kv_tag or default_kv_tag,
+                    default_index_tag=draft_idx_tag or default_idx_tag,
+                )
+                d_kv = tuple(replace(abi, checkpoint_digest=orig_digest, draft_context_cap=d_cap) for abi in d_kv)
+                d_idx = tuple(replace(abi, checkpoint_digest=orig_digest, draft_context_cap=d_cap) for abi in d_idx)
+                d_rec = tuple(replace(abi, checkpoint_digest=orig_digest, draft_context_cap=d_cap) for abi in d_rec)
+                kv_abis = (*kv_abis, *d_kv)
+                idx_abis = (*idx_abis, *d_idx)
+                rec_abis = (*rec_abis, *d_rec)
         return RuntimeQuantPlan(
             checkpoint_digest=checkpoint.digest(),
             stack_id=self._capabilities.stack_id,

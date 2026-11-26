@@ -41,6 +41,7 @@ from .model import LayerPlan, ModelSpec
 from .operators import (
     KERNEL_READINESS_VALUES,
     OWNER_KINDS,
+    ActivationQuantMode,
     KernelReadiness,
     OwnerKind,
     TensorPrecisionABI,
@@ -80,7 +81,7 @@ MANIFEST_BINDING_STATES = frozenset({"merged", "unmerged_pr"})
 StackOptimizationMode = Literal["simulation", "modeling"]
 STACK_OPTIMIZATION_MODES = frozenset({"simulation", "modeling"})
 
-SYNTHESIS_READINESS_CLASSES = frozenset({"synthesized_target", "tiler_extension"})
+SYNTHESIS_READINESS_CLASSES: frozenset[KernelReadiness] = frozenset({"synthesized_target", "tiler_extension"})
 
 RewriteTrack = Literal["config", "framework", "kernel_new", "kernel_tune"]
 REWRITE_TRACKS = frozenset({"config", "framework", "kernel_new", "kernel_tune"})
@@ -613,10 +614,10 @@ class RuntimeQuantPlan:
                 raise ModelingError(f"runtime_quant_plan_{field_name}_must_be_typed_cache_state_abi")
             object.__setattr__(self, field_name, items)
         seen_owners: set[str] = set()
-        for abi in (*self.kv_cache_abi, *self.index_cache_abi, *self.recurrent_state_abi):
-            if abi.producer_key in seen_owners:
-                raise ModelingError(f"runtime_quant_plan_duplicate_cache_owner:{abi.producer_key}")
-            seen_owners.add(abi.producer_key)
+        for cache_abi in (*self.kv_cache_abi, *self.index_cache_abi, *self.recurrent_state_abi):
+            if cache_abi.producer_key in seen_owners:
+                raise ModelingError(f"runtime_quant_plan_duplicate_cache_owner:{cache_abi.producer_key}")
+            seen_owners.add(cache_abi.producer_key)
         prepared = tuple(self.prepared_weights)
         if not all(isinstance(item, PreparedWeightSpec) for item in prepared):
             raise ModelingError("runtime_quant_plan_prepared_weights_invalid")
@@ -1655,15 +1656,44 @@ _LINEAR_ATTENTION_KINDS = frozenset({
 })
 
 
+_SYNTHETIC_PRESET_ROLE_TAGS: dict[str, tuple[str, str]] = {
+    "MXFP4_ROUTED_ONLY": ("FLOAT", "W4A8_MXFP"),
+    "MXFP8_MXFP4": ("W8A8_MXFP8", "W4A8_MXFP"),
+    "W4A8_MXFP": ("W8A8_MXFP8", "W4A8_MXFP"),
+    "W4A8": ("W8A8_DYNAMIC", "W4A8_DYNAMIC"),
+    "W4A8_DYNAMIC": ("W8A8_DYNAMIC", "W4A8_DYNAMIC"),
+    "W8A8_MIX": ("W8A8_MIX", "W8A8_DYNAMIC"),
+}
+_DIRECT_PRESET_DENSE_TAGS: dict[str, str] = {
+    "MXFP4_ROUTED_ONLY": "FLOAT",
+    "MXFP8_MXFP4": "W8A8_MXFP8",
+}
+
+
+def resolve_synthetic_preset_tag(preset: str, *, is_routed_expert: bool) -> str:
+    """Resolve a model-level synthetic preset name into its per-tensor tag."""
+    raw = str(preset or "").strip()
+    if not raw:
+        return "FLOAT"
+    upper = raw.upper().replace("-", "_")
+    pair = _SYNTHETIC_PRESET_ROLE_TAGS.get(upper)
+    if pair is not None:
+        return pair[1] if is_routed_expert else pair[0]
+    return raw
+
+
 def resolve_checkpoint_tensor_abi(
     raw_tag: str,
     native_dtype: str,
     rule: TensorQuantRule | None = None,
     *,
     role: str = "",
+    is_routed_expert: bool | None = None,
 ) -> TensorPrecisionABI:
     """Resolve a checkpoint's physical declarations and role-dependent quantizer."""
     upper = (raw_tag or "").strip().upper().replace("-", "_")
+    if is_routed_expert is False and upper in _DIRECT_PRESET_DENSE_TAGS:
+        upper = _DIRECT_PRESET_DENSE_TAGS[upper]
     abi = _tensor_abi_for_tag(upper, native_dtype, role)
     if rule is None:
         return abi
@@ -1750,9 +1780,13 @@ def _tensor_abi_for_tag(upper: str, native_dtype: str, role: str) -> TensorPreci
     if upper in {"W8A8", "W8A8_INT8", "W8A8_DYNAMIC", "W8A8_MIX", "W8A8_PDMIX",
                  "INT8", "INT8_DYNAMIC", "INT8_SYM", "QUARK_INT8"}:
         dynamic = upper in {"W8A8_DYNAMIC", "W8A8_INT8", "INT8_DYNAMIC", "INT8_SYM"}
-        mode = "dynamic_per_token" if dynamic else "static_per_tensor"
+        mode: ActivationQuantMode = "dynamic_per_token" if dynamic else "static_per_tensor"
         if upper in {"W8A8_MIX", "W8A8_PDMIX"}:
-            mode = {"pd_decode": "static_per_tensor", "pd_prefill": "dynamic_per_token"}.get(role, "pd_mixed")
+            mix_modes: dict[str, ActivationQuantMode] = {
+                "pd_decode": "static_per_tensor",
+                "pd_prefill": "dynamic_per_token",
+            }
+            mode = mix_modes.get(role, "pd_mixed")
         return TensorPrecisionABI(
             linear_method="w8a8", activation_quant_mode=mode,
             input_dtype="int8",
@@ -1793,21 +1827,29 @@ def _tensor_abi_for_tag(upper: str, native_dtype: str, role: str) -> TensorPreci
     raise ModelingError(f"unknown_checkpoint_quant_tag:{upper}")
 
 
-_FLOAT_CACHE_DTYPES = {"BF16": "bf16", "BFLOAT16": "bf16", "FP16": "fp16", "FLOAT16": "fp16"}
-_STATIC_INT8_CACHE = {"C8", "INT8", "INT8_SYM", "FAQUANT", "FAKQUANT"}
+_FLOAT_CACHE_DTYPES = {
+    "BF16": "bf16", "BFLOAT16": "bf16",
+    "FP16": "fp16", "FLOAT16": "fp16",
+    "FP32": "fp32", "FLOAT32": "fp32",
+}
+_STATIC_INT8_CACHE = {"C8", "KV_C8", "INT8", "INT8_SYM", "FAQUANT", "FAKQUANT"}
 _FP8_CACHE = {"FP8", "FP8_DYNAMIC", "FP8_E4M3", "FP8_E5M2"}
-_MX_CACHE = {"MXFP8", "MXFP8_DYNAMIC"}
-_MX_GQA_PACKET = "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"
+_MX_CACHE = {"MXFP8", "MXFP8_DYNAMIC", "W8A8_MXFP8"}
+_MX_GQA_PACKET_TAGS = frozenset({
+    "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL",
+    "MXFP8_KV",
+    "MXFP8_PER_CHANNEL",
+})
 
 
 def _cache_dtype(tag: str, native_dtype: str) -> str:
-    if tag in {"", "FLOAT"}:
+    if tag in {"", "AUTO", "NONE", "FLOAT"}:
         return native_dtype
     if tag in _FLOAT_CACHE_DTYPES:
         return _FLOAT_CACHE_DTYPES[tag]
     if tag in _STATIC_INT8_CACHE or tag == "INT8_DYNAMIC":
         return "int8"
-    if tag in _FP8_CACHE or tag in _MX_CACHE:
+    if tag in _FP8_CACHE or tag in _MX_CACHE or tag in _MX_GQA_PACKET_TAGS:
         return "fp8_e5m2" if tag == "FP8_E5M2" else "fp8_e4m3"
     raise ModelingError(f"unknown_checkpoint_cache_tag:{tag}")
 
@@ -1855,11 +1897,11 @@ def _mxfp8_page(heads: int, block: int, kd: int, vd: int) -> tuple[CachePlaneABI
 def _resolve_gqa_kv_planes(plan: LayerPlan, tag: str, rule: CacheQuantRule, native_dtype: str,
                            heads: int, tp: int, block: int) -> tuple[CachePlaneABI, ...]:
     kd, vd = plan.head_dim, plan.v_head_dim or plan.head_dim
-    if tag == _MX_GQA_PACKET:
+    if tag in _MX_GQA_PACKET_TAGS:
         return _mxfp8_page(heads, block, kd, vd)
     dtype = _cache_dtype(tag, native_dtype)
     sides = (("k", kd), ("v", vd))
-    if not tag or tag == "FLOAT" or tag in _FLOAT_CACHE_DTYPES:
+    if tag in {"", "AUTO", "NONE", "FLOAT"} or tag in _FLOAT_CACHE_DTYPES:
         if kd == vd:
             return (_plane("kv_payload", "payload", ("kv", "head", "token", "dim"),
                            (2, heads, block, kd), dtype, "page"),)
@@ -1868,7 +1910,8 @@ def _resolve_gqa_kv_planes(plan: LayerPlan, tag: str, rule: CacheQuantRule, nati
     if tag in _STATIC_INT8_CACHE:
         scale = rule.kv_scale_dtype or "fp32"
         offset = rule.kv_offset_dtype or "int8"
-        for kind, dt in (("scale", scale), ("offset", offset)):
+        aux_kinds: tuple[tuple[CachePlaneKind, str], ...] = (("scale", scale), ("offset", offset))
+        for kind, dt in aux_kinds:
             if dt != "none":
                 planes.extend(_plane(f"{side}_{kind}", kind, ("head", "dim"), (heads, width),
                                      dt, "checkpoint") for side, width in sides)
@@ -1919,7 +1962,7 @@ def _resolve_index_cache_planes(tag: str, native_dtype: str, width: int,
                                 scale_dtype: str) -> tuple[CachePlaneABI, ...]:
     dtype = _cache_dtype(tag, native_dtype)
     payload = _plane("index_k", "payload", ("dim",), (width,), dtype, "token")
-    if not tag or tag == "FLOAT" or tag in _FLOAT_CACHE_DTYPES:
+    if tag in {"", "AUTO", "NONE", "FLOAT"} or tag in _FLOAT_CACHE_DTYPES:
         return (payload,)
     scale = scale_dtype or ("e8m0" if tag in _MX_CACHE else "fp32")
     groups = (width + _MX_BLOCK_ELEMENTS - 1) // _MX_BLOCK_ELEMENTS if tag in _MX_CACHE else 1
@@ -2036,6 +2079,29 @@ def _cache_placement(plan: LayerPlan, parallel: ParallelSpec, stage: int) -> Cac
     )
 
 
+def _pp_stage_map_for_layers(
+    layers: tuple[LayerPlan, ...],
+    parallel: ParallelSpec,
+    *,
+    pp_layer_partition: Sequence[int] | None = None,
+    total_layers: int | None = None,
+) -> tuple[tuple[int, ...] | None, int, int]:
+    """Build per-layer PP stage map matching ``layer_stage_map`` without catalog imports."""
+    pp = max(1, int(parallel.pp))
+    target_count = (
+        max(1, int(total_layers))
+        if total_layers is not None
+        else max(1, sum(1 for plan in layers if _cache_scope(plan) == "target"))
+    )
+    if pp_layer_partition:
+        part = tuple(int(v) for v in pp_layer_partition)
+        if len(part) != pp or sum(part) != target_count or any(v < 0 for v in part):
+            raise ModelingError(f"pp_partition_layers:{sum(part)}!={target_count}")
+        stage_map = tuple(s for s, count in enumerate(part) for _ in range(count))
+        return stage_map, pp, target_count
+    return None, pp, target_count
+
+
 def resolve_checkpoint_cache_abis(
     layers: tuple[LayerPlan, ...],
     checkpoint: CheckpointQuantMap,
@@ -2047,7 +2113,13 @@ def resolve_checkpoint_cache_abis(
     kv_block_size: int = _DEFAULT_KV_BLOCK_SIZE,
     cp_interleave_size: int | None = None,
     kda_parallel_axis: Literal["tp", "tp_x_pcp"] = "tp_x_pcp",
-    stage: int = 0,
+    stage: int | None = None,
+    pp_layer_partition: Sequence[int] | None = None,
+    total_layers: int | None = None,
+    default_kv_tag: str = "",
+    default_index_tag: str = "",
+    kv_tag_override_explicit: bool = False,
+    index_tag_override_explicit: bool = False,
 ) -> tuple[tuple[CacheStateABI, ...], tuple[CacheStateABI, ...], tuple[CacheStateABI, ...]]:
     """Instantiate storage at the native producer and attach same-scope consumers."""
     block = _pos_int(kv_block_size, "cache_state_kv_block_invalid")
@@ -2056,6 +2128,27 @@ def resolve_checkpoint_cache_abis(
         raise ModelingError(f"kda_parallel_axis_invalid:{kda_parallel_axis}")
     digest = checkpoint.digest()
     rule = checkpoint.cache_rule
+    fallback_kv = str(default_kv_tag or "").strip().upper()
+    fallback_idx = str(default_index_tag or "").strip().upper()
+    explicit_kv = bool(kv_tag_override_explicit and fallback_kv and fallback_kv not in {"AUTO", "NONE"})
+    explicit_idx = bool(index_tag_override_explicit and fallback_idx and fallback_idx not in {"AUTO", "NONE"})
+    stage_map, pp, target_count = _pp_stage_map_for_layers(
+        layers, parallel, pp_layer_partition=pp_layer_partition, total_layers=total_layers,
+    )
+    last_stage = pp - 1
+
+    def stage_for(plan: LayerPlan, scope: CacheScope) -> int:
+        if stage is not None:
+            return int(stage)
+        if scope == "draft":
+            return last_stage
+        if pp <= 1:
+            return 0
+        idx = max(0, int(plan.index))
+        if stage_map is not None:
+            return stage_map[idx] if idx < len(stage_map) else last_stage
+        return min(last_stage, idx * pp // target_count)
+
     native_ids = {(_cache_scope(p), p.index): p.native_layer_id if p.native_layer_id >= 0 else p.index
                   for p in layers}
 
@@ -2079,23 +2172,22 @@ def resolve_checkpoint_cache_abis(
     for plan in layers:
         scope = _cache_scope(plan)
         native = native_ids[scope, plan.index]
+        layer_stage = stage_for(plan, scope)
         if plan.attention in _LINEAR_ATTENTION_KINDS:
             rec_abis.append(_resolve_recurrent_cache_abi(
                 plan, parallel, native_id=native, role=role, phase=phase, ckpt_digest=digest,
-                scope=scope, kda_parallel_axis=kda_parallel_axis, stage=stage,
+                scope=scope, kda_parallel_axis=kda_parallel_axis, stage=layer_stage,
             ))
             continue
         if plan.cache_kind == "none":
             continue
-        placement = _cache_placement(plan, parallel, stage)
-        common = dict(scope=scope, native_layer=native, phase=phase, deployment_role=role,
-                      checkpoint_digest=digest, kv_block_size=block, kernel_block_size=block,
-                      cp_interleave_size=interleave, placement=placement)
+        placement = _cache_placement(plan, parallel, layer_stage)
         ratio = max(1, plan.compress_ratio)
         owns_kv = owner_id(scope, plan.kv_owner_layer_id, native) == native
         windowed_mla = plan.attention == "mla" and plan.cache_kind == "window_compressed"
         if owns_kv or windowed_mla:
-            tag = rule.kv_tag_for_layer(native).upper()
+            tag = fallback_kv if explicit_kv else (rule.kv_tag_for_layer(native).strip() or fallback_kv).upper()
+            components: list[CacheComponentRole]
             if plan.attention == "mla":
                 planes = _resolve_mla_cache_planes(plan, tag, rule, native_dtype)
                 components = ["window_kv"] if windowed_mla else ["mla_latent"]
@@ -2108,15 +2200,22 @@ def resolve_checkpoint_cache_abis(
             for component in components:
                 shared = () if component == "window_kv" else tuple(consumers.get((scope, native, "kv"), ()))
                 kv_abis.append(CacheStateABI(
-                    **common, component_role=component, producer_key=f"{scope}.l{native}.{component}",
+                    scope=scope, native_layer=native, phase=phase, deployment_role=role,
+                    checkpoint_digest=digest, kv_block_size=block, kernel_block_size=block,
+                    cp_interleave_size=interleave, placement=placement,
+                    component_role=component, producer_key=f"{scope}.l{native}.{component}",
                     planes=planes, window=None if component == "compressed_kv" else plan.window or None,
                     compression_ratio=1 if component == "window_kv" else ratio, consumer_keys=shared,
                 ))
         if (plan.indexer or plan.owns_index_k) and owner_id(scope, plan.index_k_owner_layer_id, native) == native:
             pool = max(1, plan.index_kpool)
+            idx_tag = fallback_idx if explicit_idx else (rule.index_tag_for_layer(native).strip() or fallback_idx).upper()
             idx_abis.append(CacheStateABI(
-                **common, component_role="index_k", producer_key=f"{scope}.l{native}.index_k",
-                planes=_resolve_index_cache_planes(rule.index_tag_for_layer(native).upper(), native_dtype,
+                scope=scope, native_layer=native, phase=phase, deployment_role=role,
+                checkpoint_digest=digest, kv_block_size=block, kernel_block_size=block,
+                cp_interleave_size=interleave, placement=placement,
+                component_role="index_k", producer_key=f"{scope}.l{native}.index_k",
+                planes=_resolve_index_cache_planes(idx_tag, native_dtype,
                                                    plan.index_dim, rule.index_scale_dtype),
                 compression_ratio=ratio, pooling_ratio=pool, tail_slots=2 * pool if pool > 1 else 0,
                 consumer_keys=tuple(consumers.get((scope, native, "index_k"), ())),
@@ -2127,6 +2226,7 @@ def resolve_checkpoint_cache_abis(
 __all__ = [
     "resolve_checkpoint_cache_abis",
     "resolve_checkpoint_tensor_abi",
+    "resolve_synthetic_preset_tag",
     "ALLOCATION_FREQUENCIES",
     "CACHE_COMPONENT_ROLES",
     "CACHE_PLANE_KINDS",

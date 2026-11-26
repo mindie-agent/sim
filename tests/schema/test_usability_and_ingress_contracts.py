@@ -567,3 +567,49 @@ def test_h3_single_spine_ingress_deployment_mode_domain_routing_and_auto_va(tmp_
     assert ports_q[("draft", 0, "mlp.experts.w13")].linear_method == "dense"
     assert ports_q[("target", 0, "mlp.experts.w13")].linear_method == "mx_fp4"
     assert ports_q[("target", 3, "q_proj")].linear_method == "mx_fp8"
+
+
+def test_diffusion_domain_detection_uses_token_boundaries_and_causal_arch() -> None:
+    """Substrings and causal-LM architectures stay LLM while standalone diffusion tokens route to diffusion."""
+    from mindie_sim.backends.ascend import profiles
+    from mindie_sim.compose.inputs import HARDWARE_TOPOLOGY_ALIASES, resolve_hardware_sku
+    from mindie_sim.compose.runtime import resolve_case_contracts
+    from mindie_sim.prediction.structure import parse_case
+
+    # Verify 64 GiB SKU variant capacity and explicit aliases without disturbing 32 GiB default aliases.
+    assert profiles()["Ascend910B4-1"]["device"]["memory_bytes"] == 64 * 1024 ** 3
+    assert profiles()["Ascend910B4"]["device"]["memory_bytes"] == 32 * 1024 ** 3
+    for alias in ("910b4-1", "910b4-64g", "a2-64g", "800i-a2-64g"):
+        assert resolve_hardware_sku(alias) == "Ascend910B4-1", alias
+    assert HARDWARE_TOPOLOGY_ALIASES["800i-a2-64g"] == ("Ascend910B4-1", "a2_standard")
+    for base_alias in ("a2", "910b", "910b4", "800i-a2", "a2-8p"):
+        assert resolve_hardware_sku(base_alias) == "Ascend910B4", base_alias
+
+    base_cfg = dict(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=1024,
+        max_position_embeddings=4096,
+    )
+    for model_type in ("llama", "swan_lm", "swandit_llm", "credit_lm", "wan"):
+        case = parse_case(compose_case(
+            dict(base_cfg, model_type=model_type),
+            hardware="a3", tp=1, prompt_tokens=16, output_tokens=2, quant="bf16",
+        ))
+        _sc, plan, _lp = resolve_case_contracts(case)
+        assert [p.attention for p in case.model.layer_plans] == ["gqa", "gqa"], model_type
+        assert plan.stack_id == "vllm-ascend", model_type
+        assert len(plan.kv_cache_abi) == 2, model_type
+
+    diff_base = {k: v for k, v in base_cfg.items() if k != "architectures"}
+    for diff_type in ("wan", "wan2.1", "hunyuan_video_dit", "STDiT3", "flux", "sd3"):
+        diff_case = compose_case(
+            dict(diff_base, model_type=diff_type),
+            hardware="a5", tp=1, prompt_tokens=16, output_tokens=2, quant="bf16",
+        )
+        assert diff_case["runtime"]["metadata"]["workload_domain"] == "diffusion", diff_type
+        assert diff_case["runtime"]["metadata"]["stack_id"] == "diffusion-native", diff_type

@@ -669,3 +669,222 @@ def test_sla_certified_search_finds_nonmonotone_b5_and_maximizes_throughput_b4_o
     res_tps = solve_sla_sizing(parsed, sla_ms=30.0, context=128, max_sequences_per_dp=8, scope="body", scenarios=[{"id": "baseline"}])
     sc_tps = res_tps["scenarios"][0]
     assert sc_tps["b_sla"] == 4 and sc_tps["b_feasible"] == 4 and sc_tps["step_ms_at_sla"] == pytest.approx(10.0)
+
+
+def test_scheduler_residency_rank_offset_external_dp_chunking_and_colocated_ttft() -> None:
+    """Unified budget contracts hold across residency, rank offsets, external DP, chunking, MTP, and report."""
+    from dataclasses import replace
+    from _support.axes import REPRESENTATIVE_SKUS
+    from _support.memory_cases import case as mem_case, draft_case
+    from mindie_sim.cli.parser import build_parser
+    from mindie_sim.cli.report import _assemble_report_receipt, _report_column
+    from mindie_sim.export import build_export_bundle, compose_export_case, compute_memory_quant_ledger
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.prediction.efficiency.capacity_window import capacity_window
+    from mindie_sim.prediction.efficiency.sla import _distinct_eval_cohorts
+    from mindie_sim.prediction.scheduler import Scheduler
+
+    # 1. Queued prompts beyond max_num_seqs never inflate prefill activation workspace.
+    ws_results = []
+    for n in (1, 16):
+        reqs = [dict(id=str(i), prompt_tokens=2048, output_tokens=1) for i in range(n)]
+        raw = mem_case(requests=reqs)
+        raw["machine"] = dict(backend="ascend", sku=REPRESENTATIVE_SKUS["a2"], num_devices=1)
+        raw["model"].update(
+            layers=84, hidden_size=4096, num_heads=32, num_kv_heads=1,
+            head_dim=128, intermediate_size=11008, vocab_size=32000,
+        )
+        raw["runtime"].update(
+            max_num_seqs=1, max_num_batched_tokens=32768,
+            max_model_len=32768, gpu_memory_utilization=0.9,
+        )
+        mem = Memory(parse_case(raw))
+        ws_results.append((int(mem.workspace[0]), mem.to_dict()["status"]))
+    assert ws_results[0] == ws_results[1] and ws_results[0][1] == "feasible"
+
+    # 2. Physical rank renumbering preserves distinct cohort detection and SLA admission.
+    offset_rows = []
+    for offset in (0, 8):
+        raw = mem_case(dp=2, tp=2)
+        ranks = list(range(offset, offset + 4))
+        raw["machine"]["devices"] = [{"rank": k} for k in ranks]
+        raw["machine"]["links"] = [
+            dict(name=name, members=members, semantics="shared", capacity_bytes_per_ms=bw)
+            for name, members, bw in (("fast", ranks[:2], 1000), ("slow", ranks[2:], 100))
+        ]
+        c_off = parse_case(raw)
+        s_off = solve_sla_sizing(c_off, sla_ms=2.0, context=4, scope="body", max_sequences_per_dp=1, sensitivity="baseline")
+        row = s_off["scenarios"][0]
+        offset_rows.append((_distinct_eval_cohorts(c_off), round(row["step_ms_at_b1"], 6), row["b_feasible"]))
+    assert offset_rows[0] == offset_rows[1] and offset_rows[0][2] == 0 and offset_rows[0][1] > 2.0
+
+    # 3. External DP evaluates all external workers regardless of ordering.
+    slow_die = {"compute_peaks": {"bf16": 1e8, "fp32": 1e8}, "rates": {"memory": 1e8, "vector": 1e8}}
+    ext_rows = []
+    for dies in ([{}, slow_die], [slow_die, {}]):
+        raw = mem_case(dp=2)
+        raw["machine"]["devices"] = dies
+        raw["runtime"].update(dp=1, external_dp=2)
+        s_ext = solve_sla_sizing(parse_case(raw), context=4, sla_ms=0.5, scope="body", max_sequences_per_dp=1, sensitivity="baseline")
+        row = s_ext["scenarios"][0]
+        ext_rows.append((round(row["step_ms_at_b1"], 6), row["total_feasible_concurrency"]))
+    assert ext_rows[0] == ext_rows[1] and ext_rows[0][1] == 0 and ext_rows[0][0] > 0.5
+
+    # 4. Chunked prefill caps workspace to step chunk tokens and honors max_num_input_tokens.
+    raw_ch = mem_case(prompt=64, output=1)
+    raw_ch["machine"]["device"]["memory_bytes"] = 96 * 1024
+    raw_ch["runtime"].update(max_num_batched_tokens=8, enable_chunked_prefill=True, gpu_memory_utilization=1.0)
+    c_ch = parse_case(raw_ch)
+    w_ch = capacity_window(c_ch, phase="prefill", context=0, tokens_per_seq=64, sequences=1, output_budget=1)
+    w_step = capacity_window(c_ch, phase="prefill", context=0, tokens_per_seq=8, sequences=1, output_budget=1)
+    s_ch = solve_sla_sizing(c_ch, phase="prefill", context=0, tokens_per_seq=64, output_budget=1,
+                            scope="body", sla_ms=1000.0, max_sequences_per_dp=1, sensitivity="baseline")
+    assert w_ch["workspace_bytes"] == w_step["workspace_bytes"] and s_ch["scenarios"][0]["b_feasible"] == 1
+
+    inp_rows = []
+    for budget in (4, 16):
+        raw_in = mem_case(prompt=16, output=1)
+        raw_in["runtime"].update(max_num_batched_tokens=budget, max_num_input_tokens=4, enable_chunked_prefill=True)
+        s_in = solve_sla_sizing(parse_case(raw_in), phase="prefill", context=0, tokens_per_seq=16, output_budget=1,
+                                scope="body", sla_ms=2.6, max_sequences_per_dp=1, sensitivity="baseline")
+        inp_rows.append((round(s_in["scenarios"][0]["step_ms_at_b1"], 6), s_in["scenarios"][0]["b_feasible"]))
+    assert inp_rows[0] == inp_rows[1] and inp_rows[0][1] == 0
+
+    # 5. Default speculative decode query width clips proposals to max_num_batched_tokens - 1.
+    c_spec = replace(draft_case(), runtime=replace(draft_case().runtime, max_num_batched_tokens=2, enable_chunked_prefill=True))
+    sched = Scheduler(c_spec, list(c_spec.workload.requests), Memory(c_spec))
+    for i in range(2):
+        sched.schedule(i)
+        sched.commit(i + 1)
+    v_spec = sched.schedule(2).requests[0]
+    width = v_spec.q_len + v_spec.draft_proposal_tokens
+    s_def = solve_sla_sizing(c_spec, phase="decode", context=v_spec.context, tokens_per_seq=None, output_budget=6,
+                             scope="body", sla_ms=100.0, max_sequences_per_dp=1, sensitivity="baseline")
+    s_exp = solve_sla_sizing(c_spec, phase="decode", context=v_spec.context, tokens_per_seq=width, output_budget=6,
+                             scope="body", sla_ms=100.0, max_sequences_per_dp=1, sensitivity="baseline")
+    assert s_def["tokens_per_seq"] == width == 2
+    assert s_def["scenarios"][0]["step_ms_at_b1"] == pytest.approx(s_exp["scenarios"][0]["step_ms_at_b1"])
+
+    # 6. Fixed prefill report forwards phase="prefill" and colocated receipt enforces ttft_slo_ms.
+    kw_rep = dict(prompt_tokens=8192, output_tokens=8, deployment_mode="colocated")
+    raw_col, req_col, _ = _report_column(
+        None, model="qwen3-32b", sku="a3", phase="prefill", track="shipping",
+        quant=None, kv=None, idx_kv=None, par={"tp": 1}, conc=2, common_kw=kw_rep,
+    )
+    ref_col, _ = compose_export_case("qwen3-32b", "a3", phase="prefill", concurrency=2, **kw_rep)
+    c_col, c_ref = parse_case(raw_col), parse_case(ref_col)
+    m_col = compute_memory_quant_ledger(c_col, phase="prefill", seq_len=req_col.tokens, concurrency=req_col.sequences)
+    m_ref = compute_memory_quant_ledger(c_ref, phase="prefill", seq_len=req_col.tokens, concurrency=req_col.sequences)
+    assert c_col.runtime.max_num_batched_tokens == c_ref.runtime.max_num_batched_tokens == 16384
+    assert int(m_col.stage_budgets[0].workspace_peak_bytes) == int(m_ref.stage_budgets[0].workspace_peak_bytes)
+
+    args = build_parser().parse_args((
+        "report --model qwen3-32b --hardware a3 --deployment-mode colocated "
+        "--tp 2 --dp 1 --concurrency 1 --prompt-tokens 128 --output-tokens 8 "
+        "--ttft-ms 2 --tpot-ms 100 --mode simulation"
+    ).split())
+    raw_ttft, req_ttft = compose_export_case(
+        args.model, args.hardware, tp=args.tp, deployment_mode=args.deployment_mode,
+        prompt_tokens=args.prompt_tokens, output_tokens=args.output_tokens,
+        ttft_slo_ms=args.ttft_ms, tpot_slo_ms=args.tpot_ms, quant="auto_va",
+    )
+    dec_bundle = build_export_bundle(raw_ttft, request=req_ttft)
+    rec = _assemble_report_receipt(
+        args=args, after_bundle=dec_bundle, summary={}, brief_dict={}, digest_md="",
+        mode=args.mode, resolved_stack_id="vllm-ascend", dep_mode=args.deployment_mode,
+    )
+    assert rec["ttft_met"] is False and rec["all_slas_met"] is False and rec["feasible"] is False
+    assert rec["prefill_ttft_ms"] > float(args.ttft_ms)
+
+    # 7. External-DP per-worker rank tables, transit routes, tight-HBM input caps, concurrent chunking,
+    #    colocated prefill HBM feasibility, and chunked colocated TTFT replay.
+    from argparse import Namespace
+    from mindie_sim.cli.report import _evaluate_colocated_prefill_ttft_ms
+    from mindie_sim.prediction.collectives.topology import Topology
+    from mindie_sim.prediction.efficiency.sla import _external_worker_case
+    from mindie_sim.prediction.results import StepRequest
+    from mindie_sim.schema.workload import RequestView
+
+    rt_raw = mem_case(dp=4, tp=2, ep=2)
+    rt_raw["model"].update(n_routed_experts=4, num_experts_per_tok=2, moe_intermediate_size=32, ffn="moe")
+    rt_raw["runtime"].update(dp=2, external_dp=2, rank_table=[[0, 1], [2, 3], [4, 6], [5, 7]])
+    rt_case = parse_case(rt_raw)
+    assert (2, 3) in _distinct_eval_cohorts(rt_case)
+
+    tr_raw = mem_case(dp=2, tp=2)
+    tr_raw["runtime"].update(dp=1, external_dp=2)
+    tr_raw["machine"]["links"] = [
+        dict(name=f"edge{i}", members=[a, b], capacity_bytes_per_ms=100)
+        for i, (a, b) in enumerate(((0, 2), (2, 1), (2, 3)))
+    ]
+    tr_case = parse_case(tr_raw)
+    tr_w0 = _external_worker_case(tr_case, 0)
+    assert len(Topology(tr_w0.machine, tr_w0.runtime.parallel).route(0, 1)) == 2
+    assert solve_sla_sizing(tr_case, context=4, sla_ms=50.0, scope="body", max_sequences_per_dp=1, sensitivity="baseline")["scenarios"][0]["b_feasible"] == 1
+
+    inp_mem = mem_case(prompt=32, output=1)
+    inp_mem["machine"]["device"]["memory_bytes"] = 75_000
+    inp_mem["runtime"].update(
+        max_num_batched_tokens=32, max_num_input_tokens=4,
+        enable_chunked_prefill=True, gpu_memory_utilization=1.0,
+    )
+    c_inp = parse_case(inp_mem)
+    sched_inp = Scheduler(c_inp, list(c_inp.workload.requests), Memory(c_inp))
+    for i in range(8):
+        if sched_inp.schedule(i) is not None:
+            sched_inp.commit(i + 1)
+    assert sched_inp.states[0].generated == 1
+
+    conc_raw = mem_case(requests=[dict(id=k, prompt_tokens=6, output_tokens=3) for k in ("a", "b")])
+    conc_raw["runtime"].update(
+        max_num_seqs=2, max_num_batched_tokens=16, max_num_input_tokens=4, enable_chunked_prefill=True,
+    )
+    c_conc = parse_case(conc_raw)
+    assert _vram_max_sequences_per_dp(c_conc, context=0, tokens_per_seq=6, output_budget=3, phase="prefill") >= 2
+    s_conc = solve_sla_sizing(c_conc, phase="prefill", context=0, tokens_per_seq=6, output_budget=3,
+                              scope="body", sla_ms=1000.0, max_sequences_per_dp=2, sensitivity="baseline")
+    assert s_conc["scenarios"][0]["b_feasible"] == 2
+
+    hbm_raw = mem_case(prompt=64, output=2)
+    hbm_raw["model"]["layers"] = 1
+    hbm_raw["machine"] = dict(backend="ascend", sku=REPRESENTATIVE_SKUS["a2"], num_devices=1, device={"memory_bytes": 65_000})
+    hbm_raw["runtime"].update(max_num_batched_tokens=64, gpu_memory_utilization=1.0, kv_block_size=1)
+    hbm_raw["slo"] = dict(ttft_ms=1000.0, tpot_ms=1000.0)
+    pref_oom = build_export_bundle(hbm_raw, request=StepRequest("prefill", 64, 0, scope="model"), primitive_table=False)
+    dec_ok = build_export_bundle(hbm_raw, request=StepRequest("decode", 1, 64, scope="model"), primitive_table=False)
+    assert dec_ok.memory_ledger.fits_hbm and not pref_oom.memory_ledger.fits_hbm
+    rec_oom = _assemble_report_receipt(
+        args=Namespace(concurrency=1), after_bundle=dec_ok, prefill_bundle=pref_oom,
+        summary={}, brief_dict={}, digest_md="", mode="simulation",
+        resolved_stack_id="vllm-ascend", dep_mode="colocated",
+    )
+    assert rec_oom["hbm_feasible"] is False and rec_oom["feasible"] is False
+
+    chk_raw = mem_case(prompt=8, output=2)
+    chk_raw["model"]["layers"] = 1
+    chk_raw.update(machine={"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a2"]}, slo={"ttft_ms": 0.08})
+    chk_raw["runtime"].update(max_num_batched_tokens=4, enable_chunked_prefill=True)
+    chk_layout = {"solved": {"recommended_case": chk_raw, "winner_mode": "colocated"}}
+    rc_chk, req_chk, _ = _report_column(
+        chk_layout, model="geometry", sku=REPRESENTATIVE_SKUS["a2"], phase="prefill",
+        track="shipping", quant=None, kv=None, idx_kv=None, par={}, conc=1,
+        common_kw={"prompt_tokens": 8, "output_tokens": 2},
+    )
+    dec_chk = build_export_bundle(rc_chk, request=StepRequest("decode", 1, 8, scope="model"), primitive_table=False)
+    chk_views = [RequestView(request_id="r", q_len=4, context=c, phase="prefill", samples=(c == 4)) for c in (0, 4)]
+    expected_ttft = sum(
+        build_export_bundle(rc_chk, request=StepRequest("prefill", 4, v.context, scope="model", requests=(v,)), primitive_table=False).step_span_us
+        for v in chk_views
+    ) / 1000.0
+    actual_ttft = _evaluate_colocated_prefill_ttft_ms(
+        args=Namespace(), after_bundle=dec_chk, prefill_case=rc_chk,
+        prefill_request=req_chk, prefill_build_kwargs={"primitive_table": False},
+    )
+    assert actual_ttft == pytest.approx(expected_ttft)
+    rec_chk = _assemble_report_receipt(
+        args=Namespace(concurrency=1), after_bundle=dec_chk, prefill_case=rc_chk,
+        prefill_request=req_chk, prefill_build_kwargs={"primitive_table": False},
+        summary={}, brief_dict={}, digest_md="", mode="simulation",
+        resolved_stack_id="vllm-ascend", dep_mode="colocated",
+    )
+    assert rec_chk["ttft_met"] is False and rec_chk["feasible"] is False

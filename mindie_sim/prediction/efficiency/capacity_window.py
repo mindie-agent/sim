@@ -33,6 +33,25 @@ HBM_BYTES_PRECISION_DIGITS = 3
 HBM_UTILIZATION_PRECISION_DIGITS = 9
 
 
+def _prefill_step_token_budget(case: CaseSpec) -> int:
+    """Effective per-step prefill token ceiling honoring both batch and input budgets."""
+    budget = max(1, int(case.runtime.max_num_batched_tokens))
+    max_input = int(getattr(case.runtime, "max_num_input_tokens", 0) or 0)
+    if max_input > 0:
+        budget = min(budget, max_input)
+    return budget
+
+
+def _workspace_tokens_for_window(
+    case: CaseSpec, *, phase: str, q_tokens: int, sequences: int,
+) -> int:
+    """Compute peak single-step activation workspace tokens for one capacity window."""
+    raw_tokens = max(1, int(sequences) * max(1, int(q_tokens)))
+    if phase == "prefill" and bool(case.runtime.enable_chunked_prefill):
+        return min(raw_tokens, _prefill_step_token_budget(case))
+    return raw_tokens
+
+
 def _stage_rank_capacity_facts(memory: Memory) -> list[dict[str, Any]]:
     """Read the T08 per-rank supply from ``rank_capacity_plans``/``to_dict``.
 
@@ -42,7 +61,7 @@ def _stage_rank_capacity_facts(memory: Memory) -> list[dict[str, Any]]:
     checks, not a second private allocator.
     """
     case, p = memory.case, memory.case.runtime.parallel
-    dies, width = case.machine.dies, max(1, int(p.tp) * int(p.pcp))
+    placement = case.machine.validate_placement(p)
     dp_inner = int(p.dp)
     ext_dp = max(1, int(getattr(p, "external_dp", 1) or 1))
     util = float(case.runtime.gpu_memory_utilization)
@@ -52,12 +71,12 @@ def _stage_rank_capacity_facts(memory: Memory) -> list[dict[str, Any]]:
             physical = memory.physical_usage(replica)["hbm_bytes_per_stage_rank"]
             phys_replica = ext_idx * dp_inner + replica
             for stage in range(int(p.pp)):
+                stage_ranks = placement.stage_ranks(phys_replica, stage)
                 for rank, plan in enumerate(memory.rank_capacity_plans(
                         replica, stage, include_cache=False)):
                     report = plan.to_dict()
                     allocations = {str(item["name"]): float(item["bytes"])
                                    for item in report.get("allocations", ())}
-                    index = (phys_replica * int(p.pp) + stage) * width + rank
                     in_plan = (allocations.get("selected_plan", 0.0)
                                + allocations.get("shared_pages", 0.0)
                                + allocations.get("grants", 0.0)
@@ -66,7 +85,10 @@ def _stage_rank_capacity_facts(memory: Memory) -> list[dict[str, Any]]:
                                 if ext_idx == 0 and rank < len(physical[stage]) else 0.0)
                     external_held = max(0.0, occupied - in_plan)
                     fixed_bytes = float(report.get("peak_bytes") or 0.0)
-                    die_hbm = float(dies[index].hbm_bytes) if index < len(dies) else 0.0
+                    die_hbm = (
+                        float(placement.die_for_rank(stage_ranks[rank]).hbm_bytes)
+                        if rank < len(stage_ranks) else 0.0
+                    )
                     if ext_idx == 0:
                         cap_bytes = float(report.get("capacity_bytes") or 0.0)
                         headroom = float(report.get("headroom_bytes") or 0.0)
@@ -122,7 +144,7 @@ def capacity_window(
     scaled = (scale_case_hardware(base_case, hbm_capacity_scale=hbm_capacity_scale)
               if hbm_capacity_scale != 1.0 else base_case)
     q_tokens, b = max(1, int(tokens_per_seq)), int(sequences)
-    workspace_tokens = max(1, b * q_tokens)
+    workspace_tokens = _workspace_tokens_for_window(scaled, phase=phase, q_tokens=q_tokens, sequences=b)
     ledger = memory if memory is not None else Memory(scaled, workspace_tokens=workspace_tokens)
     if memory is not None and memory.case != scaled:
         raise ValueError("capacity_window_ledger_case_mismatch")
@@ -415,12 +437,25 @@ def _vram_max_sequences_per_dp(
     base_case = replace(case, runtime=replace(case.runtime, async_scheduling=bool(async_scheduling))) if async_scheduling is not None else case
     scaled = scale_case_hardware(base_case, hbm_capacity_scale=hbm_capacity_scale) if hbm_capacity_scale != 1.0 else base_case
     q_tokens = max(1, int(tokens_per_seq))
-    rt_cap = min(int(scaled.runtime.max_num_seqs), max(1, int(scaled.runtime.max_num_batched_tokens) // q_tokens))
+    step_budget = (
+        _prefill_step_token_budget(scaled)
+        if phase == "prefill"
+        else max(1, int(scaled.runtime.max_num_batched_tokens))
+    )
+    chunkable = phase == "prefill" and bool(scaled.runtime.enable_chunked_prefill)
+    rt_cap = (
+        int(scaled.runtime.max_num_seqs)
+        if chunkable
+        else min(int(scaled.runtime.max_num_seqs), step_budget // q_tokens)
+    )
+    if rt_cap < 1:
+        return 0
 
     def fits(b: int) -> bool:
+        expected_ws = _workspace_tokens_for_window(scaled, phase=phase, q_tokens=q_tokens, sequences=b)
         batch_memory = (
             memory if memory is not None
-            and int(getattr(memory, "workspace_tokens", 0) or 0) == max(1, b * q_tokens)
+            and int(getattr(memory, "workspace_tokens", 0) or 0) == expected_ws
             else None
         )
         return capacity_window(
@@ -498,6 +533,8 @@ def _resolve_speculative_tokens(
         min(policy_proposal, max(0, bounded_output - 1))
         if bounded_output is not None else policy_proposal
     )
+    batch_budget = max(1, int(case.runtime.max_num_batched_tokens))
+    max_prop = min(max_prop, max(0, batch_budget - 1))
     resolved_q = int(tokens_per_seq) if tokens_per_seq is not None else (1 + max_prop if max_prop > 0 else 1)
     if isinstance(tokens_per_seq, bool) or resolved_q < 1:
         raise ValueError(f"tokens_per_seq_must_be_positive_int:{tokens_per_seq}")
@@ -517,7 +554,8 @@ def _resolve_speculative_tokens(
                 1.0 + float(min(eff_prop, acc)) for acc in dp_pol.trace
             ) / float(len(dp_pol.trace))
         else:
-            expected = 1.0 + (float(policy_mean) - 1.0) * (float(eff_prop) / float(policy_proposal))
+            per_pos = max(0.0, min(1.0, (float(policy_mean) - 1.0) / float(policy_proposal)))
+            expected = 1.0 + sum(per_pos for _ in range(eff_prop))
         return resolved_q, min(float(resolved_q), expected)
     return resolved_q, float(resolved_q)
 

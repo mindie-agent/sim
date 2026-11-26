@@ -722,3 +722,74 @@ def test_before_baseline_honesty_mc2_megamoe_and_a3_int8_kv_mlapo() -> None:
     locked_ids = {entry["id"] for entry in res_ideal_locked["active_mechanisms"]}
     assert "cann_megamoe_fusion" not in locked_ids
     assert "tp_mc2_overlap" not in locked_ids
+
+
+def test_dict_and_quantspec_mixed_dense_expert_and_explicit_kv_dtype_parity() -> None:
+    """Mapping quant preserves dense vs expert weight distinction and explicit kv_dtype across stacks."""
+    from math import prod
+    from mindie_sim.compose.runtime import resolve_case_contracts
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.common import dtype_bytes
+
+    mixed_fields = dict(
+        name="mixed",
+        weight_format="bf16",
+        expert_weight_format="int4",
+        activation_format="bf16",
+    )
+    for quant in (QuantSpec(**mixed_fields), mixed_fields):
+        case = parse_case(compose_case("qwen3-30b-a3b", hardware="a3", tp=1, layers=2, quant=quant))
+        ports = dict(resolve_case_contracts(case)[1].port_abis)
+        assert ports[("target", 0, "q_proj")].weight_dtype == "bf16", type(quant).__name__
+        assert ports[("target", 0, "mlp.experts.w13")].weight_dtype == "int4", type(quant).__name__
+        elements = case.model.hidden_size * case.model.num_heads * case.model.head_dim
+        assert int(elements * dtype_bytes(ports[("target", 0, "q_proj")].weight_dtype)) == 2 * elements
+
+    kv_quant = dict(name="bf16", weight_format="bf16", kv_dtype="int8")
+    for stack in ("raw-eager", "ideal-target", "vllm-ascend"):
+        case = parse_case(compose_case(
+            "qwen3-32b", hardware="a3", tp=1, layers=1, quant=kv_quant, runtime_stack=stack,
+        ))
+        page = resolve_case_contracts(case)[1].kv_cache_abi[0]
+        payload_planes = [p for p in page.planes if p.plane_kind == "payload"]
+        expected = 2 * case.model.num_kv_heads * case.model.head_dim * page.kv_block_size
+        assert payload_planes[0].dtype == "int8", stack
+        assert sum(p.exact_bytes() for p in payload_planes) == expected, stack
+
+        ov_case = parse_case(compose_case(
+            "qwen3-32b", hardware="a3", tp=1, layers=1,
+            quant=kv_quant, kv_cache_dtype="bf16", runtime_stack=stack,
+        ))
+        ov_page = resolve_case_contracts(ov_case)[1].kv_cache_abi[0]
+        assert ov_page.planes[0].dtype == "bf16", stack
+
+        curated_ov = parse_case(compose_case(
+            "qwen3.8-27b", hardware="a5", tp=1, layers=4,
+            quant="auto", kv_cache_dtype="bf16", runtime_stack=stack,
+        ))
+        sc_ov, q_ov, _ = resolve_case_contracts(curated_ov)
+        pl_ov = [p for p in q_ov.kv_cache_abi[0].planes if p.plane_kind == "payload"]
+        assert sc_ov.model.kv_dtype == "bf16" and pl_ov[0].dtype == "bf16", stack
+        assert sum(p.exact_bytes() for p in pl_ov) == 2 * prod(pl_ov[0].logical_shape), stack
+
+    uniform_int4 = QuantSpec(
+        name="uniform-int4", weight_format="int4", expert_weight_format="int4",
+        activation_format="int8", expert_block=1, weight_block=(1, 1),
+    )
+    inv_w_only = QuantSpec(
+        name="inv-w-only", weight_format="int4", expert_weight_format="int8", activation_format="bf16",
+    )
+    for stack in ("raw-eager", "ideal-target"):
+        c_u4 = parse_case(compose_case(
+            "qwen3-30b-a3b", hardware="a3", tp=1, layers=1, quant=uniform_int4, runtime_stack=stack,
+        ))
+        p_u4 = dict(resolve_case_contracts(c_u4)[1].port_abis)
+        assert p_u4[("target", 0, "self_attn.q_proj")].weight_dtype == "int4", stack
+        assert p_u4[("target", 0, "mlp.experts.0.gate_proj")].weight_dtype == "int4", stack
+
+        c_inv = parse_case(compose_case(
+            "qwen3-30b-a3b", hardware="a3", tp=1, layers=1, quant=inv_w_only, runtime_stack=stack,
+        ))
+        p_inv = dict(resolve_case_contracts(c_inv)[1].port_abis)
+        assert p_inv[("target", 0, "self_attn.q_proj")].weight_dtype == "int4", stack
+        assert p_inv[("target", 0, "mlp.experts.0.gate_proj")].weight_dtype == "int8", stack

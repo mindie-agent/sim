@@ -3759,7 +3759,7 @@
   },
   "Ascend910B4-1": {
     "device": {
-      "memory_bytes": 34359738368,
+      "memory_bytes": 68719476736,
       "compute_peaks": {
         "int8": 491520000000000.0,
         "bf16": 245760000000000.0,

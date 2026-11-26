@@ -889,3 +889,64 @@ def test_unified_cache_state_abi_preserves_bf16_and_ideal_target_avoids_1_plus_2
     view = decision.requests[0]
     assert view.q_len == 1 and view.draft_proposal_tokens == 3
     assert view.q_len + view.draft_proposal_tokens == 4
+
+
+def test_raw_eager_and_ideal_target_precision_gdn_pp_and_draft_abi_parity() -> None:
+    """Reference stacks honor routed-only dense precision, GDN roles, PP stage KV placement, and ideal-target MTP ABIs."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.compose.runtime import resolve_case_contracts
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.common import dtype_bytes
+    from mindie_sim.schema.scenario import validate_scenario_contract
+
+    for stack in ("raw-eager", "ideal-target", "vllm-ascend"):
+        case = parse_case(compose_case(
+            "qwen3-30b-a3b", hardware="a5", tp=1, layers=1,
+            quant="mxfp4_routed_only", runtime_stack=stack,
+        ))
+        ports = dict(resolve_case_contracts(case)[1].port_abis)
+        role = "q_proj" if stack == "vllm-ascend" else "self_attn.q_proj"
+        exp_role = "mlp.experts.w13" if stack == "vllm-ascend" else "mlp.experts.0.gate_proj"
+        assert ports[("target", 0, role)].weight_dtype == "bf16", stack
+        assert ports[("target", 0, exp_role)].weight_dtype == "fp4_e2m1", stack
+        assert int(8 * dtype_bytes(ports[("target", 0, role)].weight_dtype)) == 16
+
+    for stack in ("raw-eager", "ideal-target", "vllm-ascend"):
+        case = parse_case(compose_case(
+            "Eco-Tech/Qwen3.6-35B-A3B-w8a8", hardware="a3", tp=1, layers=4, runtime_stack=stack,
+        ))
+        plan = resolve_case_contracts(case)[1]
+        l0_rows = [(r, abi.weight_dtype) for (scope, i, r), abi in plan.port_abis if scope == "target" and i == 0]
+        assert case.model.layer_plans[0].attention == "gdn"
+        assert sum(r.startswith("linear_attn.") and d == "bf16" for r, d in l0_rows) == 5, stack
+        assert sum(r.startswith("self_attn.") and d == "int8" for r, d in l0_rows) == 0, stack
+
+    for stack in ("raw-eager", "ideal-target"):
+        case = parse_case(compose_case(
+            "qwen3-32b", hardware="a3", tp=1, pp=2, layers=2, quant="bf16", runtime_stack=stack,
+        ))
+        pages = resolve_case_contracts(case)[1].kv_cache_abi
+        actual = [sum(p.total_plane_bytes() for p in pages if p.placement.pp_stage == s) for s in range(2)]
+        assert actual == list(map(int, Memory(case).cache_bytes(128))), stack
+        assert actual[0] > 0 and actual[0] == actual[1]
+
+    mtp_case = parse_case(compose_case(
+        "glm-5", hardware="a5", tp=1, layers=2, quant="bf16",
+        mtp_proposal_tokens=2, runtime_stack="ideal-target",
+    ))
+    sc_mtp, q_mtp, l_mtp = resolve_case_contracts(mtp_case)
+    validate_scenario_contract(sc_mtp)
+    assert l_mtp.scheduling.draft_invocation_count == 2
+    assert sum(k[0] == "draft" for k, _ in q_mtp.port_abis) > 0
+    assert sum(abi.scope == "draft" for abi in q_mtp.kv_cache_abi) == 1
+    assert sum(abi.scope == "draft" for abi in q_mtp.index_cache_abi) == 1
+
+    dspark_case = parse_case(compose_case(
+        "kimi-k3", hardware="a5", tp=32, ep=32, dcp=2, layers=4,
+        quant="bf16", kv_cache_dtype="int8", mtp_proposal_tokens=2,
+        spec_method="dspark", runtime_stack="ideal-target",
+    ))
+    dspark_kv = next(a for a in resolve_case_contracts(dspark_case)[1].kv_cache_abi if a.scope == "draft")
+    assert dspark_kv.placement.token_ownership_axis == "replicated"
+    assert dspark_kv.planes[0].dtype == "bf16"

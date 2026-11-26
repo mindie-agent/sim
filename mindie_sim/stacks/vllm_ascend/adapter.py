@@ -324,6 +324,22 @@ def _resolve_speculative_option(
             acceptance_mode="marginal",
             source=f"vllm-ascend:{spec_method}",
         )
+    elif requested_options.get("mtp_acceptance_length") is not None:
+        raw_accept = requested_options["mtp_acceptance_length"]
+        if isinstance(raw_accept, bool) or not isinstance(raw_accept, (int, float)) or not math.isfinite(float(raw_accept)):
+            raise ModelingError(f"invalid_mtp_acceptance_length:{raw_accept!r}")
+        accept_val = float(raw_accept)
+        if not (1.0 <= accept_val <= float(1 + raw_k)):
+            raise ModelingError(f"invalid_mtp_acceptance_length:{raw_accept!r}")
+        per_pos_prob = max(0.0, min(1.0, (accept_val - 1.0) / float(raw_k)))
+        marginals = tuple(per_pos_prob for _ in range(eff_k))
+        spec_obj = SpeculativeSpec(
+            draft_len=eff_k,
+            acceptance=marginals,
+            acceptance_mode="marginal",
+            source=f"vllm-ascend:{spec_method}",
+            label="explicit_mtp_acceptance_length",
+        )
     else:
         spec_obj = SpeculativeSpec(
             draft_len=eff_k,
@@ -560,6 +576,8 @@ def _build_stars_submit_policies(
 def _pd_local_tokens_for_abi(abi: Any, transfer_tokens: int) -> int:
     tokens = max(1, int(transfer_tokens))
     eff_tokens = min(tokens, int(abi.window)) if abi.window else tokens
+    if getattr(abi, "draft_context_cap", None):
+        eff_tokens = min(eff_tokens, int(abi.draft_context_cap))
     place = abi.placement
     if place.token_ownership_axis in {"dcp_head", "cp_striped"} and len(place.rank_ids) > 1:
         cp_shard = len(place.rank_ids)
@@ -585,7 +603,10 @@ def _pd_transfer_bytes_for_abi(abi: Any, transfer_tokens: int) -> int:
                 total += (unit_bytes * live_rows) // cap_rows
             elif abi.component_role == "recurrent_state" and abi.rollback_slots > 0:
                 if idx_pl == 0 or plane.plane_id == "recurrent_state":
-                    total += unit_bytes // (1 + int(abi.rollback_slots))
+                    if int(getattr(abi, "checkpoint_slots", 0) or 0) > 0:
+                        total += unit_bytes
+                    else:
+                        total += unit_bytes // (1 + int(abi.rollback_slots))
                 elif abi.history_slots > 0:
                     total += (unit_bytes * int(abi.history_slots)) // (int(abi.history_slots) + int(abi.rollback_slots))
                 else:
@@ -1604,7 +1625,9 @@ def _resolve_capture_and_pd_options(
         max_num_seqs=max_seqs,
         explicit_capture_sizes=explicit_cap,
         enforce_eager=enforce_eager,
-        enforce_eager_draft=draft_eager or bool(requested_options.get("enforce_eager_draft", False)),
+        enforce_eager_draft=draft_eager or bool(
+            requested_options.get("enforce_eager_draft", requested_options.get("draft_enforce_eager", False))
+        ),
         allow_mixed=bool(requested_options.get("allow_mixed_capture", False)),
         allow_ragged=bool(requested_options.get("allow_ragged_capture", False)),
     )
@@ -1743,7 +1766,9 @@ class VllmAscendStackAdapter:
             ))),
             ("include_proposed_pr", bool(requested_options.get("include_proposed_pr", track in {"proposed", "target"}))),
             ("kv_cache_dtype", eff_kv),
+            ("kv_cache_dtype_explicit", bool(requested_options.get("kv_cache_dtype_explicit", False))),
             ("indexer_kv_dtype", str(requested_options.get("indexer_kv_dtype") or tut_flags.get("indexer_kv_dtype") or "")),
+            ("indexer_kv_dtype_explicit", bool(requested_options.get("indexer_kv_dtype_explicit", False))),
             ("kv_block_size", int(requested_options.get("kv_block_size") or profile_cfg.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)),
             ("max_num_seqs", int(requested_options.get("max_num_seqs") or DEFAULT_MAX_NUM_SEQS)),
             ("max_num_batched_tokens", int(requested_options.get("max_num_batched_tokens") or 0)),
@@ -1768,7 +1793,7 @@ class VllmAscendStackAdapter:
             ("recoverssm_source_ref", recoverssm.source_ref),
             ("pd_kv_transfer_mode", pd_mode),
             ("pd_kv_transport", pd_transport),
-            ("chunked_prefill", bool(requested_options.get("chunked_prefill", True))),
+            ("chunked_prefill", bool(requested_options.get("enable_chunked_prefill", requested_options.get("chunked_prefill", True)))),
             ("async_scheduling", bool(requested_options.get("async_scheduling", False))),
             ("target_quant_projection", str(requested_options.get("target_quant_projection") or "")),
             ("field_origin_count", len(field_origins)),
