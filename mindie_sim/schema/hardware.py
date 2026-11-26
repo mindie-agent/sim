@@ -14,11 +14,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping, Sequence, Set as AbstractSet
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any
 
 from .common import ModelingError, _positive_float
 from .compute_arch import ComputeArchSpec
@@ -50,7 +51,7 @@ from .hardware_links import (
     calibration_warnings,
 )
 from .invocation import InvocationTiming
-from .parallel import ParallelSpec
+from .parallel import DieIndex, GlobalRank, ParallelSpec, RankCoord, ReplicaLocalRank
 from .physical_mechanisms import (
     PhysicalMechanismSpec, default_physical_mechanisms,
     parse_physical_mechanisms,
@@ -58,6 +59,8 @@ from .physical_mechanisms import (
 
 BITS_PER_BYTE = 8
 DEFAULT_ROOT_COMPLEX_ID = "rc0"
+_HOST_DMA_SCOPES = frozenset({"host", "device_local"})
+_HOST_DMA_CHANNEL_TAGS = ("host", "h2d", "d2h", "pcie", "dma")
 
 NATIVE_WORK_UNITS = {
     **dict.fromkeys(("hbm", "l2", "mte1", "mte2", "mte2_aic", "mte2_aiv", "mte3",
@@ -77,10 +80,78 @@ _QUANTITY_SCOPES = {
 }
 
 
-def _optional_pos_rate(value, label: str) -> float | None:
+def _optional_pos_rate(value: Any, label: str) -> float | None:
     if value is None:
         return None
     return _positive_float(value, f"{label}_invalid", allow_zero=False)
+
+
+def _channel_scope_map(
+    transfer_channels: Mapping[str, Any] | Sequence[tuple[str, Any]],
+) -> dict[str, str]:
+    entries = (
+        transfer_channels.items()
+        if isinstance(transfer_channels, Mapping)
+        else transfer_channels
+    )
+    scopes: dict[str, str] = {}
+    for channel_name, raw_items in entries:
+        record = dict(raw_items) if isinstance(raw_items, (Mapping, Sequence)) else {}
+        raw_scope = record.get("scope")
+        if raw_scope is not None:
+            scopes[str(channel_name)] = str(raw_scope).strip().lower()
+    return scopes
+
+
+def _is_host_or_dma_link(
+    link: Link,
+    channel_scopes: Mapping[str, str] | None = None,
+) -> bool:
+    scope = str(link.scope or "").strip().lower()
+    if not scope and channel_scopes is not None:
+        scope = channel_scopes.get(str(link.channel), "")
+    if scope in _HOST_DMA_SCOPES:
+        return True
+    channel = str(link.channel or "").strip().lower()
+    return any(tag in channel for tag in _HOST_DMA_CHANNEL_TAGS)
+
+
+def _induced_links_for(
+    links: Sequence[Link],
+    selected_ranks: AbstractSet[GlobalRank],
+    *,
+    transfer_channels: Mapping[str, Any] | Sequence[tuple[str, Any]] = (),
+) -> tuple[Link, ...]:
+    selected = {int(rank) for rank in selected_ranks}
+    channel_scopes = _channel_scope_map(transfer_channels) if transfer_channels else {}
+    induced: list[Link] = []
+    for link in links:
+        kept = tuple(int(member) for member in link.members if int(member) in selected)
+        if not kept:
+            continue
+        if len(kept) < 2 and not (
+            len(link.members) == 1 or _is_host_or_dma_link(link, channel_scopes)
+        ):
+            continue
+        if kept == link.members:
+            induced.append(link)
+            continue
+        kept_set = set(kept)
+        induced.append(replace(
+            link,
+            members=kept,
+            endpoint_rates=tuple(
+                (int(rank), rate)
+                for rank, rate in link.endpoint_rates
+                if int(rank) in kept_set
+            ),
+            endpoint_ids=tuple(
+                (int(rank), endpoint_id)
+                for rank, endpoint_id in link.endpoint_ids
+                if int(rank) in kept_set
+            ),
+        ))
+    return tuple(induced)
 
 
 @dataclass(frozen=True)
@@ -124,7 +195,7 @@ class Device:
         return self.compute_arch
 
     @property
-    def resource_signature(self):
+    def resource_signature(self) -> tuple[Any, ...]:
         """Hashable physical identity without rank/node/package labels."""
         arch = self.compute_arch
         return (self.sku, self.arch_family, self.memory_bytes, self.compute_peaks,
@@ -161,46 +232,53 @@ class Device:
                 self.observed_aicore_freq_mhz)
 
     @property
-    def hbm_bytes(self):
+    def hbm_bytes(self) -> int:
         return self.memory_bytes
 
     @property
-    def cube_flops_per_s(self):
+    def cube_flops_per_s(self) -> float:
         return self.peak("bf16")
 
     @property
-    def aic_count(self):
+    def aic_count(self) -> int:
         return self.compute_units
 
-    def peak(self, dtype):
+    def peak(self, dtype: str) -> float:
         return matrix_peak(dtype, self.compute_peaks, self.compute_peak_aliases, self.compute_arch)
 
-    def units(self, resource):
-        return dict(self.resource_units).get(resource, self.compute_units)
+    def units(self, resource: str) -> int:
+        declared = dict(self.resource_units)
+        if resource in declared:
+            return declared[resource]
+        if resource == "l2" and (
+            "l2" in dict(self.buffer_units) or "l2" in dict(self.buffers)
+        ):
+            return dict(self.buffer_units).get("l2", 1)
+        return self.compute_units
 
-    def pool_units(self, pool):
+    def pool_units(self, pool: str) -> int:
         return dict(self.buffer_units).get(pool, self.compute_units)
 
-    def owner_count(self, resource):
+    def owner_count(self, resource: str) -> int:
         """Owners of ``resource`` on this device (never a package total)."""
         return self.units(resource)
 
-    def total_rate(self, resource):
+    def total_rate(self, resource: str) -> float:
         """Declared device-total service of one resource, in its own unit."""
         return dict(self.rates)[resource]
 
-    def owner_rate(self, resource):
+    def owner_rate(self, resource: str) -> float:
         """Per-owner service; idle siblings do not lend their capacity."""
         count = self.owner_count(resource)
         if count < 1:
             raise ModelingError(f"resource_owner_count_nonpositive:{resource}")
         return self.total_rate(resource) / count
 
-    def total_buffer_bytes(self, pool):
+    def total_buffer_bytes(self, pool: str) -> int:
         """Per-owner pool capacity times its declared owner count."""
         return self.pool_capacity(pool) * self.pool_units(pool)
 
-    def pool_capacity(self, pool):
+    def pool_capacity(self, pool: str) -> int:
         """Declared capacity of one pool instance (per owner)."""
         try:
             return dict(self.buffers)[pool]
@@ -208,14 +286,14 @@ class Device:
             raise ModelingError(f"buffer_pool_undeclared:{pool}") from exc
 
     @staticmethod
-    def quantity_scope(quantity):
+    def quantity_scope(quantity: str) -> str:
         """Return the declared accounting scope of a device quantity."""
         try:
             return _QUANTITY_SCOPES[quantity]
         except KeyError as exc:
             raise ModelingError(f"device_quantity_scope_unknown:{quantity}") from exc
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         derived_rates = {s.name for s in self.compute_arch.instruction_services
                          if s.has_linked_supply
                          and s.name not in self.linked_rate_overrides}
@@ -279,30 +357,68 @@ class PhysicalRankMap:
     parallel: ParallelSpec
     logical_to_physical: tuple[int, ...]
     _inventory: Mapping[int, Device] = field(repr=False)
+    _links: tuple[Link, ...] = field(default=(), repr=False, compare=False)
+    _transfer_channels: tuple[tuple[str, tuple[tuple[str, object], ...]], ...] = field(
+        default=(), repr=False, compare=False,
+    )
+    _die_index_by_rank: Mapping[int, DieIndex] = field(
+        init=False, repr=False, compare=False,
+    )
+    _physical_to_logical: Mapping[int, int] = field(
+        init=False, repr=False, compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_die_index_by_rank",
+            MappingProxyType({
+                int(rank): DieIndex(idx)
+                for idx, rank in enumerate(self._inventory)
+            }),
+        )
+        object.__setattr__(
+            self,
+            "_physical_to_logical",
+            MappingProxyType({
+                int(rank): idx
+                for idx, rank in enumerate(self.logical_to_physical)
+            }),
+        )
 
     @property
-    def active_ranks(self) -> frozenset[int]:
-        return frozenset(self.logical_to_physical)
+    def active_ranks(self) -> frozenset[GlobalRank]:
+        return frozenset(GlobalRank(int(rank)) for rank in self.logical_to_physical)
 
     @property
-    def spare_ranks(self) -> frozenset[int]:
-        return frozenset(self._inventory.keys() - self.active_ranks)
+    def spare_ranks(self) -> frozenset[GlobalRank]:
+        active = {int(rank) for rank in self.logical_to_physical}
+        return frozenset(
+            GlobalRank(int(rank))
+            for rank in self._inventory.keys()
+            if int(rank) not in active
+        )
 
     def die_for_rank(self, rank: int) -> Device:
         try:
-            return self._inventory[rank]
+            return self._inventory[int(rank)]
         except KeyError as exc:
             raise ModelingError(f"hardware_placement_unknown:{rank}") from exc
 
-    def stage_ranks(self, replica: int, stage: int = 0) -> tuple[int, ...]:
+    def stage_ranks(self, replica: int, stage: int = 0) -> tuple[GlobalRank, ...]:
         p = self.parallel
         if not (0 <= replica < p.external_dp * p.dp and 0 <= stage < p.pp):
             raise ModelingError(f"placement_coordinate_unknown:{replica}:{stage}")
         width = p.tp * p.pcp
         start = (replica * p.pp + stage) * width
-        return self.logical_to_physical[start:start + width]
+        return tuple(
+            GlobalRank(int(rank))
+            for rank in self.logical_to_physical[start:start + width]
+        )
 
-    def ep_group_ranks(self, replica: int, stage: int = 0, *, lane: int = 0) -> tuple[int, ...]:
+    def ep_group_ranks(
+        self, replica: int, stage: int = 0, *, lane: int = 0,
+    ) -> tuple[GlobalRank, ...]:
         """Return the EP group containing one lane of the replica and stage."""
         p = self.parallel
         local = self.stage_ranks(replica, stage)
@@ -311,25 +427,112 @@ class PhysicalRankMap:
         if p.rank_table is not None:
             for group in p.rank_table:
                 if local[lane] in group:
-                    return group
+                    return tuple(GlobalRank(int(rank)) for rank in group)
             raise ModelingError(f"rank_table_rank_unassigned:{local[lane]}")
-        if not (p.ep_spans_dp or p.ep_spans_pcp):
-            start = lane // p.ep * p.ep
-            return local[start:start + p.ep]
-        width = p.tp // p.etp
-        copy, tp_lane = divmod(lane, p.tp)
-        offset = tp_lane // width * width
-        first = replica // p.ep_dp_width * p.ep_dp_width
-        copy_count = min(p.pcp, p.ep // width) if p.ep_spans_pcp else 1
-        first_copy = copy // copy_count * copy_count
-        copies = range(first_copy, first_copy + copy_count)
-        group = []
-        for r in range(first, first + p.ep_dp_width):
-            ranks = self.stage_ranks(r, stage)
-            for c in copies:
-                start = c * p.tp + offset
-                group.extend(ranks[start:start + width])
-        return tuple(group)
+        coords = p.ep_group_coords(replica, stage, ReplicaLocalRank(lane))
+        stage_cache: dict[tuple[int, int], tuple[GlobalRank, ...]] = {
+            (replica, stage): local,
+        }
+        ranks: list[GlobalRank] = []
+        for rep, stg, local_lane in coords:
+            key = (rep, stg)
+            stage_tuple = stage_cache.get(key)
+            if stage_tuple is None:
+                stage_tuple = self.stage_ranks(rep, stg)
+                stage_cache[key] = stage_tuple
+            ranks.append(stage_tuple[int(local_lane)])
+        return tuple(ranks)
+
+    def coord_for(
+        self,
+        replica: int,
+        stage: int,
+        local_rank: ReplicaLocalRank | int,
+    ) -> RankCoord:
+        """Project logical ``(replica, stage, local_rank)`` to a typed ``RankCoord``."""
+        p = self.parallel
+        local = self.stage_ranks(replica, stage)
+        lane = int(local_rank)
+        if not 0 <= lane < len(local):
+            raise ModelingError(f"placement_lane_unknown:{lane}")
+        global_rank = local[lane]
+        die_index = self._die_index_by_rank.get(int(global_rank))
+        if die_index is None:
+            raise ModelingError(f"hardware_placement_unknown:{global_rank}")
+        pcp_lane, tp_lane = divmod(lane, p.tp)
+        if p.cp <= 1:
+            dcp_lane = 0
+        else:
+            pcp_f = p.dcp_pcp_factor
+            tp_g = p.dcp_tp_gather
+            dp_w = p.dcp_dp_width
+            dp_i = replica % p.dp
+            if dp_w > 1:
+                dcp_lane = (
+                    (dp_i % dp_w) * (pcp_f * tp_g)
+                    + (pcp_lane % pcp_f) * tp_g
+                    + (tp_lane % tp_g)
+                ) % p.cp
+            else:
+                dcp_lane = ((tp_lane % tp_g) * pcp_f + (pcp_lane % pcp_f)) % p.cp
+        if p.ep <= 1:
+            ep_rank = 0
+        else:
+            ep_group = self.ep_group_ranks(replica, stage, lane=lane)
+            ep_rank = ep_group.index(global_rank)
+        return RankCoord(
+            global_rank=global_rank,
+            die_index=die_index,
+            replica=int(replica),
+            stage=int(stage),
+            local_rank=ReplicaLocalRank(lane),
+            tp_lane=tp_lane,
+            pcp_lane=pcp_lane,
+            dcp_lane=dcp_lane,
+            ep_rank=ep_rank,
+        )
+
+    def coord_for_physical_rank(self, rank: GlobalRank) -> RankCoord:
+        """Project one active physical ``GlobalRank`` back to its ``RankCoord``."""
+        rank_int = int(rank)
+        logical_idx = self._physical_to_logical.get(rank_int)
+        if logical_idx is None:
+            raise ModelingError(f"hardware_placement_unknown:{rank_int}")
+        p = self.parallel
+        width = p.tp * p.pcp
+        stage_slot, lane = divmod(logical_idx, width)
+        replica, stage = divmod(stage_slot, p.pp)
+        return self.coord_for(replica, stage, ReplicaLocalRank(lane))
+
+    def physical_ranks_for_cohort(
+        self, group: Sequence[int],
+    ) -> tuple[GlobalRank, ...]:
+        """Return actual physical ``GlobalRank`` IDs covering ``group`` replicas."""
+        p = self.parallel
+        seen: set[int] = set()
+        ranks: list[GlobalRank] = []
+        for replica in sorted({int(rep) for rep in group}):
+            for stage in range(p.pp):
+                for rank in self.stage_ranks(replica, stage):
+                    rank_int = int(rank)
+                    if rank_int not in seen:
+                        seen.add(rank_int)
+                        ranks.append(GlobalRank(rank_int))
+        return tuple(ranks)
+
+    def induced_links_for(
+        self,
+        selected_ranks: AbstractSet[GlobalRank],
+        *,
+        links: Sequence[Link] | None = None,
+    ) -> tuple[Link, ...]:
+        """Project links onto ``selected_ranks``, rewriting surviving members and endpoints."""
+        source_links = self._links if links is None else links
+        return _induced_links_for(
+            source_links,
+            selected_ranks,
+            transfer_channels=self._transfer_channels,
+        )
 
 
 @dataclass(frozen=True)
@@ -363,18 +566,18 @@ class Hardware:
             raise ModelingError(f"hardware_resources_are_per_placement:{query}")
 
     @property
-    def compute_peaks(self):
+    def compute_peaks(self) -> tuple[tuple[str, float], ...]:
         self._require_homogeneous("compute_peaks")
         return self.dies[0].compute_peaks
 
-    def per_placement_peaks(self, dtype):
+    def per_placement_peaks(self, dtype: str) -> dict[int, float]:
         return {device.rank: device.peak(dtype) for device in self.dies}
 
-    def peak_flops_for(self, dtype):
+    def peak_flops_for(self, dtype: str) -> float:
         self._require_homogeneous("peak_flops_for")
         return min(device.peak(dtype) for device in self.dies)
 
-    def declared_peak_key(self, dtype):
+    def declared_peak_key(self, dtype: str) -> str | None:
         return dtype if dtype in dict(self.compute_peaks) else None
 
     def package_memory_bytes(self, package: int, *, node: int = 0) -> int:
@@ -457,13 +660,20 @@ class Hardware:
             device = self.dies[0]
         device_sku = (device.sku if device is not None else "") or self.sku or self.name
         source_map = dict(self.source or {})
-        cal = dict(source_map.get("calibration") or {})
+        raw_cal = source_map.get("calibration")
+        cal: dict[str, Any] = dict(raw_cal) if isinstance(raw_cal, Mapping) else {}
         if (device is not None and not self.homogeneous
                 and device.sku and device.sku != self.sku and not cal):
             from mindie_sim.backends.ascend import profiles as ascend_profiles
             prof = ascend_profiles().get(device.sku)
             if isinstance(prof, Mapping):
-                cal = dict((prof.get("source") or {}).get("calibration") or {})
+                prof_source = prof.get("source")
+                prof_cal = (
+                    prof_source.get("calibration")
+                    if isinstance(prof_source, Mapping) else None
+                )
+                if isinstance(prof_cal, Mapping):
+                    cal = dict(prof_cal)
         calibrated_raw = cal.get("calibrated")
         if calibrated_raw is None and device is not None:
             hierarchy_prov = dict(device.physical_mechanisms.memory_hierarchy.provenance)
@@ -482,7 +692,7 @@ class Hardware:
             "anchor_sku": anchor_sku,
         }
 
-    def hardware_context(self, rank: int = 0) -> dict:
+    def hardware_context(self, rank: int = 0) -> dict[str, Any]:
         device = next((item for item in self.dies if item.rank == rank), None)
         if device is None:
             raise ModelingError(f"hardware_placement_unknown:{rank}")
@@ -518,6 +728,14 @@ class Hardware:
                if self.node_peak_bw_gbps else {}),
         }
 
+    def induced_links_for(self, selected_ranks: AbstractSet[GlobalRank]) -> tuple[Link, ...]:
+        """Project hardware links onto ``selected_ranks``."""
+        return _induced_links_for(
+            self.links,
+            selected_ranks,
+            transfer_channels=self.transfer_channels,
+        )
+
     def validate_placement(self, parallel: ParallelSpec) -> PhysicalRankMap:
         if parallel.world_size > len(self.dies):
             raise ModelingError("placement_exceeds_physical_devices")
@@ -526,7 +744,13 @@ class Hardware:
             raise ModelingError("device_rank_duplicate")
         parallel.validate_expert_placement()
         active = tuple(inventory)[:parallel.world_size]
-        placement = PhysicalRankMap(parallel, active, MappingProxyType(inventory))
+        placement = PhysicalRankMap(
+            parallel,
+            active,
+            MappingProxyType(inventory),
+            _links=self.links,
+            _transfer_channels=self.transfer_channels,
+        )
         if parallel.rank_table is not None:
             positions = {rank: pos for group in parallel.rank_table for pos, rank in enumerate(group)}
             unknown = positions.keys() - placement.active_ranks
@@ -548,7 +772,7 @@ class Hardware:
         return placement
 
     @classmethod
-    def from_mapping(cls, raw: Mapping):
+    def from_mapping(cls, raw: Mapping[str, Any]) -> Hardware:
         from mindie_sim.backends import materialize
         raw_in = _normalize_core_aliases(raw)
         backend = raw_in.get("backend")
@@ -638,9 +862,11 @@ class Hardware:
     @property
     def physical_ranks_per_node(self) -> int:
         raw_val = dict(self.topology_options).get("physical_ranks_per_node")
-        return int(raw_val) if raw_val is not None else int(self.ranks_per_node)
+        if isinstance(raw_val, (int, float, str)) and not isinstance(raw_val, bool):
+            return int(raw_val)
+        return int(self.ranks_per_node)
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return {"name": self.name, "architecture": self.arch_family,
                 "hardware_key": self.hardware_key,
                 "sku": self.sku,
@@ -666,7 +892,7 @@ from .datapath import (
 )
 
 
-def _validate_transfer_channels(raw):
+def _validate_transfer_channels(raw: Mapping[str, Any]) -> None:
     allowed_semantics = {
         "shared", "per_port", "per_pair", "direct", "fully_connected",
         "mesh", "switched", "unknown", "none",
@@ -690,7 +916,13 @@ def _validate_transfer_channels(raw):
             normalize_link_scope(channel["scope"])
 
 
-def _materialize_placement_device(raw, raw_in, backend, machine_explicit, explicit_record):
+def _materialize_placement_device(
+    raw: Mapping[str, Any],
+    raw_in: Mapping[str, Any],
+    backend: Any,
+    machine_explicit: Mapping[str, Any],
+    explicit_record: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
     from mindie_sim.backends import materialize
 
     record_fields = {
@@ -758,7 +990,14 @@ def _materialize_placement_device(raw, raw_in, backend, machine_explicit, explic
     return data, arch_family
 
 
-def _parse_placement_device(raw, raw_in, backend, machine_explicit, explicit_record, placement):
+def _parse_placement_device(
+    raw: Mapping[str, Any],
+    raw_in: Mapping[str, Any],
+    backend: Any,
+    machine_explicit: Mapping[str, Any],
+    explicit_record: Mapping[str, Any],
+    placement: tuple[int, int, int],
+) -> Device:
     data, arch_family = _materialize_placement_device(
         raw, raw_in, backend, machine_explicit, explicit_record)
     arch = _resolve_device_compute_arch(data, raw, arch_family)
@@ -866,7 +1105,7 @@ def _parse_placement_device(raw, raw_in, backend, machine_explicit, explicit_rec
     )
 
 
-def parse_hardware(raw: Mapping) -> Hardware:
+def parse_hardware(raw: Mapping[str, Any]) -> Hardware:
     """Parse a hardware declaration, including top-level network overrides."""
     if not isinstance(raw, Mapping):
         raise ModelingError("hardware_mapping_required")
