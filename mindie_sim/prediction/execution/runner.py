@@ -382,33 +382,122 @@ def try_lazy_add(execution, work, replica, release_ms, *, scope, schedule,
     return None
 
 
+def _collective_comm_groups(execution, op, replica) -> tuple[tuple[int, ...], ...]:
+    """Resolve an op's actual communicator rank group(s) on ``replica``."""
+    meta = _metadata_dict(op)
+    source_stage = int(meta.get("source_stage", op.stage))
+    stage_ranks = tuple(int(r) for r in execution.topology.ranks(replica, source_stage))
+    declared_ranks = meta.get("group_ranks")
+    if isinstance(declared_ranks, (tuple, list)) and declared_ranks:
+        return (tuple(int(r) for r in declared_ranks),)
+    axis = str(meta.get("group_axis", "tp"))
+    family = str(meta.get("collective", op.family)).strip().lower()
+    if axis == "pp" or family == "pp_p2p":
+        return (stage_ranks,) if stage_ranks else ()
+    try:
+        groups = tuple(
+            tuple(int(r) for r in group)
+            for group in execution.topology.groups(axis, replica, source_stage, metadata=meta)
+            if group
+        )
+    except ModelingError:
+        return (stage_ranks,) if stage_ranks else ()
+    return groups if groups else ((stage_ranks,) if stage_ranks else ())
+
+
+def _select_readiness_groups(
+    report,
+    groups: tuple[tuple[int, ...], ...],
+    *,
+    call_id: str | None,
+    connection_id: str | None,
+    ordinal: int | None,
+    communicator: str | None,
+) -> list[tuple[tuple[int, ...], int, str | None]]:
+    """Match ``groups`` to observed C7 calls without accepting mismatched communicators."""
+    from ..collectives.readiness import _select_calls
+
+    default_size = len(groups[0])
+    if len(groups) <= 1:
+        return [(groups[0], default_size, communicator)]
+    try:
+        selected = _select_calls(
+            report, call_id,
+            connection_id=connection_id, ordinal=ordinal, communicator=communicator,
+        )
+    except ModelingError:
+        return [(groups[0], default_size, communicator)]
+    group_by_set = {frozenset(grp): grp for grp in groups}
+    selected_set = frozenset(selected)
+    if communicator is not None:
+        matched = group_by_set.get(selected_set)
+        return [(matched, len(matched), communicator)] if matched is not None else [
+            (groups[0], default_size, communicator)
+        ]
+    by_comm: dict[str, set[int]] = {}
+    for rank, call in selected.items():
+        op_info = call.get("operation") or {}
+        comm_id = str(op_info.get("communicator") or op_info.get("group_name") or "")
+        by_comm.setdefault(comm_id, set()).add(rank)
+    has_named = any(bool(name) for name in by_comm)
+    if has_named:
+        if "" in by_comm:
+            return [(groups[0], default_size, None)]
+        if all(frozenset(rks) in group_by_set for rks in by_comm.values()):
+            return [
+                (group_by_set[frozenset(rks)], len(rks), comm_id)
+                for comm_id, rks in sorted(by_comm.items())
+            ]
+        return [(groups[0], default_size, None)]
+    matched = group_by_set.get(selected_set)
+    if matched is not None:
+        return [(matched, len(matched), None)]
+    return [(groups[0], default_size, None)]
+
+
 def observe_collective_readiness(execution, op, replica, ready):
     """Record pipeline readiness observations for a local collective op."""
     from ..collectives.readiness import bind_pipeline_ready
-    ranks = execution.topology.ranks(replica, op.stage)
-    ready_by_rank = {rank: ready for rank in ranks}
-    collective, expected_bytes, expected_dtype = _collective_native_basis(op, len(ranks))
-    meta = dict(op.metadata)
-    try:
-        readiness_context = bind_pipeline_ready(
-            execution.readiness_report, ready_by_rank,
-            expected_collective=collective,
-            expected_bytes=(int(expected_bytes)
-                            if expected_bytes is not None
-                            and expected_bytes.denominator == 1 else None),
-            expected_dtype=expected_dtype,
-            expected_group_size=len(ranks),
-            connection_id=meta.get("collective_connection_id"),
-            ordinal=meta.get("collective_call_ordinal"),
-            call_id=meta.get("collective_call_id"))
-    except ModelingError as exc:
-        execution.readiness_unresolved.append({"op_id": op.op_id, "reason": str(exc)})
-    else:
-        execution.readiness_observations.append({
-            "op_id": op.op_id, "replica": replica,
-            "ready_by_rank": tuple(sorted(ready_by_rank)),
-            "context": readiness_context,
-        })
+
+    meta = _metadata_dict(op)
+    groups = _collective_comm_groups(execution, op, replica)
+    if not groups:
+        return
+    call_id = meta.get("collective_call_id")
+    connection_id = meta.get("collective_connection_id")
+    ordinal = meta.get("collective_call_ordinal")
+    communicator = meta.get("collective_communicator")
+    targets = _select_readiness_groups(
+        execution.readiness_report, groups,
+        call_id=call_id, connection_id=connection_id,
+        ordinal=ordinal, communicator=communicator,
+    )
+    for grp, expected_group_size, grp_comm in targets:
+        ready_by_rank = {rank: ready for rank in grp}
+        collective, expected_bytes, expected_dtype = _collective_native_basis(
+            op, expected_group_size,
+        )
+        try:
+            readiness_context = bind_pipeline_ready(
+                execution.readiness_report, ready_by_rank,
+                expected_collective=collective,
+                expected_bytes=(int(expected_bytes)
+                                if expected_bytes is not None
+                                and expected_bytes.denominator == 1 else None),
+                expected_dtype=expected_dtype,
+                expected_group_size=expected_group_size,
+                connection_id=connection_id,
+                ordinal=ordinal,
+                call_id=call_id,
+                communicator=grp_comm)
+        except ModelingError as exc:
+            execution.readiness_unresolved.append({"op_id": op.op_id, "reason": str(exc)})
+        else:
+            execution.readiness_observations.append({
+                "op_id": op.op_id, "replica": replica,
+                "ready_by_rank": tuple(sorted(ready_by_rank)),
+                "context": readiness_context,
+            })
 
 
 def schedule_op_offload_reads(
@@ -1626,7 +1715,8 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
                     and op.family in {"collective", "allgather", "reduce_scatter",
                                       "allreduce", "transport"}
                     and op.link_bytes > 0
-                    and dict(op.metadata).get("group_axis") not in {"ep", "local_tp"}):
+                    and dict(op.metadata).get("group_axis") not in {"ep", "local_tp"}
+                    and not (self._collectives is not None and collective_requires_cohort(op, self.topology))):
                 observe_collective_readiness(self, op, replica, ready)
             if op.layer >= 0 and op.layer not in layer_entries:
                 layer_entries[op.layer] = ready

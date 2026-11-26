@@ -947,3 +947,115 @@ def test_namespaced_topology_preserves_primitive_table_and_sha_mismatch_propagat
             _bundled_calibrated_primitive_table("Ascend950DT_9582")
     finally:
         _bundled_calibrated_primitive_table.cache_clear()
+
+
+def test_asymmetric_rank_table_pp_tail_idle_lowering_and_substage_readiness() -> None:
+    """Lock explicit tp_lane forwarding, sliced PP tail handoff, mixed-idle export, and sub-stage readiness."""
+    from mindie_sim.prediction.collectives.readiness import SCHEMA as C7_SCHEMA
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import IterationPlan
+
+    # 1. Multi-group asymmetric rank_table=((0,1),(3,2)): rank 3 has ep_owner=0 but tp_lane=1.
+    from mindie_sim.prediction.operator_analysis import target_operators
+
+    raw_asym = compose_case("qwen3-235b-a22b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=2, tp=2, ep=2, sp=True)
+    raw_asym["runtime"]["rank_table"] = [[0, 1], [3, 2]]
+    raw_asym["runtime"]["kernels"]["sequence_parallel"]["padding"] = "right_to_tp"
+    ops_r0 = target_operators(
+        raw_asym, scope="body", phase="prefill", tokens=3,
+        selected_replica=0, physical_rank=0, apply_body_defaults=False,
+    )
+    ops_r3 = target_operators(
+        raw_asym, scope="body", phase="prefill", tokens=3,
+        selected_replica=1, physical_rank=3, apply_body_defaults=False,
+    )
+    pack_r0 = next(op for op in ops_r0 if op.recipe == "route_pack")
+    pack_r3 = next(op for op in ops_r3 if op.recipe == "route_pack")
+    assert pack_r0.vector_ops == pytest.approx(2.0 * pack_r3.vector_ops)
+    assert pack_r0.mte2_bytes == pytest.approx(2.0 * pack_r3.mte2_bytes)
+    assert pack_r3.vector_ops > 0.0
+
+    # 2. Sliced model scope with pp=2, pp_layer_partition=(1,1), layer_limit=1 emits PP handoff to stage 1,
+    #    and sliced body scope with pp_layer_partition=(2,1), sp=True keeps sp_output_gather on stage 0.
+    raw_pp = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=2, tp=1, pp=2)
+    raw_pp["runtime"]["pp_layer_partition"] = [1, 1]
+    ops_pp = target_graphs(parse_case(raw_pp), phase="decode", tokens=1, context=16, sequences=1, scope="model", layer_limit=1)[0]
+    pp_ops = [op for op in ops_pp if op.family == "pp_p2p"]
+    assert len(pp_ops) == 1
+    assert pp_ops[0].stage == 0 and dict(pp_ops[0].metadata)["destination_stage"] == 1
+    assert pp_ops[0].link_bytes > 0.0
+    final_norm = next(op for op in ops_pp if op.op_id == "final_norm")
+    assert final_norm.stage == 1 and pp_ops[0].op_id in final_norm.deps
+
+    raw_sp_pp = compose_case("qwen3-235b-a22b", hardware=REPRESENTATIVE_SKUS["a5"], layers=3, dp=1, tp=2, ep=2, pp=2, pp_layer_partition=(2, 1), sp=True)
+    ops_sp_pp = target_operators(raw_sp_pp, scope="body", phase="prefill", tokens=4, layer_limit=1, apply_body_defaults=False, resource_fusion=False)
+    sp_by_id = {op.op_id: op for op in ops_sp_pp}
+    sp_gather = sp_by_id["sp_output_gather"]
+    assert (sp_by_id[sp_gather.deps[0]].stage, sp_gather.stage) == (0, 0)
+
+    # 3. PredictionSpine.lower with active + genuinely idle (padded_tokens=0) replicas exports cleanly.
+    case_dp2 = parse_case(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=2, tp=1))
+    spine = PredictionSpine()
+    prep_dec_idle = spine.lower(
+        case_dp2,
+        LoweringRequest(iterations=(
+            (0, IterationPlan((RequestView("r0", q_len=1, context=16, samples=True, phase="decode"),))),
+            (1, IterationPlan(())),
+        )),
+    )
+    assert prep_dec_idle.structure_payload["execution"]["phase"] == "decode"
+    prep_mix_idle = spine.lower(
+        case_dp2,
+        LoweringRequest(iterations=(
+            (0, IterationPlan((
+                RequestView("r0", q_len=4, context=0, samples=False, phase="prefill"),
+                RequestView("r1", q_len=1, context=16, samples=True, phase="decode"),
+            ))),
+            (1, IterationPlan(())),
+        )),
+    )
+    assert prep_mix_idle.structure_payload["execution"]["phase"] == "mixed"
+
+    # 4. observe_collective_readiness binds exact communicator groups, rejects mismatched partitions,
+    #    and accepts multi-group subsets when communicators are named.
+    def _c7_report(rank_comms, *, collective="all_reduce", typed_bytes=8192, rank_size=2):
+        entries = rank_comms.items() if isinstance(rank_comms, dict) else [(rk, None) for rk in rank_comms]
+        return {
+            "schema": C7_SCHEMA,
+            "calls": [
+                {
+                    "call_id": "c0", "rank_index": rk, "rank_id": f"rank_{rk}",
+                    "operation": {
+                        "collective": collective, "dtype": "bf16",
+                        "typed_bytes": typed_bytes, "rank_size": rank_size,
+                        **({"communicator": comm} if comm is not None else {}),
+                    },
+                    "entry": {"start_ns": 100}, "completion": {"end_ns": 200},
+                }
+                for rk, comm in entries
+            ],
+        }
+
+    ar_tp = OpSpec(
+        "ar_tp", "allreduce", "prefill", 0, 0, ("r0",), (4, 1024), (4, 1024), (4, 1024), (4, 1024),
+        link_bytes=8192.0, dtype="bf16",
+        metadata=(("collective", "allreduce"), ("group_axis", "tp"), ("payload_dtype", "bf16")),
+    )
+    raw_ok = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=1, tp=2, pcp=2)
+    raw_ok["runtime"]["metadata"]["collective_readiness"] = _c7_report((0, 1), rank_size=2)
+    res_ok = graph_costs(raw_ok, {0: (ar_tp,)}, include_submission=False)
+    assert res_ok["execution"]["collective_readiness_unresolved"] == []
+    assert [o["ready_by_rank"] for o in res_ok["execution"]["collective_readiness_observations"]] == [(0, 1)]
+
+    raw_wrong_part = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=1, tp=2, pcp=2)
+    raw_wrong_part["runtime"]["metadata"]["collective_readiness"] = _c7_report({0: "pcp0", 2: "pcp0", 1: "pcp1", 3: "pcp1"}, rank_size=2)
+    res_wrong = graph_costs(raw_wrong_part, {0: (ar_tp,)}, include_submission=False)
+    assert res_wrong["execution"]["collective_readiness_observations"] == []
+    assert res_wrong["execution"]["collective_readiness_unresolved"]
+
+    raw_sub = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=1, tp=2, pcp=4)
+    raw_sub["runtime"]["metadata"]["collective_readiness"] = _c7_report({0: "tp0", 1: "tp0", 2: "tp1", 3: "tp1"}, rank_size=2)
+    res_sub = graph_costs(raw_sub, {0: (ar_tp,)}, include_submission=False)
+    assert res_sub["execution"]["collective_readiness_unresolved"] == []
+    assert [o["ready_by_rank"] for o in res_sub["execution"]["collective_readiness_observations"]] == [(0, 1), (2, 3)]

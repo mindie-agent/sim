@@ -772,9 +772,15 @@ class PredictionSpine:
         if replicas is not None:
             graphs = {r: graphs[r] for r in replicas if r in graphs}
         phases = {ops[0].phase for ops in graphs.values() if ops and ops[0].phase}
-        inferred_phase = req.step.phase if req.step is not None else (
-            phases.pop() if len(phases) == 1 else "mixed" if phases else "decode"
-        )
+        active_phases = phases - {"idle"}
+        if req.step is not None:
+            inferred_phase = req.step.phase
+        elif len(active_phases) == 1:
+            inferred_phase = next(iter(active_phases))
+        elif active_phases:
+            inferred_phase = "mixed"
+        else:
+            inferred_phase = "idle" if "idle" in phases else "decode"
         exec_meta: dict[str, Any] = {
             "phase": inferred_phase,
             "scope": req.step.scope if req.step is not None else "declared",

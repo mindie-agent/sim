@@ -238,9 +238,11 @@ def _select_body_sp(runtime, model, views, *, tokens, global_tokens, rank_ledger
 def _close_body_sp(
     ops, previous, *, sp, model, stages, prefix, requests, mode,
     hc_collapse_before_sp_gather: bool,
+    stage_end: int | None = None,
 ):
     """Emit optional pre-gather mHC collapse, SP output AllGather, and trim."""
-    stage_end = stages[-1] if stages else 0
+    if stage_end is None:
+        stage_end = stages[-1] if stages else 0
     hc_mult, collapse_mode = _resolve_hc_final_collapse(model)
     has_lowrank = any(getattr(plan, "hc_lowrank", 0) > 0 for plan in model.layer_plans)
     gather_width = model.hidden_size
@@ -291,6 +293,44 @@ def _has_nonuniform_expert_routing(model, layer, parallel) -> bool:
         return False
     routing = tuple(getattr(model, "expert_routing", ()) or ())
     return len(routing) > 1 and len(set(routing)) > 1
+
+
+def _resolved_tp_lane(parallel, physical_rank, *, machine=None) -> int | None:
+    """Resolve an explicit physical rank to its placement TP lane ``0..tp-1``."""
+    if physical_rank is None:
+        return None
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    if tp <= 1:
+        return 0
+    rank = int(physical_rank)
+    if machine is not None and hasattr(machine, "validate_placement"):
+        from mindie_sim.schema.parallel import GlobalRank
+        try:
+            coord = machine.validate_placement(parallel).coord_for_physical_rank(GlobalRank(rank))
+            return int(coord.tp_lane)
+        except _frontend.ModelingError:
+            pass
+    return rank % tp
+
+
+def _body_output_width(
+    model, last_layer, *, attn_state, sp_closed: bool, hc_collapse_before_sp_gather: bool,
+) -> int:
+    """Hidden channel width produced at the end of ``body`` before final norm/logits."""
+    if sp_closed:
+        hc_mult, collapse_mode = _resolve_hc_final_collapse(model)
+        if hc_mult <= 1:
+            return int(model.hidden_size)
+        has_lowrank = any(getattr(plan, "hc_lowrank", 0) > 0 for plan in model.layer_plans)
+        collapsed = hc_collapse_before_sp_gather and (has_lowrank or collapse_mode in {"mean", "learned"})
+        return int(model.hidden_size) if collapsed else int(hc_mult * model.hidden_size)
+    if attn_state is not None:
+        return int(model.hidden_size)
+    hc_mult = (
+        max(1, int(getattr(last_layer, "hc_mult", 1) or 1))
+        if getattr(last_layer, "hyper_connections", False) else 1
+    )
+    return int(model.hidden_size) * hc_mult
 
 
 class _FrontendBody:
@@ -496,6 +536,11 @@ class _FrontendBody:
                     or (multi_replica_ep and _has_nonuniform_expert_routing(model, layer, p))
                 )
             )
+            resolved_tp_lane = (
+                _resolved_tp_lane(p, physical_rank, machine=machine)
+                if physical_rank is not None
+                else (0 if rank_ledger is not None else None)
+            )
             ffn_ops, previous = self.ffn[layer.ffn](
                 **{**common, "tokens": ffn_tokens},
                 deps=hidden, parallel=p, global_tokens=global_tokens,
@@ -504,6 +549,7 @@ class _FrontendBody:
                 overlap_shared=bool(runtime.multistream_overlap_shared_expert),
                 runtime=runtime, sequence_plan=(sp if (sp_moe if layer.ffn == "moe" else sp_dense) else None),
                 ep_owner=resolved_ep_owner,
+                tp_lane=resolved_tp_lane,
                 price_owner=(rank_ledger.owner if rank_ledger is not None else
                              resolved_ep_owner if per_owner_ep_pricing else None),
             )
@@ -720,8 +766,10 @@ class _FrontendBody:
                 optimize_prefill=attnres["optimize_prefill"])
         dcp_cohort_views, dcp_local_pos, has_dcp_decode = _dcp_cohort_context(
             p, replica, views, target_cohort_views, include_spec_tokens=include_spec_tokens)
+        current_stage = stages[0] if stages else 0
         for index, layer in enumerate(model.layer_plans):
             stage = stages[index]
+            current_stage = stage
             name = f"{prefix}s{stage}.l{index}"
             common = dict(prefix=name, plan=layer, stage=stage, requests=requests,
                           tokens=tokens, model=model, mode=mode,
@@ -762,18 +810,52 @@ class _FrontendBody:
                     mode=mode, tokens=tokens, model=model, attn_state=attn_state,
                     sp=sp if sp_entry else None, prefix=prefix,
                 )
+                current_stage = stages[index + 1]
         if attn_state is not None:
             last = model.layer_plans[-1]
             final = attn_state.final(prefix=prefix + "final", last_layer=last,
                                      stage=stages[last.index])
             ops.extend(_frontend._scope(final.ops, "ffn", "residual"))
             previous = final.hidden_id
-        if sp_entry and tokens:
+        sp_closed = bool(sp_entry and tokens)
+        if sp_closed:
             previous = _close_body_sp(
                 ops, previous, sp=sp, model=model, stages=stages,
                 prefix=prefix, requests=requests, mode=mode,
                 hc_collapse_before_sp_gather=hc_collapse_before_sp_gather,
+                stage_end=current_stage,
             )
+        target_stage = p.pp - 1
+        if (
+            model.layer_plans
+            and stages
+            and stages[-1] != target_stage
+            and current_stage != target_stage
+            and 0 <= current_stage < p.pp
+        ):
+            last_index = len(model.layer_plans) - 1
+            last_layer = model.layer_plans[-1]
+            pp_tokens = sp.input_rows if sp_closed else tokens
+            pp_width = _body_output_width(
+                model, last_layer, attn_state=attn_state,
+                sp_closed=sp_closed,
+                hc_collapse_before_sp_gather=hc_collapse_before_sp_gather,
+            )
+            transfer = _frontend.comm_op(
+                op_id=f"{prefix}s{current_stage}.l{last_index}.pp",
+                deps=(previous,),
+                stage=current_stage,
+                layer=last_index,
+                requests=requests,
+                family="pp_p2p",
+                phase=mode,
+                recipe="pipeline_send",
+                link_bytes=pp_tokens * pp_width * _frontend.dtype_bytes(model.activation_dtype),
+                shape=(pp_tokens, pp_width),
+                metadata=(("group_axis", "pp"), ("destination_stage", target_stage)),
+            )
+            ops.append(transfer)
+            previous = transfer.op_id
         from mindie_sim.prediction.operators.sparse_indexer.sparse_mla_metadata import before_forward
         ops = before_forward(ops, ready)
         if not include_recover_commits:
@@ -1039,9 +1121,12 @@ def _build_representative_body(
             moe_recipe=runtime.moe_recipe, mc2_chunks=runtime.mc2_chunks,
             overlap_shared=bool(runtime.multistream_overlap_shared_expert),
             runtime=runtime, sequence_plan=None,
-            ep_owner=(int(physical_rank) % int(p.ep)
-                      if physical_rank is not None and int(p.ep) > 0
-                      else None),
+            ep_owner=(
+                _balanced_ep_owner(p, int(physical_rank), machine=machine)
+                if physical_rank is not None and int(p.ep) > 0
+                else None
+            ),
+            tp_lane=_resolved_tp_lane(p, physical_rank, machine=machine),
         )
         ops.extend(_frontend._scope(ffn_ops, "ffn"))
         if _has_sandwich_norm(lyr, model):
