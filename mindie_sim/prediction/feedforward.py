@@ -508,6 +508,88 @@ def _activation_params_meta(plan) -> tuple[tuple[str, object], ...]:
     return (("activation_params", params),) if params else ()
 
 
+def _bind_dequant_situ_quant_outputs(activation, *, rows, width):
+    """Align native ``aclnnDequantSituQuant`` op to its INT8 payload + FP32 scale outputs."""
+    meta = dict(activation.metadata)
+    if (meta.get("aclnn_symbol") != "aclnnDequantSituQuant"
+            or not meta.get("activation_abi_shipping")):
+        return activation
+    out_dtypes = tuple(meta.get("activation_output_dtypes") or ())
+    if len(out_dtypes) != 2:
+        return activation
+    payload_dtype, scale_dtype = str(out_dtypes[0]), str(out_dtypes[1])
+    shape_rows = math.ceil(rows)
+    scale_bytes = float(rows * dtype_bytes(scale_dtype))
+    write_bytes = float(rows * width * dtype_bytes(payload_dtype) + scale_bytes)
+    meta.update({
+        "output_format": payload_dtype,
+        "primary_output": "payload",
+        "activation_scale_format": scale_dtype,
+        "activation_scale_shape": (shape_rows, 1),
+        "activation_scale_bytes": scale_bytes,
+    })
+    returns = tuple(dict.fromkeys((*activation.returns, "activation_scales")))
+    return replace(
+        activation,
+        returns=returns,
+        mte3_bytes=write_bytes,
+        hbm_bytes=float(activation.mte2_bytes) + write_bytes,
+        metadata=tuple(meta.items()),
+    )
+
+
+def _bind_explicit_quantized_consumer(consumer, activation):
+    """Mark a quantized matrix consumer as already fed by native ``aclnnDequantSituQuant``."""
+    act_meta = dict(activation.metadata)
+    cons_meta = dict(consumer.metadata)
+    if (act_meta.get("aclnn_symbol") != "aclnnDequantSituQuant"
+            or not act_meta.get("activation_abi_shipping")
+            or cons_meta.get("activation_producer")
+            or cons_meta.get("activation_format") != act_meta.get("output_format")):
+        return consumer
+    act_scale_fmt = str(act_meta.get("activation_scale_format") or "fp32").strip().lower()
+    cons_scale_fmt = str(cons_meta.get("activation_scale_format") or act_scale_fmt).strip().lower()
+    if cons_scale_fmt != act_scale_fmt:
+        return consumer
+    cons_group = cons_meta.get("activation_group_size")
+    cols = int(consumer.local_shape[-1]) if getattr(consumer, "local_shape", ()) else 0
+    if cons_group is not None and int(cons_group) > 0 and cols > 0 and int(cons_group) < cols:
+        return consumer
+    act_scale_shape = tuple(act_meta.get("activation_scale_shape") or ())
+    cons_scale_shape = tuple(cons_meta.get("activation_scale_shape") or ())
+    if (act_scale_shape and cons_scale_shape
+            and math.prod(cons_scale_shape) != math.prod(act_scale_shape)):
+        return consumer
+    act_scale_bytes = act_meta.get("activation_scale_bytes")
+    cons_scale_bytes = cons_meta.get("activation_scale_bytes")
+    if (act_scale_bytes is not None and cons_scale_bytes is not None
+            and not math.isclose(float(cons_scale_bytes), float(act_scale_bytes),
+                                 rel_tol=1e-9, abs_tol=1e-9)):
+        return consumer
+    from .implementations import input_ports, set_input_ports
+
+    cons_meta["activation_producer"] = "explicit_quantization"
+    updated = replace(consumer, metadata=tuple(cons_meta.items()))
+    existing = [entry for entry in input_ports(updated) if entry.get("op") != activation.op_id]
+    new_ports = [
+        {"op": activation.op_id, "output": "payload", "source_op": activation.op_id},
+        {"op": activation.op_id, "output": "activation_scales", "source_op": activation.op_id},
+    ]
+    return set_input_ports(updated, tuple(existing + new_ports))
+
+
+def _strip_shipping_situ_meta(meta_items):
+    """Strip fused ``aclnnDequantSituQuant`` claims when falling back to eager SiTU."""
+    stripped = [
+        item for item in meta_items
+        if item[0] not in {
+            "native_kinds", "aclnn_symbol", "activation_output_dtypes", "activation_abi_shipping",
+        }
+    ]
+    stripped.append(("activation_abi_shipping", False))
+    return tuple(stripped)
+
+
 def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
           category="dense_mlp", runtime=None, reduce_output=True, **_):
     # A declared selector is configuration even when this FFN is dense. Validate
@@ -543,8 +625,8 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
             dtype=gate_in_dtype, output_dtype=model.activation_dtype, phase=mode,
         ))
         # situ_eager_chain already emits every individual kernel op; strip collapsed native_kinds
-        # so the final Cast op is not expanded a second time into 14 additional launches.
-        eager_extra_meta = tuple(item for item in act_extra_meta if item[0] != "native_kinds")
+        # and fused DequantSituQuant ABI claims on the unfused eager path.
+        eager_extra_meta = _strip_shipping_situ_meta(act_extra_meta)
         act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + eager_extra_meta)
         activation = act_ops[-1]
     elif unfuse_clipped:
@@ -562,6 +644,7 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
             requests=requests, dtype=model.activation_dtype, phase=mode, recipe="swiglu",
         )
         activation = replace(activation, metadata=activation.metadata + act_extra_meta)
+        activation = _bind_dequant_situ_quant_outputs(activation, rows=tokens, width=width)
         act_ops = [activation]
     down = gemm_op(
         op_id=prefix + ".down", deps=(activation.op_id,), stage=stage, layer=plan.index,
@@ -570,6 +653,7 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         family="down_projection", recipe="dense_down",
         metadata=(("ffn_role", "down"), ("ffn_category", category)),
     )
+    down = _bind_explicit_quantized_consumer(down, activation)
     ops, last = [gate, *act_ops, down], down.op_id
     declare_situ_quant(ops, key=prefix + ".situ_quant", activation=activation,
                        consumer=down, runtime=runtime, rows=tokens, width=width)
@@ -722,6 +806,7 @@ def _pack_routed_inputs(
     *, prefix, plan, stage, requests, model, parallel, mode, runtime,
     deps, tokens, full_tokens, hidden, latent, transport, token_partition, sequence_plan,
     routing_realization, local_rows, partitions, caller, routing_metadata, ep_owner=None,
+    tp_lane=None,
 ):
     zero_experts = _zero_expert_count(plan, model)
     router_plan = (
@@ -774,7 +859,7 @@ def _pack_routed_inputs(
     source_traffic, payload_tokens = source_issuance(
         routing_realization=routing_realization, token_partition=token_partition,
         sequence_plan=sequence_plan, plan=plan, tokens=tokens,
-        full_tokens=full_tokens, ep_owner=ep_owner)
+        full_tokens=full_tokens, ep_owner=ep_owner, tp_lane=tp_lane, parallel=parallel)
     transport_rows = None
     transport_histogram_gather = None
     if transport is not None:
@@ -1187,12 +1272,16 @@ def _emit_routed_activation(
             phase=mode, recipe="grouped_swiglu",
         )]
     filtered_abi_meta = (
-        tuple(item for item in abi_act_meta if item[0] != "native_kinds")
+        _strip_shipping_situ_meta(abi_act_meta)
         if is_eager_situ else abi_act_meta
     )
     act_params_meta = _activation_params_meta(plan) + filtered_abi_meta
     if act_params_meta:
         act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + act_params_meta)
+    if not is_eager_situ and not unfuse_clipped:
+        act_ops[-1] = _bind_dequant_situ_quant_outputs(
+            act_ops[-1], rows=activation_rows, width=expert_width,
+        )
     if gate_segments:
         elided_situ_cast = is_eager_situ and act_ops[0].recipe == "situ_gate_slice"
         consumer_indices = (
@@ -1323,6 +1412,7 @@ def _run_routed_experts(
         model=model, mode=mode, gate_segments=gate_segments,
         token_partition=token_partition, caller=caller, local_rows=local_rows,
     )
+    down = _bind_explicit_quantized_consumer(down, activation)
     ops.extend((*gate_ops, *act_ops, down))
     declare_gate_up_fusion_group(
         ops=ops, runtime=runtime, prefix=prefix, activation=activation,
@@ -1627,7 +1717,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         overlap_shared=False, runtime=None, reduce_after_join=False, sequence_plan=None,
         caller=None, sp_tokens=None, features=None,
         source_rows_by_replica=None, destination_rows_by_rank=None,
-        ep_owner=None, price_owner=None, **_):
+        ep_owner=None, price_owner=None, tp_lane=None, **_):
     validate_m10_moe_activation_legality(plan)
     pre_sp_tokens = tokens
     if sp_tokens is not None:
@@ -1667,6 +1757,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         transport=transport, token_partition=token_partition, sequence_plan=sequence_plan,
         routing_realization=routing_realization, local_rows=local_rows, partitions=partitions,
         caller=caller, routing_metadata=routing_metadata, ep_owner=ep_owner,
+        tp_lane=tp_lane,
     )
     mc2_mask_pad_id = None
     # Only emit mc2_mask_pad when an EP dispatch/transport consumer will actually receive it.
@@ -1830,8 +1921,28 @@ def _absorb_redundant_mc2_unpack(ops, last, *, prefix, runtime, parallel, transp
     return rebuilt, (combine.op_id if last == unpack.op_id else last)
 
 
+def _resolve_tp_lane(*, tp: int, tp_lane=None, ep_owner=None, parallel=None) -> int:
+    if tp <= 0:
+        return 0
+    if tp_lane is not None:
+        return int(tp_lane) % tp
+    if ep_owner is None:
+        return 0
+    rank_table = getattr(parallel, "rank_table", None) if parallel is not None else None
+    if rank_table:
+        lanes = {
+            int(group[int(ep_owner)]) % tp
+            for group in rank_table
+            if 0 <= int(ep_owner) < len(group)
+        }
+        if len(lanes) == 1:
+            return next(iter(lanes))
+    return int(ep_owner) % tp
+
+
 def source_issuance(*, routing_realization, token_partition, sequence_plan,
-                    plan, tokens, full_tokens, ep_owner=None):
+                    plan, tokens, full_tokens, ep_owner=None, tp_lane=None,
+                    parallel=None):
     """Declared source-traffic view and the rows this owner really issues."""
     source_traffic = (
         routing_realization if getattr(routing_realization, "basis", "")
@@ -1846,7 +1957,11 @@ def source_issuance(*, routing_realization, token_partition, sequence_plan,
         issued = 0
     elif token_partition is not None:
         # An explicit TP caller owns this slice's actual outgoing rows.
-        issued = token_partition.valid_per_rank[0]
+        local_rank = _resolve_tp_lane(
+            tp=token_partition.tp, tp_lane=tp_lane,
+            ep_owner=ep_owner, parallel=parallel,
+        )
+        issued = token_partition.valid_per_rank[local_rank]
     elif source_traffic is not None:
         # A source-mask / exact token ledger owns its valid outgoing rows.
         issued = source_traffic.valid_local_tokens
@@ -1855,7 +1970,10 @@ def source_issuance(*, routing_realization, token_partition, sequence_plan,
           and routing_realization is None
           and sequence_plan.valid_per_tp
           and 0 < sequence_plan.valid_global < sequence_plan.tokens_global):
-        local_rank = (int(ep_owner) % sequence_plan.tp) if ep_owner is not None else 0
+        local_rank = _resolve_tp_lane(
+            tp=sequence_plan.tp, tp_lane=tp_lane,
+            ep_owner=ep_owner, parallel=parallel,
+        )
         issued = sequence_plan.valid_per_tp[local_rank]
     else:
         # Ordinary balanced and probability plans route the physical graph
@@ -1866,16 +1984,33 @@ def source_issuance(*, routing_realization, token_partition, sequence_plan,
 
 
 def reorder_overlapped_shared(ops):
-    """Place the shared-expert stream before the first dispatch collective."""
+    """Place the shared-expert stream before the first dispatch collective or consumer."""
     shared_ops = [op for op in ops if op.stream == "shared_stream"]
     if not shared_ops:
         return ops
     routed = [op for op in ops if op.stream != "shared_stream"]
+    shared_ids = {op.op_id for op in shared_ops}
+    shared_ext_deps = {
+        dep for op in shared_ops for dep in op.deps if dep not in shared_ids
+    }
+    first_consumer = next(
+        (index for index, op in enumerate(routed)
+         if any(dep in shared_ids for dep in op.deps)),
+        len(routed),
+    )
+    last_producer = max(
+        (index for index, op in enumerate(routed) if op.op_id in shared_ext_deps),
+        default=-1,
+    )
+    if last_producer >= first_consumer:
+        return ops
     dispatch_index = next(
         (index for index, op in enumerate(routed)
          if op.recipe == "expert_dispatch" or op.family == "alltoall"),
-        len(routed))
-    return routed[:dispatch_index] + shared_ops + routed[dispatch_index:]
+        len(routed),
+    )
+    insert_index = max(last_producer + 1, min(dispatch_index, first_consumer))
+    return routed[:insert_index] + shared_ops + routed[insert_index:]
 
 
 DEFAULT_MC2_CHUNKS = 4
