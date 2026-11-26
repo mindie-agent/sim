@@ -600,6 +600,17 @@ def _zero_expert_count(plan, model) -> int:
     ))
 
 
+_ROW_CEIL_REL_TOL = 1e-12
+
+
+def _ceil_rows(value: float) -> int:
+    """Integer row ceiling tolerating relative floating-point noise above an integer."""
+    if value <= 0.0:
+        return 0
+    tol = _ROW_CEIL_REL_TOL * max(1.0, abs(value))
+    return max(1, int(math.ceil(value - tol)))
+
+
 def _route_expert_rows(
     plan, model, parallel, runtime, routing, routing_realization, *,
     caller, token_partition, sequence_plan, group_tokens, ep_owner, price_owner,
@@ -662,7 +673,7 @@ def _route_expert_rows(
         routing_metadata += (
             ("routing_valid_tokens", int(routing_group_tokens)),
             ("routing_policy_kind", getattr(routing, "kind", type(routing).__name__)),
-            ("routing_price_owner", int(price_owner) if price_owner is not None else 0),
+            ("routing_price_owner", int(price_owner) if price_owner is not None else None),
             ("routing_bank_ids", tuple(range(local_experts))),
             ("routing_eplb_active", bool(_eplb_damping_active(parallel, runtime))),
         )
@@ -692,7 +703,7 @@ def _route_expert_rows(
     receive_rows = (
         max((destination_rows[rank] for rank in represented_ranks
              if 0 <= rank < len(destination_rows)), default=0)
-        if destination_rows is not None else int(math.ceil(local_rows)))
+        if destination_rows is not None else _ceil_rows(local_rows))
     runtime_routing = dict(getattr(runtime, "routing", {}) or {})
     has_slots = (
         int(getattr(parallel, "redundant_experts_per_rank", 0) or 0) > 0
@@ -905,7 +916,7 @@ def _dispatch_explicit_transport(
         # Unquantized pass-through: declare packed activation output shape on
         # pack so downstream gate consumers see (rows, latent) instead of
         # routing index geometry (tokens, top_k).
-        pack_rows = int(math.ceil(transport_rows - 1e-12))
+        pack_rows = _ceil_rows(transport_rows)
         packing = replace(
             packing,
             metadata=packing.metadata + (("output_shape", (pack_rows, latent)),),
@@ -1058,7 +1069,7 @@ def _dispatch_routed_inputs(
                        ("traffic_model", "uniform_peer_payload"), ("routing_basis", routing_basis))
     if local_rows and exchange_options["overlap"] > 0.0:
         gate_row_cut = deepep.overlap_row_cut(
-            max(0, int(math.ceil(local_rows))), exchange_options["overlap"])
+            _ceil_rows(local_rows), exchange_options["overlap"])
     if parallel.ep > 1 and transport is None and exchange:
         dispatch_deps = (
             tuple(dict.fromkeys((last, mc2_mask_pad_id)))
@@ -1245,7 +1256,7 @@ def _run_routed_experts(
     gate_weight = layer_quant.matrix_bytes(2 * expert_width, latent, "routed_expert") * active
     down_weight = layer_quant.matrix_bytes(latent, expert_width, "routed_expert") * active
     common = dict(stage=stage, layer=plan.index, requests=requests,
-                  quant=layer_quant, category="routed_expert", phase=mode, m=math.ceil(local_rows))
+                  quant=layer_quant, category="routed_expert", phase=mode, m=_ceil_rows(local_rows))
     expert_input_deps = (last,)
     quant_producer_id = transport_quantized.op_id if transport_quantized is not None else last
     if transport is not None and parallel.ep > 1:
@@ -1333,7 +1344,7 @@ def _run_routed_experts(
                 requests=requests, family="allreduce", phase=mode, recipe="expert_tensor_reduce",
                 link_bytes=2 * (parallel.etp - 1) / parallel.etp * local_rows * latent
                            * dtype_bytes(model.activation_dtype),
-                shape=(math.ceil(local_rows), latent),
+                shape=(_ceil_rows(local_rows), latent),
                 metadata=(("group_axis", "etp"), ("comm_axis", "etp"),
                           ("comm_group_size", int(parallel.etp))),
             ),
@@ -1727,11 +1738,16 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         # Redundant physical copies change residency and active weight reads,
         # never logical assignments or aggregate FLOPs. Bind the exact
         # per-owner slot bytes after routing and before native graph lowering.
+        slot_barrier: bool | str = (
+            ("rank" if (ep_owner is not None and bool(getattr(parallel, "ep_spans_dp", False))) else True)
+            if (price_owner is None and routing_realization is None)
+            else False
+        )
         ops = bind_expert_slots(
             ops, model=model, plan=plan, parallel=parallel, routing=routing,
             runtime_routing=runtime_routing, routing_realization=routing_realization,
             group_tokens=group_tokens, expert_width=expert_width, latent=latent,
-            barrier=(price_owner is None and routing_realization is None))
+            barrier=slot_barrier)
         ops = _rescale_deepep_slot_weights(ops)
     if overlap_shared:
         ops = reorder_overlapped_shared(ops)

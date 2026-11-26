@@ -400,13 +400,15 @@ def bind_expert_slot_work(
     ops: Sequence[Any],
     *,
     slot_work: PhysicalSlotWork,
-    barrier: bool = False,
+    barrier: bool | str = False,
 ) -> tuple[Any, ...]:
     """Attach resolved physical-slot reads to routed grouped-GEMM records.
 
     Per-rank physical operators bind additive ``weight_read_bytes(rank)`` so
-    summing across EP ranks conserves total routed cold weight reads; single-rank
-    barrier callers pass ``barrier=True`` to bind ``critical_rank_weight_read_bytes()``.
+    summing across EP ranks conserves total routed cold weight reads; multi-rank
+    stochastic cohorts pass ``barrier="rank"`` to bind per-owner order-statistic
+    reads ``rank_barrier_weight_read_bytes(rank)``; single-rank barrier callers
+    pass ``barrier=True`` to bind ``critical_rank_weight_read_bytes()``.
     """
     result = []
     barrier_bytes = slot_work.critical_rank_weight_read_bytes()
@@ -421,7 +423,12 @@ def bind_expert_slot_work(
         if rank < 0 or rank >= len(slot_work.per_rank_slot_rows):
             raise ModelingError(f"expert_slot_work_rank_invalid:{rank}")
         mean_bytes = slot_work.weight_read_bytes(rank)
-        active_bytes = barrier_bytes if barrier else mean_bytes
+        if barrier == "rank":
+            active_bytes = slot_work.rank_barrier_weight_read_bytes(rank)
+        elif barrier:
+            active_bytes = barrier_bytes
+        else:
+            active_bytes = mean_bytes
         previous = float(metadata.get("routed_weight_read_bytes", 0) or 0)
         metadata.update({
             "physical_slot_rows": slot_work.per_rank_slot_rows[rank],

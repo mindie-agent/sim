@@ -26,8 +26,26 @@ from .prediction.structure import parse_case
 from .schema.case import Software
 from .schema.device_input import merge_device_inputs
 from .schema.model import LayerPlan, ModelSpec
-from .schema.parallel import ParallelSpec
+from .schema.parallel import (
+    PARALLEL_AXIS_ALIASES,
+    PARALLEL_SWITCHES,
+    ParallelSpec,
+    _CP_PHASES,
+    _CP_PLAN_ALIASES,
+)
 from .coverage import model_coverage
+
+_PARALLEL_ALIAS_GROUPS = (
+    ("tp", "tensor_parallel_size"),
+    ("dp", "data_parallel_size"),
+    ("pp", "pipeline_parallel_size"),
+    ("ep", "expert_parallel_size"),
+    ("cp", "dcp", "decode_context_parallel_size"),
+    ("pcp", "prefill_context_parallel_size"),
+    ("cp_plan", "context_parallel_plan"),
+    ("external_dp", "external_data_parallel_size"),
+    ("linear_proj_tp", "kda_proj_tp"),
+)
 
 
 def _fingerprint(value):
@@ -129,14 +147,57 @@ def _case_input(raw, *, hf_model=False):
         for field in ("devices", "dies"):
             if field in machine:
                 machine[field] = [merge_device_inputs(device) for device in machine[field]]
-    if "runtime" in result:
+    if "runtime" in result and isinstance(result["runtime"], dict):
         runtime = result["runtime"]
         parallel = Software.parallel_mapping(runtime)
-        for field in fields(ParallelSpec):
-            runtime.pop(field.name, None)
+        for key in ({field.name for field in fields(ParallelSpec)}
+                    | set(PARALLEL_AXIS_ALIASES) | set(PARALLEL_SWITCHES)):
+            runtime.pop(key, None)
         if parallel:
             runtime["parallel"] = parallel
     return result
+
+
+def _reconcile_parallel_override(raw_parallel: dict, upd_parallel: dict) -> None:
+    """Clear conflicting parallel aliases and stale derived CP plan keys before merge."""
+    for group in _PARALLEL_ALIAS_GROUPS:
+        present = [key for key in group if key in upd_parallel]
+        if present:
+            for key in group:
+                if key not in present:
+                    raw_parallel.pop(key, None)
+    if ("ep" in upd_parallel or "expert_parallel_size" in upd_parallel) and (
+        "enable_expert_parallel" not in upd_parallel
+    ):
+        raw_parallel.pop("enable_expert_parallel", None)
+    elif upd_parallel.get("enable_expert_parallel") is False and not (
+        "ep" in upd_parallel or "expert_parallel_size" in upd_parallel
+    ):
+        raw_parallel.pop("ep", None)
+        raw_parallel.pop("expert_parallel_size", None)
+    upd_has_plan = "cp_plan" in upd_parallel or "context_parallel_plan" in upd_parallel
+    upd_has_phase = "prefill_cp_plan" in upd_parallel or "decode_cp_plan" in upd_parallel
+    upd_has_dsa = "enable_dsa_cp" in upd_parallel
+    if upd_has_plan:
+        for phase_key in ("prefill_cp_plan", "decode_cp_plan"):
+            if phase_key not in upd_parallel:
+                raw_parallel.pop(phase_key, None)
+        if not upd_has_dsa:
+            raw_parallel.pop("enable_dsa_cp", None)
+    elif upd_has_phase:
+        base_plan = raw_parallel.get("cp_plan", raw_parallel.get("context_parallel_plan"))
+        resolved = _CP_PLAN_ALIASES.get(str(base_plan or "").strip().lower())
+        if resolved in _CP_PHASES:
+            base_prefill, base_decode = _CP_PHASES[resolved]
+            raw_parallel.setdefault("prefill_cp_plan", base_prefill)
+            raw_parallel.setdefault("decode_cp_plan", base_decode)
+        raw_parallel.pop("cp_plan", None)
+        raw_parallel.pop("context_parallel_plan", None)
+        if not upd_has_dsa:
+            raw_parallel.pop("enable_dsa_cp", None)
+    elif upd_has_dsa:
+        for key in ("cp_plan", "context_parallel_plan", "prefill_cp_plan", "decode_cp_plan"):
+            raw_parallel.pop(key, None)
 
 
 def _override_case(raw, updates):
@@ -151,6 +212,10 @@ def _override_case(raw, updates):
         if shadowed:
             raise ValueError("study_override_requires_explicit_layer_plans:" +
                              ",".join(sorted(shadowed)))
+    raw_parallel = raw.get("runtime", {}).get("parallel") if isinstance(raw.get("runtime"), dict) else None
+    upd_parallel = updates.get("runtime", {}).get("parallel") if isinstance(updates.get("runtime"), dict) else None
+    if isinstance(raw_parallel, dict) and isinstance(upd_parallel, dict):
+        _reconcile_parallel_override(raw_parallel, upd_parallel)
     result = _merge(raw, updates)
     if hf and "model" in updates:
         # _hf_override already resolved the complete model. A second merge

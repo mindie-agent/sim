@@ -73,6 +73,8 @@ SINK_MIN_TOKENS = 4
 TAIL_MAX_TOKENS = 512
 TAIL_FRACTION_DIVISOR = 4
 SEMANTIC_COHERENCE_TOKENS = 64
+_SPARSE_EPS = 1e-12
+_BALANCE_ITER_FACTOR = 4
 
 
 def strategy_for_plan(plan: str) -> str:
@@ -355,8 +357,8 @@ def dcp_sparse_imbalance_override(runtime: Any) -> float | None:
 
 def _sparse_sequence_moments(
     seq: SparseDcpSequence, cp: int, interleave: int,
-) -> tuple[list[float], list[float], list[float], list[float], list[float], float]:
-    """Per-rank weighted (cap, pinned, sem_mean, sem_var, residual_cap, total)."""
+) -> tuple[list[float], list[float], list[float], list[float], list[float], float, list[float]]:
+    """Per-rank weighted (cap, pinned, sem_mean, sem_var, residual_cap, total, hard_pinned)."""
     ratio = max(1, int(seq.compress_ratio))
     raw_kv = max(0, int(seq.kv_len))
     domain = (raw_kv + ratio - 1) // ratio if raw_kv > 0 else 0
@@ -365,23 +367,24 @@ def _sparse_sequence_moments(
     sel = min(float(domain), max(0.0, float(seq.selected_rows)))
     zeros = [0.0] * cp
     if domain <= 0 or sel <= 0.0 or weight <= 0.0:
-        return (list(zeros), list(zeros), list(zeros), list(zeros), list(zeros), 0.0)
+        return (list(zeros), list(zeros), list(zeros), list(zeros), list(zeros), 0.0, list(zeros))
     raw_caps = [owned_positions(0, domain - 1, cp, block, r) for r in range(cp)]
     caps = [weight * float(c) for c in raw_caps]
     if sel >= float(domain) - 1e-12:
-        return (caps, list(caps), list(zeros), list(zeros), list(zeros), weight * float(domain))
+        return (caps, list(caps), list(zeros), list(zeros), list(zeros), weight * float(domain), list(caps))
     k_int = int(math.floor(sel))
+    forced_tail = min(domain, k_int, max(0, int(seq.always_select_tail)))
+    sink_budget = max(0, min(domain, k_int) - forced_tail)
     sink_cap = SINK_MAX_TOKENS // ratio
     sink_floor = (
-        min(SINK_MIN_TOKENS, k_int)
+        min(SINK_MIN_TOKENS, sink_budget)
         if ratio == 1
-        else min(SINK_MIN_TOKENS // ratio, k_int)
+        else min(SINK_MIN_TOKENS // ratio, sink_budget)
     )
     sink_rows = min(
-        domain, k_int, max(sink_floor, min(sink_cap, k_int // SINK_FRACTION_DIVISOR)),
+        sink_budget, max(sink_floor, min(sink_cap, k_int // SINK_FRACTION_DIVISOR)),
     )
     tail_cap = TAIL_MAX_TOKENS // ratio
-    forced_tail = max(0, int(seq.always_select_tail))
     tail_target = max(forced_tail, min(tail_cap, k_int // TAIL_FRACTION_DIVISOR))
     tail_rows = min(domain - sink_rows, max(0, k_int - sink_rows), tail_target)
     a_sink = [
@@ -392,13 +395,18 @@ def _sparse_sequence_moments(
         owned_positions(domain - tail_rows, domain - 1, cp, block, r) if tail_rows > 0 else 0
         for r in range(cp)
     ]
+    a_forced_tail = [
+        owned_positions(domain - forced_tail, domain - 1, cp, block, r) if forced_tail > 0 else 0
+        for r in range(cp)
+    ]
     res_raw = [raw_caps[r] - a_sink[r] - a_tail[r] for r in range(cp)]
     res_total = sum(res_raw)
     k_sem = max(0.0, sel - float(sink_rows) - float(tail_rows))
     pinned = [weight * float(a_sink[r] + a_tail[r]) for r in range(cp)]
+    hard_pinned = [weight * float(a_forced_tail[r]) for r in range(cp)]
     residual_caps = [weight * float(res_raw[r]) for r in range(cp)]
     if k_sem <= 0.0 or res_total <= 0:
-        return (caps, pinned, list(zeros), list(zeros), residual_caps, weight * sel)
+        return (caps, pinned, list(zeros), list(zeros), residual_caps, weight * sel, hard_pinned)
     g_eff = min(float(block), float(max(1, SEMANTIC_COHERENCE_TOKENS // ratio)), k_sem)
     fpc = max(0.0, 1.0 - k_sem / float(res_total))
     w_sq = weight * weight
@@ -408,7 +416,7 @@ def _sparse_sequence_moments(
         p_r = float(res_raw[r]) / float(res_total)
         sem_means.append(weight * k_sem * p_r)
         variances.append(w_sq * k_sem * g_eff * p_r * (1.0 - p_r) * fpc)
-    return (caps, pinned, sem_means, variances, residual_caps, weight * sel)
+    return (caps, pinned, sem_means, variances, residual_caps, weight * sel, hard_pinned)
 
 
 def _waterfill_with_floors(
@@ -444,45 +452,175 @@ def _waterfill_with_floors(
     return alloc
 
 
+def _waterfill_sequence_on_batch(
+    alloc_i: list[float],
+    batch_load: list[float],
+    caps_i: Sequence[float],
+    remaining: float,
+    active_ranks: tuple[int, ...],
+) -> None:
+    """Waterfill one sequence's movable rows against cumulative batch load."""
+    rem = max(0.0, float(remaining))
+    movable = [r for r in active_ranks if alloc_i[r] < float(caps_i[r]) - _SPARSE_EPS]
+    while rem > _SPARSE_EPS and movable:
+        min_lvl = min(batch_load[r] for r in movable)
+        lowest = [r for r in movable if batch_load[r] <= min_lvl + _SPARSE_EPS]
+        upper_cands = [
+            batch_load[r] + (float(caps_i[r]) - alloc_i[r]) for r in lowest
+        ] + [batch_load[r] for r in movable if batch_load[r] > min_lvl + _SPARSE_EPS]
+        next_lvl = min(upper_cands)
+        step = (next_lvl - min_lvl) * float(len(lowest))
+        add = (rem / float(len(lowest))) if rem <= step + _SPARSE_EPS else (next_lvl - min_lvl)
+        if add <= _SPARSE_EPS:
+            break
+        for r in lowest:
+            actual = min(float(caps_i[r]) - alloc_i[r], add)
+            alloc_i[r] += actual
+            batch_load[r] += actual
+            rem = max(0.0, rem - actual)
+        movable = [r for r in active_ranks if alloc_i[r] < float(caps_i[r]) - _SPARSE_EPS]
+
+
+def _find_rebalance_path(
+    allocs: Sequence[Sequence[float]],
+    hard_floors: Sequence[Sequence[float]],
+    caps: Sequence[Sequence[float]],
+    batch_load: Sequence[float],
+    active_ranks: tuple[int, ...],
+    src: int,
+    target_max: float,
+) -> tuple[int, dict[int, tuple[int, int, float]]] | None:
+    """Find a residual augmenting path from peak rank ``src`` to a lower-load rank."""
+    parent: dict[int, tuple[int, int, float]] = {}
+    visited = {src}
+    queue = [src]
+    head = 0
+    while head < len(queue):
+        u = queue[head]
+        head += 1
+        for seq_idx, alloc_i in enumerate(allocs):
+            give = alloc_i[u] - float(hard_floors[seq_idx][u])
+            if give <= _SPARSE_EPS:
+                continue
+            caps_i = caps[seq_idx]
+            for v in active_ranks:
+                if v in visited or float(caps_i[v]) - alloc_i[v] <= _SPARSE_EPS:
+                    continue
+                edge_cap = min(give, float(caps_i[v]) - alloc_i[v])
+                visited.add(v)
+                parent[v] = (u, seq_idx, edge_cap)
+                if batch_load[v] < target_max - _SPARSE_EPS:
+                    return v, parent
+                queue.append(v)
+    return None
+
+
+def _minimax_balance_batch(
+    allocs: list[list[float]],
+    rems: Sequence[float],
+    hard_floors: Sequence[Sequence[float]],
+    caps: Sequence[Sequence[float]],
+    active_ranks: tuple[int, ...],
+    cp: int,
+) -> list[float]:
+    """Jointly waterfill and minimax-balance batch allocations across ``active_ranks``."""
+    batch_load = [sum(row[r] for row in allocs) for r in range(cp)]
+    if not active_ranks:
+        return batch_load
+    order = sorted(
+        range(len(allocs)),
+        key=lambda i: (
+            sum(max(0.0, float(caps[i][r]) - allocs[i][r]) for r in active_ranks) - float(rems[i]),
+            i,
+        ),
+    )
+    for i in order:
+        if rems[i] > _SPARSE_EPS:
+            _waterfill_sequence_on_batch(allocs[i], batch_load, caps[i], rems[i], active_ranks)
+    max_iters = len(active_ranks) * max(1, len(allocs)) * _BALANCE_ITER_FACTOR
+    for _ in range(max_iters):
+        hi = max(active_ranks, key=lambda r: batch_load[r])
+        lo_val = min(batch_load[r] for r in active_ranks)
+        if batch_load[hi] - lo_val <= _SPARSE_EPS:
+            break
+        found = _find_rebalance_path(
+            allocs, hard_floors, caps, batch_load, active_ranks, hi, batch_load[hi],
+        )
+        if found is None:
+            break
+        dst, parent = found
+        path: list[tuple[int, int, int, float]] = []
+        cur = dst
+        while cur != hi:
+            u, seq_idx, edge_cap = parent[cur]
+            path.append((u, cur, seq_idx, edge_cap))
+            cur = u
+        bottleneck = min(item[3] for item in path)
+        delta = min(bottleneck, (batch_load[hi] - batch_load[dst]) / 2.0)
+        if delta <= _SPARSE_EPS:
+            break
+        for u, v, seq_idx, _ in path:
+            allocs[seq_idx][u] -= delta
+            allocs[seq_idx][v] += delta
+        batch_load[hi] -= delta
+        batch_load[dst] += delta
+    return batch_load
+
+
 def _apply_sparse_imbalance_override(
-    moments: Sequence[tuple[list[float], list[float], list[float], list[float], list[float], float]],
+    moments: Sequence[tuple[list[float], list[float], list[float], list[float], list[float], float, list[float]]],
     cp: int,
     alpha: float,
     total: float,
 ) -> tuple[tuple[float, ...], tuple[tuple[float, ...], ...]]:
-    """Place ``min(hi[r*], alpha * total / cp)`` on highest-capacity rank ``r*`` respecting pinned rows."""
+    """Place ``min(hi[r*], alpha * total / cp)`` on highest-capacity rank ``r*`` respecting hard pins."""
+    caps_list = [m[0] for m in moments]
+    hard_list = [m[6] for m in moments]
+    if alpha <= 1.0 + _SPARSE_EPS:
+        allocs = [list(hard_i) for hard_i in hard_list]
+        rems = [max(0.0, m[5] - sum(m[6])) for m in moments]
+        batch_load = _minimax_balance_batch(
+            allocs, rems, hard_list, caps_list, tuple(range(cp)), cp,
+        )
+        return tuple(batch_load), tuple(tuple(row) for row in allocs)
     eff_caps = [
-        sum(m[1][r] + min(m[4][r], max(0.0, m[5] - sum(m[1]))) for m in moments)
+        sum(
+            m[6][r] + min(max(0.0, m[0][r] - m[6][r]), max(0.0, m[5] - sum(m[6])))
+            for m in moments
+        )
         for r in range(cp)
     ]
     raw_caps = [sum(m[0][r] for m in moments) for r in range(cp)]
     r_star = max(range(cp), key=lambda r: (eff_caps[r], raw_caps[r]))
     bounds: list[tuple[float, float]] = []
-    for _caps_i, pinned_i, _, _, res_caps_i, tot_i in moments:
-        rem_tot_i = max(0.0, tot_i - sum(pinned_i))
-        other_res = sum(res_caps_i[r] for r in range(cp) if r != r_star)
-        lo_i = pinned_i[r_star] + max(0.0, rem_tot_i - other_res)
-        hi_i = pinned_i[r_star] + min(res_caps_i[r_star], rem_tot_i)
+    for caps_i, _, _, _, _, tot_i, hard_i in moments:
+        rem_tot_i = max(0.0, tot_i - sum(hard_i))
+        res_i = [max(0.0, caps_i[r] - hard_i[r]) for r in range(cp)]
+        other_res = sum(res_i[r] for r in range(cp) if r != r_star)
+        lo_i = hard_i[r_star] + max(0.0, rem_tot_i - other_res)
+        hi_i = hard_i[r_star] + min(res_i[r_star], rem_tot_i)
         bounds.append((lo_i, hi_i))
     sum_lo = sum(lo for lo, _ in bounds)
     sum_hi = sum(hi for _, hi in bounds)
     k_star_batch = min(sum_hi, max(sum_lo, alpha * (total / float(cp))))
     span = sum_hi - sum_lo
-    frac = (k_star_batch - sum_lo) / span if span > 1e-12 else 0.0
-    per_seq: list[tuple[float, ...]] = []
-    for (caps_i, pinned_i, _, _, _res_caps_i, tot_i), (lo_i, hi_i) in zip(moments, bounds):
+    frac = (k_star_batch - sum_lo) / span if span > _SPARSE_EPS else 0.0
+    allocs = []
+    rems = []
+    for (_, _, _, _, _, tot_i, hard_i), (lo_i, hi_i) in zip(moments, bounds):
         k_star_i = lo_i + (hi_i - lo_i) * frac
-        other_pinned = sum(pinned_i[r] for r in range(cp) if r != r_star)
-        rem_other = max(0.0, tot_i - k_star_i - other_pinned)
-        alloc_i = _waterfill_with_floors(rem_other, pinned_i, caps_i, exclude=r_star)
-        alloc_i[r_star] = k_star_i
-        per_seq.append(tuple(alloc_i))
-    batch_per_rank = tuple(sum(row[r] for row in per_seq) for r in range(cp))
-    return batch_per_rank, tuple(per_seq)
+        row = list(hard_i)
+        row[r_star] = k_star_i
+        other_hard = sum(hard_i[r] for r in range(cp) if r != r_star)
+        allocs.append(row)
+        rems.append(max(0.0, tot_i - k_star_i - other_hard))
+    active_ranks = tuple(r for r in range(cp) if r != r_star)
+    batch_load = _minimax_balance_batch(allocs, rems, hard_list, caps_list, active_ranks, cp)
+    return tuple(batch_load), tuple(tuple(row) for row in allocs)
 
 
 def _apply_sparse_default_skew(
-    moments: Sequence[tuple[list[float], list[float], list[float], list[float], list[float], float]],
+    moments: Sequence[tuple[list[float], list[float], list[float], list[float], list[float], float, list[float]]],
     cp: int,
 ) -> tuple[tuple[float, ...], tuple[tuple[float, ...], ...]]:
     """Pool deterministic means and semantic variances across batch sequences."""
@@ -497,7 +635,7 @@ def _apply_sparse_default_skew(
         key=lambda r: (batch_mean[r] + z_factor * math.sqrt(max(0.0, batch_var[r])), batch_caps[r]),
     )
     seq_shifts: list[tuple[float, float]] = []
-    for caps_i, pinned_i, sem_i, _, _, _ in moments:
+    for caps_i, pinned_i, sem_i, _, _, _, _ in moments:
         mu_star = pinned_i[r_star] + sem_i[r_star]
         sem_other = sum(sem_i[r] for r in range(cp) if r != r_star)
         room = max(0.0, caps_i[r_star] - mu_star)
@@ -505,7 +643,7 @@ def _apply_sparse_default_skew(
     max_shift_total = sum(shift for shift, _ in seq_shifts)
     delta = min(max_shift_total, z_factor * math.sqrt(max(0.0, batch_var[r_star])))
     per_seq: list[tuple[float, ...]] = []
-    for (_, pinned_i, sem_i, _, _, _), (max_shift_i, sem_other_i) in zip(moments, seq_shifts):
+    for (_, pinned_i, sem_i, _, _, _, _), (max_shift_i, sem_other_i) in zip(moments, seq_shifts):
         alloc_i = [pinned_i[r] + sem_i[r] for r in range(cp)]
         if delta > 1e-12 and max_shift_total > 1e-12 and max_shift_i > 1e-12:
             d_i = delta * (max_shift_i / max_shift_total)
@@ -1145,10 +1283,23 @@ def is_v41_replicated_cache_model(model: ModelSpec) -> bool:
     ):
         return True
     facts = dict(getattr(model, "catalog_facts", ()) or ())
-    ratios = tuple(int(r) for r in (facts.get("compress_ratios") or ()) if r is not None)
+    ratios = tuple(
+        int(r)
+        for key in ("compress_ratios", "full_model_compress_ratios")
+        for r in (facts.get(key) or ())
+        if r is not None
+    )
     attn_types = dict(facts.get("attention_types") or ())
+    full_attn_types = dict(facts.get("full_model_attention_types") or ())
     has_latent_mqa = any(str(getattr(plan, "mla_variant", "") or "") == "latent_mqa" for plan in plans)
-    return bool(has_latent_mqa and (2 in ratios or int(attn_types.get("csa2", 0) or 0) > 0))
+    return bool(
+        has_latent_mqa
+        and (
+            2 in ratios
+            or int(attn_types.get("csa2", 0) or 0) > 0
+            or int(full_attn_types.get("csa2", 0) or 0) > 0
+        )
+    )
 
 
 def layer_dcp_factors(plan: Any, parallel: ParallelSpec) -> tuple[int, int, int]:

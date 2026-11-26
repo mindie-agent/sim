@@ -375,31 +375,67 @@ class RoutingPolicy:
             for index in positive:
                 inclusions[index] = 1.0
         else:
-            suffix = [0.0] * (len(positive) + 1)
-            for pos in range(len(positive) - 1, -1, -1):
-                suffix[pos] = math.fsum(
-                    probabilities[positive[j]] for j in range(pos, len(positive))
-                )
+            n_pos = len(positive)
+            suffix = [0.0] * (n_pos + 1)
+            total = 0.0
+            comp = 0.0
+            for pos in range(n_pos - 1, -1, -1):
+                val = probabilities[positive[pos]]
+                nxt = total + val
+                if not math.isfinite(nxt):
+                    total = nxt
+                    comp = 0.0
+                    suffix[pos] = nxt
+                    continue
+                if total >= val:
+                    comp += (total - nxt) + val
+                else:
+                    comp += (val - nxt) + total
+                total = nxt
+                suffix[pos] = total + comp
             remaining_int = int(layer.top_k)
-            split = len(positive)
+            split = n_pos
             for pos, index in enumerate(positive):
                 if remaining_int <= 0:
                     break
+                p_cur = probabilities[index]
                 tail_after = suffix[pos + 1]
-                if float(remaining_int - 1) * probabilities[index] >= tail_after:
+                lhs = float(remaining_int - 1) * p_cur
+                if math.isfinite(lhs) and math.isfinite(tail_after):
+                    saturated = lhs >= tail_after
+                else:
+                    scaled_tail = math.fsum(
+                        probabilities[positive[j]] / p_cur
+                        for j in range(pos + 1, n_pos)
+                    )
+                    saturated = float(remaining_int - 1) >= scaled_tail
+                if saturated:
                     inclusions[index] = 1.0
                     remaining_int -= 1
                 else:
                     split = pos
                     break
-            if remaining_int > 0 and split < len(positive):
+            if remaining_int > 0 and split < n_pos:
                 denom = suffix[split]
-                if denom > 0.0:
-                    for pos in range(split, len(positive)):
+                if math.isfinite(denom) and denom > 0.0:
+                    for pos in range(split, n_pos):
                         index = positive[pos]
                         inclusions[index] = min(
                             1.0, float(remaining_int) * (probabilities[index] / denom),
                         )
+                elif not math.isfinite(denom):
+                    scale = probabilities[positive[split]]
+                    scaled_denom = math.fsum(
+                        probabilities[positive[j]] / scale
+                        for j in range(split, n_pos)
+                    )
+                    if scaled_denom > 0.0:
+                        for pos in range(split, n_pos):
+                            index = positive[pos]
+                            inclusions[index] = min(
+                                1.0,
+                                float(remaining_int) * ((probabilities[index] / scale) / scaled_denom),
+                            )
         rows, active = [], []
         for inclusion in inclusions:
             rows.append(tokens * inclusion)
