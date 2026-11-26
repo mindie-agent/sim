@@ -137,26 +137,30 @@ def _probe_warm_entry_duration(execution, program, input_ready_ms: float) -> flo
     """Measure first-touch-warm lower-bound duration on a fresh silent probe Engine."""
     cold_view = execution.engine.admission_memory_view
     warm_engine = execution._new_engine()
-    warm_view = _make_warm_entry_view(cold_view)
-    warm_engine.attach_admission_memory_view(warm_view)
-    orig_submit_bound = warm_engine.submit_bound_access
+    try:
+        warm_view = _make_warm_entry_view(cold_view)
+        warm_engine.attach_admission_memory_view(warm_view)
+        orig_submit_bound = warm_engine.submit_bound_access
 
-    def _silent_warm_bound_access(
-        name, bound, *, after=(), release=None, owner="", priority=0,
-        memory_state=None, pattern=None, on_delivery=None,
-    ):
-        del on_delivery
-        target_state = warm_view if memory_state is cold_view else memory_state
-        return orig_submit_bound(
-            name, bound, after=after, release=release, owner=owner, priority=priority,
-            memory_state=target_state, pattern=pattern, on_delivery=None,
-        )
+        def _silent_warm_bound_access(
+            name, bound, *, after=(), release=None, owner="", priority=0,
+            memory_state=None, pattern=None, on_delivery=None,
+        ):
+            del on_delivery
+            target_state = warm_view if memory_state is cold_view else memory_state
+            return orig_submit_bound(
+                name, bound, after=after, release=release, owner=owner, priority=priority,
+                memory_state=target_state, pattern=pattern, on_delivery=None,
+            )
 
-    warm_engine.submit_bound_access = _silent_warm_bound_access
-    warm_ready = warm_engine.submit("operator_warm:input_ready", release=input_ready_ms)
-    warm_complete = program.start(warm_engine, "operator_warm", warm_ready)
-    warm_engine.advance(until=(warm_complete,))
-    return float(warm_complete.time) - float(input_ready_ms)
+        warm_engine.submit_bound_access = _silent_warm_bound_access
+        warm_ready = warm_engine.submit("operator_warm:input_ready", release=input_ready_ms)
+        warm_complete = program.start(warm_engine, "operator_warm", warm_ready)
+        warm_engine.advance(until=(warm_complete,))
+        return float(warm_complete.time) - float(input_ready_ms)
+    finally:
+        if hasattr(warm_engine, "close"):
+            warm_engine.close()
 
 
 def physical_signature(op):
@@ -308,10 +312,39 @@ def _remap_replica_scopes(row, source: int, target: int):
     return row
 
 
-def _cached_operator_row(cached, op, identity, replica, count):
-    """Restore current declaration identity on a homogeneously priced row."""
+def _prepared_meta_diff(raw_meta: Mapping, prep_meta: Mapping):
+    """Capture keys added, modified, or removed by ``execution.prepare()``."""
+    changed = {
+        key: value for key, value in prep_meta.items()
+        if key not in raw_meta or raw_meta[key] != value
+    }
+    removed = tuple(key for key in raw_meta if key not in prep_meta)
+    return (changed, removed) if (changed or removed) else None
+
+
+def _cached_operator_row(cached, op, identity, replica, count, *, meta_diff=None):
+    """Restore current declaration identity while preserving prepared work fields."""
     row = dict(cached)
-    row["operator"] = replace(op, deps=(), requests=()).to_dict()
+    cached_op = cached.get("operator")
+    if isinstance(cached_op, Mapping):
+        prepared_op = dict(cached_op)
+        prepared_op["op_id"] = op.op_id
+        prepared_op["stage"] = op.stage
+        prepared_op["layer"] = op.layer
+        prepared_op["stream"] = op.stream
+        prepared_op["notes"] = list(op.notes)
+        prepared_op["deps"] = []
+        prepared_op["requests"] = []
+        meta = dict(op.metadata)
+        if meta_diff is not None:
+            changed, removed = meta_diff
+            for key in removed:
+                meta.pop(key, None)
+            meta.update(changed)
+        prepared_op["metadata"] = meta
+        row["operator"] = prepared_op
+    else:
+        row["operator"] = replace(op, deps=(), requests=()).to_dict()
     row["physical_id"] = identity
     row = _remap_replica_scopes(row, 0, int(replica))
     basis = row.get("basis")
@@ -349,91 +382,100 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
         case, ctx.cost, recipes=recipes,
         bindings=ctx.bindings, ledger=CostLedger(), evaluation=ctx,
         stream_plans=stream_plans)
-    execution._compact_step = not execution.legacy_diagnostics
-    execution.engine._compact_step = execution._compact_step
-    engine, participants, identities, replica_scopes = execution.engine, [], {}, {}
-    for replica, original in ops.items():
-        identities[replica] = physical_id(original)
-        op, recipe = execution.prepare(original, replica)
-        scope = replay_scope[replica] if isinstance(replay_scope, Mapping) else replay_scope
-        replica_scopes[replica] = scope
-        context = execution._context(op, replica, scope, recipe=recipe)
-        ready = engine.submit(f"r{replica}:input", release=input_ready_ms)
-        participants.append(CollectiveParticipant(
-            replica, ready, context, recipe, f"r{replica}:isolated",
-            engine.future(f"r{replica}:complete")))
-    rank_events = execution._start_joint_collective("isolated", participants)
-    engine.advance(horizon=input_ready_ms)
-    early_service = {key: value for key, value in engine.serviced.items()
-                     if value and "stream_quota@" not in key}
-    engine.advance(until=tuple(item.completion for item in participants), first=False)
-    rows, attributed = [], {}
-    duration = max(item.completion.time for item in participants) - input_ready_ms
-    cohort_band_plan = None
-    if participants:
-        from ..collectives import plan_options as collective_options
+    try:
+        execution._compact_step = not execution.legacy_diagnostics
+        execution.engine._compact_step = execution._compact_step
+        engine, participants, identities, replica_scopes = execution.engine, [], {}, {}
+        for replica, original in ops.items():
+            identities[replica] = physical_id(original)
+            op, recipe = execution.prepare(original, replica)
+            scope = replay_scope[replica] if isinstance(replay_scope, Mapping) else replay_scope
+            replica_scopes[replica] = scope
+            context = execution._context(op, replica, scope, recipe=recipe)
+            ready = engine.submit(f"r{replica}:input", release=input_ready_ms)
+            participants.append(CollectiveParticipant(
+                replica, ready, context, recipe, f"r{replica}:isolated",
+                engine.future(f"r{replica}:complete")))
+        rank_events = execution._start_joint_collective("isolated", participants)
+        engine.advance(horizon=input_ready_ms)
+        early_service = {key: value for key, value in engine.serviced.items()
+                         if value and "stream_quota@" not in key}
+        engine.advance(until=tuple(item.completion for item in participants), first=False)
+        rows, attributed = [], {}
+        duration = max(item.completion.time for item in participants) - input_ready_ms
+        cohort_band_plan = None
+        if participants:
+            from ..collectives import plan_options as collective_options
 
-        first = participants[0]
-        first_algo = getattr(first.recipe, "algorithm", None)
-        if first_algo in {"ring", "pairwise"} and not collective_options(first.recipe, first.context.op):
-            participants_vol = {
-                item.replica: item.context.native_work.get("link", 0)
-                for item in participants
-            }
-            cohort_band_plan = execution.topology.band_collective_plan(
-                first.context.op, participants_vol, algorithm=first_algo,
+            first = participants[0]
+            first_algo = getattr(first.recipe, "algorithm", None)
+            if first_algo in {"ring", "pairwise"} and not collective_options(first.recipe, first.context.op):
+                participants_vol = {
+                    item.replica: item.context.native_work.get("link", 0)
+                    for item in participants
+                }
+                cohort_band_plan = execution.topology.band_collective_plan(
+                    first.context.op, participants_vol, algorithm=first_algo,
+                )
+        for item in participants:
+            context = item.context
+            transport = execution.transport_options_for(
+                context.op, item.replica, replica_scopes.get(item.replica, "none"))
+            accounting = execution.topology.accounting(
+                context.op, item.replica, volume=context.native_work.get("link", 0),
+                transport=transport, recipe=item.recipe, band_plan=cohort_band_plan)
+            for resource, amount in accounting.wire_by_resource.items():
+                attributed[resource] = attributed.get(resource, 0) + amount
+            row_context = (
+                replace(context, work=dict(accounting.wire_by_resource))
+                if ((getattr(item.recipe, "algorithm", None) == "oneshot"
+                     or cohort_band_plan is not None)
+                    and context.joint_native_service is None)
+                else context
             )
-    for item in participants:
-        context = item.context
-        transport = execution.transport_options_for(
-            context.op, item.replica, replica_scopes.get(item.replica, "none"))
-        accounting = execution.topology.accounting(
-            context.op, item.replica, volume=context.native_work.get("link", 0),
-            transport=transport, recipe=item.recipe, band_plan=cohort_band_plan)
-        for resource, amount in accounting.wire_by_resource.items():
-            attributed[resource] = attributed.get(resource, 0) + amount
-        row_context = (
-            replace(context, work=dict(accounting.wire_by_resource))
-            if ((getattr(item.recipe, "algorithm", None) == "oneshot"
-                 or cohort_band_plan is not None)
-                and context.joint_native_service is None)
-            else context
-        )
-        row = _cost_row(
-            execution, context.op, item.recipe, row_context,
-            identity=identities[item.replica], count=1,
-            duration=item.completion.time - input_ready_ms,
-            input_ready_ms=input_ready_ms, serviced=accounting.wire_by_resource,
-            early_service=early_service)
-        rows.append({
-            "replica": item.replica, **row,
-            "communication": _communication_description(accounting, item.recipe),
-            "isolation_boundary": "complete_collective_cohort",
-            "cohort_replicas": list(ops), "cohort_duration_ms": duration,
-            "service_attribution": "physical_source_ranks",
-        })
-    actual = {key: value for key, value in engine.serviced.items()
-              if value and "stream_quota@" not in key}
-    expected_service = dict(attributed)
-    if cohort_band_plan is not None:
-        for key, amount in _band_plan_aux_service(cohort_band_plan).items():
-            expected_service[key] = expected_service.get(key, 0.0) + amount
-    if any(not math.isclose(expected_service.get(key, 0), actual.get(key, 0),
-                            rel_tol=1e-12, abs_tol=1e-9)
-           for key in expected_service.keys() | actual.keys()):
-        raise ValueError("collective_cohort_source_wire_accounting_mismatch")
-    return {
-        "boundary": "complete_collective_cohort",
-        "duration_ms": duration, "replicas": list(ops),
-        "rank_completion_ms": {str(rank): event.time for rank, event in rank_events.items()},
-        "serviced": actual, "operators": rows,
-    }
+            row = _cost_row(
+                execution, context.op, item.recipe, row_context,
+                identity=identities[item.replica], count=1,
+                duration=item.completion.time - input_ready_ms,
+                input_ready_ms=input_ready_ms, serviced=accounting.wire_by_resource,
+                early_service=early_service)
+            rows.append({
+                "replica": item.replica, **row,
+                "communication": _communication_description(accounting, item.recipe),
+                "isolation_boundary": "complete_collective_cohort",
+                "cohort_replicas": list(ops), "cohort_duration_ms": duration,
+                "service_attribution": "physical_source_ranks",
+            })
+        actual = {key: value for key, value in engine.serviced.items()
+                  if value and "stream_quota@" not in key}
+        expected_service = dict(attributed)
+        if cohort_band_plan is not None:
+            for key, amount in _band_plan_aux_service(cohort_band_plan).items():
+                expected_service[key] = expected_service.get(key, 0.0) + amount
+        if any(not math.isclose(expected_service.get(key, 0), actual.get(key, 0),
+                                rel_tol=1e-12, abs_tol=1e-9)
+               for key in expected_service.keys() | actual.keys()):
+            raise ValueError("collective_cohort_source_wire_accounting_mismatch")
+        return {
+            "boundary": "complete_collective_cohort",
+            "duration_ms": duration, "replicas": list(ops),
+            "rank_completion_ms": {str(rank): event.time for rank, event in rank_events.items()},
+            "serviced": actual, "operators": rows,
+        }
+    finally:
+        if hasattr(execution.engine, "close"):
+            execution.engine.close()
 
 
 def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_ms,
-                  evaluation=None, stream_plans=None):
+                  evaluation=None, stream_plans=None, target_replicas=None):
     """Isolate joint transports once, retaining each replica's local programs."""
     from mindie_sim.prediction.execution.dispatch import cohorts
+
+    target_set = (
+        frozenset(int(r) for r in target_replicas)
+        if target_replicas is not None else None
+    )
 
     if stream_plans:
         from mindie_sim.prediction.streams import validate_stream_plan_ranks
@@ -478,6 +520,8 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
     for (group, identifier), members in joins.items():
         if set(members) != set(group):
             raise ValueError(f"operator_collective_participants_mismatch:{identifier}")
+        if target_set is not None and not any(int(r) in target_set for r in group):
+            continue
         key = tuple((rank, op.stage, physical_id(op))
                     for rank, op in sorted(members.items()))
         if key not in cache:
@@ -489,7 +533,8 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
             result.update(id=f"cohort{len(cache)}", occurrences=0)
             for row in result["operators"]:
                 row.update(cohort_id=result["id"], occurrences=0, total_ms=0)
-                rows.append(row)
+                if target_set is None or int(row.get("replica", -1)) in target_set:
+                    rows.append(row)
             cache[key] = result
         result = cache[key]
         result["occurrences"] += 1
@@ -498,6 +543,8 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
             row["total_ms"] += row["duration_ms"]
 
     for rank, items in expanded.items():
+        if target_set is not None and int(rank) not in target_set:
+            continue
         local = tuple(op for op in items if (rank, op.op_id) not in joint_nodes)
         rank_plans = (
             tuple(p for p in stream_plans if int(p.rank) == int(rank))
@@ -651,7 +698,7 @@ def _evaluate_isolated_group(
 
 def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=None,
                     input_ready_ms=0, replica=0, evaluation=None, stream_plans=None,
-                    _compute_warm: bool = False):
+                    _compute_warm: bool = False, target_replicas=None):
     """Price local operators or complete replica->operators cohort mappings."""
     from mindie_sim.prediction.program import RecipeBook
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
@@ -669,7 +716,8 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         from mindie_sim.prediction.efficiency.exposed_breakdown import unavailable_breakdown
         result = _cohort_costs(
             case, ops, recipes, primitives, replay_scope, input_ready_ms,
-            evaluation=ctx, stream_plans=stream_plans)
+            evaluation=ctx, stream_plans=stream_plans,
+            target_replicas=target_replicas)
         result.update(unavailable_breakdown(
             "operator_only", boundary="operator_sum"))
         return result
@@ -707,47 +755,58 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
                     bound = bind_stream_owners(plan, profile.datapath)
                     for sid, owners in bound.items():
                         stream_owners_lookup[(int(replica), profile.stage, sid)] = owners
-    for group in groups.values():
-        op = group["op"]
-        signature = physical_signature(op)
-        identity = physical_id(op)
-        profile_key = ctx.bindings.profile_key(replica, op.stage)
-        op_owners = stream_owners_lookup.get((int(replica), int(op.stage), op.stream or "main"))
-        link_scope = (
-            (int(replica),)
-            if (float(getattr(op, "link_bytes", 0.0) or 0.0) > 0.0
-                or dict(op.metadata).get("group_axis"))
-            else ()
-        )
-        cache_key = (profile_key, int(op.stage), signature, replay_scope,
-                     float(input_ready_ms), op_owners, link_scope, bool(_compute_warm))
-        if isolated_cache is not None:
-            cached = isolated_cache.get(cache_key)
-            if cached is not None:
-                rows.append(_cached_operator_row(
-                    cached, op, identity, replica, int(group["count"])))
-                continue
-        from mindie_sim.prediction.efficiency.cost import CostLedger
-        if execution is None:
-            execution = Execution(
-                case, ctx.cost, recipes=recipes,
-                bindings=ctx.bindings, ledger=CostLedger(),
-                isolated_replica=int(replica), evaluation=ctx,
-                stream_plans=stream_plans)
-            execution._compact_step = not execution.legacy_diagnostics
-        else:
-            execution.reset_engine()
-        execution.engine._compact_step = execution._compact_step
-        row = _evaluate_isolated_group(
-            execution, op, replica=replica, replay_scope=replay_scope,
-            input_ready_ms=input_ready_ms, identity=identity, count=group["count"],
-            compute_warm=bool(_compute_warm),
-        )
-        rows.append(row)
-        if isolated_cache is not None:
-            isolated_cache.put(
-                cache_key,
-                _remap_replica_scopes(dict(row), int(replica), 0))
+    try:
+        for group in groups.values():
+            op = group["op"]
+            signature = physical_signature(op)
+            identity = physical_id(op)
+            profile_key = ctx.bindings.profile_key(replica, op.stage)
+            op_owners = stream_owners_lookup.get((int(replica), int(op.stage), op.stream or "main"))
+            link_scope = (
+                (int(replica),)
+                if (float(getattr(op, "link_bytes", 0.0) or 0.0) > 0.0
+                    or dict(op.metadata).get("group_axis"))
+                else ()
+            )
+            cache_key = (profile_key, int(op.stage), signature, replay_scope,
+                         float(input_ready_ms), op_owners, link_scope, bool(_compute_warm))
+            if isolated_cache is not None:
+                entry = isolated_cache.get(cache_key)
+                if entry is not None:
+                    if isinstance(entry, tuple) and len(entry) == 2:
+                        cached_row, meta_diff = entry
+                    else:
+                        cached_row, meta_diff = entry, None
+                    rows.append(_cached_operator_row(
+                        cached_row, op, identity, replica, int(group["count"]),
+                        meta_diff=meta_diff))
+                    continue
+            from mindie_sim.prediction.efficiency.cost import CostLedger
+            if execution is None:
+                execution = Execution(
+                    case, ctx.cost, recipes=recipes,
+                    bindings=ctx.bindings, ledger=CostLedger(),
+                    isolated_replica=int(replica), evaluation=ctx,
+                    stream_plans=stream_plans)
+                execution._compact_step = not execution.legacy_diagnostics
+            else:
+                execution.reset_engine()
+            execution.engine._compact_step = execution._compact_step
+            row = _evaluate_isolated_group(
+                execution, op, replica=replica, replay_scope=replay_scope,
+                input_ready_ms=input_ready_ms, identity=identity, count=group["count"],
+                compute_warm=bool(_compute_warm),
+            )
+            rows.append(row)
+            if isolated_cache is not None:
+                prep_meta = dict((row.get("operator") or {}).get("metadata") or ())
+                meta_diff = _prepared_meta_diff(dict(op.metadata), prep_meta)
+                isolated_cache.put(
+                    cache_key,
+                    (_remap_replica_scopes(dict(row), int(replica), 0), meta_diff))
+    finally:
+        if execution is not None and hasattr(execution.engine, "close"):
+            execution.engine.close()
     from mindie_sim.prediction.efficiency.exposed_breakdown import unavailable_breakdown
     return {
         "schema": "mindie-sim.operators/1",

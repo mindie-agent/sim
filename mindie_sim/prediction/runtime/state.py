@@ -35,11 +35,12 @@ DEFAULT_ZERO_PROGRESS_LIMIT = 100_000
 class _LazyTraceDeque:
     """Bounded ring buffer materializing task trace dicts only when read."""
 
-    __slots__ = ("_dq", "maxlen")
+    __slots__ = ("_dq", "maxlen", "_ext_mut")
 
     def __init__(self, iterable=(), maxlen: int | None = None):
         self.maxlen = maxlen
         self._dq = deque(iterable, maxlen=maxlen)
+        self._ext_mut = 0
 
     @staticmethod
     def _to_dict(row):
@@ -60,9 +61,11 @@ class _LazyTraceDeque:
 
     def append(self, item) -> None:
         self._dq.append(item)
+        self._ext_mut += 1
 
     def clear(self) -> None:
         self._dq.clear()
+        self._ext_mut += 1
 
     def __len__(self) -> int:
         return len(self._dq)
@@ -91,11 +94,12 @@ class _LazyTraceDeque:
 class _LazyAllocTraceDeque:
     """Bounded ring buffer materializing allocation audit dicts only when read."""
 
-    __slots__ = ("_dq", "maxlen")
+    __slots__ = ("_dq", "maxlen", "_ext_mut")
 
     def __init__(self, iterable=(), maxlen: int | None = None):
         self.maxlen = maxlen
         self._dq = deque(iterable, maxlen=maxlen)
+        self._ext_mut = 0
 
     @staticmethod
     def _to_dict(row):
@@ -114,9 +118,11 @@ class _LazyAllocTraceDeque:
 
     def append(self, item) -> None:
         self._dq.append(item)
+        self._ext_mut += 1
 
     def clear(self) -> None:
         self._dq.clear()
+        self._ext_mut += 1
 
     def __len__(self) -> int:
         return len(self._dq)
@@ -219,6 +225,7 @@ class RuntimeState:
         self._stage_prepared: dict[tuple, Any] = {}
         self._stage_prepared_id: dict[int, tuple] = {}
         self._releases: list[tuple[float, int]] = []
+        self._max_release: float = 0.0
         self._sequence = 0
         self._next_launch = 0
         # Periodic acceleration registries are populated by the template
@@ -247,6 +254,7 @@ class RuntimeState:
         self._trace_view = _LazyTraceDeque(maxlen=trace_limit)
         self._trace_dq = self._trace_view._dq
         self._trace_maxlen = 0 if trace_limit is None else int(trace_limit)
+        self._trace_appends = 0
         self.trace_dropped = 0
         self._evicted_service_spans: dict[str, list[tuple[float, float]]] = {}
         # One authoritative typed state ledger. FragmentConductor and
@@ -306,6 +314,7 @@ class RuntimeState:
         self._trace_dq = self._trace_view._dq
         ml = self._trace_view.maxlen
         self._trace_maxlen = -1 if ml is None else int(ml)
+        self._trace_appends = 0
 
     @property
     def allocation_trace(self):

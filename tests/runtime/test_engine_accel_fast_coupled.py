@@ -531,3 +531,154 @@ def test_c11_sparse_epoch_dynamic_4096_res_and_multiunit_parity() -> None:
     finally:
         _close(eng_py)
         _close(eng_c)
+
+
+def test_prepared_cache_clear_resets_floor_peaks_and_uses_monotonic_static_id() -> None:
+    """Clearing prepared caches clears _seen_floor_peaks and monotonic static_id prevents id() reuse."""
+    from mindie_sim.prediction.program.stages import Stage
+    from mindie_sim.prediction.runtime.engine import Allocation, Engine, Resource
+
+    eng = Engine(
+        (Resource("mte2", 1024.0, units=4),),
+        pools={"l0b": 262144.0},
+        pool_units={"l0b": 4},
+        backend="python",
+    )
+    try:
+        a1 = Allocation("a1", "l0b", 32768.0, (0,))
+        s1 = Stage(
+            "k1",
+            work={"mte2": 128.0},
+            acquire=(a1,),
+            free=(a1,),
+            placement={"mte2": (0,)},
+        )
+        p1 = eng._prepare_static_stage(s1)
+        eng._submit_prepared(p1, "t1")
+        eng.advance()
+        assert eng.peak_unit_allocated[("l0b", 0)] == 32768.0
+        assert p1.static_id in eng._seen_floor_peaks
+
+        eng._clear_prepared_caches()
+        assert not eng._seen_floor_peaks
+
+        a2 = Allocation("a2", "l0b", 65536.0, (0,))
+        s2 = Stage(
+            "k2",
+            work={"mte2": 128.0},
+            acquire=(a2,),
+            free=(a2,),
+            placement={"mte2": (0,)},
+        )
+        p2 = eng._prepare_static_stage(s2)
+        assert p2.static_id > p1.static_id
+        eng._submit_prepared(p2, "t2")
+        eng.advance()
+        assert eng.peak_unit_allocated[("l0b", 0)] == 65536.0
+    finally:
+        eng.close()
+
+
+def test_engine_close_releases_accel_and_preserves_status() -> None:
+    """Engine.close() deterministically frees the native arena while keeping final accel_status()."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    eng = Engine((Resource("r0", 1.0),), backend="python")
+    eng.submit("t0", {"r0": 2.0})
+    eng.advance()
+    before = eng.accel_status()
+    eng.close()
+    assert eng._accel is None
+    assert eng.accel_status()["accel_backend"] == before["accel_backend"]
+    eng.close()
+
+
+def test_replica_block_reciprocity_accepts_tp_unbalanced_tokens_and_rejects_cycles() -> None:
+    """Replica-block reciprocity accepts seq%tp!=0 DP-symmetric matrices and rejects directed cycles."""
+    from mindie_sim.prediction.runtime.dp_cohort_dedup import is_symmetric_native_program
+
+    # 2 DP replicas x 2 TP ranks: pos 0 sends 2048B to all peers, pos 1 sends 0B.
+    rows_sym = (
+        (0.0, 2048.0, 2048.0, 2048.0),
+        (0.0, 0.0, 0.0, 0.0),
+        (2048.0, 2048.0, 0.0, 2048.0),
+        (0.0, 0.0, 0.0, 0.0),
+    )
+    inner_sym = SimpleNamespace(
+        peer_count=4,
+        route_matrix=None,
+        route_matrix_bytes=rows_sym,
+        start_with_handles=lambda *_a, **_kw: None,
+        payload_basis_for=lambda _rk: "expected",
+        local_frames_for=lambda _rk: 0,
+    )
+    assert is_symmetric_native_program(SimpleNamespace(program=inner_sym), 4, local_rank_count=2) is True
+
+    # Directed cross-replica cycle (R0 -> R1 -> R2 -> R0, local_k=2) MUST be rejected.
+    rows_cyc = [[0.0] * 6 for _ in range(6)]
+    for rep in range(3):
+        nxt = (rep + 1) % 3
+        rows_cyc[rep * 2][nxt * 2] = 2048.0
+    inner_cyc = SimpleNamespace(
+        peer_count=6,
+        route_matrix=None,
+        route_matrix_bytes=tuple(tuple(r) for r in rows_cyc),
+        start_with_handles=lambda *_a, **_kw: None,
+        payload_basis_for=lambda _rk: "expected",
+        local_frames_for=lambda _rk: 0,
+    )
+    assert is_symmetric_native_program(SimpleNamespace(program=inner_cyc), 6, local_rank_count=2) is False
+
+
+def test_coupled_unplaced_multi_unit_bus_runs_native_and_hands_back_on_partial_peer() -> None:
+    """Unplaced multi-unit bus stays C11-eligible with 0-ULP parity until a partial peer touches it."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    res = (
+        Resource("matrix", 32.0, units=32),
+        Resource("mte1", 32.0, units=32),
+        Resource("memory", 320.0, units=32),
+    )
+    # 1. Pure unplaced shared bus + proportional placed compute -> C11 native_steps > 0, exact parity.
+    out_clean = {}
+    for be in ("python", "c"):
+        eng = Engine(res, backend=be)
+        try:
+            evs = [
+                eng.submit(
+                    f"g{i}",
+                    {"matrix": 4.0, "mte1": 4.0, "memory": 40.0},
+                    coupled=True,
+                    placement={"matrix": (i,), "mte1": (i,)},
+                )
+                for i in range(16)
+            ]
+            eng.advance()
+            st = eng.accel_status()
+            out_clean[be] = ([float(e.time) for e in evs], int(st["native_steps"]), int(st["python_steps"]))
+        finally:
+            eng.close()
+    assert out_clean["c"][1] > 0 and out_clean["c"][2] == 0
+    assert out_clean["c"][0] == pytest.approx(out_clean["python"][0], rel=0.0, abs=1e-12)
+
+    # 2. A peer partially placing on ``memory`` triggers handback so unplaced-span redistribution stays exact.
+    out_mix = {}
+    for be in ("python", "c"):
+        eng = Engine(res, backend=be)
+        try:
+            e_c = eng.submit(
+                "coupled_unplaced_bus",
+                {"matrix": 1.0, "memory": 320.0},
+                coupled=True,
+                placement={"matrix": (0,)},
+            )
+            e_p = eng.submit(
+                "partial_bus_peer",
+                {"memory": 20.0},
+                placement={"memory": (0,)},
+            )
+            eng.advance()
+            out_mix[be] = (float(e_c.time), float(e_p.time))
+        finally:
+            eng.close()
+    assert out_mix["c"] == pytest.approx(out_mix["python"], rel=0.0, abs=1e-12)

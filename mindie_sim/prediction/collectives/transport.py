@@ -750,6 +750,7 @@ class TransportPlan:
             service = engine.submit(
                 prefix + f":hop{hop_index}:service", hop.demand,
                 after=tuple(hop_dependencies), owner=owner, coupled=True,
+                native_hook=hop_index == 0,
                 on_complete=(
                     (lambda _event, fi=flow_index, ci=chunk_index: on_hop0_done(fi, ci))
                     if hop_index == 0
@@ -768,7 +769,7 @@ class TransportPlan:
                 latency=float(self.hop_startup_us) / MS_PER_S, owner=owner,
                 metadata={"startup_boundary": "destination_receipt_once"})
         engine.submit(
-            prefix + ":received", after=(previous,), owner=owner,
+            prefix + ":received", after=(previous,), owner=owner, native_hook=True,
             on_complete=lambda event, fi=flow_index, d=destination,
             value=useful, p=prefix, a=allocation:
                 arrived(fi, d, value, p, a, event))

@@ -479,7 +479,9 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
     )
     b_q35 = build_export_bundle(raw_q35, request=req)
     q35_ops = {o.op_id: o for o in b_q35.operators}
-    assert q35_ops["s0.l3.rope"].ascend_kernel in {"split_qkv_rmsnorm_mrope_kernel", "InplacePartialRotaryMul"}
+    assert q35_ops["s0.l3.rope"].ascend_kernel in {
+        "split_qkv_rmsnorm_mrope_kernel", "InplacePartialRotaryMul", "aclnnInplacePartialRotaryMul",
+    }
     assert "split_qkv_rmsnorm_mrope_fused" in q35_ops["s0.l3.rope"].canonical_op_key
     mrope_desc = resolve_ascend_kernel_identity(
         "s0.l3.rope", None, "rotary", "split_qkv_rmsnorm_mrope_fused", (), "bf16", parse_case(raw_q35), None, (),

@@ -15,8 +15,9 @@
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import ctypes
+import math
 from typing import Any
 import weakref
 
@@ -256,12 +257,15 @@ def coupled_placement_proportional(engine: Any, task: Any) -> bool:
     """True when multi-unit resources on a coupled task have proportional widths."""
     if not (task.coupled and task.placement and len(task.remaining) > 1):
         return True
+    partial_live = getattr(engine, "_partial_placed_live", None)
     first_u = first_tot = 0
     for name in task.remaining:
         res_obj = engine.resources[name]
         if res_obj.units <= 1:
             continue
         units = task.placement.get(name)
+        if units is None and (not partial_live or name not in partial_live):
+            continue
         u_len = res_obj.units if units is None else len(units)
         if first_tot == 0:
             first_u, first_tot = u_len, res_obj.units
@@ -297,65 +301,216 @@ def _peer_breaks_cohort(task: Any, peer: Any) -> bool:
     return False
 
 
-def has_asymmetric_cohort(engine: Any) -> bool:
+def _has_other_unit_overlap(
+    t_units: Any,
+    owner_task: Any,
+    peer_map: Mapping[Any, tuple[int, Any]],
+) -> bool:
+    t_set = None if t_units is None else set(t_units)
+    for p_units, (cnt, single) in peer_map.items():
+        if cnt == 1 and single is owner_task:
+            continue
+        if t_set is None or p_units is None or not t_set.isdisjoint(p_units):
+            return True
+    return False
+
+
+def _has_other_member_asymmetry(
+    members: tuple[frozenset[int], ...],
+    owner_task: Any,
+    peer_map: Mapping[Any, tuple[int, Any]],
+) -> bool:
+    for p_units, (cnt, single) in peer_map.items():
+        if p_units is None or (cnt == 1 and single is owner_task):
+            continue
+        p_set = set(p_units)
+        if len({len(p_set.intersection(m)) for m in members}) > 1:
+            return True
+    return False
+
+
+def _record_sig_count(bucket: dict[Any, tuple[int, Any]], sig: Any, task: Any) -> None:
+    prev = bucket.get(sig)
+    bucket[sig] = (1, task) if prev is None else (prev[0] + 1, None)
+
+
+def _build_cohort_peer_index(tasks: Mapping[int, Any], cohort_seqs: Any = None):
+    """Build deduplicated resource-indexed cohort and peer placement tables."""
+    if cohort_seqs is None:
+        cohorts = [t for t in tasks.values() if t.remaining and t.cohort_size > 1]
+    else:
+        cohorts = [
+            t for seq in cohort_seqs
+            if (t := tasks.get(seq)) is not None and t.remaining and t.cohort_size > 1
+        ]
+    if not cohorts:
+        return None
+    cohort_res: set[str] = set()
+    uncoupled_by_res: dict[str, dict[Any, tuple[int, Any]]] = {}
+    members_by_res: dict[str, dict[Any, tuple[int, Any]]] = {}
+    for c in cohorts:
+        cohort_res.update(c.remaining)
+        if not c.coupled:
+            c_place = c.placement or {}
+            for rname in c.remaining:
+                _record_sig_count(uncoupled_by_res.setdefault(rname, {}), c_place.get(rname), c)
+        if c.cohort_members:
+            for rname, members in c.cohort_members:
+                if rname in c.remaining:
+                    _record_sig_count(members_by_res.setdefault(rname, {}), members, c)
+    peer_units_by_res: dict[str, dict[Any, tuple[int, Any]]] = {}
+    for task in tasks.values():
+        rem = task.remaining
+        if not rem:
+            continue
+        p_place = task.placement or {}
+        for rname, amt in rem.items():
+            if amt > 0.0 and rname in cohort_res:
+                _record_sig_count(peer_units_by_res.setdefault(rname, {}), p_place.get(rname), task)
+    return cohort_res, uncoupled_by_res, members_by_res, peer_units_by_res
+
+
+def _peer_breaks_indexed_cohort(
+    peer: Any,
+    uncoupled_by_res: Mapping[str, Mapping[Any, tuple[int, Any]]],
+    members_by_res: Mapping[str, Mapping[Any, tuple[int, Any]]],
+) -> bool:
+    rem = peer.remaining
+    if not rem:
+        return False
+    p_place = peer.placement or {}
+    for rname, amt in rem.items():
+        if amt <= 0.0:
+            continue
+        p_units = p_place.get(rname)
+        u_map = uncoupled_by_res.get(rname)
+        if u_map and _has_other_unit_overlap(p_units, peer, u_map):
+            return True
+        m_map = members_by_res.get(rname)
+        if m_map and p_units is not None:
+            p_set = set(p_units)
+            for members, (cnt, single) in m_map.items():
+                if cnt == 1 and single is peer:
+                    continue
+                if len({len(p_set.intersection(m)) for m in members}) > 1:
+                    return True
+    return False
+
+
+def _cohort_needs_split_indexed(
+    cohort: Any,
+    peer_units_by_res: Mapping[str, Mapping[Any, tuple[int, Any]]],
+    fifo_names: Any,
+) -> bool:
+    if fifo_names and any(r in fifo_names for r in cohort.remaining):
+        return True
+    if not cohort.cohort_members and cohort.coupled:
+        return False
+    if not cohort.coupled and cohort.cohort_size > 1:
+        c_place = cohort.placement or {}
+        for rname in cohort.remaining:
+            p_map = peer_units_by_res.get(rname)
+            if p_map and _has_other_unit_overlap(c_place.get(rname), cohort, p_map):
+                return True
+    if cohort.cohort_members:
+        for rname, members in cohort.cohort_members:
+            if rname not in cohort.remaining:
+                continue
+            p_map = peer_units_by_res.get(rname)
+            if p_map and _has_other_member_asymmetry(members, cohort, p_map):
+                return True
+    return False
+
+
+def has_asymmetric_cohort(engine: Any, cohort_seqs: Any = None) -> bool:
     """True when an active/ready cohort touches FIFO or has symmetry broken now."""
     now = engine.now
+    tasks = engine._tasks
+    if cohort_seqs is None:
+        active_cohorts = [
+            t for t in tasks.values()
+            if t.cohort_size > 1 and t.remaining
+            and (t.start is not None or (t.waiting == 0 and t.release <= now))
+        ]
+    else:
+        active_cohorts = [
+            t for seq in cohort_seqs
+            if (t := tasks.get(seq)) is not None and t.remaining
+            and (t.start is not None or (t.waiting == 0 and t.release <= now))
+        ]
+    if not active_cohorts:
+        return False
     fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
-    live_now = [
-        t for t in engine._tasks.values()
-        if t.remaining and (t.start is not None or (t.waiting == 0 and t.release <= now))
-    ]
-    for task in live_now:
-        if task.cohort_size <= 1:
-            continue
+    breakable: list[Any] = []
+    cohort_res: set[str] = set()
+    for task in active_cohorts:
         if fifo_names and any(r in fifo_names for r in task.remaining):
             return True
-        if not task.cohort_members and task.coupled:
+        if task.cohort_members or not task.coupled:
+            breakable.append(task)
+            cohort_res.update(task.remaining)
+    if not breakable:
+        return False
+    for peer in tasks.values():
+        rem = peer.remaining
+        if not rem or (peer.start is None and (peer.waiting != 0 or peer.release > now)):
             continue
-        for peer in live_now:
+        if cohort_res.isdisjoint(rem):
+            continue
+        for task in breakable:
             if peer is not task and _peer_breaks_cohort(task, peer):
                 return True
     return False
 
 
-def _cohort_needs_split_with(cohort: Any, all_tasks: Sequence[Any], fifo_names: Any) -> bool:
-    if fifo_names and any(r in fifo_names for r in cohort.remaining):
-        return True
-    if not cohort.cohort_members and cohort.coupled:
-        return False
-    return any(other is not cohort and _peer_breaks_cohort(cohort, other) for other in all_tasks)
-
-
-def cohort_break_horizon(engine: Any, horizon: float) -> float:
+def cohort_break_horizon(engine: Any, horizon: float, cohort_seqs: Any = None) -> float:
     """Clamp epoch horizon to the earliest future peer or cohort release breaking symmetry."""
-    all_tasks = [t for t in engine._tasks.values() if t.remaining]
-    cohorts = [t for t in all_tasks if t.cohort_size > 1 and (t.cohort_members or not t.coupled)]
-    fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
-    if not cohorts and not any(t.cohort_size > 1 for t in all_tasks):
-        return horizon
     now = engine.now
+    if getattr(engine, "_max_release", math.inf) <= now:
+        return horizon
+    tasks = engine._tasks
+    index = _build_cohort_peer_index(tasks, cohort_seqs)
+    if index is None:
+        return horizon
+    cohort_res, uncoupled_by_res, members_by_res, peer_units_by_res = index
+    fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
     eff = horizon
-    for fut in all_tasks:
-        if fut.start is not None or fut.release <= now or fut.release >= eff:
+    for fut in tasks.values():
+        rem = fut.remaining
+        if not rem or fut.start is not None or fut.release <= now or fut.release >= eff:
             continue
-        if any(fut is not c and _peer_breaks_cohort(c, fut) for c in cohorts) or (
-            fut.cohort_size > 1 and _cohort_needs_split_with(fut, all_tasks, fifo_names)
+        if fut.cohort_size <= 1 and cohort_res.isdisjoint(rem):
+            continue
+        if _peer_breaks_indexed_cohort(fut, uncoupled_by_res, members_by_res) or (
+            fut.cohort_size > 1 and _cohort_needs_split_indexed(fut, peer_units_by_res, fifo_names)
         ):
             eff = fut.release
     return eff
 
 
-def stop_slots_for_epoch(engine: Any, until: Sequence[Any]) -> list[int]:
+def stop_slots_for_epoch(
+    engine: Any,
+    until: Sequence[Any],
+    cohort_seqs: Any = None,
+    backend: Any = None,
+) -> list[int]:
     """Collect ``until`` slots plus predecessors waking an asymmetric peer or cohort."""
     slots = engine._native_slots
     out = [slots[e.sequence] for e in until if not e.done and e.sequence in slots]
-    all_tasks = [t for t in engine._tasks.values() if t.remaining]
-    cohorts = [t for t in all_tasks if t.cohort_size > 1 and (t.cohort_members or not t.coupled)]
-    fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
-    if not cohorts and not any(t.cohort_size > 1 for t in all_tasks):
-        return out
-    seen = set(out)
+    cache_key = None
+    if backend is not None:
+        cache_key = (engine._sequence, backend.epoch_tasks, id(backend.arena), bool(engine._fifo_live))
+        if backend._cohort_stop_key == cache_key:
+            return out
     tasks = engine._tasks
+    index = _build_cohort_peer_index(tasks, cohort_seqs)
+    if index is None:
+        if backend is not None:
+            backend._cohort_stop_key = cache_key
+        return out
+    cohort_res, uncoupled_by_res, members_by_res, peer_units_by_res = index
+    fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
+    seen = set(out)
     for seq, slot in slots.items():
         if slot in seen:
             continue
@@ -366,12 +521,16 @@ def stop_slots_for_epoch(engine: Any, until: Sequence[Any]) -> list[int]:
             w = tasks.get(wseq)
             if w is None or not w.remaining:
                 continue
-            if any(w is not c and _peer_breaks_cohort(c, w) for c in cohorts) or (
-                w.cohort_size > 1 and _cohort_needs_split_with(w, all_tasks, fifo_names)
+            if w.cohort_size <= 1 and cohort_res.isdisjoint(w.remaining):
+                continue
+            if _peer_breaks_indexed_cohort(w, uncoupled_by_res, members_by_res) or (
+                w.cohort_size > 1 and _cohort_needs_split_indexed(w, peer_units_by_res, fifo_names)
             ):
                 out.append(slot)
                 seen.add(slot)
                 break
+    if backend is not None:
+        backend._cohort_stop_key = cache_key
     return out
 
 

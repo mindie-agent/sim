@@ -120,6 +120,7 @@ class RingGroup:
                     f"{prefix}:hop{hop_index}:service", hop.demand,
                     after=(previous,), owner=owner, coupled=True,
                     on_complete=transmitted if hop_index == 0 else None,
+                    native_hook=hop_index == 0,
                 )
                 previous = engine.submit(
                     f"{prefix}:hop{hop_index}:arrival", after=(service,),
@@ -134,7 +135,7 @@ class RingGroup:
                 issue(receiver)
 
             engine.submit(prefix + ":received", after=(previous,), on_complete=arrived,
-                          owner=owner)
+                          owner=owner, native_hook=True)
 
         for index in range(count):
             issue(index)
@@ -290,7 +291,7 @@ class PairwiseGroup:
                         after=(event, initial[destination]),
                         on_complete=lambda arrival: deliver(
                             destination_index, round_index, arrival),
-                        owner=owner)
+                        owner=owner, native_hook=True)
                     return
                 message = self.topology.route_message(MessageFlow(
                     source, destination, payload))
@@ -309,6 +310,7 @@ class PairwiseGroup:
                         hop.demand, after=(previous,),
                         owner=owner, coupled=True,
                         on_complete=sent if hop_index == 0 else None,
+                        native_hook=hop_index == 0,
                     )
                     previous = engine.submit(
                         f"{prefix}:hop{hop_index}:arrival", after=(service,),
@@ -320,13 +322,13 @@ class PairwiseGroup:
                     after=(previous, initial[destination]),
                     on_complete=lambda arrival: deliver(
                         destination_index, round_index, arrival),
-                    owner=owner)
+                    owner=owner, native_hook=True)
 
             engine.submit(
                 prefix + ":ready", after=tuple(dependencies), owner=owner,
                 metadata={"source_rank": source, "destination_rank": destination,
                           "round": round_index},
-                on_complete=dispatched,
+                on_complete=dispatched, native_hook=True,
             )
 
         for index in range(count):

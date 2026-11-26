@@ -23,6 +23,9 @@ from .stages import Stage, _declares_no_work, scope_allocations
 PIPELINE_COHORT_WINDOW = 512
 #: Bounded tile window an interior fold may materialize.
 PIPELINE_FOLD_WINDOW = 512
+#: Bounded tile count eligible for callback-free static DAG submission.
+_STATIC_UNROLL_MAX_TILES = 128
+_MIN_STATIC_UNROLL_TILES = 2
 _INDEX_COORD_ARITY = 5
 _MIN_FOLD_TILES = 4
 _MIN_FOLD_ENTRIES = 3
@@ -252,7 +255,6 @@ class PipelineProgram:
         if self.count == 1 and not self.setup_ms and not self.minimum_ms:
             return self._start_single_tile(engine, name, ready, scoped, owner)
 
-        complete = engine.future(name + ":pipeline_complete")
         setup = (
             engine.submit(name + ":setup", after=(ready,), latency=self.setup_ms, owner=owner)
             if self.setup_ms else ready
@@ -261,6 +263,10 @@ class PipelineProgram:
             engine.submit(name + ":span", after=(setup,), latency=self.minimum_ms, owner=owner)
             if self.minimum_ms else None
         )
+        static_done = self._try_start_static_dag(engine, name, setup, observation, scoped, owner)
+        if static_done is not None:
+            return static_done
+        complete = engine.future(name + ":pipeline_complete")
         stage_tail: dict[str, Event] = {}
         tile_events: dict[int, dict[str, Event]] = {}
         live_tiles: set[int] = set()
@@ -373,6 +379,106 @@ class PipelineProgram:
             after=(complete, observation) if observation is not None else (complete,),
             owner=owner,
         )
+
+    def _can_static_unroll(
+        self, engine: Engine, tiles: Sequence[tuple[Stage, ...]],
+    ) -> bool:
+        """True when all tiles can be submitted statically as a callback-free DAG."""
+        if engine.memory is not None or engine._periodic_runs:
+            return False
+        fifo_names = engine.fifo_resource_names() if hasattr(engine, "fifo_resource_names") else frozenset()
+        first_sinks: tuple[str, ...] | None = None
+        for stages in tiles:
+            consumed: set[str] = set()
+            for stage in stages:
+                if (
+                    stage.program is not None or stage.fragment is not None
+                    or stage.acquire or stage.free or stage.deliveries
+                    or stage.latency_from_first_service
+                ):
+                    return False
+                if fifo_names and stage.work and any(r in fifo_names for r in stage.work):
+                    return False
+                if stage.after:
+                    consumed.update(stage.after)
+            if self.slots > 1 and self.slots < self.count:
+                sinks = tuple(stage.name for stage in stages if stage.name not in consumed)
+                if not sinks:
+                    return False
+                if first_sinks is None:
+                    first_sinks = sinks
+                elif sinks != first_sinks:
+                    return False
+        return True
+
+    def _try_start_static_dag(
+        self, engine: Engine, name: str, setup: Event,
+        observation: Event | None, scoped: Callable, owner: str,
+    ) -> Event | None:
+        """Submit bounded allocation-free tiles statically with zero retire callbacks."""
+        if not (_MIN_STATIC_UNROLL_TILES <= self.count <= _STATIC_UNROLL_MAX_TILES):
+            return None
+        tiles = [tuple(self.tile(index)) for index in range(self.count)]
+        if not self._can_static_unroll(engine, tiles):
+            return None
+        stage_tail: dict[str, Event] = {}
+        tile_events: dict[int, dict[str, Event]] = {}
+        tile_retires: list[Event] = []
+        max_lag = 1
+        for index, stages in enumerate(tiles):
+            for st in stages:
+                for _, lag in st.previous_lags:
+                    if lag > max_lag:
+                        max_lag = lag
+            slot_gate = tile_retires[index - self.slots] if index >= self.slots else setup
+            local: dict[str, Event] = {}
+            previous = dict(stage_tail)
+            consumed: set[str] = set()
+            for stage in stages:
+                if stage.after:
+                    consumed.update(stage.after)
+                deps = [local[key] for key in stage.after]
+                if not stage.after and slot_gate is not setup:
+                    deps.append(slot_gate)
+                deps.extend(previous[key] for key in stage.previous if key in previous)
+                for dep_name, lag in stage.previous_lags:
+                    target = index - lag
+                    if target >= 0:
+                        prior_tile = tile_events.get(target)
+                        if prior_tile is not None and dep_name in prior_tile:
+                            deps.append(prior_tile[dep_name])
+                if stage.name in stage_tail:
+                    deps.append(stage_tail[stage.name])
+                task_name = f"{name}:tile{index}:{stage.name}"
+                if _declares_no_work(stage):
+                    ev = _zero_work_alias(engine, deps, slot_gate)
+                    if ev is not None:
+                        local[stage.name] = stage_tail[stage.name] = ev
+                        continue
+                event = stage.submit(
+                    engine, task_name, tuple(deps) or (slot_gate,), scoped, owner,
+                )
+                local[stage.name] = stage_tail[stage.name] = event
+            if max_lag > 1:
+                tile_events[index] = local
+                cutoff = index - max_lag
+                if cutoff in tile_events:
+                    del tile_events[cutoff]
+            sinks = tuple(dict.fromkeys(
+                local[stage.name] for stage in stages if stage.name not in consumed
+            )) or (slot_gate,)
+            tile_retire = (
+                sinks[0]
+                if len(sinks) == 1
+                else engine.submit(f"{name}:tile{index}:retire", after=sinks, owner=owner)
+            )
+            tile_retires.append(tile_retire)
+        tail_deps = list(dict.fromkeys(tile_retires[-min(self.slots, self.count):]))
+        if observation is not None:
+            tail_deps.append(observation)
+        if len(tail_deps) == 1:
+            return tail_deps[0]
+        return engine.submit(name + ":complete", after=tuple(tail_deps), owner=owner)
 
     def _start_single_tile(self, engine, name, ready, scoped, owner):
         def submit_tile0(trigger: Event) -> tuple[Event, ...]:

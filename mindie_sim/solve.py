@@ -49,6 +49,7 @@ from mindie_sim.schema.scenario import validate_deployment_mode
 from mindie_sim.sweep.mapreduce import map_ordered, resolve_granted_workers
 from mindie_sim.sweep.pd import (
     _compose_track_arg,
+    _prefill_prefix_split,
     _prefill_workspace_tokens,
     _reclaim_sweep_memory,
     _single_die_decode_tps,
@@ -207,6 +208,7 @@ def _analyze_case_bounded(
     context: int,
     sequences: int,
     scope: str,
+    shared_isolated_caches: dict[Any, Any] | None = None,
 ) -> dict[str, Any]:
     """Run ``analyze_network_efficiency`` with replica-0 timeline bounding."""
     parsed = parse_case(raw_case)
@@ -230,6 +232,26 @@ def _analyze_case_bounded(
     from mindie_sim.prediction.execution.layer_runs import execute_native_cohort_graph
 
     ctx = EvaluationContext.create(eff_case)
+    if shared_isolated_caches is not None:
+        rt = eff_case.runtime
+        iso_key = (
+            rt.collective_startup_mode,
+            rt.matrix_compute_policy,
+            rt.graph_mode,
+            rt.graph_capture_mode,
+            bool(rt.enable_torch_compile),
+            bool(rt.enable_npugraph_ex),
+            bool(rt.enable_static_kernel),
+            bool(rt.enable_super_kernel),
+            json.dumps(rt.kernels or {}, sort_keys=True, separators=(",", ":"), default=repr),
+            json.dumps(rt.submission or {}, sort_keys=True, separators=(",", ":"), default=repr),
+            json.dumps(rt.memory or {}, sort_keys=True, separators=(",", ":"), default=repr),
+        )
+        shared_iso = shared_isolated_caches.get(iso_key)
+        if shared_iso is None:
+            shared_isolated_caches[iso_key] = ctx.isolated_results
+        else:
+            ctx.isolated_results = shared_iso
     graph_rep, _, _ = execute_native_cohort_graph(
         eff_case, sg, external_inputs=ext_in,
         isolated=False, evaluation=ctx, timeline_replicas=(0,),
@@ -238,7 +260,7 @@ def _analyze_case_bounded(
     try:
         op_rep = operator_costs(eff_case, r0_ops, replica=0, evaluation=ctx)
     except ValueError:
-        cohort_rep = operator_costs(eff_case, sg, evaluation=ctx)
+        cohort_rep = operator_costs(eff_case, sg, evaluation=ctx, target_replicas=(0,))
         r0_rows = [row for row in cohort_rep["operators"] if row.get("replica", 0) == 0]
         op_rep = {
             **cohort_rep,
@@ -413,7 +435,7 @@ def _compare_feature_tracks_bounded(
     del use_archetype_folding
     skip_keys = {"feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"}
     cleaned = {k: v for k, v in compose_kwargs.items() if k not in skip_keys}
-    eff_ctx = 0 if phase == "prefill" else int(context)
+    eff_ctx = max(0, int(context))
     eff_seq = max(1, int(sequences))
     eff_workers = resolve_granted_workers(granted_workers)
 
@@ -444,7 +466,23 @@ def _compare_feature_tracks_bounded(
     if len(uncached_tasks) > 1 and eff_workers > 1:
         results = map_ordered(_analyze_track_worker, uncached_tasks, granted_workers=eff_workers)
     else:
-        results = [_analyze_track_worker(task) for task in uncached_tasks]
+        shared_iso_caches: dict[Any, Any] = {}
+        try:
+            results = []
+            for fp, raw_c, ph, tok, ctx_n, seq_n, sc, need_bn in uncached_tasks:
+                eff = _analyze_case_bounded(
+                    raw_c, phase=ph, tokens=tok, context=ctx_n, sequences=seq_n,
+                    scope=sc, shared_isolated_caches=shared_iso_caches,
+                )
+                results.append((
+                    fp,
+                    _track_summary_from_eff(eff),
+                    _bottleneck_payload_from_eff(eff) if need_bn else None,
+                ))
+        finally:
+            for iso_cache in shared_iso_caches.values():
+                iso_cache.clear()
+            shared_iso_caches.clear()
     for fp, summary, bn_payload in results:
         summary_cache[fp] = summary
         if bn_payload is not None and bottleneck_out is not None:
@@ -787,8 +825,10 @@ def _evaluate_winner_analysis(
     is_prefill_only = winner_mode == "pd_prefill" or (winner_mode != "pd_decode" and int(output) <= 1)
     win_phase = "prefill" if is_prefill_only else "decode"
     win_seq = 1 if is_prefill_only else max(1, int((best or {}).get("b_feasible", 1) or 1))
-    win_tokens = max(1, int(prompt)) if is_prefill_only else (1 + win_mtp)
-    win_context = 0 if is_prefill_only else prompt
+    if is_prefill_only:
+        win_tokens, win_context = _prefill_prefix_split(parsed_rec, prompt)
+    else:
+        win_tokens, win_context = 1 + win_mtp, prompt
     win_scope = "model"
     win_role = (
         ("pd_prefill" if is_prefill_only else "pd_decode")

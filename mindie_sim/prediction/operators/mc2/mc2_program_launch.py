@@ -56,7 +56,8 @@ class _Mc2Program(Mc2ProgramState):
     """
 
     def _schedule_transport(self, engine, name, phase, prerequisite, view,
-                            transport, *, count=False, placeholders=None):
+                            transport, *, count=False, placeholders=None,
+                            source_map=None):
         """Route this launch's whole-EP directed cells once, coupled TX+RX.
 
         One transmission reserves every physical hop capacity in ``hop.demand``
@@ -71,6 +72,8 @@ class _Mc2Program(Mc2ProgramState):
                          (transport.get("sources") or ())}
         if not local_indices and 0 <= int(view.rank) < len(group):
             local_indices = {int(view.rank)}
+        canonical_mirror = transport.get("canonical_mirror")
+        placeholder_dict = dict(placeholders or {})
         work = {}
         peer_events = {}
         parent_events = []
@@ -129,8 +132,7 @@ class _Mc2Program(Mc2ProgramState):
                 previous = (arrival,)
             arrival = previous[0]
             final = arrival
-            promise = dict(placeholders or {}).get(
-                (_si, _di, phase.name))
+            promise = placeholder_dict.get((_si, _di, phase.name))
             if promise is not None:
                 final = engine.submit(
                     f"{name}:{phase.name}:{source}->{destination}:retire",
@@ -140,6 +142,13 @@ class _Mc2Program(Mc2ProgramState):
             parent_events.append(final)
             if _di in local_indices and _si != _di:
                 incoming_arrivals.append(final)
+                if canonical_mirror is not None and source_map is not None:
+                    source_map[(_si, _di, phase.name)] = final
+            elif canonical_mirror is not None and (_si, _di) in canonical_mirror:
+                twin_si, twin_di = canonical_mirror[(_si, _di)]
+                incoming_arrivals.append(final)
+                if source_map is not None:
+                    source_map[(twin_si, twin_di, phase.name)] = final
             frames += int(cell_frames)
             edges += 1
             useful_bytes += float(useful)
@@ -163,14 +172,14 @@ class _Mc2Program(Mc2ProgramState):
         # each sender resolves its own cell; no timestamp or global barrier is
         # synthesized here.
         incoming = []
-        for peer in range(len(group)):
-            for destination in sorted(local_indices):
-                if peer == destination:
-                    continue
-                promise = dict(placeholders or {}).get(
-                    (peer, destination, phase.name))
-                if promise is not None:
-                    incoming.append(promise)
+        if placeholder_dict:
+            for peer in range(len(group)):
+                for destination in sorted(local_indices):
+                    if peer == destination:
+                        continue
+                    promise = placeholder_dict.get((peer, destination, phase.name))
+                    if promise is not None:
+                        incoming.append(promise)
         complete = engine.submit(
             f"{name}:{phase.name}:peer_complete",
             after=tuple(dict.fromkeys(tuple(parent_events) + tuple(incoming)))
@@ -602,7 +611,8 @@ class _Mc2Program(Mc2ProgramState):
         return phase_ready, event
 
     def _start_frame_exchange(
-        self, engine, name, phase, event, view, placeholder_map, handles, source_map=None,
+        self, engine, name, phase, event, view, placeholder_map, handles,
+        source_map=None, *, canonical_mirror: bool = False,
     ):
         # Whole-frame projected token payload: exact selected
         # destinations.  The source transmission is one physical issue
@@ -634,7 +644,9 @@ class _Mc2Program(Mc2ProgramState):
                      engine.resolve(promise))
                     if placeholder is not None else None))
             peer_events.append(send)
-            if placeholder is None:
+            if canonical_mirror and source_map is not None:
+                source_map[(peer, view.rank, phase.name)] = arrival
+            elif placeholder is None:
                 # No peer receive will consume this arrival (isolated
                 # representative launch). The send is complete only
                 # when its declared propagation has elapsed.
@@ -794,7 +806,7 @@ class _Mc2Program(Mc2ProgramState):
             details = self._schedule_transport(
                 engine, name, phase, event, view, transport,
                 count=phase.name == "count_status_exchange",
-                placeholders=placeholder_map)
+                placeholders=placeholder_map, source_map=source_map)
             event = details["event"]
             handles["transport"][phase.name] = {
                 key: value for key, value in details.items()
@@ -811,6 +823,7 @@ class _Mc2Program(Mc2ProgramState):
             event = self._start_frame_exchange(
                 engine, name, phase, event, view, placeholder_map, handles,
                 source_map=source_map,
+                canonical_mirror=bool(transport and transport.get("canonical_frame_mirror")),
             )
         elif (link and view.peer_labels and
               not (phase.name == "payload_exchange" and

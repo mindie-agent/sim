@@ -70,6 +70,7 @@ def deliver_slots(backend) -> None:
 def reclaim_arena(backend, engine) -> None:
     """Reset the arena at an empty boundary and rebuild live accounting."""
     backend.arena.reset()
+    backend._cohort_stop_key = None
     backend.seeded = False
     backend.deliver.clear()
     backend.drops.clear()
@@ -122,35 +123,64 @@ def flush_pending(backend, engine) -> None:
     index = backend.res_index
     touched = backend.touched_res_ids
     slots = engine._native_slots
+    now = engine.now
+    inf_val = math.inf
+    pending_list = backend.pending
     rows = []
-    for event, task, pending in backend.pending:
-        wset = set(task.cohort_widened) if (task.cohort_size > 1 and task.cohort_widened) else ()
+    rows_append = rows.append
+    for event, task, pending in pending_list:
+        wset = (
+            set(task.cohort_widened)
+            if (task.cohort_size > 1 and task.cohort_widened) else ()
+        )
+        placement = task.placement
+        caps = task.caps
         links = []
-        for name, remaining in task.remaining.items():
-            rid = index[name]
-            touched.add(rid)
-            units = task.placement.get(name, ()) if task.placement else ()
-            links.append((rid, remaining,
-                          task.caps.get(name, math.inf), units, name in wset))
+        links_append = links.append
+        if placement or caps or wset:
+            for name, remaining in task.remaining.items():
+                rid = index[name]
+                touched.add(rid)
+                units = placement.get(name, ()) if placement else ()
+                links_append((rid, remaining,
+                              caps.get(name, inf_val) if caps else inf_val,
+                              units, name in wset))
+        else:
+            for name, remaining in task.remaining.items():
+                rid = index[name]
+                touched.add(rid)
+                links_append((rid, remaining, inf_val, (), False))
         flags = task_flags(task, engine)
-        task.waiting = sum(
-            1 for predecessor in pending if not predecessor.done)
-        rows.append((
+        n_pend = len(pending)
+        if n_pend == 0:
+            task.waiting = 0
+        elif n_pend == 1:
+            task.waiting = 0 if pending[0].time is not None else 1
+        else:
+            w_cnt = 0
+            for predecessor in pending:
+                if predecessor.time is None:
+                    w_cnt += 1
+            task.waiting = w_cnt
+        rows_append((
             event.sequence, flags, int(task.priority), int(task.cohort_size),
-            task.waiting, engine.now, task.latency, task.release, links, 0))
+            task.waiting, now, task.latency, task.release, links, 0))
     assigned = backend.arena.submit(rows)
-    edges = []
-    for (event, _task, pending), slot in zip(backend.pending, assigned):
+    for (event, _task, _pending), slot in zip(pending_list, assigned):
         slots[event.sequence] = slot
-        del pending
-    for (event, _task, pending) in backend.pending:
-        for predecessor in pending:
-            pred_slot = slots.get(predecessor.sequence)
-            if pred_slot is not None:
-                edges.append((pred_slot, slots[event.sequence], event.sequence))
+    edges = []
+    edges_append = edges.append
+    slots_get = slots.get
+    for (event, _task, pending), slot in zip(pending_list, assigned):
+        if pending:
+            seq = event.sequence
+            for predecessor in pending:
+                pred_slot = slots_get(predecessor.sequence)
+                if pred_slot is not None:
+                    edges_append((pred_slot, slot, seq))
     if edges:
         backend.arena.link(edges)
-    backend.pending.clear()
+    pending_list.clear()
     if backend.deliver:
         deliver_slots(backend)
 
@@ -292,11 +322,34 @@ def solver_capacity_exceeded(tasks: int, links: int, units: int,
     return False
 
 
+def _prepared_demand_unchanged(task) -> bool:
+    prep = task.prepared
+    if (prep is None or task.start is not None or task.service
+            or task.placement is not prep.placement):
+        return False
+    rem = task.remaining
+    pd = prep.demand
+    if len(rem) != len(pd):
+        return False
+    for name in rem:
+        if name not in pd:
+            return False
+    return True
+
+
 def explicit_units(task) -> int:
     """Placement-pool cells stored for the live links (explicit tuples only)."""
-    placement = task.placement or {}
-    return sum(len(placement[name]) for name in task.remaining
-               if name in placement)
+    if _prepared_demand_unchanged(task):
+        return task.prepared.explicit_units
+    placement = task.placement
+    if not placement:
+        return 0
+    total = 0
+    for name in task.remaining:
+        units = placement.get(name)
+        if units is not None:
+            total += len(units)
+    return total
 
 
 def effective_units(engine, task) -> int:
@@ -307,12 +360,15 @@ def effective_units(engine, task) -> int:
     only explicit tuples undercounted the overlap/coupled solver demand and let
     the kernel fault after admission instead of declining in preflight.
     """
-    placement = task.placement or {}
+    if _prepared_demand_unchanged(task):
+        return task.prepared.effective_units
+    placement = task.placement
+    resources = engine.resources
     total = 0
     for name in task.remaining:
-        units = placement.get(name)
+        units = placement.get(name) if placement else None
         if units is None:
-            resource = engine.resources.get(name)
+            resource = resources.get(name)
             total += resource.units if resource is not None else 0
         else:
             total += len(units)
@@ -321,6 +377,10 @@ def effective_units(engine, task) -> int:
 
 def task_usage(engine, task, pending) -> tuple[int, int, int, int]:
     """``(links, effective_units, edges, explicit_storage)`` for one row."""
+    if _prepared_demand_unchanged(task):
+        prep = task.prepared
+        return (len(task.remaining), prep.effective_units, len(pending),
+                prep.explicit_units)
     return (len(task.remaining), effective_units(engine, task), len(pending),
             explicit_units(task))
 
@@ -508,6 +568,7 @@ def sync_back(backend, engine) -> None:
     backend.epoch_links = backend.epoch_units = 0
     backend.epoch_storage = 0
     backend.epoch_tasks = backend.epoch_edges = 0
+    backend._cohort_stop_key = None
     # every native table is gone, so these already-complete snapshot
     # members wake the restored Python frontier exactly once.  Doing this here
     # (rather than leaving them in ``_completable``) keeps the trace order:

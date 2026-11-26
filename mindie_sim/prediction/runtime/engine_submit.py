@@ -68,7 +68,8 @@ class _EngineSubmitMixin:
     ) -> Event:
         # Dependencies and allocations remain live invocation state. Only static
         # work, supply and placement validation can be shared by repeated tiles.
-        prepared = _refresh_prepared_for_hbm_bus(self, prepared, name)
+        if self._hbm_bus_aliases and prepared.hbm_bus_epoch != self._hbm_bus_epoch:
+            prepared = _refresh_prepared_for_hbm_bus(self, prepared, name)
         now = self.now
         tasks = self._tasks
         pending_one = None
@@ -77,6 +78,8 @@ class _EngineSubmitMixin:
             pending_one, pending, release = self._pending_predecessors(name, after, release, tasks)
         if release is None or release < now:
             release = now
+        elif release > self._max_release:
+            self._max_release = release
         fast_ctx = self._memory_context_fast
         if (not metadata and memory is None and memory_pools is None
                 and memory_bindings is None):
@@ -114,7 +117,7 @@ class _EngineSubmitMixin:
         event = Event(self._sequence, name, runtime_uid=self.uid)
         waiting_count = (1 if pending_one is not None
                          else (0 if pending is None else len(pending)))
-        deliv_tuple = _coalesce_deliveries(deliveries)
+        deliv_tuple = _coalesce_deliveries(deliveries) if deliveries else ()
         wave_rec = self._wave_recorder
         task = _Task(
             event, prepared.demand.copy() if prepared.demand else {},
@@ -136,10 +139,33 @@ class _EngineSubmitMixin:
             prepared.hbm_accounting,
             {} if prepared.hbm_accounting else None,
         )
-        needs_hbm_split = _task_needs_hbm_bus_split(task)
+        needs_hbm_split = bool(
+            prepared.hbm_accounting and not prepared.coupled
+            and _task_needs_hbm_bus_split(task)
+        )
         if needs_hbm_split and task.start_callback is None:
             task.start_callback = _hbm_bus_split_start_hook
         tasks[event.sequence] = task
+        partial_res = prepared.partial_placed_resources
+        if partial_res:
+            live_partial = self._partial_placed_live
+            newly_partial: set[str] | None = None
+            for rname in partial_res:
+                prev_cnt = live_partial.get(rname, 0)
+                live_partial[rname] = prev_cnt + 1
+                if prev_cnt == 0:
+                    if newly_partial is None:
+                        newly_partial = set()
+                    newly_partial.add(rname)
+            if newly_partial is not None and self._accel is not None and self._native_seqs:
+                for live_seq in self._native_seqs:
+                    live_t = tasks.get(live_seq)
+                    if (live_t is not None and live_t.coupled and live_t.placement
+                            and len(live_t.remaining) > 1
+                            and any(r in newly_partial and r not in live_t.placement
+                                    for r in live_t.remaining)):
+                        self._accel._handback_mixed(self)
+                        break
         ledger_state = self.state_ledger
         if (ledger_state is not None and after
                 and (ledger_state._event_commits or ledger_state._causal_stack)):
@@ -334,7 +360,8 @@ class _EngineSubmitMixin:
         self, prepared, name: str, obs_name: str, after, owner: str = "",
     ) -> tuple[Event, Event]:
         """Submit a host launch task and its start_boundary observer in one step."""
-        prepared = _refresh_prepared_for_hbm_bus(self, prepared, name)
+        if self._hbm_bus_aliases and prepared.hbm_bus_epoch != self._hbm_bus_epoch:
+            prepared = _refresh_prepared_for_hbm_bus(self, prepared, name)
         now = self.now
         tasks = self._tasks
         pending_one = None
@@ -373,6 +400,8 @@ class _EngineSubmitMixin:
                         pending.append(predecessor)
         if release is None or release < now:
             release = now
+        elif release > self._max_release:
+            self._max_release = release
         fast_ctx = self._memory_context_fast
         if fast_ctx is not None:
             ledger, pools, bindings, memory_replica, memory_stage = fast_ctx

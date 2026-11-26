@@ -48,6 +48,8 @@ EXCEL_COL_RADIX = 26
 ASCII_UPPER_A = 65
 EXCEL_MAX_FORMULA_ARGS = 255
 EXCEL_MAX_FORMULA_CHARS = 8192
+_COL_LETTER_CACHE_LIMIT = 256
+_STYLE_ATTR_CACHE_LIMIT = 64
 #: Row heights (pt) and Excel calc ID.
 DEFAULT_ROW_HEIGHT_PT = 19.0
 HEADER_ROW_HEIGHT_PT = 28.0
@@ -143,10 +145,7 @@ class LineChartSpec:
     series: tuple[ChartSeries, ...]
 
 
-def column_letter(col_index: int) -> str:
-    """Convert 1-based Excel column index to letters (``1 -> 'A'``, ``27 -> 'AA'``)."""
-    if col_index < 1:
-        raise ValueError(f"invalid_excel_col_index:{col_index}")
+def _compute_column_letter(col_index: int) -> str:
     chars: list[str] = []
     n = int(col_index)
     while n > 0:
@@ -155,9 +154,31 @@ def column_letter(col_index: int) -> str:
     return "".join(reversed(chars))
 
 
+_COL_LETTER_CACHE: tuple[str, ...] = (
+    "",
+    *(_compute_column_letter(idx) for idx in range(1, _COL_LETTER_CACHE_LIMIT + 1)),
+)
+_STYLE_ATTR_CACHE: tuple[str, ...] = tuple(
+    "" if idx == 0 else f' s="{idx}"' for idx in range(_STYLE_ATTR_CACHE_LIMIT)
+)
+
+
+def column_letter(col_index: int) -> str:
+    """Convert 1-based Excel column index to letters (``1 -> 'A'``, ``27 -> 'AA'``)."""
+    idx = int(col_index)
+    if idx < 1:
+        raise ValueError(f"invalid_excel_col_index:{col_index}")
+    if idx <= _COL_LETTER_CACHE_LIMIT:
+        return _COL_LETTER_CACHE[idx]
+    return _compute_column_letter(idx)
+
+
 def cell_ref(row: int, col: int) -> str:
     """Format 1-based ``(row, col)`` as an A1 cell reference."""
-    return f"{column_letter(col)}{int(row)}"
+    c_idx = int(col)
+    if 1 <= c_idx <= _COL_LETTER_CACHE_LIMIT:
+        return f"{_COL_LETTER_CACHE[c_idx]}{int(row)}"
+    return f"{column_letter(c_idx)}{int(row)}"
 
 
 def _parse_cell_ref(ref: str) -> tuple[int, int]:
@@ -417,7 +438,10 @@ class _SharedStringTable:
         self._items: list[str] = []
 
     def add(self, text: str) -> int:
-        clean = _sanitize_xml_text(text)
+        idx = self._index.get(text)
+        if idx is not None:
+            return idx
+        clean = _ILLEGAL_XML_RE.sub("", text)
         idx = self._index.get(clean)
         if idx is None:
             idx = len(self._items)
@@ -437,26 +461,39 @@ class _SharedStringTable:
 
 
 def _cell_to_xml(row: int, col: int, rec: _CellRecord, sst: _SharedStringTable) -> str:
-    ref = cell_ref(row, col)
-    s_attr = f' s="{rec.style}"' if rec.style else ""
-    if rec.formula is not None:
-        f_xml = f"<f>{xml_escape(_sanitize_xml_text(rec.formula))}</f>"
-        if rec.value is None:
-            return f'<c r="{ref}"{s_attr}>{f_xml}</c>'
-        if isinstance(rec.value, bool):
-            return f'<c r="{ref}" t="b"{s_attr}>{f_xml}<v>{1 if rec.value else 0}</v></c>'
-        if isinstance(rec.value, (int, float)):
-            return f'<c r="{ref}"{s_attr}>{f_xml}<v>{rec.value}</v></c>'
-        v_str = xml_escape(_sanitize_xml_text(str(rec.value)))
-        return f'<c r="{ref}" t="str"{s_attr}>{f_xml}<v>{v_str}</v></c>'
-    if rec.value is None:
-        return f'<c r="{ref}"{s_attr}/>'
-    if isinstance(rec.value, bool):
-        return f'<c r="{ref}" t="b"{s_attr}><v>{1 if rec.value else 0}</v></c>'
-    if isinstance(rec.value, (int, float)):
-        return f'<c r="{ref}"{s_attr}><v>{rec.value}</v></c>'
-    idx = sst.add(str(rec.value))
-    return f'<c r="{ref}" t="s"{s_attr}><v>{idx}</v></c>'
+    col_let = _COL_LETTER_CACHE[col] if 1 <= col <= _COL_LETTER_CACHE_LIMIT else column_letter(col)
+    style = rec.style
+    s_attr = (
+        _STYLE_ATTR_CACHE[style]
+        if 0 <= style < _STYLE_ATTR_CACHE_LIMIT
+        else (f' s="{style}"' if style else "")
+    )
+    formula = rec.formula
+    val = rec.value
+    if formula is None:
+        if val is None:
+            return f'<c r="{col_let}{row}"{s_attr}/>'
+        val_type = type(val)
+        if val_type is str:
+            return f'<c r="{col_let}{row}" t="s"{s_attr}><v>{sst.add(val)}</v></c>'
+        if val_type is int or val_type is float:
+            return f'<c r="{col_let}{row}"{s_attr}><v>{val}</v></c>'
+        if val_type is bool:
+            return f'<c r="{col_let}{row}" t="b"{s_attr}><v>{1 if val else 0}</v></c>'
+        if isinstance(val, bool):
+            return f'<c r="{col_let}{row}" t="b"{s_attr}><v>{1 if val else 0}</v></c>'
+        if isinstance(val, (int, float)):
+            return f'<c r="{col_let}{row}"{s_attr}><v>{val}</v></c>'
+        return f'<c r="{col_let}{row}" t="s"{s_attr}><v>{sst.add(str(val))}</v></c>'
+    f_xml = f"<f>{xml_escape(_ILLEGAL_XML_RE.sub('', formula))}</f>"
+    if val is None:
+        return f'<c r="{col_let}{row}"{s_attr}>{f_xml}</c>'
+    if isinstance(val, bool):
+        return f'<c r="{col_let}{row}" t="b"{s_attr}>{f_xml}<v>{1 if val else 0}</v></c>'
+    if isinstance(val, (int, float)):
+        return f'<c r="{col_let}{row}"{s_attr}>{f_xml}<v>{val}</v></c>'
+    v_str = xml_escape(_ILLEGAL_XML_RE.sub("", str(val)))
+    return f'<c r="{col_let}{row}" t="str"{s_attr}>{f_xml}<v>{v_str}</v></c>'
 
 
 class Workbook:

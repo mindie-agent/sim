@@ -152,7 +152,7 @@ _WORKER_EVAL_CACHE_MAX = 2
 _WORKER_EVAL_CACHE: OrderedDict[str, tuple[CaseSpec, LayerCohortPlan, EvaluationContext]] = OrderedDict()
 
 
-def _reclaim_sweep_memory() -> None:
+def _reclaim_sweep_memory(*, preserve_worker_cache: bool = False) -> None:
     """Release transient structural memos, cyclic GC garbage, and Linux glibc heap pages."""
     from mindie_sim.prediction.execution.runner import Execution
     from mindie_sim.prediction.execution.streams import clear_stream_caches
@@ -160,19 +160,27 @@ def _reclaim_sweep_memory() -> None:
     from mindie_sim.prediction.frontend.features import _NORMAL_SUMMARY_CACHE
     from mindie_sim.prediction.operators.matrix.matrix_mapping import _SELECT_CACHE
     from mindie_sim.prediction.program.invocation import _HW_INV_CACHE
-    from mindie_sim.prediction.program.physical_key import _METADATA_MEMO, _SIGNATURE_MEMO
+    from mindie_sim.prediction.program.physical_key import (
+        _METADATA_MEMO,
+        _SIGNATURE_MEMO,
+        _normalize_reference_cached,
+    )
     from mindie_sim.prediction.projections import _REPLICATED_MEMO
     from mindie_sim.prediction.runtime.engine_types import _UNITS_MASK_CACHE
     from mindie_sim.prediction.structure import _PARSE_MEMO
     from mindie_sim.templates.catlass_lower import _PURE_LOWER_CACHE
 
     clear_stream_caches()
-    for cache in (
-        _WORKER_EVAL_CACHE, _SOLVE_COMPOSE_CACHE, _VRAM_SOLVE_CACHE,
+    _normalize_reference_cached.cache_clear()
+    caches: list[Any] = [
+        _SOLVE_COMPOSE_CACHE, _VRAM_SOLVE_CACHE,
         Execution._isolated_scripts, _SELECT_CACHE, _PARSE_MEMO, _UNITS_MASK_CACHE,
         _NORMAL_SUMMARY_CACHE, _GRAPH_CACHE, _METADATA_MEMO, _SIGNATURE_MEMO,
         _PURE_LOWER_CACHE, _HW_INV_CACHE, _REPLICATED_MEMO,
-    ):
+    ]
+    if not preserve_worker_cache:
+        caches.append(_WORKER_EVAL_CACHE)
+    for cache in caches:
         cache.clear()
     for mod_name, mod in list(sys.modules.items()):
         if mod is None or mod_name.endswith(".registry"):
@@ -2595,6 +2603,21 @@ def _dcp_choices_for_candidate(
     return legal if legal else (1,)
 
 
+def _linear_state_heads_divisible_by_tp(model_spec: Any, tp: int) -> bool:
+    """True when every GDN/KDA linear-attention layer has ``linear_state_heads % tp == 0``."""
+    tp_i = max(1, int(tp))
+    for plan in getattr(model_spec, "layer_plans", ()) or ():
+        if getattr(plan, "attention", "") in {"gdn", "kda"}:
+            linear_heads = int(
+                getattr(plan, "linear_value_heads", 0)
+                or getattr(plan, "linear_heads", 0)
+                or 1
+            )
+            if linear_heads % tp_i != 0:
+                return False
+    return True
+
+
 def _build_colocated_candidates(
     *,
     num_devices: int,
@@ -2622,6 +2645,8 @@ def _build_colocated_candidates(
         if not _matches_pinned(cand, pinned):
             return
         if model_spec is not None:
+            if "tp" not in pinned and not _linear_state_heads_divisible_by_tp(model_spec, tp):
+                return
             dcp_ok, _ = validate_vllm_ascend_dcp_codomain(
                 model_spec, ParallelSpec(dp=dp, tp=tp, ep=ep, pp=pp, pcp=pcp, cp=dcp),
             )
@@ -2692,6 +2717,8 @@ def _build_pd_stage_candidates(
         if not _matches_pinned(cand, pinned):
             return
         if model_spec is not None:
+            if "tp" not in pinned and not _linear_state_heads_divisible_by_tp(model_spec, tp):
+                return
             dcp_ok, _ = validate_vllm_ascend_dcp_codomain(
                 model_spec, ParallelSpec(dp=dp, tp=tp, ep=ep, pp=pp, pcp=pcp, cp=dcp),
             )
@@ -2825,6 +2852,14 @@ def _colocated_prefill_only_row(
     }
 
 
+def _prefill_prefix_split(parsed: CaseSpec, prompt_tokens: int) -> tuple[int, int]:
+    """Derive ``(compute_tokens, hit_tokens)`` from declared request ``prefix_tokens``."""
+    reqs = tuple(getattr(getattr(parsed, "workload", None), "requests", ()) or ())
+    raw_prefix = int(getattr(reqs[0], "prefix_tokens", 0) or 0) if reqs else 0
+    hit_tokens = max(0, min(raw_prefix, max(0, int(prompt_tokens) - 1)))
+    return max(1, int(prompt_tokens) - hit_tokens), hit_tokens
+
+
 def _evaluate_pd_prefill_candidate(
     raw_case: Mapping[str, Any],
     *,
@@ -2849,12 +2884,13 @@ def _evaluate_pd_prefill_candidate(
             dcp_ok=False, dcp_reason=dcp_reason, deployment_mode="pd_prefill",
             configured_max_num_seqs=int(parsed.runtime.max_num_seqs),
         )
-    prefill_ws = _prefill_workspace_tokens(parsed, prompt_tokens)
+    compute_tokens, hit_tokens = _prefill_prefix_split(parsed, prompt_tokens)
+    prefill_ws = _prefill_workspace_tokens(parsed, compute_tokens)
     p_mem = Memory(parsed, workspace_tokens=prefill_ws)
     p_kv = p_mem.cache_bytes(prompt_tokens + 1, padded=True)
     hbm_ok = bool(
         prompt_tokens <= parsed.runtime.max_model_len
-        and (parsed.runtime.enable_chunked_prefill or prompt_tokens <= parsed.runtime.max_num_batched_tokens)
+        and (parsed.runtime.enable_chunked_prefill or compute_tokens <= parsed.runtime.max_num_batched_tokens)
         and all(cap >= 0.0 and cap >= kv for row in p_mem.capacity for cap, kv in zip(row, p_kv))
     )
     if not hbm_ok:
@@ -2873,7 +2909,7 @@ def _evaluate_pd_prefill_candidate(
     ctx_box: list[EvaluationContext | None] = [None]
     try:
         p_step, _ = _eval_prefill_with_plan(
-            parsed, compute_tokens=prompt_tokens, hit_tokens=0,
+            parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
             min_layers=ARCHETYPE_FOLD_MIN_LAYERS, rep_info=rep_info, eval_ctx_box=ctx_box,
             apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
             allow_unbound_formula=allow_unbound_formula,
@@ -4019,19 +4055,33 @@ def _solve_sla_archetype_aware(
             floors[key] = 0.0
         if probe_sink is not None:
             probe_sink[key] = val
+        if len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(par.dp) > 1:
+            ctx_live = local_ctx_box[0] if local_ctx_box else None
+            if ctx_live is not None:
+                ctx_live.prepared_programs.clear()
+                ctx_live.isolated_results.clear()
+            _reclaim_sweep_memory(preserve_worker_cache=True)
         return val
 
     full_bs, _ = _decode_batch_capture_boundaries(parsed, q_tok)
-    if measure_b1:
-        _probe(1)
-    while True:
-        next_bs = _certified_sla_next_probes(
-            limit, float(sla_ms), memo, rays_map, floors, capture_bs=full_bs, budget=1,
-        )
-        if not next_bs:
-            break
-        for cand_b in next_bs:
-            _probe(cand_b)
+    try:
+        if measure_b1:
+            _probe(1)
+        while True:
+            next_bs = _certified_sla_next_probes(
+                limit, float(sla_ms), memo, rays_map, floors, capture_bs=full_bs, budget=1,
+            )
+            if not next_bs:
+                break
+            for cand_b in next_bs:
+                _probe(cand_b)
+    finally:
+        if eval_ctx_box is None and local_ctx_box and local_ctx_box[0] is not None:
+            local_ctx_box[0].prepared_programs.clear()
+            local_ctx_box[0].isolated_results.clear()
+            local_ctx_box[0] = None
+            if len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE:
+                _reclaim_sweep_memory(preserve_worker_cache=True)
     best_b, best_t, max_feas_b = _select_best_feasible_batch(memo, limit, float(sla_ms))
     t1_val = float(memo.get(1) or (best_t if best_b == 1 and best_t is not None else 0.0))
     return _build_sla_scenario_result(
@@ -4205,6 +4255,7 @@ def _eval_decode_probe_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
         emit_est, per_dp_dies, sla_ms, apply_target_envelope, rewrite_plan,
         allow_unbound_formula, num_devices,
     ) = task
+    eval_ctx: EvaluationContext | None = None
     try:
         cached = _WORKER_EVAL_CACHE.get(cand_key)
         if cached is not None:
@@ -4250,6 +4301,12 @@ def _eval_decode_probe_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
         raise
     except (ModelingError, ValueError) as exc:
         return False, (cand_idx, isinstance(exc, ModelingError), str(exc))
+    finally:
+        if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
+            if eval_ctx is not None:
+                eval_ctx.prepared_programs.clear()
+                eval_ctx.isolated_results.clear()
+            _reclaim_sweep_memory(preserve_worker_cache=True)
 
 
 def _pick_parallel_decode_probes(
@@ -4762,12 +4819,13 @@ def _search_pd_prefill_deployments(
                 coverage["static_rejected"] += 1
                 continue
             par = parsed.runtime.parallel
-            prefill_ws = _prefill_workspace_tokens(parsed, prompt)
+            compute_tokens, _ = _prefill_prefix_split(parsed, prompt)
+            prefill_ws = _prefill_workspace_tokens(parsed, compute_tokens)
             p_mem = Memory(parsed, workspace_tokens=prefill_ws)
             p_kv = p_mem.cache_bytes(prompt + 1, padded=True)
             hbm_ok = bool(
                 prompt <= parsed.runtime.max_model_len
-                and (parsed.runtime.enable_chunked_prefill or prompt <= parsed.runtime.max_num_batched_tokens)
+                and (parsed.runtime.enable_chunked_prefill or compute_tokens <= parsed.runtime.max_num_batched_tokens)
                 and all(cap >= 0.0 and cap >= kv for row in p_mem.capacity for cap, kv in zip(row, p_kv))
             )
             if not hbm_ok:
@@ -6129,6 +6187,11 @@ def solve_optimal_deployment(
         indexer_kv_dtype=indexer_kv_dtype, parallel="fixed", homogeneous_graph_reuse="auto",
         **overrides_clean,
     )
+    if dep_norm == "pd_prefill" and float(pool_prefix_hit_ratio) > 0.0 and "prefix_tokens" not in common_kw:
+        hit_r = float(pool_prefix_hit_ratio)
+        if hit_r < 0.0 or hit_r > 1.0:
+            raise ModelingError(f"invalid_pool_prefix_hit_ratio:{pool_prefix_hit_ratio}")
+        common_kw["prefix_tokens"] = min(int(math.floor(prompt * hit_r)), max(0, prompt - 1))
     compose_for = _make_solve_compose_fn(
         common_kw, prompt=prompt, max_sequences_per_dp=max_sequences_per_dp,
         mtp_acceptance_length=mtp_acceptance_length,

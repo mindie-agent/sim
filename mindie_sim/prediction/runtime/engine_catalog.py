@@ -37,6 +37,8 @@ class _EngineCatalogMixin:
         self._stage_prepared.clear()
         self._stage_prepared_id.clear()
         self._pair_rate_cache.clear()
+        self._seen_floor_peaks.clear()
+        self._validated_placements.clear()
 
     def _hbm_bus_registry(self) -> tuple[dict[tuple[str, str], tuple[Any, str | None]], set[str]]:
         declared = self.__dict__.get("_declared_hbm_buses")

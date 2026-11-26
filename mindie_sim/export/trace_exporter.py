@@ -36,6 +36,7 @@ from collections.abc import Iterator, Mapping, Sequence
 import re
 from dataclasses import dataclass, replace
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -43,6 +44,7 @@ from typing import Any
 
 from mindie_sim.prediction.results import CaseInput, ReplayOptions, StepEvaluation, StepRequest
 from .bundle import build_export_bundle, compose_export_case
+from .kernel_catalog import strip_op_prefix
 from .models import (
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
@@ -62,6 +64,13 @@ from .public_view import format_track_label
 TRACE_EXPORT_RECEIPT_SCHEMA = "mindie-sim.msprof-trace-receipt/2"
 #: Stream buffer size (64 KiB) for bounded low-RSS JSON emission.
 STREAM_BUFFER_BYTES = 64 * 1024
+#: Number of serialized trace JSON lines batched per buffered write call.
+_STREAM_BATCH_EVENTS = 256
+#: Maximum distinct ``(dur_us, work_tuple)`` variants cached per archetype template op.
+_MAX_OP_VARIANT_CACHE = 16
+#: Operator args keys emitted before ``Task Id`` and ``Layer`` (for exact JSON order preservation).
+_ARGS_PREFIX_KEYS = ("Model Name", "Hardware SKU", "Phase", "Task Type", "Stream Id")
+_ARGS_DYNAMIC_KEYS = frozenset((*_ARGS_PREFIX_KEYS, "Task Id", "Layer"))
 #: Timestamp decimal precision in microseconds (3 decimal places = 1 ns).
 TIMESTAMP_US_DECIMALS = 3
 #: Metric rounding decimals for compact readable ``msinsight`` args.
@@ -592,8 +601,6 @@ def _emit_op_and_pipes(
     op_placement: Mapping[Any, tuple[int, int, float, str]],
     pending_flows: list[tuple[Any, tuple[int, int, float, str], float]] | None = None,
 ) -> tuple[list[dict[str, Any]], tuple[int, int, float, str], int]:
-    from .kernel_catalog import strip_op_prefix
-
     pid, tid = _op_pid_tid(op, base_pid)
     cat = "Communication" if op.task_type == "HCCL" else "Kernel"
     k_name = op.ascend_kernel or op.logical_role or op.canonical_op_key
@@ -1146,6 +1153,298 @@ def _flush_pending_flows(
     return out, flow_id
 
 
+@dataclass(slots=True)
+class _PreparedOpVariant:
+    dur_us: float
+    dur_rounded: float
+    base_args: dict[str, Any]
+    pipe_spans_rel: tuple[tuple[int, str, float, float, dict[str, Any]], ...]
+    comp_rel: tuple[tuple[float, float], ...]
+    comm_rel: tuple[tuple[float, float], ...]
+    hbm_tot: float
+    vec_ops: float
+    cube_busy_s: float
+    ws_peak_bytes: float
+    op_json_tpl: tuple[str, str, str, str] | None = None
+    pipe_json_tpls: tuple[tuple[str, float, str], ...] = ()
+
+
+@dataclass(slots=True)
+class _PreparedOpSpec:
+    op: OperatorExportRow
+    d_idx: int
+    base_pid: int
+    hw_pid: int
+    dev_pid: int
+    dev_tid: int
+    cat: str
+    stripped_id: str
+    fused_key: str | None
+    k_name: str
+    event_name: str
+    is_h2d_op: bool
+    in_reps: int
+    rel_start_us: float
+    pipeline_info: tuple[int, tuple[str, ...]] | None
+    pipeline_desc: Any
+    base_work: tuple[float, ...]
+    variants: dict[tuple[float, tuple[float, ...]], _PreparedOpVariant]
+
+
+def _prepare_template_ops(
+    templates: Mapping[str, _ArchetypeTemplate],
+    sched_counts: Mapping[str, int],
+    die_map: Mapping[tuple[int, int, int], int],
+    pipeline_by_occ: Mapping[Any, tuple[int, tuple[str, ...]]],
+    pipeline_desc_by_occ: Mapping[Any, Any],
+) -> dict[str, tuple[_PreparedOpSpec, ...]]:
+    prepared: dict[str, tuple[_PreparedOpSpec, ...]] = {}
+    for aid, tpl in templates.items():
+        entry_sched_cnt = max(1, int(sched_counts.get(aid, 1)))
+        specs: list[_PreparedOpSpec] = []
+        for op in tpl.ops:
+            coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
+            d_idx = die_map.get(coord, 0)
+            base_pid = _pid_base(d_idx)
+            dev_pid, dev_tid = _op_pid_tid(op, base_pid)
+            stripped_id = strip_op_prefix(op.op_id)
+            fused_key = (
+                "rewrite_fused:" + "+".join(strip_op_prefix(src) for src in op.absorbed_source_ops)
+                if op.op_id.startswith("rewrite:") and op.absorbed_source_ops
+                else None
+            )
+            k_name = op.ascend_kernel or op.logical_role or op.canonical_op_key
+            op_tag = stripped_id or op.canonical_op_key
+            event_name = f"{k_name} [{op_tag}]" if (op_tag and op_tag != k_name) else k_name
+            specs.append(_PreparedOpSpec(
+                op=op,
+                d_idx=d_idx,
+                base_pid=base_pid,
+                hw_pid=base_pid + PID_OFFSET_HARDWARE,
+                dev_pid=dev_pid,
+                dev_tid=dev_tid,
+                cat="Communication" if op.task_type == "HCCL" else "Kernel",
+                stripped_id=stripped_id,
+                fused_key=fused_key,
+                k_name=k_name,
+                event_name=event_name,
+                is_h2d_op=(op.family == "engram_rh2d" or "host_uva" in op.op_id.lower()),
+                in_reps=_op_in_entry_repeats(op, entry_sched_cnt),
+                rel_start_us=max(0.0, op.start_us - tpl.min_start_us),
+                pipeline_info=pipeline_by_occ.get(op.occurrence),
+                pipeline_desc=pipeline_desc_by_occ.get(op.occurrence),
+                base_work=(
+                    float(op.flops),
+                    float(op.vector_ops),
+                    float(op.hbm_read_bytes),
+                    float(op.hbm_write_bytes),
+                    float(op.hbm_total_bytes),
+                    float(op.mte2_bytes),
+                    float(op.mte3_bytes),
+                    float(op.fixpipe_bytes),
+                    float(op.link_bytes),
+                    float(op.cube_peak_flops_per_s),
+                ),
+                variants={},
+            ))
+        prepared[aid] = tuple(specs)
+    return prepared
+
+
+def _encode_variant_json_templates(
+    spec: _PreparedOpSpec,
+    dur_rounded: float,
+    base_args: Mapping[str, Any],
+    pipe_spans: Sequence[tuple[int, str, float, float, dict[str, Any]]],
+    json_encode: Any,
+) -> tuple[tuple[str, str, str, str], tuple[tuple[str, float, str], ...]]:
+    args_before = {k: base_args[k] for k in _ARGS_PREFIX_KEYS}
+    args_after = {k: v for k, v in base_args.items() if k not in _ARGS_DYNAMIC_KEYS}
+    op_head = json_encode({"name": spec.event_name, "cat": spec.cat, "ph": "X"})[:-1] + ',"ts":'
+    op_mid1 = (
+        f',"dur":{json_encode(dur_rounded)},"pid":{spec.dev_pid},"tid":{spec.dev_tid},"args":'
+        + json_encode(args_before)[:-1]
+        + ',"Task Id":'
+    )
+    op_mid2 = ',"Layer":'
+    op_tail = "," + json_encode(args_after)[1:] + "}"
+    p_tpls: list[tuple[str, float, str]] = []
+    for p_tid, p_name, rel_off, p_dur_r, p_args in pipe_spans:
+        p_head = json_encode({"name": p_name, "cat": "Pipe", "ph": "X"})[:-1] + ',"ts":'
+        p_tail = (
+            f',"dur":{json_encode(p_dur_r)},"pid":{spec.hw_pid},"tid":{p_tid},'
+            f'"args":{json_encode(p_args)}}}'
+        )
+        p_tpls.append((p_head, rel_off, p_tail))
+    return (op_head, op_mid1, op_mid2, op_tail), tuple(p_tpls)
+
+
+def _build_prepared_variant(
+    bundle: ExportBundle,
+    spec: _PreparedOpSpec,
+    dur_us: float,
+    work_tuple: tuple[float, ...],
+    *,
+    include_pipe_lanes: bool,
+    cube_peak_default: float,
+    vec_peak: float,
+    mte2_peak: float,
+    mte3_peak: float,
+    fp_peak: float,
+    link_peak: float,
+    json_encode: Any = None,
+) -> _PreparedOpVariant:
+    op = spec.op
+    flops, vec_ops, hbm_r, hbm_w, hbm_tot, mte2_b, mte3_b, fp_raw, link_b, op_cube_pk = work_tuple
+    dur = max(0.0, float(dur_us))
+    cube_peak = op_cube_pk if op_cube_pk > 0.0 else cube_peak_default
+    fp_bytes = max(0.0, fp_raw)
+
+    cube_us = min(dur, (flops / cube_peak) * US_PER_SECOND) if (flops > 0.0 and cube_peak > 0.0 and dur > 0.0) else 0.0
+    vec_us = min(dur, (vec_ops / vec_peak) * US_PER_SECOND) if (vec_ops > 0.0 and vec_peak > 0.0 and dur > 0.0) else 0.0
+    mte2_us = min(dur, (mte2_b / mte2_peak) * US_PER_SECOND) if (mte2_b > 0.0 and mte2_peak > 0.0 and dur > 0.0) else 0.0
+    mte3_us = min(dur, (mte3_b / mte3_peak) * US_PER_SECOND) if (mte3_b > 0.0 and mte3_peak > 0.0 and dur > 0.0) else 0.0
+    fp_us = min(dur, (fp_bytes / fp_peak) * US_PER_SECOND) if (fp_bytes > 0.0 and fp_peak > 0.0 and dur > 0.0) else 0.0
+
+    aic_ratio = round(min(1.0, cube_us / dur), RATIO_DECIMALS) if (dur > 0.0 and cube_us > 0.0) else 0.0
+    aiv_ratio = round(min(1.0, vec_us / dur), RATIO_DECIMALS) if (dur > 0.0 and vec_us > 0.0) else 0.0
+    mte2_ratio = round(min(1.0, mte2_us / dur), RATIO_DECIMALS) if (dur > 0.0 and mte2_us > 0.0) else 0.0
+    mte3_ratio = round(min(1.0, mte3_us / dur), RATIO_DECIMALS) if (dur > 0.0 and mte3_us > 0.0) else 0.0
+    fp_ratio = round(min(1.0, fp_us / dur), RATIO_DECIMALS) if (dur > 0.0 and fp_us > 0.0) else 0.0
+
+    dur_rounded = _round_us(dur_us)
+    base_args: dict[str, Any] = {
+        "Model Name": bundle.model_name,
+        "Hardware SKU": bundle.hardware_sku,
+        "Phase": bundle.phase,
+        "Task Type": op.task_type,
+        "Stream Id": op.stream_index,
+        "Task Id": 0,
+        "Layer": "",
+        "Archetype": op.archetype_title or op.layer_label,
+        "Submodule": op.submodule,
+        "Logical Role": op.logical_role,
+        "Ascend Kernel": op.ascend_kernel,
+        "Kernel Backend": op.kernel_backend,
+        "Kernel Status": op.kernel_status,
+        "Source Ref": op.source_ref,
+        "Shapes & Dtype": op.tensor_contract,
+        "FLOPs": round(flops, 1),
+        "Vector Ops": round(vec_ops, 1),
+        "HBM Read (B)": round(hbm_r, 1),
+        "HBM Write (B)": round(hbm_w, 1),
+        "HBM Total (B)": round(hbm_tot, 1),
+        "Link Bytes (B)": round(link_b, 1),
+        "L2 Hit (%)": _round_metric(op.l2_hit_pct),
+        "Bottleneck": op.bound_display or op.dominant_bound,
+        "aic_mac_ratio": aic_ratio,
+        "aiv_vec_ratio": aiv_ratio,
+        "mte2_ratio": mte2_ratio,
+        "mte3_ratio": mte3_ratio,
+        "fixpipe_ratio": fp_ratio,
+        "L* Physical Lower Bound (us)": _round_us(op.l_star_lean_us),
+        "Sim Pred (us)": dur_rounded,
+        "Gap vs L* (us)": round(op.gap_us, TIMESTAMP_US_DECIMALS),
+        "Physical-Limit Gap Ratio (T_pred / L*)": (
+            round(op.gap_ratio, RATIO_DECIMALS) if op.gap_ratio is not None else None
+        ),
+        "Gap Radar Rank": op.gap_radar_rank,
+    }
+    if spec.pipeline_info is not None:
+        base_args["Fused Phases"] = spec.pipeline_info[0]
+        if spec.pipeline_info[1]:
+            base_args["Fused Members"] = ",".join(spec.pipeline_info[1])
+    if op.measured_sum_us is not None:
+        base_args["Measured (us)"] = _round_us(op.measured_sum_us)
+        base_args["Measured Kernels"] = len(op.measured_kernels)
+    if op.ape_pct is not None:
+        base_args["APE (%)"] = _round_metric(op.ape_pct)
+
+    has_pipe_work = (
+        flops > 0.0 or vec_ops > 0.0 or mte2_b > 0.0 or mte3_b > 0.0 or fp_raw > 0.0
+    )
+    pipe_spans: list[tuple[int, str, float, float, dict[str, Any]]] = []
+    if include_pipe_lanes and dur_us > 0.0 and (op.task_type != "HCCL" or has_pipe_work):
+        k_name = spec.k_name
+        d_mte2 = min(dur_us, max(PIPE_MIN_SUBSPAN_US, mte2_us)) if mte2_b > 0.0 else 0.0
+        d_cube = min(dur_us, max(PIPE_MIN_SUBSPAN_US, cube_us)) if flops > 0.0 else 0.0
+        d_vec = min(dur_us, max(PIPE_MIN_SUBSPAN_US, vec_us)) if vec_ops > 0.0 else 0.0
+        d_fp = min(dur_us, max(PIPE_MIN_SUBSPAN_US, fp_us)) if fp_bytes > 0.0 else 0.0
+        d_mte3 = min(dur_us, max(PIPE_MIN_SUBSPAN_US, mte3_us)) if mte3_b > 0.0 else 0.0
+        store_tail = max(d_fp, d_mte3)
+        if d_mte2 > 0.0:
+            pipe_spans.append((
+                TID_PIPE_MTE2, f"{k_name}:MTE2", 0.0, _round_us(d_mte2),
+                {"Pipe": "MTE2", "Bytes": round(mte2_b, 1), "mte2_ratio": mte2_ratio, "Kernel": k_name},
+            ))
+        if d_cube > 0.0:
+            pipe_spans.append((
+                TID_PIPE_CUBE, f"{k_name}:Cube", max(0.0, min(dur_us - d_cube, (dur_us - store_tail) - d_cube)),
+                _round_us(d_cube),
+                {"Pipe": "Cube(AIC)", "FLOPs": round(flops, 1), "aic_mac_ratio": aic_ratio, "Dtype": op.dtype, "Kernel": k_name},
+            ))
+        if d_vec > 0.0:
+            pipe_spans.append((
+                TID_PIPE_VECTOR, f"{k_name}:Vector", max(0.0, min(dur_us - d_vec, (dur_us - d_mte3) - d_vec)),
+                _round_us(d_vec),
+                {"Pipe": "Vector(AIV)", "Vector Ops": round(vec_ops, 1), "aiv_vec_ratio": aiv_ratio, "Kernel": k_name},
+            ))
+        if d_fp > 0.0:
+            pipe_spans.append((
+                TID_PIPE_FIXPIPE, f"{k_name}:Fixpipe", max(0.0, dur_us - d_fp), _round_us(d_fp),
+                {"Pipe": "Fixpipe", "Bytes": round(fp_bytes, 1), "fixpipe_ratio": fp_ratio, "Kernel": k_name},
+            ))
+        if d_mte3 > 0.0:
+            pipe_spans.append((
+                TID_PIPE_MTE3, f"{k_name}:MTE3", max(0.0, dur_us - d_mte3), _round_us(d_mte3),
+                {"Pipe": "MTE3", "Bytes": round(mte3_b, 1), "mte3_ratio": mte3_ratio, "Kernel": k_name},
+            ))
+
+    comp_rel: list[tuple[float, float]] = []
+    comm_rel: list[tuple[float, float]] = []
+    if dur_us > 0.0:
+        phased = None
+        if spec.pipeline_desc is not None:
+            op_for_pipe = op if work_tuple == spec.base_work else replace(op, cube_peak_flops_per_s=op_cube_pk)
+            phased = _schedule_pipeline_phase_intervals(spec.pipeline_desc, op_for_pipe, 0.0, dur_us, bundle.hardware_peaks)
+        if phased is not None:
+            comp_rel, comm_rel = phased
+        elif op.task_type == "HCCL":
+            comm_rel.append((0.0, dur_us))
+            if flops > 0.0 or vec_ops > 0.0:
+                comp_dur = min(dur_us, max(cube_us, vec_us))
+                if comp_dur > 0.0:
+                    comp_rel.append((0.0, comp_dur))
+        else:
+            comp_rel.append((0.0, dur_us))
+            if link_b > 0.0:
+                comm_dur = min(dur_us, (link_b / link_peak) * US_PER_SECOND) if link_peak > 0.0 else dur_us
+                if comm_dur > 0.0:
+                    comm_rel.append((0.0, comm_dur))
+
+    cube_busy_s = (flops / cube_peak) if (flops > 0.0 and cube_peak > 0.0) else 0.0
+    op_json_tpl: tuple[str, str, str, str] | None = None
+    pipe_json_tpls: tuple[tuple[str, float, str], ...] = ()
+    if json_encode is not None:
+        op_json_tpl, pipe_json_tpls = _encode_variant_json_templates(
+            spec, dur_rounded, base_args, pipe_spans, json_encode,
+        )
+    return _PreparedOpVariant(
+        dur_us=dur_us,
+        dur_rounded=dur_rounded,
+        base_args=base_args,
+        pipe_spans_rel=tuple(pipe_spans),
+        comp_rel=tuple(comp_rel),
+        comm_rel=tuple(comm_rel),
+        hbm_tot=hbm_tot,
+        vec_ops=vec_ops,
+        cube_busy_s=cube_busy_s,
+        ws_peak_bytes=max(hbm_w, mte3_b),
+        op_json_tpl=op_json_tpl,
+        pipe_json_tpls=pipe_json_tpls,
+    )
+
+
 def _iter_scheduled_full_model_trace(
     bundle: ExportBundle,
     die_map: Mapping[tuple[int, int, int], int],
@@ -1155,21 +1454,24 @@ def _iter_scheduled_full_model_trace(
     include_counters: bool,
     include_overlap: bool,
     pipeline_desc_by_occ: Mapping[Any, Any] = (),
-) -> Iterator[dict[str, Any]]:
+    _json_encode: Any = None,
+) -> Iterator[Any]:
     """Stream full multi-layer Target + Draft schedule using native per-layer timings when recorded.
 
     [Cohesive-Pipeline] Single-pass chronological trace event generator over target and draft layer schedules.
     """
-    from .kernel_catalog import strip_op_prefix
-
+    raw_mode = _json_encode is not None
     effective_schedule, sched_counts = _expand_effective_trace_schedule(bundle)
     templates = _build_archetype_templates(bundle, sched_counts)
+    prepared_by_arch = _prepare_template_ops(
+        templates, sched_counts, die_map, pipeline_by_occ, pipeline_desc_by_occ,
+    )
     per_layer = dict(getattr(bundle, "per_layer_timings", None) or {})
     entry_windows, total_span_us = _compute_scheduled_entry_windows(
         effective_schedule, templates, per_layer, bundle,
     )
     track_display = format_track_label(bundle.feature_track, lang="en")
-    yield {
+    root_ev = {
         "name": f"ModelRunner.execute_model [{bundle.model_name} | {bundle.phase.upper()} | graph={bundle.graph_capture_mode}]",
         "cat": "Framework", "ph": "X", "ts": 0.0, "dur": _round_us(total_span_us),
         "pid": PID_FRAMEWORK, "tid": TID_FW_ENGINE,
@@ -1179,6 +1481,15 @@ def _iter_scheduled_full_model_trace(
             "Graph Capture": bundle.graph_capture_mode, "Feature Track": track_display,
         },
     }
+    yield ("X", _json_encode(root_ev)) if raw_mode else root_ev
+
+    peaks = bundle.hardware_peaks
+    cube_peak_default = float(peaks.get("cube_peak_flops_per_s") or 0.0)
+    vec_peak = float(peaks.get("vector_peak_ops_per_s") or 0.0)
+    mte2_peak = float(peaks.get("mte2_peak_bytes_per_s") or 0.0)
+    mte3_peak = float(peaks.get("mte3_peak_bytes_per_s") or 0.0)
+    fp_peak = float(peaks.get("fixpipe_peak_bytes_per_s") or 0.0)
+    link_peak = float(peaks.get("link_peak_bytes_per_s") or 0.0)
 
     is_graph_mode = bundle.graph_capture_mode.lower() not in {"eager", "none", "off"}
     comp_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
@@ -1202,86 +1513,238 @@ def _iter_scheduled_full_model_trace(
             scope_bounds[entry.scope][0] = min(scope_bounds[entry.scope][0], l_start)
             scope_bounds[entry.scope][1] = max(scope_bounds[entry.scope][1], l_end)
 
-        yield {
+        layer_ev = {
             "name": entry.label, "cat": "MSTX_Layer", "ph": "X",
             "ts": _round_us(l_start), "dur": _round_us(layer_span),
             "pid": PID_FRAMEWORK, "tid": TID_FW_LAYER_MSTX,
             "args": {"Scope": entry.scope, "Archetype": entry.archetype_id, "Layer": entry.full_layer_index},
         }
+        yield ("X", _json_encode(layer_ev)) if raw_mode else layer_ev
         scale_span = (layer_span / tpl.span_us) if tpl.span_us > 0.0 else 1.0
         for sub_name, r_lo, r_hi in tpl.sub_spans:
             if r_hi <= r_lo:
                 continue
-            yield {
+            sub_ev = {
                 "name": f"{sub_name} ({entry.label})", "cat": "MSTX_Submodule", "ph": "X",
                 "ts": _round_us(l_start + r_lo * scale_span), "dur": _round_us((r_hi - r_lo) * scale_span),
                 "pid": PID_FRAMEWORK, "tid": TID_FW_SUBMODULE_MSTX,
                 "args": {"Submodule": sub_name, "Layer": entry.label},
             }
+            yield ("X", _json_encode(sub_ev)) if raw_mode else sub_ev
 
+        layer_json = _json_encode(entry.label) if raw_mode else ""
         local_placement: dict[Any, tuple[int, int, float, str]] = {}
         first_op_for_scope = entry.scope not in launched_scopes
-        entry_sched_cnt = max(1, int(sched_counts.get(entry.archetype_id, 1)))
         entry_comp: dict[int, list[tuple[float, float]]] = defaultdict(list)
         entry_comm: dict[int, list[tuple[float, float]]] = defaultdict(list)
-        entry_ops_by_die: dict[int, list[tuple[OperatorExportRow, int]]] = defaultdict(list)
-        for op in tpl.ops:
-            coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
-            d_idx = die_map.get(coord, 0)
-            base = _pid_base(d_idx)
-            exact_timing = _lookup_entry_op_timing(op, layer_ops_map, strip_op_prefix) if layer_ops_map else None
-            if layer_ops_map and exact_timing is None:
-                continue
+        entry_metrics: dict[int, list[float]] = {}
+
+        for spec in prepared_by_arch[entry.archetype_id]:
+            op = spec.op
+            exact_timing = None
+            if layer_ops_map:
+                exact_timing = layer_ops_map.get(spec.stripped_id)
+                if exact_timing is None and spec.fused_key is not None:
+                    exact_timing = layer_ops_map.get(spec.fused_key)
+                if exact_timing is None:
+                    continue
+            work_tuple = spec.base_work
             if exact_timing is not None:
                 op_ts = l_start + float(exact_timing[0])
-                op_eff = replace(op, dur_us=float(exact_timing[1]), end_us=op.start_us + float(exact_timing[1]))
+                op_dur = float(exact_timing[1])
                 if layer_work_map:
-                    op_eff = _apply_exact_op_work(op_eff, layer_work_map, strip_op_prefix)
+                    w_hit = layer_work_map.get(spec.stripped_id)
+                    if w_hit is None and spec.fused_key is not None:
+                        w_hit = layer_work_map.get(spec.fused_key)
+                    if w_hit is not None and len(w_hit) >= _WORK_TUPLE_LEN:
+                        h0, h1, h2, h3, h4, h5, h6, h7, h8, h9 = w_hit[:_WORK_TUPLE_LEN]
+                        work_tuple = (
+                            float(h0), float(h1), float(h2), float(h3), float(h4),
+                            float(h5), float(h6), float(h7), float(h8), float(h9),
+                        )
             else:
-                op_ts = l_start + max(0.0, op.start_us - tpl.min_start_us)
-                op_eff = op
-            is_h2d_op = op_eff.family == "engram_rh2d" or "host_uva" in op_eff.op_id.lower()
-            if first_op_for_scope or not is_graph_mode or is_h2d_op:
-                dev_pid, dev_tid = _op_pid_tid(op_eff, base)
+                op_ts = l_start + spec.rel_start_us
+                op_dur = op.dur_us
+
+            if first_op_for_scope or not is_graph_mode or spec.is_h2d_op:
                 launch_name, l_dur = _resolve_host_launch_spec(
-                    op_eff, entry, is_graph_mode=is_graph_mode, is_h2d_op=is_h2d_op, bundle=bundle,
+                    op, entry, is_graph_mode=is_graph_mode, is_h2d_op=spec.is_h2d_op, bundle=bundle,
                 )
                 l_events, flow_id = _emit_host_launch_with_flow(
-                    name=launch_name, dev_ts=op_ts, dev_pid=dev_pid, dev_tid=dev_tid,
+                    name=launch_name, dev_ts=op_ts, dev_pid=spec.dev_pid, dev_tid=spec.dev_tid,
                     launch_dur_us=l_dur,
-                    flow_id=flow_id, extra_args={"scope": entry.scope, "layer": entry.label, "transfer": "H2D" if is_h2d_op else "launch"},
+                    flow_id=flow_id, extra_args={"scope": entry.scope, "layer": entry.label, "transfer": "H2D" if spec.is_h2d_op else "launch"},
                 )
-                yield from l_events
+                if raw_mode:
+                    for ev in l_events:
+                        yield (ev.get("ph"), _json_encode(ev))
+                else:
+                    yield from l_events
                 if first_op_for_scope:
                     launched_scopes.add(entry.scope)
                     first_op_for_scope = False
 
-            in_reps = _op_in_entry_repeats(op_eff, entry_sched_cnt)
             use_global_placement = (
                 entry.full_layer_index is None
-                or op_eff.layer is None
-                or int(entry.full_layer_index) == int(op_eff.layer)
+                or op.layer is None
+                or int(entry.full_layer_index) == int(op.layer)
             )
-            events, task_id, flow_id = _emit_entry_op_repeats(
-                bundle, op_eff, op_ts=op_ts, in_reps=in_reps, task_id=task_id,
-                layer_label=entry.label, base_pid=base, flow_id=flow_id,
-                include_pipe_lanes=include_pipe_lanes,
-                pipeline_info=pipeline_by_occ.get(op_eff.occurrence),
-                op_placement=global_placement if use_global_placement else local_placement,
-                mirror_placement=local_placement if use_global_placement else global_placement,
-                pending_flows=pending_flows if use_global_placement else None,
-            )
-            yield from events
-            op_span = op_eff.dur_us * float(in_reps)
-            if op_span > 0.0:
-                c_ivs, m_ivs = _op_comp_comm_intervals(
-                    op_eff, op_ts, op_span, bundle.hardware_peaks,
-                    pipeline_desc=pipeline_desc_by_occ.get(op_eff.occurrence),
+            place_primary = global_placement if use_global_placement else local_placement
+            place_mirror = local_placement if use_global_placement else global_placement
+            d_idx = spec.d_idx
+
+            if spec.in_reps > 1:
+                op_eff = op
+                if exact_timing is not None:
+                    op_eff = replace(op, dur_us=op_dur, end_us=op.start_us + op_dur)
+                    if layer_work_map:
+                        op_eff = _apply_exact_op_work(op_eff, layer_work_map, strip_op_prefix)
+                events, task_id, flow_id = _emit_entry_op_repeats(
+                    bundle, op_eff, op_ts=op_ts, in_reps=spec.in_reps, task_id=task_id,
+                    layer_label=entry.label, base_pid=spec.base_pid, flow_id=flow_id,
+                    include_pipe_lanes=include_pipe_lanes,
+                    pipeline_info=spec.pipeline_info,
+                    op_placement=place_primary,
+                    mirror_placement=place_mirror,
+                    pending_flows=pending_flows if use_global_placement else None,
                 )
-                entry_comp[d_idx].extend(c_ivs)
-                entry_comm[d_idx].extend(m_ivs)
+                if raw_mode:
+                    for ev in events:
+                        yield (ev.get("ph"), _json_encode(ev))
+                else:
+                    yield from events
+                op_span = op_eff.dur_us * float(spec.in_reps)
+                if op_span > 0.0:
+                    c_ivs, m_ivs = _op_comp_comm_intervals(
+                        op_eff, op_ts, op_span, peaks, pipeline_desc=spec.pipeline_desc,
+                    )
+                    entry_comp[d_idx].extend(c_ivs)
+                    entry_comm[d_idx].extend(m_ivs)
+                if include_counters:
+                    scale = float(spec.in_reps)
+                    acc = entry_metrics.get(d_idx)
+                    if acc is None:
+                        acc = [0.0, 0.0, 0.0, 0.0]
+                        entry_metrics[d_idx] = acc
+                    acc[0] += op_eff.hbm_total_bytes * scale
+                    acc[2] += op_eff.vector_ops * scale
+                    if op_eff.flops > 0.0:
+                        eff_pk = float(op_eff.cube_peak_flops_per_s) if float(op_eff.cube_peak_flops_per_s) > 0.0 else cube_peak_default
+                        if eff_pk > 0.0:
+                            acc[1] += (op_eff.flops * scale) / eff_pk
+                    acc[3] = max(acc[3], max(op_eff.hbm_write_bytes, op_eff.mte3_bytes))
+                continue
+
+            v_key = (op_dur, work_tuple)
+            variant = spec.variants.get(v_key)
+            if variant is None:
+                variant = _build_prepared_variant(
+                    bundle, spec, op_dur, work_tuple,
+                    include_pipe_lanes=include_pipe_lanes,
+                    cube_peak_default=cube_peak_default,
+                    vec_peak=vec_peak,
+                    mte2_peak=mte2_peak,
+                    mte3_peak=mte3_peak,
+                    fp_peak=fp_peak,
+                    link_peak=link_peak,
+                    json_encode=_json_encode,
+                )
+                if len(spec.variants) < _MAX_OP_VARIANT_CACHE:
+                    spec.variants[v_key] = variant
+
+            ts_rounded = _round_us(op_ts)
+            if raw_mode:
+                if not math.isfinite(ts_rounded):
+                    raise ValueError("Out of range float values are not JSON compliant")
+                op_head, op_mid1, op_mid2, op_tail = variant.op_json_tpl
+                yield ("X", f"{op_head}{ts_rounded}{op_mid1}{task_id}{op_mid2}{layer_json}{op_tail}")
+            else:
+                op_args = variant.base_args.copy()
+                op_args["Task Id"] = task_id
+                op_args["Layer"] = entry.label
+                yield {
+                    "name": spec.event_name,
+                    "cat": spec.cat,
+                    "ph": "X",
+                    "ts": ts_rounded,
+                    "dur": variant.dur_rounded,
+                    "pid": spec.dev_pid,
+                    "tid": spec.dev_tid,
+                    "args": op_args,
+                }
+            task_id += 1
+            placement = (spec.dev_pid, spec.dev_tid, op_ts + op_dur, spec.k_name)
+
+            for pred in op.predecessors:
+                src = place_primary.get(pred)
+                if src is None:
+                    if use_global_placement:
+                        pending_flows.append((pred, placement, op_ts))
+                    continue
+                src_pid, src_tid, src_end_us, src_name = src
+                if src_pid == spec.dev_pid and src_tid == spec.dev_tid:
+                    continue
+                dst_ts = max(src_end_us, op_ts)
+                sync_kind = "EventRecord/Wait" if src_pid != spec.dev_pid else "StreamSync"
+                f_args = {"src_kernel": src_name, "dst_kernel": spec.k_name, "sync_kind": sync_kind}
+                s_ev = {
+                    "name": f"SetFlag->{sync_kind}", "cat": "SetFlag_WaitFlag", "ph": "s",
+                    "id": flow_id, "ts": _round_us(src_end_us), "pid": src_pid, "tid": src_tid, "args": f_args,
+                }
+                f_ev = {
+                    "name": f"WaitFlag<-{sync_kind}", "cat": "SetFlag_WaitFlag", "ph": "f", "bp": "e",
+                    "id": flow_id, "ts": _round_us(dst_ts), "pid": spec.dev_pid, "tid": spec.dev_tid, "args": f_args,
+                }
+                if raw_mode:
+                    yield ("s", _json_encode(s_ev))
+                    yield ("f", _json_encode(f_ev))
+                else:
+                    yield s_ev
+                    yield f_ev
+                flow_id += 1
+
+            if raw_mode:
+                for p_head, rel_off, p_tail in variant.pipe_json_tpls:
+                    p_ts = ts_rounded if rel_off == 0.0 else _round_us(op_ts + rel_off)
+                    if not math.isfinite(p_ts):
+                        raise ValueError("Out of range float values are not JSON compliant")
+                    yield ("X", f"{p_head}{p_ts}{p_tail}")
+            else:
+                for p_tid, p_name, rel_off, p_dur_r, p_args in variant.pipe_spans_rel:
+                    yield {
+                        "name": p_name, "cat": "Pipe", "ph": "X",
+                        "ts": ts_rounded if rel_off == 0.0 else _round_us(op_ts + rel_off),
+                        "dur": p_dur_r,
+                        "pid": spec.hw_pid, "tid": p_tid, "args": p_args.copy(),
+                    }
+
+            place_primary[op.occurrence] = placement
+            place_mirror[op.occurrence] = placement
+
+            if variant.comp_rel:
+                c_list = entry_comp[d_idx]
+                for r_lo, r_hi in variant.comp_rel:
+                    lo = op_ts + r_lo
+                    hi = op_ts + r_hi
+                    if hi > lo:
+                        c_list.append((lo, hi))
+            if variant.comm_rel:
+                m_list = entry_comm[d_idx]
+                for r_lo, r_hi in variant.comm_rel:
+                    lo = op_ts + r_lo
+                    hi = op_ts + r_hi
+                    if hi > lo:
+                        m_list.append((lo, hi))
             if include_counters:
-                entry_ops_by_die[d_idx].append((op_eff, in_reps))
+                acc = entry_metrics.get(d_idx)
+                if acc is None:
+                    entry_metrics[d_idx] = [variant.hbm_tot, variant.cube_busy_s, variant.vec_ops, variant.ws_peak_bytes]
+                else:
+                    acc[0] += variant.hbm_tot
+                    acc[1] += variant.cube_busy_s
+                    acc[2] += variant.vec_ops
+                    if variant.ws_peak_bytes > acc[3]:
+                        acc[3] = variant.ws_peak_bytes
 
         # Accumulate compact per-layer overlap intervals & counter samples strictly from emitted ops.
         for d_k, ivs in entry_comp.items():
@@ -1289,13 +1752,21 @@ def _iter_scheduled_full_model_trace(
         for d_k, ivs in entry_comm.items():
             comm_by_die[d_k].extend(_merge_intervals(ivs))
         if include_counters and layer_span > 0.0:
-            for d_k, emitted_ops in entry_ops_by_die.items():
-                samples_by_die[d_k].append(
-                    _layer_metric_sample(emitted_ops, l_start + layer_span * MIDPOINT_FRACTION, layer_span, bundle.hardware_peaks)
-                )
+            dur_s = max(layer_span / US_PER_SECOND, MIN_POSITIVE_SECONDS)
+            ts_mid = l_start + layer_span * MIDPOINT_FRACTION
+            for d_k, acc in entry_metrics.items():
+                ws_gib = acc[3] / float(GIB_BYTES)
+                bw_gbps = (acc[0] / dur_s) / BYTES_PER_GB
+                cube_pct = PCT_SCALE * acc[1] / dur_s
+                vec_pct = (PCT_SCALE * (acc[2] / dur_s) / vec_peak) if vec_peak > 0.0 else 0.0
+                samples_by_die[d_k].append((ts_mid, bw_gbps, cube_pct, vec_pct, ws_gib))
 
     deferred_events, flow_id = _flush_pending_flows(pending_flows, global_placement, flow_id)
-    yield from deferred_events
+    if raw_mode:
+        for ev in deferred_events:
+            yield (ev.get("ph"), _json_encode(ev))
+    else:
+        yield from deferred_events
 
     for sc_key, (s_lo, s_hi) in scope_bounds.items():
         if s_hi > s_lo:
@@ -1303,18 +1774,21 @@ def _iter_scheduled_full_model_trace(
                 f"Target Forward Pass ({bundle.total_target_layers} Layers)" if sc_key == "target"
                 else f"Speculative Draft Forward Pass ({bundle.total_draft_layers} Layers)"
             )
-            yield {
+            sc_ev = {
                 "name": sc_title, "cat": "Framework", "ph": "X",
                 "ts": _round_us(s_lo), "dur": _round_us(s_hi - s_lo),
                 "pid": PID_FRAMEWORK, "tid": TID_FW_ENGINE,
                 "args": {"Scope": sc_key},
             }
+            yield ("X", _json_encode(sc_ev)) if raw_mode else sc_ev
 
     stage_by_die = {idx: int(coord[1]) for coord, idx in die_map.items()}
     if include_overlap:
-        yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), total_span_us)
+        for ev in _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), total_span_us):
+            yield (ev.get("ph"), _json_encode(ev)) if raw_mode else ev
     if include_counters:
-        yield from _iter_counter_events_from_samples(bundle, samples_by_die, stage_by_die=stage_by_die)
+        for ev in _iter_counter_events_from_samples(bundle, samples_by_die, stage_by_die=stage_by_die):
+            yield (ev.get("ph"), _json_encode(ev)) if raw_mode else ev
 
 
 def _iter_direct_trace(
@@ -1483,6 +1957,61 @@ def iter_msprof_trace_events(
         )
 
 
+def _iter_msprof_trace_json_lines(
+    bundle: ExportBundle,
+    *,
+    encode: Any,
+    include_pipe_lanes: bool,
+    include_counters: bool,
+    include_overlap: bool,
+) -> Iterator[tuple[Any, str]]:
+    """Yield ``(ph, encoded_json_line)`` lazily with exact parity to ``iter_msprof_trace_events``."""
+    coords = _die_coordinates(bundle)
+    die_map = {coord: idx for idx, coord in enumerate(coords)}
+    for ev in _iter_metadata_events(coords):
+        yield (ev.get("ph"), encode(ev))
+    exposed_sum_ns = sum(op_exposed_int_ns(op, op.repeat_count) for op in bundle.operators)
+    step_ns = max(bundle_step_int_ns(bundle), exposed_sum_ns)
+    idle_ns = max(0, step_ns - exposed_sum_ns)
+    receipt_ev = {
+        "ph": "M",
+        "name": "mindie_sim_step_receipt",
+        "pid": PID_FRAMEWORK,
+        "tid": TID_FW_ENGINE,
+        "args": {
+            "step_span_ns": step_ns,
+            "disjoint_exposed_sum_ns": exposed_sum_ns,
+            "idle_or_wait_ns": idle_ns,
+            "reconciliation_error_ns": step_ns - (exposed_sum_ns + idle_ns),
+        },
+    }
+    yield ("M", encode(receipt_ev))
+
+    pipeline_by_occ = {
+        pipe.owner: (len(pipe.phases), pipe.member_op_ids)
+        for pipe in bundle.pipelines
+    }
+    pipeline_desc_by_occ = {pipe.owner: pipe for pipe in bundle.pipelines}
+    if bundle.full_trace_schedule:
+        yield from _iter_scheduled_full_model_trace(
+            bundle, die_map, pipeline_by_occ,
+            include_pipe_lanes=include_pipe_lanes,
+            include_counters=include_counters,
+            include_overlap=include_overlap,
+            pipeline_desc_by_occ=pipeline_desc_by_occ,
+            _json_encode=encode,
+        )
+    else:
+        for ev in _iter_direct_trace(
+            bundle, die_map, pipeline_by_occ,
+            include_pipe_lanes=include_pipe_lanes,
+            include_counters=include_counters,
+            include_overlap=include_overlap,
+            pipeline_desc_by_occ=pipeline_desc_by_occ,
+        ):
+            yield (ev.get("ph"), encode(ev))
+
+
 def _stream_trace_events_to_fd(
     fd: int,
     bundle: ExportBundle,
@@ -1493,27 +2022,36 @@ def _stream_trace_events_to_fd(
 ) -> tuple[int, dict[str, int]]:
     total = 0
     ph_counts: dict[str, int] = {"M": 0, "X": 0, "s": 0, "C": 0}
+    encode = json.JSONEncoder(
+        ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode
+    chunk: list[str] = []
     with os.fdopen(
         fd, "w", encoding="utf-8", newline="\n", buffering=STREAM_BUFFER_BYTES,
     ) as handle:
         handle.write("[\n")
-        first = True
-        for event in iter_msprof_trace_events(
+        first_chunk = True
+        for ph, line in _iter_msprof_trace_json_lines(
             bundle,
+            encode=encode,
             include_pipe_lanes=include_pipe_lanes,
             include_counters=include_counters,
             include_overlap=include_overlap,
         ):
-            if not first:
-                handle.write(",\n")
-            first = False
-            handle.write(
-                json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            )
+            chunk.append(line)
             total += 1
-            ph = str(event.get("ph") or "")
             if ph in ph_counts:
                 ph_counts[ph] += 1
+            if len(chunk) >= _STREAM_BATCH_EVENTS:
+                if not first_chunk:
+                    handle.write(",\n")
+                handle.write(",\n".join(chunk))
+                chunk.clear()
+                first_chunk = False
+        if chunk:
+            if not first_chunk:
+                handle.write(",\n")
+            handle.write(",\n".join(chunk))
         handle.write("\n]\n")
     return total, ph_counts
 
