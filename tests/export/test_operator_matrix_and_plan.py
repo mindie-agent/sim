@@ -36,12 +36,15 @@ from mindie_sim.backends.ascend import profiles as ascend_profiles
 from mindie_sim.cli import _main as cli_main
 from mindie_sim.compose import compose_case
 from mindie_sim.export.matrix_writer import (
+    HW_NOMINAL_COLUMNS,
     OUTWARD_OP_COLUMNS,
     assert_zero_internal_jargon,
     export_operator_matrix,
 )
-from mindie_sim.export.ooxml import ChartSeries, LineChartSpec, Workbook
+from mindie_sim.export.ooxml import ChartSeries, LineChartSpec, Workbook, column_letter
 from mindie_sim.export.operator_matrix import (
+    BUILDERS,
+    COLLECTIVE_BUILDERS,
     build_bench_plan,
     build_operator_matrix,
     derive_physical_seq_cliffs,
@@ -58,6 +61,7 @@ from mindie_sim.onboarding.profiler_normalizer import (
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.bench_matrix import (
     BENCH_PLAN_V2_SCHEMA,
+    FABRIC_COLLECTIVE_ABI_MAP,
     BenchPlanV2,
     HardwareNominalSpec,
     HbmAdmissibilityReceipt,
@@ -483,3 +487,111 @@ def test_profiler_normalizer_qualified_survival_and_concurrent_s1_execution(tmp_
     )
     assert len(rows_s1) == 1 and rows_s1[0]["device_ranks"] == [0, 1]
     assert rows_s1[0]["measured_ns"] == 600_000
+
+
+def test_nominal_cube_vector_peak_columns_ooxml_formulas_and_builder_lock(tmp_path: Path) -> None:
+    """Verify Cube+Vector nominal peak columns, shifted OOXML formula refs, retired tools & profiler builder lock."""
+    import xml.etree.ElementTree as ET
+
+    repo_root = Path(__file__).resolve().parents[2]
+    assert not (repo_root / "tools" / "bench_packets.py").exists()
+    assert not (repo_root / "tools" / "export_subgraph_bench_plan.py").exists()
+
+    hf_path = _write_synthetic_hf_config(tmp_path, name="nominal-peak-demo")
+    out_dir = tmp_path / "matrix_outward"
+    rc = cli_main([
+        "matrix", "--models", str(hf_path), "--skus", "Ascend950DT_9582,Ascend910_9362",
+        "--phases", "decode", "--seq-range", "512..512", "--no-auto-cliffs",
+        "--concurrencies", "1", "--parallel-arms", "tp1", "--layers", "1",
+        "--no-fabric", "--out-dir", str(out_dir),
+    ])
+    assert rc == 0
+    assert_zero_internal_jargon(out_dir)
+
+    with (out_dir / "hardware_nominal_specs.csv").open(encoding="utf-8") as fh:
+        csv_rows = list(csv.reader(fh))
+    assert tuple(csv_rows[0]) == HW_NOMINAL_COLUMNS
+    cube_i = HW_NOMINAL_COLUMNS.index("Nominal Cube Peak(TFLOPS)")
+    vec_i = HW_NOMINAL_COLUMNS.index("Nominal Vector Peak(TFLOPS)")
+    tot_i = HW_NOMINAL_COLUMNS.index("Nominal Total Peak Cube+Vector(TFLOPS)")
+    assert vec_i == cube_i + 1 and tot_i == vec_i + 1
+    by_sku = {r[0]: dict(zip(HW_NOMINAL_COLUMNS, r)) for r in csv_rows[1:]}
+    for sku, exp_cube, exp_vec, exp_tot in (
+        ("Ascend950DT_9582", 432.54, 54.07, 486.60),
+        ("Ascend910_9362", 270.34, 16.90, 287.23),
+    ):
+        rec = by_sku[sku]
+        c_val, v_val, t_val = (
+            float(rec["Nominal Cube Peak(TFLOPS)"]),
+            float(rec["Nominal Vector Peak(TFLOPS)"]),
+            float(rec["Nominal Total Peak Cube+Vector(TFLOPS)"]),
+        )
+        assert round(c_val, 2) == exp_cube and round(v_val, 2) == exp_vec and round(t_val, 2) == exp_tot
+        assert c_val + v_val == pytest.approx(t_val, abs=1e-6)
+    assert float(by_sku["Ascend910_9362"]["Intra-Pkg SIO Peak(Bytes/s)"]) > 0.0
+
+    readme = (out_dir / "README.md").read_text(encoding="utf-8")
+    for token in ("Nominal Cube Peak", "Nominal Vector Peak", "Nominal Total Peak Cube+Vector", "486.60", "287.23"):
+        assert token in readme
+
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    cube_col, vec_col, tot_col = column_letter(cube_i + 1), column_letter(vec_i + 1), column_letter(tot_i + 1)
+    bf16_raw_col = column_letter(HW_NOMINAL_COLUMNS.index("BF16 Cube Peak(FLOPs/s)") + 1)
+    hbm_raw_col = column_letter(HW_NOMINAL_COLUMNS.index("HBM Peak(Bytes/s)") + 1)
+    vec_raw_col = column_letter(HW_NOMINAL_COLUMNS.index("Vector Peak(Ops/s)") + 1)
+    model_dir = next((out_dir / "models").iterdir())
+    for xlsx_path, hw_sheet in (
+        (out_dir / "summary" / "Executive_Summary.xlsx", "xl/worksheets/sheet2.xml"),
+        (model_dir / "Operator_Breakdown.xlsx", "xl/worksheets/sheet1.xml"),
+    ):
+        with zipfile.ZipFile(xlsx_path, "r") as zf:
+            for member in zf.namelist():
+                if member.endswith((".xml", ".rels")):
+                    ET.fromstring(zf.read(member))
+            hw_root = ET.fromstring(zf.read(hw_sheet))
+            cells = {c.attrib["r"]: c for c in hw_root.findall(".//m:c", ns)}
+            for r_idx in (2, 3):
+                tot_cell = cells[f"{tot_col}{r_idx}"]
+                f_node = tot_cell.find("m:f", ns)
+                assert f_node is not None and f_node.text == f"{cube_col}{r_idx}+{vec_col}{r_idx}"
+            if xlsx_path.name == "Operator_Breakdown.xlsx":
+                op_xml = zf.read("xl/worksheets/sheet3.xml").decode("utf-8")
+                assert f"Hardware_Nominal_Specs!${bf16_raw_col}$2:${bf16_raw_col}$3" in op_xml
+                assert f"Hardware_Nominal_Specs!${hbm_raw_col}$2:${hbm_raw_col}$3" in op_xml
+                assert f"Hardware_Nominal_Specs!${tot_col}$2:${tot_col}$3" not in op_xml
+                if f"Hardware_Nominal_Specs!${vec_raw_col}$2:${vec_raw_col}$3" in op_xml:
+                    assert vec_raw_col != tot_col
+
+    assert COLLECTIVE_BUILDERS <= BUILDERS
+    assert {v[0] for v in FABRIC_COLLECTIVE_ABI_MAP.values()} <= BUILDERS
+    try:
+        from mindie_profiler.bench.operators import COLLECTIVE_OPS, OPERATOR_BUILDERS
+    except ImportError:
+        OPERATOR_BUILDERS = COLLECTIVE_OPS = None  # type: ignore[assignment]
+    if OPERATOR_BUILDERS is not None and COLLECTIVE_OPS is not None:
+        profiler_vocab = set(OPERATOR_BUILDERS) | set(COLLECTIVE_OPS)
+        assert not sorted(set(BUILDERS) - profiler_vocab)
+
+    # Verify HF32 & canonical d2d_intra_package SIO rows bind to exact shifted Hardware_Nominal_Specs columns.
+    from dataclasses import replace as dc_replace
+    from mindie_sim.export.matrix_writer import _nominal_spec_row, _write_model_operator_breakdown_xlsx
+    base_manifest = build_operator_matrix(MatrixSpec(
+        models=(str(hf_path),), skus=("Ascend950DT_9582", "Ascend910_9362"), phases=("decode",),
+        seq_min=512, seq_max=512, anchor_ladder=(512,), auto_physical_cliffs=False,
+        concurrencies=(1,), parallel_arms=(ParallelArmSpec(arm_id="tp1", dp=1, tp=1, ep=1, num_devices=1),),
+    ), layers=1)
+    r_a5 = next(r for r in base_manifest.rows if r.sku == "Ascend950DT_9582")
+    r_a3 = next(r for r in base_manifest.rows if r.sku == "Ascend910_9362")
+    probe_rows = [
+        dc_replace(r_a5, cube_dtype="hf32", cube_flops=216_268_800, per_call_stage0_us=2.0),
+        dc_replace(r_a3, link_tier="d2d_intra_package", link_bytes=270_000, per_call_stage0_us=1.0),
+    ]
+    probe_xlsx = tmp_path / "hf32_sio_probe.xlsx"
+    nom_rows = [_nominal_spec_row(s) for _, s in sorted(base_manifest.nominal_specs.items())]
+    _write_model_operator_breakdown_xlsx(probe_xlsx, nom_rows, [], probe_rows, [])
+    hf32_col = column_letter(HW_NOMINAL_COLUMNS.index("HF32 Cube Peak(FLOPs/s)") + 1)
+    sio_col = column_letter(HW_NOMINAL_COLUMNS.index("Intra-Pkg SIO Peak(Bytes/s)") + 1)
+    with zipfile.ZipFile(probe_xlsx, "r") as zf:
+        op_probe_xml = zf.read("xl/worksheets/sheet3.xml").decode("utf-8")
+    assert f"Hardware_Nominal_Specs!${hf32_col}$2:${hf32_col}$3" in op_probe_xml
+    assert f"Hardware_Nominal_Specs!${sio_col}$2:${sio_col}$3" in op_probe_xml

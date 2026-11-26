@@ -27,7 +27,6 @@ from typing import Any
 from mindie_sim.catalog import fleet
 from mindie_sim.export.matrix_writer import export_operator_matrix
 from mindie_sim.export.operator_matrix import (
-    DEFAULT_LEGACY_SKUS,
     enumerate_parallel_arms,
     parse_parallel_arm_tokens,
     parse_seq_range,
@@ -204,47 +203,9 @@ def matrix_main(argv: Sequence[str] | None = None, *, prog: str = "mindie-sim ma
         return 2
 
 
-def export_subgraph_bench_plan_cli(argv: Sequence[str] | None = None) -> int:
-    """Backward-compatible CLI for ``tools/export_subgraph_bench_plan.py``."""
-    raw = list(sys.argv[1:] if argv is None else argv)
-    if "--out-dir" in raw or "--seq-range" in raw or "--parallel-arms" in raw:
-        if "--plan-only" not in raw:
-            raw = ["--plan-only", "--compat-v1", *raw]
-        return matrix_main(raw, prog="export_subgraph_bench_plan")
-    parser = argparse.ArgumentParser(
-        prog="export_subgraph_bench_plan",
-        description="Export deduplicated bench_plan_v2 and legacy subgraph_plan_v1 artifacts.",
-    )
-    parser.add_argument("--catalog", choices=("maintained",), default="maintained")
-    parser.add_argument("--skus", nargs="+", default=list(DEFAULT_LEGACY_SKUS))
-    parser.add_argument("--models", nargs="+", default=None)
-    parser.add_argument("--geometries", nargs="+", default=["prefill", "decode"])
-    parser.add_argument("--tracks", nargs="+", default=["merged", "unmerged_pr"])
-    parser.add_argument("--workers", type=int, default=None)
-    parser.add_argument("--no-heldout-geometry-probes", action="store_true")
-    parser.add_argument("--layers", type=int, default=None)
-    parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args(raw)
-    models = list(args.models) if args.models else ["all"]
-    phases = [g for g in args.geometries if g in {"prefill", "decode"}] or ["prefill", "decode"]
-    translated = [
-        "--models", *models,
-        "--skus", *args.skus,
-        "--phases", ",".join(phases),
-        "--plan-only", "--compat-v1",
-        "--out-dir", str(args.out),
-    ]
-    if args.no_heldout_geometry_probes:
-        translated.append("--no-auto-cliffs")
-    if args.layers is not None:
-        translated.extend(["--layers", str(int(args.layers))])
-    return matrix_main(translated, prog="export_subgraph_bench_plan")
-
-
 __all__ = [
     "MATRIX_BOOLEAN_FLAGS",
     "build_matrix_parser",
     "enumerate_parallel_arms",
-    "export_subgraph_bench_plan_cli",
     "matrix_main",
 ]

@@ -17,7 +17,7 @@ owns = ["mindie_sim/backends/ascend.py", "mindie_sim/schema/hardware.py", "mindi
 [[module]]
 path = "schema/test_catalog_and_parallel_axes.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog", "mindie_sim/schema/parallel.py", "mindie_sim/prediction/sharding/local_tp.py", "tools/export_subgraph_bench_plan.py", "tools/bench_packets.py"]
+owns = ["mindie_sim/catalog", "mindie_sim/schema/parallel.py", "mindie_sim/prediction/sharding/local_tp.py"]
 [[module]]
 path = "schema/test_model_catalog_conservation.py"
 tier = "tier0"
