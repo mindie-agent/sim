@@ -344,10 +344,33 @@ def _admit_pd_handoff(
         par = cases[pool].runtime.parallel
         dcp_dp = max(1, int(getattr(par, "dcp_dp_width", 1) or 1))
         first_rep = (int(replica) // dcp_dp) * dcp_dp
-        local = (decode_local if pool == "decode"
-                 else memory[pool].cache_bytes(state.computed, padded=False))
         for dp_off in range(dcp_dp):
             rep_i = first_rep + dp_off
+            if pool == "decode":
+                local = (
+                    demand.decode_cohort_stage_bytes[dp_off]
+                    if dp_off < len(demand.decode_cohort_stage_bytes)
+                    else decode_local
+                )
+            elif (
+                memory[pool].rank_token_owners is not None
+                or (int(getattr(par, "cp", 1) or 1) > 1
+                    and not (getattr(par, "cp_plan", "") == "dsa_cp"
+                             and int(getattr(par, "pcp", 1) or 1) > 1))
+            ):
+                per_rank = [
+                    memory[pool]._rank_cache_bytes(
+                        state.computed, padded=False,
+                        rank=memory[pool]._physical_cache_rank(rep_i, 0, rk),
+                    )
+                    for rk in range(memory[pool].width)
+                ]
+                local = tuple(
+                    float(max((row[st] for row in per_rank), default=0.0))
+                    for st in range(int(par.pp))
+                )
+            else:
+                local = memory[pool].cache_bytes(state.computed, padded=False)
             for stage, stage_bytes in enumerate(local):
                 roles = execution[pool].stage_names[rep_i, stage]
                 demands[roles["hbm"]] = stage_bytes
@@ -360,6 +383,29 @@ def _admit_pd_handoff(
         published=published,
         active_draft=demand.active_draft,
     )
+    if handoff.transfers:
+        sent_by_stage_rank: dict[tuple[int, int], float] = {}
+        for item in handoff.transfers:
+            key = (int(item.source_stage), int(item.source_rank))
+            sent_by_stage_rank[key] = sent_by_stage_rank.get(key, 0.0) + float(item.payload_bytes)
+        p_par = cases["prefill"].runtime.parallel
+        p_dcp_dp = max(1, int(getattr(p_par, "dcp_dp_width", 1) or 1))
+        p_first = (int(placement["prefill", request]) // p_dcp_dp) * p_dcp_dp
+        demands_updated = False
+        for dp_off in range(p_dcp_dp):
+            rep_i = p_first + dp_off
+            for stage in range(int(p_par.pp)):
+                stage_rks = tuple(int(rk) for rk in execution["prefill"].topology.ranks(rep_i, stage))
+                fanout_max = max(
+                    (sent_by_stage_rank.get((stage, rk), 0.0) for rk in stage_rks),
+                    default=0.0,
+                )
+                hbm_res = execution["prefill"].stage_names[rep_i, stage]["hbm"]
+                if fanout_max > demands.get(hbm_res, 0.0):
+                    demands[hbm_res] = fanout_max
+                    demands_updated = True
+        if demands_updated:
+            handoff = replace(handoff, memory_work=tuple(sorted(demands.items())))
     if not handoff.transfers:
         transfers[request] = engine.submit(
             f"pd:{request}", owner=f"request:{request}",
@@ -473,17 +519,27 @@ def _submit_rank_handoff(
                           handoff.receive_buffer_ids)[rank],
                       "tokens": state.computed + 1})
         for rank in destination_ranks}
-    releases = {
-        rank: (engine.future(
-            f"pd:{request}:consumer_release:r{rank}"),)
-        for rank in destination_ranks}
-    consumer_release[request] = {
-        rank: events[0] for rank, events in releases.items()}
+    hbm_dest_ranks = {item.destination_rank for item in handoff.hbm_transfers()}
+    host_bytes_by_rank = dict(handoff.receive_host_bytes)
     destination_ranges = defaultdict(list)
     for item in handoff.hbm_transfers():
         if item.destination_byte_range:
             destination_ranges[item.destination_rank].append(
                 item.destination_byte_range)
+    hbm_hold_ranks = []
+    for rank in destination_ranks:
+        if rank not in hbm_dest_ranks and host_bytes_by_rank.get(rank, 0) > 0:
+            continue
+        if not destination_ranges.get(rank):
+            raise ModelingError(
+                f"pd_handoff_destination_ranges_missing:{request}:r{rank}")
+        hbm_hold_ranks.append(rank)
+    releases = {
+        rank: (engine.future(
+            f"pd:{request}:consumer_release:r{rank}"),)
+        for rank in hbm_hold_ranks}
+    consumer_release[request] = {
+        rank: events[0] for rank, events in releases.items()}
     release_callbacks = {}
     for rank, events in releases.items():
         buffer_id = dict(handoff.receive_buffer_ids)[rank]
@@ -492,8 +548,6 @@ def _submit_rank_handoff(
             (target, request), 0)
         hold_event = events[0]
         rank_ranges = tuple(destination_ranges.get(rank) or ())
-        if not rank_ranges:
-            raise ModelingError(f"pd_handoff_destination_ranges_missing:{request}:r{rank}")
         held = memory["decode"].hold_for_async_consumer(
             target, request, consumer_name,
             storage=buffer_id,

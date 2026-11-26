@@ -1265,5 +1265,95 @@ def test_solver_full_grid_admission_explicit_mode_overlap_and_early_abort(monkey
     assert oom_pd["deployment_outcome"]["has_winner_case"] is False
 
 
+def test_disaggregated_handoff_dcp_demand_host_only_receiver_and_explicit_owners():
+    """DCP decode HBM demand charges per-rank max, host-only receivers skip HBM hold, and explicit owners bypass TP filter."""
+    from _support.memory_cases import sparse_mla_case
+    from _support.serving_cases import bind_pd_pool, linear_work, pd_model_case
+    from mindie_sim.prediction.disaggregated.handoff import compute_pd_handoff_plan
+    from mindie_sim.prediction.disaggregated.serving import predict_pd
 
+    # 1. Idle DCP sibling die must not halve actual receiver HBM bandwidth charge or transfer elapsed time.
+    for tp in (1, 2):
+        raw = pd_model_case(8, 1)
+        bind_pd_pool(raw, "decode", tuple(range(1, tp + 1)), tp, tp)
+        decode_pool = raw["pools"]["decode"]
+        decode_pool["runtime"]["kv_block_size"] = 128
+        decode_pool["machine"]["device"]["rates"]["memory"] = 64_000
+        raw["connector"]["link"]["capacity_bytes_per_ms"] = 1e9
+        result = predict_pd(raw, lower=linear_work)
+        handoff = result["execution"]["pd_handoffs"][0]
+        start_ms = result["requests"][0]["first_token_abs_ms"]
+        assert handoff["receive_capacity_bytes"] == {1: 512}
+        assert handoff["memory_work"]["decode:memory@r0:s0"] == pytest.approx(512.0)
+        assert handoff["complete_ms"] - start_ms >= 8.0 - 1e-6
+
+    # 2. Sparse-KV host-only destination rank completes cleanly without raising missing HBM range errors.
+    p_case = sparse_mla_case(context_tokens=8)
+    d_case = sparse_mla_case(
+        context_tokens=8,
+        tp=2,
+        offloading={
+            "implementation": "vllm_ascend_sparse_kv_offload",
+            "options": {"use_fused_copy_sfa": False, "dram_size_per_dp_gb": 64.0},
+        },
+    )
+    d_case["runtime"].update(dcp=2, metadata={"enable_sfa_dcp_sharded_indexer": True})
+    plan = compute_pd_handoff_plan(p_case, d_case, tokens=8)
+    assert plan["destination_hbm_rank_bytes"] == {1: 1040}
+    assert plan["destination_host_rank_bytes"] == {1: 9216, 2: 9216}
+    pools = {role: {k: c[k] for k in ("machine", "runtime")} for role, c in (("prefill", p_case), ("decode", d_case))}
+    served = predict_pd(dict(p_case, pools=pools, connector={"bytes_per_s": 50e9}))
+    assert served["status"] == "modeled"
+
+    # 3. Explicit rank_token_owners overrides TP-lane replication filtering when DCP == 1,
+    #    handles tail growth beyond the last span, and bills prefill unicast fan-out HBM reads.
+    raw_own = pd_model_case(8, 1)
+    bind_pd_pool(raw_own, "prefill", (0, 1), 2, 1)
+    raw_own["pools"]["prefill"]["runtime"]["metadata"] = {"rank_token_owners": [(0, 4), (4, 8)]}
+    p_own, d_own = [
+        parse_case(dict(model=raw_own["model"], workload=raw_own["workload"], **pool))
+        for pool in raw_own["pools"].values()
+    ]
+    assert compute_pd_handoff_plan(p_own, d_own, tokens=8)["source_rank_bytes"] == {0: 256, 1: 256}
+    assert compute_pd_handoff_plan(p_own, d_own, tokens=9)["source_rank_bytes"] == {0: 256, 1: 320}
+
+    raw_fanout = pd_model_case(8, 1)
+    bind_pd_pool(raw_fanout, "prefill", (0, 1), 2, 1)
+    bind_pd_pool(raw_fanout, "decode", (2, 3), 2, 1)
+    raw_fanout["pools"]["prefill"]["runtime"]["metadata"] = {"rank_token_owners": [(0, 4), (4, 8)]}
+    fanout_res = predict_pd(raw_fanout, lower=linear_work)
+    assert fanout_res["execution"]["pd_handoffs"][0]["memory_work"]["prefill:memory@r0:s0"] == pytest.approx(512.0)
+
+    # 4. Non-inherited MLA draft replica grouping covers cross-DP DCP shards (tp=2, dp=dcp=3)
+    #    and inherited draft handoff respects draft.dcp_sharded=False.
+    from dataclasses import replace as _replace
+    from _support.memory_cases import case as _mem_case
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.catalog.types import AuxiliarySpec
+
+    mla_draft = DraftSpec(
+        kind="mtp", layers=1, hidden_size=64, intermediate_size=128,
+        num_heads=4, num_kv_heads=1, head_dim=16, q_width=64, kv_width=16,
+        attention_kind="mla", q_lora_rank=64, kv_lora_rank=512,
+        qk_nope_head_dim=64, qk_rope_head_dim=64, v_head_dim=64, dcp_sharded=True,
+    )
+    raw_mp = _mem_case(dp=3, tp=2, pp=1)
+    raw_mp["model"]["num_kv_heads"] = 1
+    raw_mp["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=6)
+    raw_mp["runtime"].update(dcp=3, kv_block_size=1, metadata={"spec_method": "mtp", "mtp_proposal_tokens": 1, "cp_kv_cache_interleave_size": 1})
+    raw_md = _mem_case(dp=1, tp=1, pp=1)
+    raw_md["model"]["num_kv_heads"] = 1
+    raw_md["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=1)
+    raw_md["runtime"].update(dcp=1, kv_block_size=1, metadata={"spec_method": "mtp", "mtp_proposal_tokens": 1, "cp_kv_cache_interleave_size": 1})
+    p_mla = _replace(parse_case(raw_mp), model=_replace(parse_case(raw_mp).model, auxiliary=AuxiliarySpec(mtp=mla_draft)))
+    d_mla = _replace(parse_case(raw_md), model=_replace(parse_case(raw_md).model, auxiliary=AuxiliarySpec(mtp=mla_draft)))
+    assert {0, 2, 4}.issubset(set(compute_pd_handoff_plan(p_mla, d_mla, tokens=3)["source_rank_bytes"]))
+
+    raw_ns = compose_case("glm-5.3", "a3", layers=1, tp=2, ep=1, dcp=2, block_size=1, mtp_proposal_tokens=1)
+    raw_ns["runtime"].setdefault("metadata", {})["cp_kv_cache_interleave_size"] = 1
+    p_sh = parse_case(raw_ns)
+    p_ns = _replace(p_sh, model=_replace(p_sh.model, auxiliary=_replace(p_sh.model.auxiliary, mtp=_replace(p_sh.model.auxiliary.mtp, dcp_sharded=False))))
+    h_ns = compute_pd_handoff_plan(p_ns, p_ns, tokens=1)
+    h_sh = compute_pd_handoff_plan(p_sh, p_sh, tokens=1)
+    assert sum(h_ns["destination_hbm_rank_bytes"].values()) > sum(h_sh["destination_hbm_rank_bytes"].values())
 

@@ -424,27 +424,30 @@ class Memory(
         self.expert_staging_workspace = single["staging"]
 
     def _ep_rank_for_die(self, replica: int, stage: int, local_rank: int, placement=None) -> int:
+        from mindie_sim.schema.common import ModelingError
+        from mindie_sim.schema.parallel import ReplicaLocalRank
+
         p = self.case.runtime.parallel
         ep = max(1, int(p.ep))
         if ep <= 1 or len(self.weights_by_ep_rank) <= 1:
             return 0
+        rep_i = int(replica)
+        stg_i = int(stage)
+        lane_i = int(local_rank)
+        lane = ReplicaLocalRank(lane_i)
         if placement is not None:
-            from mindie_sim.schema.common import ModelingError
             try:
-                local = placement.stage_ranks(replica, stage)
-                group = placement.ep_group_ranks(replica, stage, lane=local_rank)
-                return int(group.index(local[local_rank]))
+                return int(placement.coord_for(rep_i, stg_i, lane).ep_rank)
             except ModelingError:
                 pass
-        if not (p.ep_spans_dp or p.ep_spans_pcp):
-            return int(local_rank) % ep
-        width = max(1, int(p.tp) // max(1, int(p.etp)))
-        copy, tp_lane = divmod(int(local_rank), max(1, int(p.tp)))
-        copy_count = min(int(p.pcp), max(1, ep // width)) if p.ep_spans_pcp else 1
-        rep_in_ep = int(replica) % max(1, int(p.ep_dp_width))
-        copy_in_ep = copy % max(1, copy_count)
-        tp_in_ep = tp_lane % width
-        return min(ep - 1, max(0, ((rep_in_ep * copy_count) + copy_in_ep) * width + tp_in_ep))
+        if p.rank_table is None:
+            coords = p.ep_group_coords(rep_i, stg_i, lane)
+            return int(coords.index((rep_i, stg_i, lane)))
+        logical_rank = (rep_i * int(p.pp) + stg_i) * int(p.tp) * int(p.pcp) + lane_i
+        for group in p.rank_table:
+            if logical_rank in group:
+                return int(tuple(int(item) for item in group).index(logical_rank))
+        return lane_i % ep
 
     def _resolve_c8_static_channel_scale_by_stage(self, case, p) -> tuple[int, ...]:
         """Resolve fixed per-die load-time GQA static C8/FAQuant scale/offset planes."""

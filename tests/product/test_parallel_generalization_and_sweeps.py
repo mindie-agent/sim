@@ -375,3 +375,26 @@ def test_cross_node_non_superpod_tp16_admission_and_solve_four_track_contract():
     assert opt_pd["best_configuration"]["pd_ratio"] == sw_pd["best_configuration"]["pd_ratio"]
     assert opt_max["pd_ratio"] == sw_max["pd_ratio"] == "1P:7D"
     assert opt_max["sustainable_tps"] == pytest.approx(sw_max["sustainable_tps"], rel=1e-9)
+
+
+def test_heterogeneous_machine_shrink_retains_surviving_switch_links():
+    """Shrinking a heterogeneous machine delegates to induced_links_for so surviving >=2-rank switch links stay wired."""
+    from dataclasses import replace
+    from _support.memory_cases import case
+    from mindie_sim import graph_costs, target_graphs
+    from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.sweep.resize import materialize_machine_for_devices
+
+    durations = {}
+    for count in (2, 4):
+        raw = case(tp=2, dp=count // 2)
+        raw["machine"]["devices"] = [{}, {}] + ([{}, {"memory_bytes": 2**31}] if count == 4 else [])
+        raw["machine"]["ranks_per_node"] = 2
+        parsed = parse_case(raw)
+        shrunk = materialize_machine_for_devices(parsed, raw, 2)
+        assert len(shrunk.dies) == 2
+        assert any(set(link.members) == {0, 1} for link in shrunk.links)
+        case_2 = replace(parsed, machine=shrunk, runtime=replace(parsed.runtime, parallel=ParallelSpec(dp=1, tp=2)))
+        graphs = target_graphs(case_2, phase="decode", tokens=1, context=4, sequences=1, scope="body")
+        durations[count] = graph_costs(case_2, graphs, external_inputs={"analysis_input": 0}, compact=True)["duration_ms"]
+    assert durations[4] == pytest.approx(durations[2], rel=1e-9)

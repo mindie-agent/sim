@@ -471,46 +471,33 @@ def _explicit_topk_ids(value, *, tokens, top_k, experts, rows):
 
 def _balanced_ep_owner(parallel, physical_rank: int, *, replica: int = 0, machine=None) -> int:
     """Resolve one explicit physical rank to its EP-group shard index ``0..ep-1``."""
+    from mindie_sim.schema.parallel import GlobalRank, ReplicaLocalRank
+
+    del replica
     rank = int(physical_rank)
     ep = max(1, int(parallel.ep))
     if machine is not None and hasattr(machine, "validate_placement"):
         rank_map = machine.validate_placement(parallel)
-        total_replicas = max(1, int(getattr(parallel, "external_dp", 1) or 1) * int(parallel.dp))
-        stages = max(1, int(parallel.pp))
-        order = [int(replica)] + [r for r in range(total_replicas) if r != int(replica)]
-        for rep in order:
-            if not 0 <= rep < total_replicas:
-                continue
-            for stage in range(stages):
-                stage_ranks = rank_map.stage_ranks(rep, stage)
-                if rank in stage_ranks:
-                    lane = stage_ranks.index(rank)
-                    ep_group = rank_map.ep_group_ranks(rep, stage, lane=lane)
-                    return ep_group.index(rank)
-        raise ModelingError(f"balanced_routing_physical_rank_unknown:{rank}")
+        try:
+            return int(rank_map.coord_for_physical_rank(GlobalRank(rank)).ep_rank)
+        except ModelingError as exc:
+            raise ModelingError(f"balanced_routing_physical_rank_unknown:{rank}") from exc
     table = getattr(parallel, "rank_table", None)
     if table is not None:
         for group in table:
             if rank in group:
                 return tuple(int(item) for item in group).index(rank)
         raise ModelingError(f"balanced_routing_physical_rank_unknown:{rank}")
+    if ep <= 1:
+        return 0
     tp = max(1, int(parallel.tp))
     pcp = max(1, int(parallel.pcp))
     pp = max(1, int(parallel.pp))
     stage_slot, lane = divmod(rank, tp * pcp)
-    rep, _stage = divmod(stage_slot, pp)
-    if not (bool(getattr(parallel, "ep_spans_dp", False))
-            or bool(getattr(parallel, "ep_spans_pcp", False))):
-        return lane % ep
-    etp = max(1, int(getattr(parallel, "etp", 1) or 1))
-    ep_tp_w = max(1, tp // etp)
-    copy_idx, tp_lane = divmod(lane, tp)
-    offset = tp_lane % ep_tp_w
-    copy_count = min(pcp, max(1, ep // ep_tp_w)) if bool(getattr(parallel, "ep_spans_pcp", False)) else 1
-    local_copy = copy_idx % max(1, copy_count)
-    ep_dp_w = max(1, int(getattr(parallel, "ep_dp_width", 1) or 1))
-    local_rep = rep % ep_dp_w
-    return (local_rep * copy_count + local_copy) * ep_tp_w + offset
+    rep, stage = divmod(stage_slot, pp)
+    lane_typed = ReplicaLocalRank(lane)
+    coords = parallel.ep_group_coords(rep, stage, lane_typed)
+    return int(coords.index((rep, stage, lane_typed)))
 
 
 def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_tokens=None,
@@ -601,9 +588,16 @@ def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_to
             raise ModelingError(
                 "routing_realization_ambiguous_query_position_or_source")
         if len(selected_explicit) == 1:
+            ep_rep_rank = (
+                _balanced_ep_owner(
+                    runtime.parallel, int(physical_rank), replica=int(replica), machine=machine,
+                )
+                if physical_rank is not None and int(runtime.parallel.ep) > 1
+                else physical_rank
+            )
             return _explicit_routing(
                 selected_explicit[0], layer, phase, logical_tokens, views, replica,
-                physical_rank=physical_rank, query_position=query_position)
+                physical_rank=ep_rep_rank, query_position=query_position)
         if (int(runtime.parallel.ep) > 1 and logical_tokens > 0
                 and any(item.get("phase") == phase for item in explicit)):
             raise ModelingError(
@@ -925,6 +919,7 @@ def _explicit_routing(item, layer, phase, tokens, views, replica,
             raise ModelingError("explicit_token_routing_requests_must_be_sequence")
         actual = _norm_views(views)
         request_ids, positions, topk_rows, owners = [], [], [], []
+        missing_slices: list[tuple[int, int]] = []
         for entry in requests:
             if not isinstance(entry, Mapping):
                 raise ModelingError("explicit_token_routing_request_must_be_mapping")
@@ -963,12 +958,6 @@ def _explicit_routing(item, layer, phase, tokens, views, replica,
             if ids is None or (len(ids) != q_len and not single_row):
                 raise ModelingError(
                     f"explicit_token_routing_request_topk_rows_required:{request_id}")
-            owner = entry.get("source_owner", entry.get("source_rank"))
-            if owner is None:
-                owner = item.get("source_owner", item.get("source_rank"))
-            if owner is None:
-                owner_missing = True
-                owner = int(replica)
             if q_len == 1 and ids and all(type(value) is int for value in ids):
                 topk_rows.append(tuple(ids))
             elif len(ids) == q_len and all(
@@ -980,14 +969,49 @@ def _explicit_routing(item, layer, phase, tokens, views, replica,
             # A request may declare one owner for all rows or per-row owners.
             declared_owners = entry.get("source_owners")
             if declared_owners is not None:
-                if len(declared_owners) != q_len:
+                if (isinstance(declared_owners, (str, bytes))
+                        or not isinstance(declared_owners, (list, tuple))
+                        or len(declared_owners) != q_len):
                     raise ModelingError(
                         f"explicit_token_routing_request_source_owner_count_mismatch:{request_id}")
-                owners.extend(int(value) for value in declared_owners)
+                if any(type(value) is not int for value in declared_owners):
+                    raise ModelingError(
+                        f"explicit_token_routing_source_owner_out_of_ep:{request_id}")
+                owners.extend(declared_owners)
             else:
-                owners.extend([int(owner)] * q_len)
+                owner = entry.get("source_owner", entry.get("source_rank"))
+                if owner is None:
+                    owner = item.get("source_owner", item.get("source_rank"))
+                if owner is None:
+                    if q_len > 0:
+                        owner_missing = True
+                        missing_slices.append((len(owners), len(owners) + q_len))
+                    owner = int(replica)
+                elif type(owner) is not int:
+                    raise ModelingError(
+                        f"explicit_token_routing_source_owner_out_of_ep:{owner}")
+                owners.extend([owner] * q_len)
             request_ids.extend([request_id] * q_len)
             positions.extend([int(position) if position is not None else -1] * q_len)
+        item_owners = item.get("source_owners")
+        if owner_missing and item_owners is not None:
+            if type(item_owners) is int:
+                for lo, hi in missing_slices:
+                    owners[lo:hi] = [int(item_owners)] * (hi - lo)
+                owner_missing = False
+            elif (not isinstance(item_owners, (str, bytes))
+                  and isinstance(item_owners, (list, tuple))
+                  and len(item_owners) == len(topk_rows)):
+                if any(type(value) is not int for value in item_owners):
+                    raise ModelingError("explicit_token_routing_source_owner_out_of_ep")
+                for lo, hi in missing_slices:
+                    owners[lo:hi] = [int(value) for value in item_owners[lo:hi]]
+                owner_missing = False
+            else:
+                raise ModelingError(
+                    "explicit_token_routing_source_owner_count_must_match_tokens:"
+                    f"{len(item_owners) if isinstance(item_owners, (list, tuple)) else type(item_owners).__name__}"
+                    f"!={len(topk_rows)}")
         topk = tuple(topk_rows)
         source_owners = tuple(owners)
     else:

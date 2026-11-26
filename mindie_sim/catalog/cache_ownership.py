@@ -428,6 +428,7 @@ def _draft_cache_parallel(
     draft_kind: str,
     *,
     interleave: int = DEFAULT_INTERLEAVE,
+    block_size: int | None = None,
 ) -> Any:
     """Resolve draft parallel placement honoring ``draft.dcp_sharded``."""
     from mindie_sim.catalog.cache import uses_inherited_draft_cache
@@ -443,12 +444,13 @@ def _draft_cache_parallel(
     elif uses_inherited_draft_cache(model, draft_kind):
         sharded = True
     else:
+        page_tokens = max(1, int(block_size if block_size is not None else interleave))
         row_bytes = _draft_row_bytes_int(
             model, draft, tp=max(1, int(getattr(parallel, "tp", 1) or 1)),
         )
         sharded = _draft_is_dcp_sharded(
             model, parallel, draft_kind, dcp=cp,
-            draft_page=max(1, int(interleave)) * row_bytes,
+            draft_page=page_tokens * row_bytes,
         )
     if sharded:
         return parallel
@@ -465,15 +467,18 @@ def draft_cache_components(
     from mindie_sim.catalog.draft_geometry import draft_layer_plans
 
     components: dict[str, float] = {}
-    interleave = max(
+    page_block = max(
         ONE, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
+    interleave = max(ONE, int(cp_interleave(runtime))) if runtime is not None else page_block
     eff_seq = _effective_draft_sequence_tokens(model, draft_kind, sequence_tokens, runtime)
     draft_model = _draft_cache_model(model, draft_kind)
-    draft_parallel = _draft_cache_parallel(model, parallel, draft_kind, interleave=interleave)
+    draft_parallel = _draft_cache_parallel(
+        model, parallel, draft_kind, interleave=interleave, block_size=page_block,
+    )
     for plan in draft_layer_plans(model, draft_kind):
         values = layer_cache_components(
             draft_model, plan, draft_parallel, eff_seq, capacity_padded=capacity_padded,
-            interleave=interleave, rank=rank, owner_spans=owner_spans,
+            interleave=interleave, block_size=page_block, rank=rank, owner_spans=owner_spans,
             runtime=runtime, query_tokens=query_tokens, phase=phase)
         for name, value in values.items():
             components[f"draft.{name}"] = components.get(f"draft.{name}", ZERO_FLOAT) + float(value)

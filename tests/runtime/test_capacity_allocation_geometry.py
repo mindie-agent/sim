@@ -647,3 +647,146 @@ def test_tile_solver_honors_zero_vs_32kib_simt_ub_carveout():
     sol_32k = solve(TilePipelineSpec("simt_32k_fit", (cand_216k,)), None, hw_32k)
     ub_32k = next(p for p in sol_32k.pool_peaks if p.pool == "ub")
     assert ub_32k.capacity_bytes == 216 * 1024 and ub_32k.peak_bytes == 216 * 1024
+
+
+def test_rank_capacity_plans_use_per_rank_shards_global_dcp_and_stage_offload_fallback():
+    """Capacity plans use per-rank expert shards, typed RankCoord DCP/EP axes, and per-stage offload fallback."""
+    import copy
+    from _support.memory_cases import case, sparse_mla_case
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.parallel import ReplicaLocalRank
+
+    # 1. Per-rank expert weights match rank_weights instead of repeating stage max across lighter EP ranks.
+    raw_asym = case(tp=2, ep=2)
+    raw_asym["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=2)
+    raw_asym["model"].update(ffn="moe", num_experts=5, top_k=1, moe_intermediate_size=128)
+    mem_asym = Memory(parse_case(raw_asym))
+    plans_asym = mem_asym.rank_capacity_plans(0, 0, include_cache=False)
+    assert [int(next(a.bytes for a in p.allocations if a.name == "weights")) for p in plans_asym] == [
+        int(w) for w in mem_asym.rank_weights[0][0]
+    ] == [162752, 113600]
+
+    # 2. Capacity EP die-to-group indexing matches PhysicalRankMap.coord_for under composite tp*pcp/ep layouts.
+    raw_ep = case(tp=2, ep=3)
+    raw_ep["runtime"].update(dp=1, tp=2, pp=1, ep=3, pcp=3)
+    raw_ep["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=6)
+    raw_ep["model"].update(ffn="moe", num_experts=7, top_k=2, moe_intermediate_size=128)
+    parsed_ep = parse_case(raw_ep)
+    mem_ep = Memory(parsed_ep)
+    placement_ep = parsed_ep.machine.validate_placement(parsed_ep.runtime.parallel)
+    assert [mem_ep._ep_rank_for_die(0, 0, lane, placement_ep) for lane in range(6)] == [
+        placement_ep.coord_for(0, 0, ReplicaLocalRank(lane)).ep_rank for lane in range(6)
+    ] == [0, 0, 1, 1, 2, 2]
+
+    # 3. Cross-DP DCP capacity plans match live_rank for both zero-based and offset physical rank IDs.
+    for devices in (None, [{"rank": rk} for rk in range(8, 16)]):
+        raw_dcp = case(dp=8)
+        raw_dcp["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=8)
+        if devices is not None:
+            raw_dcp["machine"]["devices"] = devices
+        raw_dcp["runtime"].update(dcp=8, kv_block_size=1)
+        mem_dcp = Memory(parse_case(raw_dcp))
+        plans_dcp = [mem_dcp.rank_capacity_plan(rep, 0, tokens=1, rank=0) for rep in range(8)]
+        assert mem_dcp.resize(0, "r", 1)
+        assert [int(next(a.bytes for a in p.allocations if a.name == "cache_allocation")) for p in plans_dcp] == [
+            int(rep[0][0]) for rep in mem_dcp.live_rank
+        ] == [128, 0, 0, 0, 0, 0, 0, 0]
+
+    # 4. Empty pages.groups sparse-offload fallback applies num_shared_layers per PP stage, not globally.
+    raw_off = sparse_mla_case(
+        context_tokens=8,
+        tp=1,
+        offloading={
+            "implementation": "vllm_ascend_sparse_kv_offload",
+            "options": {
+                "use_fused_copy_sfa": False,
+                "dram_size_per_dp_gb": 64.0,
+                "layerwise_kv_offload": True,
+                "num_shared_layers": 1,
+            },
+        },
+    )
+    raw_off["runtime"]["pp"] = 2
+    base_plans = copy.deepcopy(raw_off["model"]["layer_plans"])
+    raw_off["model"]["layer_plans"] = [
+        dict(base_plans[0], index=0),
+        dict(base_plans[1], index=1),
+        dict(base_plans[0], index=2),
+        dict(base_plans[1], index=3),
+    ]
+    raw_off["model"]["layers"] = 4
+    raw_off["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=2)
+    mem_off = Memory(parse_case(raw_off))
+    rep_full = mem_off._max_model_len_report()["sparse_kv_offload"]
+    mem_empty = object.__new__(Memory)
+    mem_empty.__dict__.update(mem_off.__dict__)
+    empty_pages = copy.copy(mem_off.pages)
+    empty_pages.groups = ()
+    mem_empty.pages = empty_pages
+    rep_empty = mem_empty._max_model_len_report()["sparse_kv_offload"]
+    assert rep_empty["npu_limit_blocks"] == rep_full["npu_limit_blocks"]
+
+
+def test_draft_kv_separates_dcp_interleave_from_physical_page_block_size():
+    """Inherited draft KV shards DCP by interleave size while non-inherited draft KV rounds pages by kv_block_size."""
+    from mindie_sim.catalog.cache_ownership import draft_cache_components
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.prediction.structure import parse_case
+
+    raw_inh = compose_case(
+        "glm-5.3", hardware="a3", tp=8, ep=8, dcp=2, layers=4,
+        block_size=128, mtp_proposal_tokens=1,
+    )
+    raw_inh["runtime"]["metadata"]["cp_kv_cache_interleave_size"] = 16
+    parsed_inh = parse_case(raw_inh)
+    per_rank = [
+        int(draft_cache_components(
+            parsed_inh.model, parsed_inh.runtime.parallel, draft_kind="mtp",
+            sequence_tokens=32, runtime=parsed_inh.runtime, rank=rk,
+            capacity_padded=False,
+        )["draft.mla_kv"])
+        for rk in (0, 1)
+    ]
+    assert per_rank == [10496, 10496]
+
+    raw_non = compose_case(
+        "qwen3.5-35b-a3b", hardware="a3", layers=4, tp=2, ep=2,
+        block_size=128, mtp_proposal_tokens=1,
+    )
+    raw_non["runtime"].setdefault("metadata", {})["cp_kv_cache_interleave_size"] = 16
+    mem_non = Memory(parse_case(raw_non))
+    bytes_1 = mem_non.resident_memory_receipt(sequence_tokens=1, batch_per_dp=1).dies[0].draft_cache_bytes
+    bytes_128 = mem_non.resident_memory_receipt(sequence_tokens=128, batch_per_dp=1).dies[0].draft_cache_bytes
+    assert bytes_1 == bytes_128 == 131072
+
+    # Cross-DP pp>1 rank_cache_allocation avoids double-counting shard 0 and rank=None honors skewed rank_token_owners.
+    from _support.memory_cases import case as _mem_case
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.catalog.types import AuxiliarySpec
+
+    mla_draft = DraftSpec(
+        kind="mtp", layers=1, hidden_size=64, intermediate_size=128,
+        num_heads=4, num_kv_heads=1, head_dim=16, q_width=64, kv_width=16,
+        attention_kind="mla", q_lora_rank=64, kv_lora_rank=512,
+        qk_nope_head_dim=64, qk_rope_head_dim=64, v_head_dim=64, dcp_sharded=True,
+    )
+    raw_pp = _mem_case(dp=2, pp=2, tp=1)
+    raw_pp["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=4)
+    raw_pp["runtime"].update(dcp=2, kv_block_size=1, metadata={"spec_method": "mtp", "mtp_proposal_tokens": 1, "cp_kv_cache_interleave_size": 1})
+    c_pp = parse_case(raw_pp)
+    mem_pp = Memory(replace(c_pp, model=replace(c_pp.model, auxiliary=AuxiliarySpec(mtp=mla_draft))))
+    assert [float(a["components"][1]["valid"]["draft_kv"]["total"]) for a in mem_pp.rank_cache_allocation(1)] == [1152.0, 0.0]
+
+    raw_sk = _mem_case(tp=2)
+    raw_sk["model"]["num_kv_heads"] = 1
+    raw_sk["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=2)
+    raw_sk["runtime"].update(
+        dcp=2, kv_block_size=128,
+        metadata={"spec_method": "mtp", "mtp_proposal_tokens": 1,
+                  "cp_kv_cache_interleave_size": 16, "rank_token_owners": [(0, 256), (256, 256)]},
+    )
+    c_sk = parse_case(raw_sk)
+    mem_sk = Memory(replace(c_sk, model=replace(c_sk.model, auxiliary=AuxiliarySpec(mtp=mla_draft))))
+    assert mem_sk._non_inherited_draft_cache_bytes(mem_sk.case.model, 256, padded=True, rank=None)[0] == 256 * 1152

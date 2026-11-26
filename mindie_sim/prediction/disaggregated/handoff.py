@@ -163,7 +163,16 @@ def _token_span(memory, index, tokens):
     owners = getattr(memory, "rank_token_owners", None)
     if owners is not None and 0 <= index < len(owners):
         lo, hi = owners[index]
-        return (max(0, min(tokens, int(lo))), max(0, min(tokens, int(hi))))
+        clipped_lo = max(0, min(tokens, int(lo)))
+        clipped_hi = max(0, min(tokens, int(hi)))
+        if index == len(owners) - 1:
+            covered = sum(
+                max(0, min(tokens, int(end)) - max(0, int(start)))
+                for start, end in owners
+            )
+            if tokens > covered:
+                clipped_hi = min(tokens, clipped_hi + (tokens - covered))
+        return (clipped_lo, clipped_hi)
     parallel = memory.case.runtime.parallel
     cp = max(1, int(parallel.cp))
     if cp > 1:
@@ -278,6 +287,7 @@ class PdExpectedDemand:
     draft_state_bytes: int
     decode_local_stage_bytes: tuple[float, ...]
     active_draft: _ActiveDraftHandoff | None
+    decode_cohort_stage_bytes: tuple[tuple[float, ...], ...] = ()
 
 
 def _spec_method_from_runtime(runtime: Any) -> str:
@@ -336,8 +346,8 @@ def _resolve_active_draft_handoff(
     from mindie_sim.prediction.capacity.cache import _draft_is_dcp_sharded, _draft_row_bytes_int
 
     p_par, d_par = p_case.runtime.parallel, d_case.runtime.parallel
-    p_block = max(1, int(cp_interleave(p_case.runtime)))
-    d_block = max(1, int(cp_interleave(d_case.runtime)))
+    p_block = max(1, int(getattr(p_case.runtime, "kv_block_size", 0) or cp_interleave(p_case.runtime)))
+    d_block = max(1, int(getattr(d_case.runtime, "kv_block_size", 0) or cp_interleave(d_case.runtime)))
     p_row = int(_draft_row_bytes_int(p_case.model, p_spec, tp=p_par.tp))
     d_row = int(_draft_row_bytes_int(d_case.model, d_spec, tp=d_par.tp))
     p_shd = bool(_draft_is_dcp_sharded(
@@ -442,6 +452,7 @@ def compute_expected_pd_handoff_demand(
     offload, offload_layers, hot_tokens = _sparse_offload_params(decode_memory, n_tokens)
     target_owners = getattr(decode_memory, "rank_token_owners", None)
     stage_hbm_total = [0] * pp
+    stage_rank_hbm = [[0] * len(d_topo.ranks(0, st)) for st in range(pp)]
     host_total = 0
     draft_kv_total = 0
     draft_state_total = 0
@@ -459,7 +470,7 @@ def compute_expected_pd_handoff_demand(
         )
         window = int(getattr(layer, "window", 0) or 0)
         host_counted = False
-        for _index, _rank, values, span, cache_rank in dst_views:
+        for index, _rank, values, span, cache_rank in dst_views:
             for comp, comp_bytes in values.items():
                 if comp_bytes <= 0:
                     continue
@@ -484,9 +495,12 @@ def compute_expected_pd_handoff_demand(
                             hi - max(lo, n_tokens - hot_tokens)
                             for lo, hi in runs if hi > max(lo, n_tokens - hot_tokens)
                         )
-                        stage_hbm_total[st] += hot_rows * row_unit
+                        hot_bytes = hot_rows * row_unit
+                        stage_hbm_total[st] += hot_bytes
+                        stage_rank_hbm[st][index] += hot_bytes
                 else:
                     stage_hbm_total[st] += comp_bytes
+                    stage_rank_hbm[st][index] += comp_bytes
 
     active_draft = _resolve_active_draft_handoff(
         prefill_case, decode_case, prefill_memory, decode_memory, n_tokens,
@@ -495,20 +509,29 @@ def compute_expected_pd_handoff_demand(
         draft_st = pp - 1
         dst_ranks = d_topo.ranks(0, draft_st)
         if active_draft.inherited:
+            from mindie_sim.catalog.cache_ownership import _draft_cache_parallel
+
+            d_interleave = max(1, int(cp_interleave(decode_case.runtime)))
+            d_draft_par = _draft_cache_parallel(
+                decode_case.model, d_par, active_draft.kind,
+                interleave=d_interleave,
+                block_size=max(1, int(getattr(decode_case.runtime, "kv_block_size", 0) or d_interleave)),
+            )
             for d_layer in active_draft.d_draft_plans:
                 num_heads = int(getattr(d_layer, "num_kv_heads", 0) or 0)
                 has_head_axis = d_layer.attention in {"gqa", "projection_only"}
-                target_spans = _local_head_spans(num_heads, d_par.tp) if has_head_axis else ()
+                target_spans = _local_head_spans(num_heads, d_draft_par.tp) if has_head_axis else ()
                 dst_views = _handoff_rank_views(
-                    decode_case, d_layer, d_par, dst_ranks, decode_memory,
+                    decode_case, d_layer, d_draft_par, dst_ranks, decode_memory,
                     target_owners, target_spans, has_head_axis, active_draft.eff_tokens,
                     stage=draft_st, replica=0, phase="decode",
                 )
-                for _index, _rank, values, _span, _cache_rank in dst_views:
+                for index, _rank, values, _span, _cache_rank in dst_views:
                     for comp, comp_bytes in values.items():
                         if comp_bytes <= 0:
                             continue
                         stage_hbm_total[draft_st] += comp_bytes
+                        stage_rank_hbm[draft_st][index] += comp_bytes
                         if comp in SHARDED_STATE_COMPONENTS:
                             draft_state_total += comp_bytes
                         else:
@@ -524,11 +547,23 @@ def compute_expected_pd_handoff_demand(
                 layer_bytes = owned_rows * active_draft.d_row_bytes
                 total_rank_draft = layer_bytes * int(active_draft.d_draft_spec.layers)
                 stage_hbm_total[draft_st] += total_rank_draft
+                stage_rank_hbm[draft_st][index] += total_rank_draft
                 draft_kv_total += total_rank_draft
 
     hbm_total = sum(stage_hbm_total)
-    stage_width = max(1, d_topo._width)
-    decode_local = tuple(float(st_bytes) / float(stage_width) for st_bytes in stage_hbm_total)
+    decode_local = tuple(float(max(rank_bytes, default=0)) for rank_bytes in stage_rank_hbm)
+    dcp_dp = max(1, d_topo._dcp_dp)
+    local_w = max(1, d_topo._local_width)
+    decode_cohort_stage_bytes = tuple(
+        tuple(
+            float(max(
+                stage_rank_hbm[st][dp_off * local_w:(dp_off + 1) * local_w],
+                default=0,
+            ))
+            for st in range(pp)
+        )
+        for dp_off in range(dcp_dp)
+    )
     return PdExpectedDemand(
         total_volume_bytes=hbm_total + host_total,
         hbm_volume_bytes=hbm_total,
@@ -537,6 +572,7 @@ def compute_expected_pd_handoff_demand(
         draft_state_bytes=draft_state_total,
         decode_local_stage_bytes=decode_local,
         active_draft=active_draft,
+        decode_cohort_stage_bytes=decode_cohort_stage_bytes,
     )
 
 
@@ -932,7 +968,7 @@ def _emit_head_transfers(
         per_head_token = need // denom
         d_tp = dest_index % tp_d
         d_pcp = (dest_index // tp_d) % pcp_d
-        if p_dcp == 1 and d_dcp == 1:
+        if p_dcp == 1 and d_dcp == 1 and source_owners is None:
             ordered_sources = [
                 entry for entry in src_manifest
                 if ((entry[0] // tp_p) % pcp_p) == (d_pcp % pcp_p)
@@ -1147,7 +1183,21 @@ def _draft_token_runs(
     cache_rank = canonical_physical_rank(
         index, parallel, stage=stage, replica=replica, cohort_size=cohort_size,
     )
-    return interleaved_token_runs(toks, cp_n, block, cache_rank % cp_n)
+    tp_dim = max(1, int(getattr(parallel, "tp", 1) or 1))
+    pcp_dim = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    pp_dim = max(1, int(getattr(parallel, "pp", 1) or 1))
+    dp_dim = max(1, int(getattr(parallel, "dp", 1) or 1))
+    pcp_f = max(1, int(getattr(parallel, "dcp_pcp_factor", 1) or 1))
+    tp_g = max(1, int(getattr(parallel, "dcp_tp_gather", 1) or 1))
+    dp_w = max(1, int(getattr(parallel, "dcp_dp_width", 1) or 1))
+    tp_i = cache_rank % tp_dim
+    pcp_i = (cache_rank // tp_dim) % pcp_dim
+    dp_i = (cache_rank // (tp_dim * pcp_dim * pp_dim)) % dp_dim
+    if dp_w > 1:
+        cp_rank = ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp_n
+    else:
+        cp_rank = ((tp_i % tp_g) * pcp_f + (pcp_i % pcp_f)) % cp_n
+    return interleaved_token_runs(toks, cp_n, block, cp_rank)
 
 
 def pd_destination_rank_offset(prefill_case: Any, decode_case: Any) -> int:
@@ -1303,6 +1353,7 @@ def _emit_non_inherited_gqa_draft_handoff(
             d_idx, d_rank, dst_head_spans[d_idx % len(dst_head_spans)],
             d_runs, _packed_run_offsets(d_runs), sum(hi - lo for lo, hi in d_runs),
         ))
+    source_owners = getattr(prefill_mem, "rank_token_owners", None)
     for layer_offset in range(int(draft_info.d_draft_spec.layers)):
         logical_layer = body_layers + layer_offset
         for d_idx, d_rank, dspan, d_runs, d_offsets, dst_rows in dst_entries:
@@ -1310,7 +1361,7 @@ def _emit_non_inherited_gqa_draft_handoff(
                 continue
             dst_size = dst_rows * draft_info.d_row_bytes
             dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{d_rank}"
-            if p_cp == 1 and d_cp == 1:
+            if p_cp == 1 and d_cp == 1 and source_owners is None:
                 d_tp, d_pcp = d_idx % tp_d, (d_idx // tp_d) % pcp_d
                 ordered = [
                     entry for entry in src_entries
@@ -1393,12 +1444,30 @@ def _bind_non_inherited_draft_handoff(
         )
         src_runs_all.append((s_idx, s_rank, s_runs, sum(hi - lo for lo, hi in s_runs) * draft_info.p_row_bytes))
 
-    replicas = len(source) // max(1, p_cp) if len(source) % max(1, p_cp) == 0 else 1
-    grouped: dict[int, list[tuple[int, tuple[tuple[int, int], ...], int]]] = defaultdict(list)
-    if replicas > 1:
+    complete_groups: list[list[tuple[int, tuple[tuple[int, int], ...], int]]] = []
+    if getattr(prefill_mem, "rank_token_owners", None) is None and len(source) > max(1, p_cp):
+        tp_dim = max(1, int(getattr(prefill_p, "tp", 1) or 1))
+        pcp_dim = max(1, int(getattr(prefill_p, "pcp", 1) or 1))
+        pp_dim = max(1, int(getattr(prefill_p, "pp", 1) or 1))
+        dp_dim = max(1, int(getattr(prefill_p, "dp", 1) or 1))
+        pcp_f = max(1, int(getattr(prefill_p, "dcp_pcp_factor", 1) or 1)) if p_cp > 1 else 1
+        tp_g = max(1, int(getattr(prefill_p, "dcp_tp_gather", 1) or 1)) if p_cp > 1 else 1
+        dp_w = max(1, int(getattr(prefill_p, "dcp_dp_width", 1) or 1)) if p_cp > 1 else 1
+        grouped_by_key: dict[
+            tuple[int, int, int], list[tuple[int, tuple[tuple[int, int], ...], int]]
+        ] = defaultdict(list)
         for s_idx, s_rank, runs, size in src_runs_all:
-            j_p = _upstream_rank_coord(s_idx, prefill_p)
-            grouped[j_p // p_cp].append((s_rank, runs, size))
+            cache_rank = canonical_physical_rank(
+                s_idx, prefill_p, stage=source_stage, replica=prefill_rep, cohort_size=len(source),
+            )
+            tp_i = cache_rank % tp_dim
+            pcp_i = (cache_rank // tp_dim) % pcp_dim
+            dp_i = (cache_rank // (tp_dim * pcp_dim * pp_dim)) % dp_dim
+            grouped_by_key[(dp_i // dp_w, pcp_i // pcp_f, tp_i // tp_g)].append((s_rank, runs, size))
+        complete_groups = [
+            members for members in grouped_by_key.values()
+            if len(members) >= max(1, p_cp)
+        ]
     flat_sources = [(s_rank, runs, size) for _idx, s_rank, runs, size in src_runs_all]
 
     for layer_offset in range(int(draft_info.d_draft_spec.layers)):
@@ -1412,7 +1481,10 @@ def _bind_non_inherited_draft_handoff(
             if target_rows <= 0:
                 continue
             j_d = _upstream_rank_coord(d_idx, decode_p)
-            cand_sources = grouped.get(j_d % replicas) or flat_sources if replicas > 1 else flat_sources
+            cand_sources = (
+                complete_groups[j_d % len(complete_groups)]
+                if complete_groups else flat_sources
+            )
             received = 0
             dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{d_rank}"
             for s_rank, lo, hi, size, offset, unit in transfers_for_runs(cand_sources, d_runs):
@@ -1621,6 +1693,20 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
     if active_draft is not None:
         body_len = len(prefill_case.model.layer_plans)
         if active_draft.inherited:
+            from mindie_sim.catalog.cache_ownership import _draft_cache_parallel
+
+            p_interleave = max(1, int(cp_interleave(prefill_case.runtime)))
+            d_interleave = max(1, int(cp_interleave(decode_case.runtime)))
+            p_draft_par = _draft_cache_parallel(
+                prefill_case.model, prefill_p, active_draft.kind,
+                interleave=p_interleave,
+                block_size=max(1, int(getattr(prefill_case.runtime, "kv_block_size", 0) or p_interleave)),
+            )
+            d_draft_par = _draft_cache_parallel(
+                decode_case.model, decode_p, active_draft.kind,
+                interleave=d_interleave,
+                block_size=max(1, int(getattr(decode_case.runtime, "kv_block_size", 0) or d_interleave)),
+            )
             src_st = max(0, int(prefill_p.pp) - 1)
             dst_st = max(0, int(decode_p.pp) - 1)
             for idx, d_layer in enumerate(active_draft.d_draft_plans):
@@ -1628,7 +1714,7 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                     d_layer, body_len + idx, src_st, dst_st,
                     request, active_draft.eff_tokens, published, emit,
                     prefill_exec, decode_exec, prefill_rep, decode_rep,
-                    prefill_case, decode_case, prefill_p, decode_p,
+                    prefill_case, decode_case, p_draft_par, d_draft_par,
                     prefill_mem, decode_mem, False, set(), 0,
                     component_prefix="draft.",
                 )
