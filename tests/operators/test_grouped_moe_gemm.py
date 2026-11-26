@@ -186,7 +186,9 @@ def test_fused_swiglu_handoff_matches_physical_datapath(hardware_sku):
         scale_bytes = 4 * m + 4 * n * sum(count > 0 for count in rows)
         assert resources["mte2_aiv"] - scale_bytes == gm // 2
         assert resources["mte3"] == m * (width + 4)
-        assert resources["hbm"] == resources["l2"] == resources["mte2_aic"] + gm + scale_bytes + resources["mte3"]
+        assert float(geom.rates.get("l2", 0.0) or 0.0) == 0.0
+        assert "l2" not in resources
+        assert resources["hbm"] == resources["mte2_aic"] + gm + scale_bytes + resources["mte3"]
         assert all(stage.work["hbm"] == stage.work["fixpipe"] for stage in fix)
         assert next(stage for stage in stages if stage.name == "weight_scales").after == ("gmm1",)
 

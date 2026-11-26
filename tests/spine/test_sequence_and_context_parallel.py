@@ -482,11 +482,15 @@ def test_full_cohort_work_survives_sequence_shards_and_idle_source(counts):
 def test_real_source_prefill_wrapper_uses_local_rows_without_shrinking_attention_or_experts():
     raw = json.loads((REPO_ROOT / SP_CASE_PATH).read_text()); raw["runtime"]["graph_mode"] = "eager"
     raw["runtime"]["kernels"] = {"sequence_parallel": dict(DECLARATION), "lowerings": {"matrix_wrapper": {"implementation": "vllm_ascend_mxfp8_single_group_eager", "options": {"projection_recipes": ["latent_projection"]}}}}
-    graphs = target_graphs(raw, phase="prefill", tokens=8192, scope="model"); assert len(graphs) == 4
+    parsed = parse_case(raw)
+    expected_rows = math.ceil(RoutingPolicy(**dict(parsed.runtime.routing)).local(parsed.model, parsed.model.layer_plans[1], parsed.runtime.parallel, 8192 * parsed.runtime.parallel.dp, runtime=parsed.runtime)[0])
+    assert expected_rows >= 16384
+    graphs = target_graphs(parsed, phase="prefill", tokens=8192, scope="model"); assert len(graphs) == 4
     for ops in graphs.values():
         latent = [op for op in ops if op.recipe == "latent_projection"]
         assert len(latent) == 184 and all(op.local_shape[0] == 1024 for op in latent) and all("matrix_wrapper" in dict(op.metadata) for op in latent)
-        assert all(op.local_shape[0] == 16384 for op in ops if op.family == "grouped_gemm")
+        grouped = [op for op in ops if op.family == "grouped_gemm"]
+        assert grouped and all(op.local_shape[0] == expected_rows for op in grouped)
         assert all(op.local_shape[0] == 8192 for op in ops if op.family == "attention") and any(op.family == "attention" for op in ops)
         shared = [op for op in ops if dict(op.metadata).get("ffn_category") == "shared_expert"]; assert shared and all(op.local_shape[0] == 8192 for op in shared)
 @pytest.mark.parametrize("batch", [1, 2, 4, 8, 32])

@@ -564,15 +564,20 @@ def test_unmodeled_gate_resolves_layer_override_and_flat_timeline():
     with pytest.raises(UnmodeledCapabilityError):
         assert_report_supported( {"timeline": [{"op_id": "a", "family": "attention", "recipe": "unmodeled_attention_core", "layer": 0}]}, entry="analyze_network_efficiency")
 def test_dspark_body_does_not_inherit_target_cache_writer():
+    from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import LAYOUT
     quant = quant_preset("w8a8_mxfp8").to_dict() | {"kv_dtype": "int8"}
     raw = compose_case("kimi-k3.1", hardware="a5", tp=8, dp=1, ep=8, dcp=8, num_devices=8, layers=4, quant=quant, mtp_proposal_tokens=5, prompt_tokens=8, output_tokens=2)
-    raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})[ "native_fusion"] = {"implementation": "declared_native_fusion", "options": {"roles": ["mla_prolog"]}}
+    lowerings = raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})
+    assert "mla_prolog" not in lowerings
+    lowerings["mla_prolog"] = {"implementation": "vllm_ascend_mla_prolog_v3", "options": {"cache_layout": LAYOUT}}
+    lowerings["native_fusion"] = {"implementation": "declared_native_fusion", "options": {"roles": ["mla_prolog"]}}
     parsed = parse_case(raw)
-    assert parsed.runtime.kernels["lowerings"]["mla_prolog"]["options"]["cache_layout"]
+    assert parsed.runtime.kernels["lowerings"]["mla_prolog"]["options"]["cache_layout"] == LAYOUT
     graph = target_graphs(parsed, phase="decode", tokens=6, context=4, sequences=1, scope="model")[0]
+    target = [op for op in graph if op.phase != "draft" and dict(op.metadata).get("fusion_role") == "mla_prolog"]
     body = [op for op in graph if op.phase == "draft" and dict(op.metadata).get("fusion_role") == "mla_prolog"]
     context = by_recipe(graph, "draft_context_mla_prolog_v3")
-    assert not body and len(context) == 5
+    assert target and not body and len(context) == 5
 def test_native_moe_inverse_indices_are_charged_once_on_pack_and_unpack():
     graph = target_graphs(parse_case(compose_case( "glm-5.3-flash", hardware="a5", tp=8, dp=1, ep=8, num_devices=8, layers=4, prompt_tokens=64, output_tokens=2, max_num_batched_tokens=256, exclude_optimizations=("cann_megamoe_fusion",))), phase="decode", tokens=64, context=0, sequences=1, scope="body")[0]
     pack = next(op for op in graph if op.recipe == "moe_init_routing_v3")

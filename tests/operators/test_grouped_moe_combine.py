@@ -51,10 +51,15 @@ def test_combine_reads_routed_values_and_publishes_one_row_per_token(hardware, t
     phase = next(item for item in plan.pipeline_spec.phases if item.phase_id == "combine:local")
     payload = 2 * tokens * hidden
     expected_read = topk * payload + 4 * tokens * topk + 8 * len(rows)
-    assert {item.resource: item.amount for item in phase.work} == {
-        "hbm": expected_read + payload, "l2": expected_read + payload,
+    expected = {
+        "hbm": expected_read + payload,
         "mte2_aiv": expected_read, "mte3": payload, "vector": 2 * tokens * topk * hidden,
     }
+    has_l2 = float(geometry.rates.get("l2", 0.0) or 0.0) > 0.0
+    assert has_l2 == geometry.datapath.has_l0c_to_ub
+    if has_l2:
+        expected["l2"] = expected_read + payload
+    assert {item.resource: item.amount for item in phase.work} == expected
     assert phase.after == ("gmm2",)
 
 
@@ -103,7 +108,8 @@ def test_int32_dequant_reads_channel_scales_once_per_participating_core_and_grou
     plan = grouped_moe.build(op, geometry)
     reads = [{item.resource: item.amount for item in phase.work}
              for phase in plan.pipeline_spec.phases if phase.phase_id.endswith(":read")]
-    assert reads == [dict.fromkeys(("hbm", "l2", "mte2_aiv"), amount) for amount in owner_reads]
+    assert float(geometry.rates.get("l2", 0.0) or 0.0) == 0.0
+    assert reads == [dict.fromkeys(("hbm", "mte2_aiv"), amount) for amount in owner_reads]
     assert plan.work.resources["mte2_aiv"] == sum(owner_reads)
 
 
@@ -207,8 +213,9 @@ def test_deepep_forward_and_inverse_transport_share_integer_row_cut(ep, node_wid
         parsed.model, parsed.model.layer_plans[0], parsed.runtime.parallel,
         4 * ep, runtime=parsed.runtime)[0])
     main_rows, tail_rows = deepep.overlap_row_cut(received, 0.25)
-    chunks = target_graphs(raw, phase="prefill", tokens=4, scope="model")[0]
     tokens, width, top_k = 4, 32, 2
+    early_cols, late_cols = deepep.down_overlap_columns(width, 0.25)
+    chunks = target_graphs(raw, phase="prefill", tokens=4, scope="model")[0]
     flat = tokens * width * 2 * top_k * (ep - 1) / ep
     nodes = ep // node_width
     remote_hit = (
@@ -216,13 +223,18 @@ def test_deepep_forward_and_inverse_transport_share_integer_row_cut(ep, node_wid
         if nodes > 1 else 0.0
     )
     two_stage = tokens * width * 2 * (remote_hit + top_k * (node_width - 1) / node_width)
-    for kind in ("dispatch", "combine"):
+    expected_splits = (
+        ("dispatch", main_rows / received, tail_rows / received, "deepep_row_cut", (main_rows, tail_rows)),
+        ("combine", late_cols / width, early_cols / width, "deepep_column_cut", (early_cols, late_cols)),
+    )
+    for kind, main_share, tail_share, cut_key, cut_value in expected_splits:
         recipe = f"expert_{kind}"
         full, tail = one(chunks, recipe), one(chunks, recipe + "_overlap")
         assert one(plain, recipe).link_bytes == pytest.approx(flat)
         assert (full.link_bytes, tail.link_bytes) == pytest.approx(
-            (two_stage * (main_rows / received), two_stage * (tail_rows / received)))
-        assert dict(one(chunks, "expert_dispatch").metadata)["deepep_row_cut"] == (main_rows, tail_rows)
+            (two_stage * main_share, two_stage * tail_share))
+        assert dict(full.metadata)[cut_key] == cut_value
+        assert dict(tail.metadata)[cut_key] == cut_value
         assert tail.stream == "deepep_comm_stream"
     ids = {op.op_id for op in chunks} | {"analysis_input"}
     assert all(set(op.deps) <= ids for op in chunks)
