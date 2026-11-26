@@ -193,28 +193,72 @@ def _apply_post_parallel(
 
 
 def _workload_geometry(parsed, *, context: int | None,
-                       query_tokens: int | None) -> dict[str, int]:
+                       query_tokens: int | None,
+                       phase: str = DEFAULT_PHASE) -> dict[str, int]:
     """Explicit workload geometry derived from the composed case.
 
     ``analyze_network_efficiency`` defaults to context zero and one sequence;
     every comparison entry therefore states the geometry it actually priced.
+    For ``phase="prefill"``, an uncached prompt runs as query tokens on top of
+    its declared cached prefix; for ``phase="decode"``, the prompt forms the
+    existing context and the default step decodes one token per sequence.
     """
     parallel = parsed.runtime.parallel
-    prompts = [int(request.prompt_tokens) for request in parsed.workload.requests]
-    resolved_context = (int(context) if context is not None
-                        else max(prompts or [0]))
-    resolved_query = (int(query_tokens) if query_tokens is not None
-                      else DEFAULT_QUERY_TOKENS)
+    requests = tuple(parsed.workload.requests)
+    prompts = [int(request.prompt_tokens) for request in requests]
     dp_replicas = max(1, int(parallel.dp))
     per_dp_requests = (
         (len(prompts) + dp_replicas - 1) // dp_replicas
         if prompts else int(parsed.runtime.max_num_seqs)
     )
+    is_prefill = str(phase or DEFAULT_PHASE).strip().lower() == "prefill"
+    if is_prefill:
+        if requests:
+            rep = max(
+                requests,
+                key=lambda req: (
+                    max(0, int(req.prompt_tokens) - int(getattr(req, "prefix_tokens", 0) or 0)),
+                    int(req.prompt_tokens),
+                ),
+            )
+            rep_prompt = int(rep.prompt_tokens)
+            max_cached_prefix = max(0, rep_prompt - DEFAULT_QUERY_TOKENS)
+            rep_prefix = min(max_cached_prefix, max(0, int(getattr(rep, "prefix_tokens", 0) or 0)))
+            default_context = rep_prefix
+            default_query = max(DEFAULT_QUERY_TOKENS, rep_prompt - rep_prefix)
+        else:
+            default_context = 0
+            default_query = DEFAULT_QUERY_TOKENS
+        resolved_context = int(context) if context is not None else default_context
+        resolved_query = int(query_tokens) if query_tokens is not None else default_query
+    else:
+        resolved_context = (int(context) if context is not None
+                            else max(prompts or [0]))
+        resolved_query = (int(query_tokens) if query_tokens is not None
+                          else DEFAULT_QUERY_TOKENS)
     return {
         "context": resolved_context,
         "query_tokens_per_sequence": resolved_query,
         "sequences_per_dp": max(1, min(int(parsed.runtime.max_num_seqs), per_dp_requests)),
     }
+
+
+def _step_geometry(parsed, geometry: Mapping[str, int], *, phase: str) -> tuple[int, int]:
+    """Scheduled per-step ``(tokens_per_seq, sequences)`` honoring chunked-prefill budgets."""
+    q_tokens = int(geometry["query_tokens_per_sequence"])
+    seqs = int(geometry["sequences_per_dp"])
+    if str(phase or DEFAULT_PHASE).strip().lower() == "prefill" and bool(
+        getattr(parsed.runtime, "enable_chunked_prefill", False)
+    ):
+        budget = max(1, int(parsed.runtime.max_num_batched_tokens))
+        max_input = int(getattr(parsed.runtime, "max_num_input_tokens", 0) or 0)
+        if max_input > 0:
+            budget = min(budget, max_input)
+        if q_tokens > budget:
+            return budget, 1
+        if seqs * q_tokens > budget:
+            return q_tokens, max(1, budget // q_tokens)
+    return q_tokens, seqs
 
 
 def _summary_metrics(effective: Mapping[str, Any]) -> dict[str, Any]:
@@ -266,11 +310,12 @@ def _evaluate_sku(payload: Mapping[str, Any]) -> dict[str, Any]:
     geometry = payload["geometry"]
     from .prediction.evaluation import EvaluationContext
     eval_ctx = EvaluationContext.create(parsed)
+    step_tokens, step_seqs = _step_geometry(parsed, geometry, phase=payload["phase"])
     effective = analyze_network_efficiency(
         parsed, phase=payload["phase"],
-        tokens=geometry["query_tokens_per_sequence"],
+        tokens=step_tokens,
         context=geometry["context"],
-        sequences=geometry["sequences_per_dp"],
+        sequences=step_seqs,
         scope=payload["scope"],
         evaluation_context=eval_ctx,
     )
@@ -446,6 +491,7 @@ def compare_skus(
         sku_geometry = _workload_geometry(
             parse_case(composed), context=context,
             query_tokens=query_tokens_per_sequence,
+            phase=phase,
         )
         resolved.append((label, composed, sku_geometry))
     geometry = resolved[0][2]
@@ -541,11 +587,12 @@ def _efficiency_only(payload: Mapping[str, Any]) -> dict[str, Any]:
     parsed = parse_case(payload["case"])
     num_dies = max(1, len(parsed.machine.dies))
     geometry = payload["geometry"]
+    step_tokens, step_seqs = _step_geometry(parsed, geometry, phase=payload["phase"])
     effective = analyze_network_efficiency(
         parsed, phase=payload["phase"],
-        tokens=geometry["query_tokens_per_sequence"],
+        tokens=step_tokens,
         context=geometry["context"],
-        sequences=geometry["sequences_per_dp"], scope=payload["scope"])
+        sequences=step_seqs, scope=payload["scope"])
     return {
         "sku": payload["sku"],
         "num_devices": num_dies,

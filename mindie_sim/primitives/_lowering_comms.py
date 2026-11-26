@@ -257,6 +257,27 @@ def _crosscore(b):
     b.meta.update(event_id=event, reverse_depth=REVERSE_DEPTH if reverse else 0)
 
 
+def _mutex_write_duration_ms(b, work, owner: int) -> float:
+    """Resolve isolated producer work duration when ``duration_ms`` is omitted."""
+    if not work:
+        return 0.0
+    role_by_row = {v: k for k, v in b.ctx.resource_names.items()} if b.ctx is not None else {}
+    duration = 0.0
+    for row, amount in work.items():
+        amt = float(amount)
+        if amt <= 0.0:
+            continue
+        if b.ctx is None:
+            raise ModelingError(f"primitive_mutex_work_rate_missing:{row}")
+        resolved_row = row if row in b.ctx.rates else b.row(row)
+        role = role_by_row.get(resolved_row, row)
+        rate = b._ctx_owner_rate(role, resolved_row, owner)
+        if rate is None or rate <= 0.0:
+            raise ModelingError(f"primitive_mutex_work_rate_missing:{row}")
+        duration = max(duration, amt / rate)
+    return duration
+
+
 def _mutex(b):
     if not b.arch35:
         b.gap("async_mutex_requires_dav_3510")
@@ -299,7 +320,13 @@ def _mutex(b):
                 producer_extra_after=tuple(events[dep].publish for dep in dependency),
                 consumer_extra_after={"consume": wait},
             )
-            durations[events[name].write] = 0 if reuse else entry.get("duration_ms", 0)
+            if reuse:
+                write_dur = 0.0
+            elif "duration_ms" in entry:
+                write_dur = float(entry["duration_ms"])
+            else:
+                write_dur = _mutex_write_duration_ms(b, work, owner)
+            durations[events[name].write] = write_dur
     nodes = {stage.name: stage for ring in rings.values() for stage in ring.to_stages()}
     for name in TopologicalSorter({name: stage.after for name, stage in nodes.items()}).static_order():
         b.append(nodes[name], durations.get(name))
@@ -309,15 +336,7 @@ def _mutex(b):
 
 def _stars(b):
     declared = b.dp.stars_spec if b.dp is not None else None
-    first = b.value(f"{b.get('owner_kind', 'aic')}_first_issue_ns", declared.first_issue_us * US_TO_MS / NS_TO_MS if declared else 0)
-    interval = b.value("issue_interval_ns", declared.issue_interval_us * US_TO_MS / NS_TO_MS if declared else 0)
-    spec = StarsSpec(b.get("queue_scope", declared.queue_scope if declared else "die"),
-                     b.integer("queue_depth", declared.queue_depth if declared else 1, 1),
-                     b.integer("lanes", declared.lanes if declared else 1, 1),
-                     interval * NS_TO_MS / US_TO_MS, first * NS_TO_MS / US_TO_MS,
-                     b.get("release_policy", declared.release_policy if declared else "descriptor_ready"),
-                     b.cell.evidence_id or (declared.evidence_id if declared else "undeclared"))
-    b.extra["stars_spec"] = spec
+    owner_kind = str(b.get("owner_kind", "aic") or "aic").strip().lower()
     die, ns = b.integer("die"), str(b.get("namespace", ""))
     default_host_ms = b.value("host_submit_ns", 0) * NS_TO_MS
     raw_descs = b.get("descriptors", 1)
@@ -328,6 +347,36 @@ def _stars(b):
                float(d.get("host_submit_ns", default_host_ms / NS_TO_MS)) * NS_TO_MS,
                dict(d.get("work", {}))) for d in raw_descs)
     )
+    has_kernel_work = any(bool(work) for _, _, _, work in descs)
+    params = b.cell.parameters or {}
+    measured_owner = str(params.get("issue_interval_owner") or "all").strip().lower()
+    interval_band = b.cell.metrics.get("issue_interval_ns")
+    interval_measured = interval_band is not None and interval_band.p50 is not None
+    declared_interval_ns = declared.issue_interval_us * US_TO_MS / NS_TO_MS if declared else 0.0
+    declared_first_ns = declared.first_issue_us * US_TO_MS / NS_TO_MS if declared else 0.0
+    interval_allowed = (
+        not (has_kernel_work and params.get("issue_interval_includes_min_kernel", False))
+        and (measured_owner in {"all", owner_kind} or (not has_kernel_work and not interval_measured))
+    )
+    interval = (
+        b.value("issue_interval_ns", declared_interval_ns)
+        if interval_allowed
+        else declared_interval_ns
+    )
+    first_metric = f"{owner_kind}_first_issue_ns"
+    first_allowed = not (has_kernel_work and params.get("first_issue_includes_min_kernel", False))
+    if first_allowed and first_metric in b.cell.metrics:
+        first_total = b.value(first_metric)
+        first_extra = max(0.0, first_total - interval)
+    else:
+        first_extra = declared_first_ns
+    spec = StarsSpec(b.get("queue_scope", declared.queue_scope if declared else "die"),
+                     b.integer("queue_depth", declared.queue_depth if declared else 1, 1),
+                     b.integer("lanes", declared.lanes if declared else 1, 1),
+                     interval * NS_TO_MS / US_TO_MS, first_extra * NS_TO_MS / US_TO_MS,
+                     b.get("release_policy", declared.release_policy if declared else "descriptor_ready"),
+                     b.cell.evidence_id or (declared.evidence_id if declared else "undeclared"))
+    b.extra["stars_spec"] = spec
     b.stars_plan = (die, ns, descs)
     for _, _, _, work in descs:
         for row in work:

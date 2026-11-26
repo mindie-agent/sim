@@ -657,3 +657,67 @@ def test_subgraph_boundary_respects_producer_and_consumer_caps():
     assert max_reads == pytest.approx(2_328_064.0)
     assert shared_ext_reuse == pytest.approx(918_016.0)
     _assert_boundary_roundtrip(prolog["math_summary"], writes + max_reads + shared_ext_reuse)
+
+
+def test_semantic_subgraph_ledger_preserves_persistent_cache_writes():
+    from mindie_sim.subgraph_math import semantic_subgraph_ledger
+
+    report = {
+        "nodes": [
+            {
+                "node_id": "rank:0/s0.l0.kv_write",
+                "deps": [],
+                "operator": {"family": "cache_store", "dtype": "bf16", "metadata": {}},
+                "physical_work": {
+                    "flops": 0.0, "vector_ops": 0.0, "hbm_bytes": 4096.0,
+                    "mte2_bytes": 0.0, "mte3_bytes": 4096.0, "matrix_flops": {},
+                },
+            },
+            {
+                "node_id": "rank:0/s0.l0.attn",
+                "deps": ["rank:0/s0.l0.kv_write"],
+                "operator": {"family": "attention", "dtype": "bf16", "metadata": {}},
+                "physical_work": {
+                    "flops": 0.0, "vector_ops": 0.0, "hbm_bytes": 8192.0,
+                    "mte2_bytes": 4096.0, "mte3_bytes": 4096.0, "matrix_flops": {},
+                },
+            },
+        ],
+    }
+    ledger = semantic_subgraph_ledger(
+        report, ("rank:0/s0.l0.kv_write", "rank:0/s0.l0.attn"), external_outputs=("rank:0/s0.l0.attn",),
+    )
+    breakdown = ledger["boundary_breakdown_bytes"]
+    assert breakdown["unfused_member_hbm_bytes"] == pytest.approx(12288.0)
+    assert breakdown["eliminated_internal_roundtrip_bytes"] == pytest.approx(4096.0)
+    assert ledger["boundary_hbm"] == pytest.approx(8192.0)
+
+    scatter_report = {
+        "nodes": [
+            {
+                "node_id": "rank:0/s0.l0.state_scatter",
+                "deps": [],
+                "family": "vector",
+                "operator": {"family": "vector", "dtype": "bf16", "metadata": {"state_value_output": "persistent_cache"}},
+                "physical_work": {
+                    "flops": 0.0, "vector_ops": 0.0, "hbm_bytes": 4096.0,
+                    "mte2_bytes": 0.0, "mte3_bytes": 4096.0, "matrix_flops": {},
+                },
+            },
+            {
+                "node_id": "rank:0/s0.l0.out",
+                "deps": ["rank:0/s0.l0.state_scatter"],
+                "family": "vector",
+                "operator": {"family": "vector", "dtype": "bf16", "metadata": {}},
+                "physical_work": {
+                    "flops": 0.0, "vector_ops": 0.0, "hbm_bytes": 4096.0,
+                    "mte2_bytes": 4096.0, "mte3_bytes": 0.0, "matrix_flops": {},
+                },
+            },
+        ],
+    }
+    scatter_ledger = semantic_subgraph_ledger(
+        scatter_report, ("rank:0/s0.l0.state_scatter", "rank:0/s0.l0.out"),
+        external_outputs=("rank:0/s0.l0.out",),
+    )
+    assert scatter_ledger["boundary_hbm"] == pytest.approx(4096.0)

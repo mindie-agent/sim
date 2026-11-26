@@ -262,16 +262,26 @@ def _scale_rates(rates: dict[str, Any], s_c: float, s_v: float) -> dict[str, Any
 
 def _base_die_hbm_peak(
     device: Mapping[str, Any], base_assumptions: Mapping[str, str],
+    *, device_index: int | None = None,
 ) -> float:
     current_hbm = float((device.get("rates") or {}).get("hbm", 1.0))
-    raw_peak = base_assumptions.get("derivation.hbm_peak_bytes_per_s")
-    raw_rate = base_assumptions.get("derivation.hbm_rate_bytes_per_s")
-    if raw_peak is not None and raw_rate is not None:
+    candidates: list[tuple[str, str]] = []
+    if device_index is not None:
+        candidates.append((
+            f"derivation.die.{device_index}.hbm_peak_bytes_per_s",
+            f"derivation.die.{device_index}.hbm_rate_bytes_per_s",
+        ))
+    candidates.append(("derivation.hbm_peak_bytes_per_s", "derivation.hbm_rate_bytes_per_s"))
+    for peak_key, rate_key in candidates:
+        raw_peak = base_assumptions.get(peak_key)
+        raw_rate = base_assumptions.get(rate_key)
+        if raw_peak is None or raw_rate is None:
+            continue
         try:
             peak_val = float(raw_peak)
             rate_val = float(raw_rate)
         except ValueError:
-            return current_hbm
+            continue
         if (math.isfinite(peak_val) and peak_val > 0.0
                 and math.isclose(current_hbm, rate_val)):
             return peak_val
@@ -327,6 +337,7 @@ def _derive_single_device(
     device: dict[str, Any],
     base_die: Any,
     *,
+    device_index: int,
     arch_family: str,
     sku: str,
     core_override: bool,
@@ -383,11 +394,15 @@ def _derive_single_device(
         device["memory_bytes"] = _positive_count(memory_bytes, "hardware_derivation_memory_invalid")
     if raw_peak is not None:
         rates["hbm"] = raw_peak * hbm_eta
+        assumptions[f"derivation.die.{device_index}.hbm_peak_bytes_per_s"] = repr(raw_peak)
+        assumptions[f"derivation.die.{device_index}.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
         if record_hbm_assumptions:
             assumptions["derivation.hbm_peak_bytes_per_s"] = repr(raw_peak)
             assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
     elif hbm_efficiency is not None and "hbm" in rates:
-        rates["hbm"] = float(rates["hbm"]) * hbm_eta
+        rates["hbm"] = float(die_hbm_peak) * hbm_eta
+        assumptions[f"derivation.die.{device_index}.hbm_peak_bytes_per_s"] = repr(die_hbm_peak)
+        assumptions[f"derivation.die.{device_index}.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
         if record_hbm_assumptions:
             assumptions["derivation.hbm_peak_bytes_per_s"] = repr(die_hbm_peak)
             assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
@@ -510,7 +525,7 @@ def derive_hardware_sku(
     for device_index, device in enumerate(devices):
         die_hbm_peak = (
             raw_peak if raw_peak is not None
-            else _base_die_hbm_peak(device, base_assumptions)
+            else _base_die_hbm_peak(device, base_assumptions, device_index=device_index)
         )
         die_aic = new_aic if core_override else int(device.get("compute_units", 1) or 1)
         hbm_eta, hbm_provenance = _resolve_efficiency(
@@ -523,12 +538,21 @@ def derive_hardware_sku(
             assumptions.update(hbm_provenance)
             if hbm_efficiency is not None:
                 assumptions["derivation.hbm_efficiency"] = repr(hbm_eta)
+            elif raw_peak is not None:
+                assumptions["derivation.hbm_efficiency"] = repr(hbm_eta)
+                for stale_key in (
+                    "derivation.efficiency_axis", "derivation.efficiency_x",
+                    "derivation.efficiency_y", "derivation.efficiency_knots",
+                    "derivation.efficiency_provenance",
+                ):
+                    assumptions.pop(stale_key, None)
             assumptions.update({
                 key.replace("efficiency", "mte2_efficiency", 1): value
                 for key, value in mte2_provenance.items()
             })
         _derive_single_device(
             device, base_hardware.dies[device_index],
+            device_index=device_index,
             arch_family=base_hardware.arch_family, sku=sku,
             core_override=core_override, new_aic=new_aic, new_aiv=new_aiv,
             s_c=s_c, s_v=s_v, memory_bytes=memory_bytes,

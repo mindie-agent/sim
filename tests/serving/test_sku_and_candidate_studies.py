@@ -609,3 +609,37 @@ def test_regime_physical_rate_guards_duplicate_ids_and_member_mismatches():
     raw_req.setdefault("runtime", {}).setdefault("kernels", {})["service_regimes"] = [mk("req", 1, 200, coordinates={"q": {"path": "metadata.absent"}})]
     with pytest.raises(ModelingError, match="service_regime_requires_declared_coordinate:req"):
         graph_costs(raw_req, (copy_op(1024),), isolated=False)
+
+
+def test_sku_comparison_prefill_geometry_derives_query_and_prefix_tokens():
+    from mindie_sim.sku_comparison import _step_geometry, _workload_geometry
+
+    raw = compose_case("qwen3-30b-a3b", hardware=DT_SKU, tp=1, dp=1, ep=1, layers=1,
+                       prompt_tokens=1024, output_tokens=16, concurrency=4)
+    for req in raw["workload"]["requests"]:
+        req["prefix_tokens"] = 256
+    parsed = parse_case(raw)
+    prefill = _workload_geometry(parsed, context=None, query_tokens=None, phase="prefill")
+    decode = _workload_geometry(parsed, context=None, query_tokens=None, phase="decode")
+    explicit = _workload_geometry(parsed, context=128, query_tokens=512, phase="prefill")
+    assert (prefill["context"], prefill["query_tokens_per_sequence"]) == (256, 768)
+    assert (decode["context"], decode["query_tokens_per_sequence"]) == (1024, 1)
+    assert (explicit["context"], explicit["query_tokens_per_sequence"]) == (128, 512)
+
+    full_cached = deepcopy(raw)
+    for req in full_cached["workload"]["requests"]:
+        req["prompt_tokens"] = 16
+        req["prefix_tokens"] = 16
+    cached_geom = _workload_geometry(parse_case(full_cached), context=None, query_tokens=None, phase="prefill")
+    assert (cached_geom["context"], cached_geom["query_tokens_per_sequence"]) == (15, 1)
+
+    chunked = deepcopy(raw)
+    chunked["runtime"]["enable_chunked_prefill"] = True
+    chunked["runtime"]["max_num_batched_tokens"] = 512
+    for req in chunked["workload"]["requests"]:
+        req["prompt_tokens"] = 2048
+        req["prefix_tokens"] = 0
+    chunked_parsed = parse_case(chunked)
+    chunked_geom = _workload_geometry(chunked_parsed, context=None, query_tokens=None, phase="prefill")
+    assert chunked_geom["query_tokens_per_sequence"] == 2048
+    assert _step_geometry(chunked_parsed, chunked_geom, phase="prefill") == (512, 1)

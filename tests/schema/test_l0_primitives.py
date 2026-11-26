@@ -516,7 +516,7 @@ def test_stars_descriptor_queue_enforces_first_issue_and_credit_depth(register_d
     result = _lower("P15_rts_stars", dict(queue_depth=1, lanes=1, descriptors=2), table, datapath=dp)
     spec = result.stars_spec
     assert isinstance(spec, StarsSpec) and (spec.queue_depth, spec.lanes) == (1, 1)
-    assert spec.first_issue_us == pytest.approx(0.5) and spec.issue_interval_us == pytest.approx(0.2) and _run(result).now == pytest.approx(900e-6)
+    assert spec.first_issue_us == pytest.approx(0.3) and spec.issue_interval_us == pytest.approx(0.2) and _run(result).now == pytest.approx(700e-6)
 
 def test_stream_budgets_bind_disjoint_owners_and_derive_nested_span(register_device):
     table, dp = register_device
@@ -607,3 +607,92 @@ def test_bench_idle_npu_parser_rejects_prefix_match_and_die_mismatch(register_de
     with pytest.raises(ValueError, match="bench_sample_sku_mismatch"):
         build_primitive_table_payload(sku=CALIBRATED_REGISTER_SKU, cann_version="9", endpoint_alias="lab", campaign_id="c", raw_measurements={"device_name": REPRESENTATIVE_SKUS["a5"]})
     assert register_device[0].cell("P20_host_dma_sync").band("host_h2d_bytes_per_s").certified_upper_capacity == pytest.approx(64.0e9) and not load_primitives(UNMEASURED_REGISTER_SKU, datapath=_datapath(UNMEASURED_REGISTER_SKU)).provenance.calibrated
+
+
+def test_table_only_datacopy_uses_table_scatter_geometry(register_device):
+    table, dp = register_device
+    params = {"runs": (AddressRun(0, 2, 64, 8192),)}
+    with_dp = _lower("P01_datacopy", params, table, datapath=dp)
+    table_only = _lower("P01_datacopy", params, table)
+    assert table_only.bound_access is not None and with_dp.bound_access is not None
+    assert table_only.bound_access.ledger.dram_bus_transaction_bytes == with_dp.bound_access.ledger.dram_bus_transaction_bytes
+    assert table_only.analytical_ms == pytest.approx(with_dp.analytical_ms)
+
+
+def test_stars_repeated_submissions_and_single_descriptor_latency_match_hardware_contract(register_device):
+    table, dp = register_device
+    single = _lower("P15_rts_stars", {"owner_kind": "aiv", "descriptors": 1}, table, datapath=dp)
+    expected_single_ms = (
+        table.sim_rate_p50("P15_rts_stars", "host_submit_ns", allow_uncalibrated_declaration=True)
+        + table.sim_rate_p50("P15_rts_stars", "aiv_first_issue_ns", allow_uncalibrated_declaration=True)
+    ) * 1e-6
+    assert single.analytical_ms == pytest.approx(expected_single_ms)
+    assert _run(single).now == pytest.approx(expected_single_ms)
+    zero_host_one = _lower("P15_rts_stars", {"owner_kind": "aiv", "descriptors": [{"host_submit_ns": 0.0}]}, table, datapath=dp)
+    zero_host_two = _lower(
+        "P15_rts_stars",
+        {"owner_kind": "aiv", "descriptors": [{"host_submit_ns": 0.0}, {"host_submit_ns": 0.0}]},
+        table,
+        datapath=dp,
+    )
+    engine = _engine(zero_host_one)
+    ev0 = submit_lowered_primitive(engine, zero_host_one, name_prefix="batch0")
+    ev1 = submit_lowered_primitive(engine, zero_host_one, name_prefix="batch1")
+    engine.advance(until=(ev0, ev1), first=False)
+    assert engine.now == pytest.approx(zero_host_two.analytical_ms)
+
+    # Spec change between submissions keeps live replay state without double-charging replay 0.
+    t_a = _with_latencies(table, "P15_rts_stars", host_submit_ns=0, aic_first_issue_ns=5000, issue_interval_ns=1000)
+    t_b = _with_latencies(table, "P15_rts_stars", host_submit_ns=0, aic_first_issue_ns=3000, issue_interval_ns=1000)
+    r0 = _lower("P15_rts_stars", {"queue_depth": 4, "descriptors": [{"replay": 0, "host_submit_ns": 0}]}, t_a, datapath=dp)
+    r1 = _lower("P15_rts_stars", {"queue_depth": 4, "descriptors": [{"replay": 1, "host_submit_ns": 0}]}, t_b, datapath=dp)
+    r2 = _lower("P15_rts_stars", {"queue_depth": 4, "descriptors": [{"replay": 0, "host_submit_ns": 0}]}, t_a, datapath=dp)
+    e_mix = _engine(r0, r1, r2)
+    evs = [submit_lowered_primitive(e_mix, r, name_prefix=f"mix{i}") for i, r in enumerate((r0, r1, r2))]
+    e_mix.advance(until=tuple(evs), first=False)
+    assert e_mix.now == pytest.approx(9e-3)
+
+    # Kernel-bearing AIC descriptor ignores min-kernel-inclusive AIV cadence on calibrated tables.
+    cube_ctx = RecipeContext(None, {}, {"cube": "cube"}, {"cube": 1.0}, dp.aic_count)
+    aic_work = _lower(
+        "P15_rts_stars",
+        {"owner_kind": "aic", "descriptors": [{"host_submit_ns": 0, "work": {"cube": 1.0}}]},
+        table,
+        datapath=dp,
+        context=cube_ctx,
+    )
+    assert aic_work.stars_spec.issue_interval_us == pytest.approx(0.0)
+    assert aic_work.stars_spec.first_issue_us == pytest.approx(0.0)
+
+
+def test_mutex_work_without_explicit_duration_matches_engine_span(register_device):
+    table, dp = register_device
+    rates, units = {"mte2_aic": dp.aic_count * 100.0}, {"mte2_aic": dp.aic_count}
+    ctx = RecipeContext(None, {}, {"mte2_aic": "mte2_aic"}, rates, dp.aic_count, resource_units=units)
+    steps = [{"l1a": {"addr": 0, "coord": 0, "work": {"mte2_aic": 500.0}}}]
+    with pytest.raises(ModelingError, match="primitive_mutex_work_rate_missing"):
+        _lower("P14_mutex_block_mmad", {"steps": steps, "l1a_slot_bytes": 64}, table, datapath=dp)
+    result = _lower("P14_mutex_block_mmad", {"steps": steps, "l1a_slot_bytes": 64}, table, datapath=dp, context=ctx)
+    tau_ms = table.sim_rate_p50("P14_mutex_block_mmad", "mutex_overhead_ns", allow_uncalibrated_declaration=True) * 1e-6
+    assert result.analytical_ms == pytest.approx(5.0 + 3.0 * tau_ms)
+    assert _run(result, rates=rates, units=units, pools={"l1": 64}).now == pytest.approx(result.analytical_ms)
+
+
+def test_stream_nested_program_with_allocations_computes_isolated_span(register_device):
+    from mindie_sim.prediction.program.stages import Allocation, ParallelProgram
+
+    table, dp = register_device
+    prog = ParallelProgram((
+        KernelProgram((
+            Stage("alloc_work", {"r": 4.0}, caps={"r": 1.0}, acquire=(Allocation("buf", "ub", 64.0, (1,)),)),
+            Stage("free_work", {"r": 2.0}, after=("alloc_work",), caps={"r": 1.0}, free=(Allocation("buf", "ub", 64.0, (1,)),)),
+        )),
+        KernelProgram((Stage("peer_work", {"r2": 3.0}, caps={"r2": 1.0}),)),
+    ))
+    result = _lower("P16_multistream_core_control", {"program": prog}, table, datapath=dp)
+    ev_ms = table.sim_rate_p50("P16_multistream_core_control", "stream_event_ns", allow_uncalibrated_declaration=True) * 1e-6
+    assert result.analytical_ms == pytest.approx(6.0 + ev_ms)
+    eng = Engine([Resource("r", 1.0), Resource("r2", 1.0)], backend="python", pools={"ub": 64.0}, pool_units={"ub": 2})
+    done = submit_lowered_primitive(eng, result)
+    eng.advance(until=(done,))
+    assert done.time == pytest.approx(result.analytical_ms)

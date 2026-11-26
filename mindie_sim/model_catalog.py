@@ -47,8 +47,9 @@ from mindie_sim.catalog.fleet import (
     FLEET_CATALOG_ENTRIES, FLEET_MODEL_ALIASES,
 )
 from mindie_sim.catalog.weights import (
-    body_parameter_count, body_weight_bytes, sharded_weight_bytes as _sharded,
-    stage_weight_bytes, stage_weight_terms, weight_breakdown,
+    _default_slot_plans, body_parameter_count, body_weight_bytes,
+    sharded_weight_bytes as _sharded, stage_weight_bytes, stage_weight_terms,
+    weight_breakdown,
 )
 
 CONFIG_DIR = Path(__file__).with_name("model_configs")
@@ -64,6 +65,7 @@ _RECURRENT_KINDS = {"gdn", "kda", "mamba"}
 _TOKEN_KV_KINDS = {"gqa", "mla", "gqa_sparse_indexer"}
 _DIT_ACTIVE_CACHE_METHODS = {"teacache", "fbcache", "taylorseer"}
 _DIT_ACTIVE_SPARSE_METHODS = {"topk", "svg"}
+_HIGH_PRECISION_NATIVE = frozenset({"fp32", "bf16", "fp16", "hf32"})
 
 
 def _catalog_key(key: str) -> str:
@@ -347,11 +349,24 @@ def _refresh_catalog_facts(
     return spec
 
 
+_NATIVE_DTYPE_ALIASES = {"float32": "fp32", "bfloat16": "bf16", "float16": "fp16"}
+
+
+def _canonical_native_dtype(raw: Any) -> str:
+    key = str(raw or "").strip().lower()
+    return _NATIVE_DTYPE_ALIASES.get(key, key)
+
+
 def normalize_model(model: ModelSpec) -> ModelSpec:
+    native_fmt = next(
+        (canon for fmt in (model.activation_dtype, model.compute_dtype, model.weight_dtype)
+         if (canon := _canonical_native_dtype(fmt)) in _HIGH_PRECISION_NATIVE),
+        "bf16",
+    )
     quant = model.quant or QuantSpec(
         name=model.quantization, weight_format=model.weight_dtype,
         expert_weight_format=model.weight_dtype, activation_format=model.activation_dtype,
-        kv_dtype=model.kv_dtype,
+        kv_dtype=model.kv_dtype, native_format=native_fmt,
     )
     if model.layer_plans:
         if len(model.layer_plans) != model.layers:
@@ -364,6 +379,7 @@ def normalize_model(model: ModelSpec) -> ModelSpec:
         "num_experts": model.num_experts, "top_k": model.top_k,
         "moe_intermediate_size": model.moe_intermediate_size,
         "num_shared_experts": model.num_shared_experts,
+        "zero_expert_num": int(model.zero_expert_num),
     }
     if model.mla:
         dimensions.update({
@@ -395,17 +411,24 @@ def derive_expert_pruned(
     base = base_key if isinstance(base_key, ModelSpec) else load_model(base_key)
     base = normalize_model(base)
     e, k = int(num_experts), int(top_k)
-    m_inter = int(moe_intermediate_size) if moe_intermediate_size is not None else int(base.moe_intermediate_size)
+    override_inter = int(moe_intermediate_size) if moe_intermediate_size is not None else None
+    if override_inter is not None and override_inter <= 0:
+        raise ModelingError(f"derive_expert_pruned_invalid:E={e}:K={k}:inter={override_inter}")
+    m_inter = (
+        override_inter if override_inter is not None
+        else (int(base.moe_intermediate_size)
+              or max((int(p.moe_intermediate_size) for p in base.layer_plans if p.ffn == "moe"), default=0))
+    )
     if e <= 0 or k <= 0 or k > e or m_inter <= 0:
         raise ModelingError(f"derive_expert_pruned_invalid:E={e}:K={k}:inter={m_inter}")
 
-    plans = tuple(_prune_moe_plan(plan, e, k, moe_intermediate_size=m_inter) for plan in base.layer_plans)
+    plans = tuple(_prune_moe_plan(plan, e, k, moe_intermediate_size=override_inter) for plan in base.layer_plans)
     aux = base.auxiliary
     if aux is not None:
         aux = replace(
             aux,
-            mtp=_prune_draft_spec(aux.mtp, e=e, k=k, moe_intermediate_size=m_inter),
-            dspark=_prune_draft_spec(aux.dspark, e=e, k=k, moe_intermediate_size=m_inter),
+            mtp=_prune_draft_spec(aux.mtp, e=e, k=k, moe_intermediate_size=override_inter),
+            dspark=_prune_draft_spec(aux.dspark, e=e, k=k, moe_intermediate_size=override_inter),
         )
     keep = len(base.expert_routing) == e
     spec = replace(
@@ -582,16 +605,43 @@ def sharded_weight_bytes(
 
 
 def model_weight_detail(model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1) -> dict[str, Any]:
-    stages = stage_weight_bytes(model, parallel, node_ranks)
-    stages_draft = stage_weight_bytes(model, parallel, node_ranks, include_draft=True)
+    from mindie_sim.catalog.weights import _has_expert_quant_overrides
+
+    normalized = normalize_model(model)
+    slot_plans = _default_slot_plans(normalized, parallel)
+    ep = max(1, int(getattr(parallel, "ep", 1) or 1))
+    if slot_plans and ep > 1 and _has_expert_quant_overrides(normalized):
+        per_rank = [
+            stage_weight_bytes(normalized, parallel, node_ranks, slot_plans=slot_plans, ep_rank=rank)
+            for rank in range(ep)
+        ]
+        per_rank_draft = [
+            stage_weight_bytes(
+                normalized, parallel, node_ranks, include_draft=True, slot_plans=slot_plans, ep_rank=rank,
+            )
+            for rank in range(ep)
+        ]
+        n_stages = len(per_rank[0]) if per_rank else 0
+        stages = [max(row[idx] for row in per_rank) for idx in range(n_stages)]
+        stages_draft = [max(row[idx] for row in per_rank_draft) for idx in range(n_stages)]
+        peak_rank = max(range(ep), key=lambda r: max(per_rank[r], default=0.0))
+        category_bytes = weight_breakdown(
+            normalized, parallel, node_ranks, slot_plans=slot_plans, ep_rank=peak_rank,
+        )
+    else:
+        stages = stage_weight_bytes(normalized, parallel, node_ranks, slot_plans=slot_plans)
+        stages_draft = stage_weight_bytes(
+            normalized, parallel, node_ranks, include_draft=True, slot_plans=slot_plans,
+        )
+        category_bytes = weight_breakdown(normalized, parallel, node_ranks, slot_plans=slot_plans)
     return {
         "stage_bytes": stages, "stage_bytes_with_optional_draft": stages_draft,
         "largest_stage_bytes": max(stages) if stages else 0.0,
         "largest_stage_with_draft_bytes": max(stages_draft) if stages_draft else 0.0,
         "largest_stage": max(range(len(stages)), key=lambda i: stages[i]) if stages else 0,
-        "category_bytes": weight_breakdown(model, parallel, node_ranks),
-        "logical_body_parameters": body_parameter_count(model),
-        "logical_body_weight_bytes": body_weight_bytes(model), "node_ranks": node_ranks,
+        "category_bytes": category_bytes,
+        "logical_body_parameters": body_parameter_count(normalized),
+        "logical_body_weight_bytes": body_weight_bytes(normalized), "node_ranks": node_ranks,
     }
 
 
