@@ -23,7 +23,8 @@ from .common import (
     MX_DTYPES, MX_SCALE_GROUP_SIZE, PER_TOKEN_SCALE_BYTES, QUANT_OPS_PER_ELEMENT, ROUTED_MODES,
     SHIPPING_MEGAMOE_ACTIVATIONS, SHIPPING_SWIGLU_QUANT_ACTIVATIONS, SPARSE_GROUP_LIST_TYPE,
     StageDemand, activation_stages, capability_gap, contract_fields,
-    blaze_tasks, ceil_div, element_bytes, fractal_issues, fractal_k0, make_plan, matrix_schedule,
+    blaze_tasks, ceil_div, element_bytes, fractal_issues, fractal_k0,
+    gemm_declared_scale_spec, make_plan, matrix_schedule,
     matrix_stages, tensor_bytes, validate_contract, vector_stages,
 )
 
@@ -111,7 +112,7 @@ GMM1_WAVE_N_TILES_PER_CORE = 4
 MEGA_MOE_META_INFO_ELEMENTS = 8
 MEGA_MOE_META_INFO_BYTES = MEGA_MOE_META_INFO_ELEMENTS * INT32_HANDOFF_BYTES_PER_ELEM
 FP4_DTYPES = frozenset({"fp4", "fp4_e2m1", "mxfp4"})
-FP8_E4M3_COMPAT_DTYPES = frozenset({"fp8", "fp8_e4m3", "mxfp8", "hif8"})
+FP8_E4M3_COMPAT_DTYPES = frozenset({"fp8", "fp8_e4m3", "mxfp8", "hifloat8"})
 A8W4_NZ_LAYOUTS = frozenset({"FRACTAL_NZ_C0_32", "FRACTAL_NZ", "NZ"})
 ARCH35_MIN_EP_WORLD_SIZE = 2
 ARCH35_MAX_EP_WORLD_SIZE = 1024
@@ -122,7 +123,7 @@ V2_PERTOKEN_DTYPE_TUPLES = frozenset({
     ("fp8_e4m3", "fp8_e4m3", "int8"),
     ("fp8_e5m2", "fp8_e5m2", "fp8_e5m2"),
     ("fp8_e5m2", "fp8_e5m2", "int8"),
-    ("hif8", "hif8", "hif8"),
+    ("hifloat8", "hifloat8", "hifloat8"),
 })
 _GATED_ACTIVATION_DIVISOR = 2
 SHARED_DTYPE_ALIASES = {
@@ -826,7 +827,11 @@ class _Arch35Strategy:
         if mode in GEMM_MODES:
             schedule = matrix_schedule(contract, ctx, contract.group_rows, contract.n, contract.k,
                                        n_tail_alignment=_nz_tail_alignment(contract))
-            stages = matrix_stages("gmm", (), contract, schedule, contract.k, contract.output_dtype)
+            stages = matrix_stages(
+                "gmm", (), contract, schedule, contract.k, contract.output_dtype,
+                scale_spec=gemm_declared_scale_spec(op, contract),
+                aiv_cores=ctx.effective_aiv_cores,
+            )
             metadata.update(useful_flops=schedule.useful_flops, issued_fractals=schedule.issued_fractals,
                             max_waves=schedule.max_waves, wave_tail_imbalance=schedule.wave_tail_imbalance)
             implementation = "aclnnGroupedMatmul"
@@ -838,6 +843,11 @@ class _Arch35Strategy:
                 else activation_stages(
                     "dequant_swiglu_quant", (), ctx, contract, contract.group_rows,
                     has_activation_scale=fields.get("has_activation_scale", True),
+                    has_quant_scale=bool(fields.get("has_quant_scale", False)),
+                    quant_scale_dtype=str(fields.get("quant_scale_dtype", "fp32")),
+                    has_quant_offset=bool(fields.get("has_quant_offset", False)),
+                    quant_offset_dtype=str(fields.get("quant_offset_dtype", "fp32")),
+                    quant_mode=int(fields.get("quant_mode", 0) or 0),
                 )
             )
             implementation = "aclnnDequantSwigluQuant"

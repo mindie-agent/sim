@@ -70,6 +70,7 @@ MODE_ALIASES = {"grouped_moe": "grouped_gemm", "megamoe_arch35": "mega_moe"}
 DTYPE_ALIASES = {
     "float32": "fp32", "float16": "fp16", "bfloat16": "bf16",
     "fp8_e4m3fn": "fp8_e4m3",
+    "hif8": "hifloat8", "hifp8": "hifloat8",
     "mx_fp8": "mxfp8", "mxfp8_e4m3": "mxfp8", "mx_fp4": "mxfp4",
     "mxfp4_e2m1": "mxfp4", "w8a8": "int8",
 }
@@ -147,7 +148,7 @@ def fractal_k0(compute_dtype: str) -> int:
         return FP32_FRACTAL_K
     if dtype in {"bf16", "fp16"}:
         return HALF_PRECISION_FRACTAL_K
-    if dtype in {"int8", "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "hif8", "w4a8"}:
+    if dtype in {"int8", "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "hifloat8", "w4a8"}:
         return BYTE_PRECISION_FRACTAL_K
     if dtype in {"mxfp4", "fp4", "fp4_e2m1", "int4"}:
         return PACKED_PRECISION_FRACTAL_K
@@ -406,13 +407,66 @@ class GroupedMoeContract:
         return self.dtype_b
 
 
+def _decode_sparse_group_list(raw, declared_experts: int | None = None) -> tuple[int, ...] | None:
+    """Decode CANN ``group_list_type == 2`` ``[(group_idx, count), ...]`` pairs into a dense histogram."""
+    if isinstance(raw, (str, bytes, Mapping)):
+        return None
+    try:
+        items = tuple(raw)
+    except TypeError:
+        return None
+    if not items:
+        return None
+    pairs: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    for item in items:
+        if isinstance(item, (str, bytes, Mapping)):
+            return None
+        try:
+            pair = tuple(item)
+        except TypeError:
+            return None
+        if len(pair) != 2:
+            return None
+        group_idx = _integer(pair[0], "sparse_group_index")
+        count = _integer(pair[1], "group_rows")
+        if group_idx in seen:
+            raise ModelingError(f"grouped_moe_duplicate_sparse_group_id:{group_idx}")
+        seen.add(group_idx)
+        pairs.append((group_idx, count))
+    max_idx = max(group_idx for group_idx, _ in pairs)
+    if declared_experts is not None and max_idx >= declared_experts:
+        raise ModelingError(
+            f"grouped_moe_sparse_group_index_out_of_range:{max_idx}:{declared_experts}"
+        )
+    num_groups = max(max_idx + 1, declared_experts or 0)
+    dense = [0] * num_groups
+    for group_idx, count in pairs:
+        dense[group_idx] = count
+    return tuple(dense)
+
+
 def _contract_rows(fields, mode, m, expected_total):
     rows = fields.get("matrix_group_rows", fields.get("group_rows", fields.get("expert_rows")))
     list_rows = None
     if "group_list" in fields:
         kind = fields.get("group_list_type", 0)
         if kind == SPARSE_GROUP_LIST_TYPE:
-            if rows is None:
+            raw_experts = fields.get("num_experts", fields.get("matrix_weight_bank_groups"))
+            declared_experts = (
+                _integer(raw_experts, "num_experts", 1)
+                if raw_experts is not None else None
+            )
+            sparse_rows = _decode_sparse_group_list(fields["group_list"], declared_experts)
+            if sparse_rows is not None:
+                list_rows = tuple(
+                    count for _, count in normalize_group_rows(
+                        sparse_rows, expected_total=expected_total,
+                    )
+                )
+                if rows is None:
+                    rows = list_rows
+            elif rows is None:
                 raise ModelingError("grouped_moe_sparse_group_list_requires_dense_histogram")
         elif kind not in {0, 1}:
             raise ModelingError(f"grouped_moe_unsupported_group_list_type:{kind}")
@@ -518,14 +572,13 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
     if mode not in GEMM_MODES and n % divisor:
         raise ModelingError("grouped_moe_gated_width_alignment")
     m = _integer(m, "m")
-    cumulative_group_list = (
+    has_group_list = (
         "group_list" in fields
-        and fields.get("group_list_type", 0) == 0
-        and fields.get("cumulative", True) is True
+        and fields.get("group_list_type", 0) in {0, 1, SPARSE_GROUP_LIST_TYPE}
     )
     valid = fields.get(
         "valid_rows",
-        fields.get("routed_rows", None if (routed or cumulative_group_list) else m),
+        fields.get("routed_rows", None if (routed or has_group_list) else m),
     )
     rows = _contract_rows(fields, mode, m, valid)
     allocated = _integer(fields.get("allocated_rows", sum(rows) if routed else m), "allocated_rows")
@@ -534,23 +587,29 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
     if _integer(fields.get("scale_group_size", MX_SCALE_GROUP_SIZE), "scale_group_size", 1) != MX_SCALE_GROUP_SIZE:
         raise ModelingError("grouped_moe_unsupported_scale_group")
 
-    operand_default = fields.get("compute_dtype", fields.get("compute_format", op.dtype or "bf16"))
+    pabi = getattr(op, "precision_abi", None)
+    pabi_weight = str(getattr(pabi, "weight_dtype", "") or "").strip() if pabi is not None else ""
+    pabi_output = str(getattr(pabi, "output_dtype", "") or "").strip() if pabi is not None else ""
+    operand_default = fields.get("compute_dtype") or fields.get("compute_format") or op.dtype or "bf16"
     dtype_a, explicit_input = _resolve_input_dtype(op, fields, mode, str(operand_default))
-    dtype_b = _dtype(fields.get("dtype_b", fields.get("weight_dtype", "int4" if dtype_a == "w4a8" else dtype_a)))
+    default_b = pabi_weight or ("int4" if dtype_a == "w4a8" else dtype_a)
+    dtype_b = _dtype(str(fields.get("dtype_b") or fields.get("weight_dtype") or default_b))
     if dtype_a == "w4a8":
         dtype_a = "int8"
     a8w4_packed = (routed or mode == "gmm_swiglu_quant") and dtype_a == "int8" and dtype_b in {"int4", "int32"}
     compute_default = "w4a8" if a8w4_packed else dtype_a
-    compute_dtype = _dtype(fields.get("compute_dtype", fields.get("compute_format", compute_default)))
+    compute_dtype = _dtype(str(fields.get("compute_dtype") or fields.get("compute_format") or compute_default))
     if mode != "dequant_swiglu_quant":
         fractal_k0(compute_dtype)
-    output_dtype = _dtype(fields.get("output_dtype", fields.get("output_format", op.dtype or "bf16")))
+    output_dtype = _dtype(
+        str(fields.get("output_dtype") or fields.get("output_format") or pabi_output or op.dtype or "bf16")
+    )
     act_mx_scaled, weight_mx_scaled, act_mx_padded, weight_mx_padded = _resolve_mx_scale_flags(
         op, fields, dtype_a, dtype_b,
     )
     quant_default = dtype_a if dtype_a in MX_DTYPES or (routed and dtype_a in {"bf16", "fp16"}) else "int8"
     if mode == "gmm_swiglu_quant" and (dtype_a in MX_DTYPES or act_mx_scaled):
-        quant_default = fields.get("output_dtype", fields.get("output_format", quant_default))
+        quant_default = fields.get("output_dtype") or fields.get("output_format") or pabi_output or quant_default
     quant_dtype = _dtype(fields.get("quant_dtype", fields.get("quant_output_dtype", quant_default)))
     default_handoff = "int32" if compute_dtype in {"int8", "w4a8"} else output_dtype
     if mode == "dequant_swiglu_quant" and explicit_input and "handoff_dtype" in fields:
@@ -560,7 +619,6 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
     for dtype in (dtype_a, dtype_b, output_dtype, quant_dtype, handoff_dtype):
         element_bytes(1, dtype)
     layout_a = str(fields.get("layout_a", "ND")).upper()
-    pabi = getattr(op, "precision_abi", None)
     pabi_layout = str(getattr(pabi, "weight_layout", "") or "").upper() if pabi is not None else ""
     default_layout_b = pabi_layout if pabi_layout in VALID_LAYOUTS_B else "ND"
     layout_b = str(fields.get("layout_b", fields.get("weight_layout", default_layout_b))).upper()
@@ -607,7 +665,7 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
             and None in transfer and not callable(fields.get("cohort_transport_builder"))):
         raise capability_gap(op, ctx, "explicit_dispatch_and_combine_transport")
     row_scale = float(_nonneg_number(fields.get("expected_row_scale", 1.0), "expected_row_scale"))
-    if not (0.0 < row_scale <= 1.0):
+    if row_scale <= 0.0:
         raise ModelingError(f"grouped_moe_invalid_expected_row_scale:{row_scale!r}")
     return GroupedMoeContract(
         mode, abi, sum(rows), n, k, rows, allocated, tokens, dtype_a, dtype_b, compute_dtype,
@@ -721,9 +779,98 @@ def matrix_schedule(contract, ctx, rows, n, k, *, start_core=0, n_tail_alignment
     )
 
 
+@dataclass(frozen=True, slots=True)
+class GemmScaleSpec:
+    act_scale_dtype: str | None = None
+    act_group_k: int | None = None
+    weight_scale_dtype: str | None = None
+    weight_block_n: int = 1
+    weight_block_k: int = 1
+    epilogue_ops_per_output: float = 0.0
+
+
+def gemm_declared_scale_spec(
+    op: OpSpec, contract: GroupedMoeContract,
+) -> GemmScaleSpec:
+    """Return declared non-MX scale shapes and epilogue vector work for GEMM modes."""
+    fields = contract_fields(op)
+    pabi = getattr(op, "precision_abi", None)
+    act_raw = (
+        fields.get("act_scale_dtype")
+        or fields.get("activation_scale_format")
+        or (getattr(pabi, "act_scale_dtype", "") if pabi is not None else "")
+    )
+    act_dtype = _dtype(str(act_raw)) if act_raw and str(act_raw).strip() else ""
+    act_scale = (
+        act_dtype
+        if (
+            not contract.act_mx_scaled
+            and act_dtype
+            and act_dtype not in MX_SCALE_DTYPES
+            and fields.get("has_activation_scale", True) is not False
+        )
+        else None
+    )
+    wt_raw = (
+        fields.get("weight_scale_dtype")
+        or fields.get("weight_scale_format")
+        or (getattr(pabi, "weight_scale_dtype", "") if pabi is not None else "")
+    )
+    wt_dtype = _dtype(str(wt_raw)) if wt_raw and str(wt_raw).strip() else ""
+    wt_scale = (
+        wt_dtype
+        if (
+            not contract.weight_mx_scaled
+            and wt_dtype
+            and wt_dtype not in MX_SCALE_DTYPES
+            and fields.get("has_weight_scale", True) is not False
+        )
+        else None
+    )
+    raw_block = fields.get("weight_block") or (getattr(pabi, "weight_block", None) if pabi is not None else None)
+    wt_block_n = wt_block_k = 1
+    if isinstance(raw_block, (tuple, list)) and len(raw_block) == 2:
+        bn, bk = int(raw_block[0] or 1), int(raw_block[1] or 1)
+        wt_block_n, wt_block_k = max(1, bn), max(1, bk)
+    act_pack = str(
+        fields.get("act_scale_pack")
+        or (getattr(pabi, "act_scale_pack", "") if pabi is not None else "")
+        or ""
+    ).strip().lower()
+    raw_act_group = fields.get("activation_group_size") or (
+        getattr(pabi, "act_group_size", 0) if pabi is not None else 0
+    )
+    act_group_val = int(raw_act_group or 0)
+    act_shape = fields.get("activation_scale_shape")
+    wt_layout = str(
+        fields.get("weight_representation")
+        or (getattr(pabi, "weight_layout", "") if pabi is not None else "")
+        or ""
+    ).lower()
+    is_block_act = (
+        (isinstance(act_shape, (tuple, list)) and len(act_shape) >= 2)
+        or (act_group_val > 0 and (act_pack not in {"", "scalar"} or wt_block_k > 1 or "block" in wt_layout))
+    )
+    act_group_k = act_group_val if (is_block_act and act_group_val > 0) else None
+    epilogue = fields.get("matrix_epilogue")
+    epilogue_ops = (
+        float(epilogue.get("operations_per_output", 0.0) or 0.0)
+        if isinstance(epilogue, Mapping) else 0.0
+    )
+    return GemmScaleSpec(
+        act_scale_dtype=act_scale,
+        act_group_k=act_group_k,
+        weight_scale_dtype=wt_scale,
+        weight_block_n=wt_block_n,
+        weight_block_k=wt_block_k,
+        epilogue_ops_per_output=max(0.0, epilogue_ops),
+    )
+
+
 def matrix_stages(
     name, after, contract, schedule, k, output_dtype, *, input_dtype=None, input_scaled=False,
     output_row_divisor: int = 1, useful_flops_override: int | None = None, metadata=(),
+    scale_spec: GemmScaleSpec | None = None, aiv_cores: int = 1,
 ):
     dtype = input_dtype or contract.dtype_a
     stages, ends = [], []
@@ -734,6 +881,17 @@ def matrix_stages(
     weight_k = ceil_div(k, k_alignment) * k_alignment
     act_mx = contract.act_mx_scaled if input_dtype is None else dtype in MX_DTYPES
     act_mx_pad = contract.act_mx_padded if input_dtype is None else True
+    aiv_pool = max(1, int(aiv_cores))
+    act_s_dt = scale_spec.act_scale_dtype if scale_spec is not None else None
+    wt_s_dt = scale_spec.weight_scale_dtype if scale_spec is not None else None
+    act_k_blocks = (
+        ceil_div(k, scale_spec.act_group_k)
+        if (scale_spec is not None and scale_spec.act_group_k) else 1
+    )
+    wt_bn = scale_spec.weight_block_n if scale_spec is not None else 1
+    wt_bk = scale_spec.weight_block_k if scale_spec is not None else 1
+    wt_k_blocks = ceil_div(k, wt_bk) if wt_bk > 1 else 1
+    epi_ops_per_out = scale_spec.epilogue_ops_per_output if scale_spec is not None else 0.0
     for owner in schedule.nonempty_owners:
         a_rows, b_cols = schedule.owner_input_rows[owner], schedule.owner_weight_columns[owner]
         a = tensor_bytes(a_rows, k, dtype, scaled=input_scaled, mx_scaled=act_mx, mx_padded=act_mx_pad)
@@ -744,6 +902,11 @@ def matrix_stages(
         out_elems = schedule.owner_output_elements[owner] // output_row_divisor
         out = element_bytes(out_elems, output_dtype)
         read, cube, fix = (f"{name}:{owner}:{step}" for step in ("read", "cube", "fixpipe"))
+        act_scale_b = element_bytes(a_rows * act_k_blocks, act_s_dt) if act_s_dt else 0
+        wt_scale_elems = ceil_div(b_cols, wt_bn) * wt_k_blocks if wt_s_dt else 0
+        wt_scale_b = element_bytes(wt_scale_elems, wt_s_dt) if wt_s_dt else 0
+        scale_bytes = act_scale_b + wt_scale_b
+        fix_deps: tuple[str, ...] = (cube,)
         stages.extend((
             StageDemand(read, after, Work(resources={"hbm": a+b, "l2": a+b, "mte2_aic": a+b}),
                         "aic", owner, metadata),
@@ -751,8 +914,26 @@ def matrix_stages(
                 {contract.compute_dtype: schedule.owner_issued_flops[owner]},
                 {"mte1": a+b},
             ), "aic", owner, metadata),
-            StageDemand(fix, (cube,), Work(resources={"hbm": out, "l2": out, "fixpipe": out}), "aic", owner, metadata),
         ))
+        if scale_bytes > 0:
+            scale_stage = f"{name}:{owner}:scales"
+            stages.append(StageDemand(
+                scale_stage, after,
+                Work(resources={"hbm": scale_bytes, "l2": scale_bytes, "mte2_aiv": scale_bytes}),
+                "aiv", owner % aiv_pool, metadata,
+            ))
+            fix_deps = (cube, scale_stage)
+            if epi_ops_per_out > 0.0 and out_elems > 0:
+                epi_stage = f"{name}:{owner}:epilogue"
+                stages.append(StageDemand(
+                    epi_stage, fix_deps,
+                    Work(resources={"vector": float(out_elems) * epi_ops_per_out}),
+                    "aiv", owner % aiv_pool, metadata,
+                ))
+                fix_deps = (epi_stage,)
+        stages.append(
+            StageDemand(fix, fix_deps, Work(resources={"hbm": out, "l2": out, "fixpipe": out}), "aic", owner, metadata)
+        )
         ends.append(fix)
     useful = schedule.useful_flops if useful_flops_override is None else useful_flops_override
     stages.append(StageDemand(name, tuple(ends) or after, metadata=(*metadata,
@@ -804,6 +985,9 @@ def vector_stages(name, after, ctx, rows, *, read, compute, write, group_read=0,
 def activation_stages(
     name, after, ctx, contract, rows, metadata=(), *,
     has_activation_scale=True, weight_scale_dtype: str | None = None,
+    has_quant_scale: bool = False, quant_scale_dtype: str = "fp32",
+    has_quant_offset: bool = False, quant_offset_dtype: str = "fp32",
+    quant_mode: int = 1,
 ):
     width = contract.intermediate
     quantized = contract.quant_dtype not in {"bf16", "fp16"}
@@ -815,9 +999,19 @@ def activation_stages(
         group_read = element_bytes(contract.n, "fp32")
     else:
         group_read = 0
+    # Dynamic quant (quant_mode == 1) takes per-channel smooth scales [width];
+    # static quant (quant_mode == 0) reads one scalar scale/offset per group.
+    param_elems = width if quant_mode == 1 else 1
+    smooth_ops = 0
+    if quantized and has_quant_scale:
+        group_read += element_bytes(param_elems, _dtype(quant_scale_dtype))
+        smooth_ops += width
+    if quantized and has_quant_offset:
+        group_read += element_bytes(param_elems, _dtype(quant_offset_dtype))
+        smooth_ops += width
     return vector_stages(
         name, after, ctx, rows, read=element_bytes(contract.n, contract.handoff_dtype) + scale_read,
-        compute=width * (ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)),
+        compute=width * (ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)) + smooth_ops,
         write=tensor_bytes(1, width, contract.quant_dtype, scaled=quantized), metadata=metadata,
         group_read=group_read,
     )

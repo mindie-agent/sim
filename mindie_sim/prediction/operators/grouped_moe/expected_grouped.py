@@ -50,7 +50,9 @@ _EXACT_INT_TOL = 1e-9
 _CONVEX_WEIGHT_EPS = 1e-12
 
 
-def _dispersed_group_rows(rows: float, banks: int) -> tuple[int, ...]:
+def _dispersed_group_rows(
+    rows: float, banks: int, *, valid_tokens: int | None = None,
+) -> tuple[int, ...]:
     """Zero-demand-safe, row-conserving binomial dispersion across active banks (G2)."""
     if rows <= 0.0:
         return ()
@@ -58,30 +60,50 @@ def _dispersed_group_rows(rows: float, banks: int) -> tuple[int, ...]:
     if raw_banks <= 0:
         raise ModelingError(f"grouped_moe_zero_banks_nonzero_rows:rows={rows}")
     total_rows = max(1, int(round(rows)))
+    if valid_tokens is not None and valid_tokens > 0:
+        total_rows = min(total_rows, raw_banks * int(valid_tokens))
     bank_count = min(raw_banks, total_rows)
     if bank_count == 1:
         return (total_rows,)
     if total_rows <= bank_count:
         return (1,) * bank_count
     mean_m = float(total_rows) / float(bank_count)
+    # Without-replacement top-k visits each bank at most once per token, so
+    # per-bank count variance is mean_m * (1 - p) with p = mean_m / valid_tokens.
+    has_cap = (
+        valid_tokens is not None
+        and valid_tokens > 0
+        and total_rows <= bank_count * valid_tokens
+    )
+    inclusion_p = (
+        min(1.0, mean_m / float(valid_tokens))
+        if (valid_tokens is not None and valid_tokens > 0)
+        else (1.0 / float(bank_count))
+    )
     spread = min(
         mean_m - 1.0,
-        math.sqrt(mean_m * (1.0 - 1.0 / float(bank_count))),
+        math.sqrt(mean_m * max(0.0, 1.0 - inclusion_p)),
     )
     low_m = max(1, math.floor(mean_m - spread))
     high_m = max(1, math.ceil(mean_m + spread))
+    if has_cap:
+        high_m = min(int(valid_tokens), high_m)
     half = bank_count // 2
     if bank_count % 2 == 0:
         counts = [low_m] * half + [high_m] * half
     else:
         mid_m = max(1, int(round(mean_m)))
+        if has_cap:
+            mid_m = min(int(valid_tokens), mid_m)
         counts = [low_m] * half + [mid_m] + [high_m] * half
     # Exact largest-remainder conservation so sum(counts) == total_rows strictly.
     diff = total_rows - sum(counts)
     idx = 0
     while diff > 0:
-        counts[idx % bank_count] += 1
-        diff -= 1
+        pos = idx % bank_count
+        if not has_cap or counts[pos] < int(valid_tokens):
+            counts[pos] += 1
+            diff -= 1
         idx += 1
     while diff < 0:
         pos = (bank_count - 1 - (idx % bank_count))
@@ -273,12 +295,24 @@ def _scale_stage_work(stage, factor: float):
     )
 
 
+def _scale_phase_work(phase, factor: float):
+    scaled_stages = tuple(_scale_stage_work(s, factor) for s in phase.stages)
+    scaled_residue = tuple(
+        tuple(_scale_stage_work(s, factor) for s in group)
+        for group in phase.residue_stages
+    )
+    return replace(phase, stages=scaled_stages, residue_stages=scaled_residue)
+
+
 def _scale_program_work(program, factor: float):
     """Weight a conditional execution program's issued work by firing probability ``factor``."""
+    from mindie_sim.prediction.operators.matrix.matrix import _StreamRefillProgram
     from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
     from mindie_sim.prediction.program.pipeline import PipelineProgram, PipelineTemplateProgram
     from mindie_sim.prediction.program.stages import KernelProgram, ParallelProgram
 
+    if isinstance(program, _StreamRefillProgram):
+        return replace(program, pipeline=_scale_program_work(program.pipeline, factor))
     if isinstance(program, KernelProgram):
         return replace(
             program,
@@ -313,15 +347,14 @@ def _scale_program_work(program, factor: float):
         return replace(program, panel=_scaled_panel)
     if isinstance(program, PipelineTemplateProgram):
         tmpl = program.template
-        scaled_phases = tuple(
-            replace(ph, stages=tuple(_scale_stage_work(s, factor) for s in ph.stages))
-            for ph in tmpl.phases
-        )
+        scaled_phases = tuple(_scale_phase_work(ph, factor) for ph in tmpl.phases)
+        scaled_motif = tuple(_scale_phase_work(ph, factor) for ph in tmpl.motif_phases)
         scaled_tmpl = replace(
             tmpl,
             setup=tuple(_scale_stage_work(s, factor) for s in tmpl.setup),
             drain=tuple(_scale_stage_work(s, factor) for s in tmpl.drain),
             phases=scaled_phases,
+            motif_phases=scaled_motif,
             minimum_ms=float(tmpl.minimum_ms) * factor,
             setup_ms=float(tmpl.setup_ms) * factor,
         )
@@ -371,11 +404,13 @@ def _scale_op_and_context(op, context, meta: dict, factor: float):
 
 
 def _realize_bank_branches(
-    rows: float, banks: int,
+    rows: float, banks: int, *, valid_tokens: int | None = None,
 ) -> tuple[tuple[float, int, tuple[int, ...], tuple[int, ...], int], ...]:
     """Realize integer row/bank schedules with fractal padding applied before averaging."""
+    if valid_tokens is not None and valid_tokens > 0:
+        rows = min(rows, float(banks * int(valid_tokens)))
     if rows <= float(banks):
-        dispersed = _dispersed_group_rows(float(banks), banks)
+        dispersed = _dispersed_group_rows(float(banks), banks, valid_tokens=valid_tokens)
         padded_groups, padded_m = _per_group_padded_m(dispersed)
         return ((1.0, banks, dispersed, padded_groups, padded_m),)
     r_lo, r_hi = math.floor(rows), math.ceil(rows)
@@ -383,12 +418,12 @@ def _realize_bank_branches(
     f_lo = 1.0 - f_hi
     if r_lo == r_hi or f_hi <= _CONVEX_WEIGHT_EPS or f_lo <= _CONVEX_WEIGHT_EPS:
         r_int = r_lo if f_hi <= _CONVEX_WEIGHT_EPS else r_hi
-        dispersed = _dispersed_group_rows(float(r_int), banks)
+        dispersed = _dispersed_group_rows(float(r_int), banks, valid_tokens=valid_tokens)
         padded_groups, padded_m = _per_group_padded_m(dispersed)
         return ((1.0, banks, dispersed, padded_groups, padded_m),)
-    disp_lo = _dispersed_group_rows(float(r_lo), banks)
+    disp_lo = _dispersed_group_rows(float(r_lo), banks, valid_tokens=valid_tokens)
     pad_grp_lo, pad_lo = _per_group_padded_m(disp_lo)
-    disp_hi = _dispersed_group_rows(float(r_hi), banks)
+    disp_hi = _dispersed_group_rows(float(r_hi), banks, valid_tokens=valid_tokens)
     pad_grp_hi, pad_hi = _per_group_padded_m(disp_hi)
     return (
         (f_lo, banks, disp_lo, pad_grp_lo, pad_lo),
@@ -506,20 +541,26 @@ class ExpectedGroupedMatmul:
             sub_unit_prob = p_active
         else:
             sub_unit_prob = None
+            raw_valid = meta.get("routing_valid_tokens")
+            valid_tokens = (
+                int(raw_valid)
+                if raw_valid is not None and not isinstance(raw_valid, bool) and int(raw_valid) > 0
+                else None
+            )
             b_lo, b_hi = math.floor(active), math.ceil(active)
             w_hi = active - float(b_lo)
             w_lo = 1.0 - w_hi
             if b_lo == b_hi or w_hi <= _CONVEX_WEIGHT_EPS or w_lo <= _CONVEX_WEIGHT_EPS:
                 banks = b_lo if w_hi <= _CONVEX_WEIGHT_EPS else b_hi
-                branches = _realize_bank_branches(rows, banks)
+                branches = _realize_bank_branches(rows, banks, valid_tokens=valid_tokens)
             else:
                 lo_parts = tuple(
                     (w_lo * rw, bc, bd, bp, bm)
-                    for rw, bc, bd, bp, bm in _realize_bank_branches(rows, b_lo)
+                    for rw, bc, bd, bp, bm in _realize_bank_branches(rows, b_lo, valid_tokens=valid_tokens)
                 )
                 hi_parts = tuple(
                     (w_hi * rw, bc, bd, bp, bm)
-                    for rw, bc, bd, bp, bm in _realize_bank_branches(rows, b_hi)
+                    for rw, bc, bd, bp, bm in _realize_bank_branches(rows, b_hi, valid_tokens=valid_tokens)
                 )
                 branches = lo_parts + hi_parts
                 banks = b_hi

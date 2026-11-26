@@ -634,3 +634,161 @@ def test_routing_ep_owner_matches_rank_coord_and_honors_request_source_owners():
             views=(RequestView("r0", 1, 0, True, "prefill"),), physical_rank=phys, machine=c_p.machine,
         )
         assert r_p.representative_rank == 1
+
+
+def test_masked_dispatch_placement_deepep_relays_and_empty_ranks():
+    from mindie_sim.catalog.expert_slots import expert_slot_plan
+    from mindie_sim.prediction.operator_analysis import target_operators
+    from mindie_sim.prediction.operators.moe_transport.deepep_exchange import (
+        _deepep_exact_stage_matrices, _deepep_peer_traffic_matrix, deepep_group_volume,
+    )
+    from tests._support.hardware import MODEL, WORKLOAD
+
+    mask = dict(kind="vllm_ascend_mc2_tp_slice", padding="right_to_tp")
+    model_local = dict(MODEL, hidden_size=32, num_heads=4, ffn="moe", num_experts=4,
+                       moe_intermediate_size=32, top_k=1, expert_routing=[0, 1, 0, 0])
+    case_local = parse_case(dict(
+        machine=dict(backend="ascend", sku="Ascend950DT_9581", num_devices=2), model=model_local,
+        workload=WORKLOAD, runtime=dict(tp=2, ep=2, kernels={"moe_token_partition": mask}),
+    ))
+    slots_local = expert_slot_plan(case_local.model, case_local.model.layer_plans[0], case_local.runtime.parallel)
+    disp_local = next(
+        op for op in target_operators(case_local, phase="prefill", tokens=1, apply_body_defaults=False)
+        if op.recipe == "expert_dispatch"
+    )
+    assert slots_local.expert_ids_by_rank == ((0, 1), (2, 3))
+    assert dict(disp_local.metadata)["peer_traffic"]["payload_bytes"][0][1] == 0.0
+
+    model_relay = dict(MODEL, hidden_size=32, num_heads=4, ffn="moe", num_experts=4,
+                       moe_intermediate_size=32, top_k=1, expert_routing=[0, 0, 0, 1])
+    case_relay = dict(
+        machine=dict(backend="ascend", sku="Ascend950DT_9581", num_devices=4), model=model_relay,
+        workload=WORKLOAD, runtime=dict(
+            tp=4, ep=4, kernels={"moe_token_partition": mask},
+            metadata=dict(enable_deepep=True, deepep_ranks_per_node=2),
+        ),
+    )
+    edges = lambda mat: [(s, d, b) for s, row in enumerate(mat) for d, b in enumerate(row) if b]
+    relay_ops = target_operators(case_relay, phase="prefill", tokens=1, apply_body_defaults=False)
+    disp_stages = [edges(dict(op.metadata)["peer_traffic"]["payload_bytes"])
+                   for op in relay_ops if op.recipe == "expert_dispatch"]
+    comb_stages = [edges(dict(op.metadata)["peer_traffic"]["payload_bytes"])
+                   for op in relay_ops if op.recipe == "expert_combine"]
+    exact_stages = [
+        edges(stage) for stage in _deepep_exact_stage_matrices(
+            [0], [[3]], [(r, 0) for r in range(4)], ep=4, ranks_per_node=2, row_bytes=64, is_combine=False,
+        )
+    ]
+    assert disp_stages == exact_stages == [[(0, 2, 64.0)], [(2, 3, 64.0)]]
+    assert comb_stages == [[(3, 2, 64.0)], [(2, 0, 64.0)]]
+
+    model_sparse_ep = dict(MODEL, hidden_size=32, num_heads=4, ffn="moe", num_experts=2, top_k=2, moe_intermediate_size=32)
+    wl_4 = {"requests": [{"prompt_tokens": 4, "output_tokens": 1}]}
+    case_sparse_ep = parse_case(dict(
+        machine=dict(backend="ascend", sku="Ascend950DT_9581", num_devices=4), model=model_sparse_ep, workload=wl_4,
+        runtime=dict(tp=4, ep=4, metadata=dict(enable_deepep=True, deepep_ranks_per_node=2)),
+    ))
+    assert deepep_group_volume(1, 32, 2, ep=4, ranks_per_node=2, dtype_bytes_val=2, num_experts=2) == pytest.approx(32.0)
+    disp_sparse = next(
+        op for op in target_operators(case_sparse_ep, phase="prefill", tokens=4, apply_body_defaults=False)
+        if op.recipe == "expert_dispatch"
+    )
+    assert disp_sparse.link_bytes == pytest.approx(96.0)
+    assert dict(disp_sparse.metadata).get("peer_volume_basis") == "group_mean"
+    peer_mat = _deepep_peer_traffic_matrix(96.0, ep=4, ranks_per_node=2, top_k=2, num_experts=2)["payload_bytes"]
+    assert peer_mat == ((0.0, 128.0, 0.0, 0.0), (128.0, 0.0, 0.0, 0.0), (64.0, 0.0, 0.0, 0.0), (0.0, 64.0, 0.0, 0.0))
+
+    # Single expert on rank 0: intra-node traffic goes only 1->0 (128 B), never 0->1 (0 B).
+    peer_one = _deepep_peer_traffic_matrix(64.0, ep=4, ranks_per_node=2, top_k=1, num_experts=1)["payload_bytes"]
+    assert peer_one[0][1] == 0.0 and peer_one[1][0] == pytest.approx(128.0)
+
+    # Top-2 skewed routing to a single remote rank never forwards more bytes than the relay receives.
+    model_skew = dict(MODEL, hidden_size=32, num_heads=4, ffn="moe", num_experts=4,
+                      moe_intermediate_size=32, top_k=2, expert_routing=[0.0, 0.5, 0.0, 0.5])
+    case_skew = dict(
+        machine=dict(backend="ascend", sku="Ascend950DT_9581", num_devices=4), model=model_skew,
+        workload=WORKLOAD, runtime=dict(
+            tp=4, ep=4, kernels={"moe_token_partition": mask},
+            metadata=dict(enable_deepep=True, deepep_ranks_per_node=2),
+        ),
+    )
+    skew_ops = target_operators(case_skew, phase="prefill", tokens=1, apply_body_defaults=False)
+    skew_disp = [edges(dict(op.metadata)["peer_traffic"]["payload_bytes"])
+                 for op in skew_ops if op.recipe == "expert_dispatch"]
+    assert skew_disp[0] == [(0, 2, 64.0)]
+    assert (2, 3, 64.0) in skew_disp[1]
+
+
+def test_zero_expert_straggler_group_prefix_and_softmax_renorm_schedule():
+    from math import comb
+    from mindie_sim.catalog.quant import quant_preset
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.operator_analysis import target_operators
+    from mindie_sim.prediction.operators.moe_routing import moe_gating_fusion as gating
+    from mindie_sim.schema.case import Software
+    from mindie_sim.schema.hardware import Hardware
+    from mindie_sim.schema.model import LayerPlan
+    from tests._support.hardware import MODEL, WORKLOAD
+
+    model_q = dict(MODEL, hidden_size=32, num_heads=4, ffn="moe", num_experts=4, top_k=1,
+                   moe_intermediate_size=32, quant=quant_preset("w8a8_int8").to_dict())
+    fusion = dict(implementation="declared_native_fusion", options={"roles": ["grouped_gate_up_activation_quant"]})
+    lower = dict(native_fusion=fusion, group_list_prefix="vllm_ascend_group_list_prefix")
+    for transport in ({}, {"moe_transport": {"dispatch_dtype": "int8"}}):
+        case_q = dict(
+            machine=dict(backend="ascend", sku="Ascend950DT_9581", num_devices=2), model=model_q,
+            workload=WORKLOAD, runtime=dict(tp=2, ep=2, kernels=dict(lowerings=lower, **transport)),
+        )
+        ops_q = target_operators(case_q, phase="prefill", tokens=1, apply_body_defaults=False)
+        assert [op.local_shape for op in ops_q if op.recipe == "expert_group_list_cumsum"] == [(2,)]
+
+    hw = Hardware.from_mapping(dict(backend="ascend", sku="Ascend950DT_9581", num_devices=1))
+    geom = Geometry.from_devices(hw.dies)
+    rt = Software(kernels={"moe_gating": "vllm_ascend_cann_gating"})
+    for experts in (128, 4096):
+        layer = LayerPlan(0, ffn="moe", num_experts=experts, top_k=2, router_norm_topk=True)
+        op_g = gating.build_selection(
+            prefix="m", plan=layer, logits_input="x", weight_dtype="fp32", weight_bytes=4,
+            stage=0, requests=("r",), tokens=1, mode="decode", runtime=rt,
+        ).ops[0]
+        plan_g = gating.build_moe_gating_topk(op_g, geom)
+        assert plan_g.metadata["row_program"]["wave_stages"] == (
+            "logits_load", "expert_topk", "softmax_topk", "renorm_store",
+        )
+        assert plan_g.work.resources["vector"] == pytest.approx(experts + 2 * (5 + 4))
+    layer_plain = LayerPlan(0, ffn="moe", num_experts=128, top_k=2, router_norm_topk=False)
+    op_plain = gating.build_selection(
+        prefix="m", plan=layer_plain, logits_input="x", weight_dtype="fp32", weight_bytes=4,
+        stage=0, requests=("r",), tokens=1, mode="decode", runtime=rt,
+    ).ops[0]
+    assert gating.build_moe_gating_topk(op_plain, geom).metadata["row_program"]["wave_stages"] == (
+        "logits_load", "softmax_reduce", "expert_topk", "renorm_store",
+    )
+
+    model_zero = dict(MODEL, hidden_size=32, num_heads=4, ffn="moe", num_experts=4,
+                      top_k=4, zero_expert_num=12, moe_intermediate_size=32)
+    case_zero = dict(
+        machine=dict(backend="ascend", sku="Ascend950DT_9581", num_devices=4), model=model_zero,
+        workload=WORKLOAD, runtime=dict(tp=4, ep=4),
+    )
+    gate_zero = next(
+        op for op in target_operators(case_zero, phase="prefill", tokens=1, apply_body_defaults=False)
+        if op.recipe == "grouped_gate_up"
+    )
+    meta_zero = dict(gate_zero.metadata)
+    expected_prob = 1.0 - comb(12, 4) / comb(16, 4)
+    assert meta_zero["expected_rows"] == pytest.approx(expected_prob, rel=1e-12)
+    assert meta_zero["expected_active_experts"] == pytest.approx(expected_prob, rel=1e-12)
+
+    # Zero experts with E[N_real]=1 across 2 ranks (2 real experts/rank): exact E[max R_r] = 24/28.
+    model_zero2 = dict(MODEL, hidden_size=32, num_heads=4, ffn="moe", num_experts=4,
+                       top_k=2, zero_expert_num=4, moe_intermediate_size=32)
+    case_zero2 = dict(
+        machine=dict(backend="ascend", sku="Ascend950DT_9581", num_devices=2), model=model_zero2,
+        workload=WORKLOAD, runtime=dict(tp=2, ep=2),
+    )
+    gate_zero2 = next(
+        op for op in target_operators(case_zero2, phase="prefill", tokens=1, apply_body_defaults=False)
+        if op.recipe == "grouped_gate_up"
+    )
+    assert dict(gate_zero2.metadata)["expected_rows"] == pytest.approx(24.0 / 28.0, rel=1e-12)

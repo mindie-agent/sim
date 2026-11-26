@@ -136,7 +136,14 @@ def lower(ops, bindings):
                 source.recipe == "expert_dispatch"
                 or source.family in {"alltoall", "alltoallv", "mc2_protocol"}
             ):
-                dispatch_producers.append(source)
+                is_aux_exchange = (
+                    source.recipe == "expert_scale_dispatch"
+                    or sm.get("payload_kind") in {"row_scale", "block_scale"}
+                    or sm.get("deepep_relay_stage") == "inter_relay"
+                    or bool(sm.get("deepep_overlap_branch"))
+                )
+                if not is_aux_exchange:
+                    dispatch_producers.append(source)
                 pending.extend(source.deps)
             elif (source.recipe in {"route_pack", "moe_init_routing_v3"}
                     and sm.get("num_experts")):

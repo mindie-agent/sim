@@ -772,3 +772,253 @@ def test_splitk_workspace_charges_fixpipe_and_routes_warm_vs_spill_reads():
     prog_l2 = plan_l2.program(ctx_l2)
     assert [s.name for s in prog_l2.stages] == ["setup", "splits", "split_sync", "merge"]
     assert eng_l2.serviced["cube"] == pytest.approx(ctx_l2.bind(plan_l2.work)["cube"])
+
+
+def test_grouped_rows_l2_read_credit_conserved_across_matrix_recipes():
+    from mindie_sim.catalog.ops import QuantSpec, gemm_op
+    from mindie_sim.prediction.engine import Engine, Resource
+    from mindie_sim.prediction.operators.grouped_moe.grouped_rows import adapt as adapt_rows
+    from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul, TiledMatmul
+    from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul
+    from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+
+    op = gemm_op(
+        op_id="g", deps=(), stage=0, layer=0, requests=(), m=3, n=32, k=32,
+        quant=QuantSpec("bf16"), category="routed_expert", phase="decode", weight_count=2,
+        metadata=(("matrix_group_rows", (1, 2)),), family="grouped_gemm",
+    )
+    names = {r: r for r in ("hbm", "cube", "mte1", "mte2", "mte3", "vector")}
+    work = dict(hbm=op.hbm_bytes - 1024, mte2=op.mte2_bytes, mte3=op.mte3_bytes, cube=op.flops)
+    ctx = RecipeContext(op, work, names, dict.fromkeys(names, 1e6), 1,
+                        compute_peaks={"bf16": 1e9}, native_work=work)
+    for recipe in (
+        TiledMatmul(template_execution=False),
+        TiledMatmul(template_execution=True),
+        HierarchicalMatmul(),
+        MappedMatmul(),
+        SteadyMatmul(),
+    ):
+        eng = Engine([Resource(r, 1e6) for r in names], backend="python")
+        prog = adapt_rows(recipe, op).lower(ctx)
+        eng.advance(until=(prog.start(eng, "g", eng.submit("r")),))
+        assert eng.serviced["hbm"] == pytest.approx(work["hbm"])
+
+    # Split-K grouped wrapper bills parent independent HBM once (setup only, never duplicated in children).
+    op_sk = gemm_op(
+        op_id="gsk", deps=(), stage=0, layer=0, requests=(), m=3, n=64, k=4096,
+        quant=QuantSpec("bf16"), category="routed_expert", phase="decode", weight_count=2,
+        metadata=(("matrix_group_rows", (1, 2)),), family="grouped_gemm",
+    )
+    extra_hbm = 192.0
+    base_sk = dict(hbm=op_sk.hbm_bytes, mte2=op_sk.mte2_bytes, mte3=op_sk.mte3_bytes, cube=op_sk.flops)
+    plus_sk = {**base_sk, "hbm": op_sk.hbm_bytes + extra_hbm}
+    serviced_sk = []
+    for wk in (base_sk, plus_sk):
+        ctx_sk = RecipeContext(op_sk, wk, names, dict.fromkeys(names, 1e6), 4,
+                               compute_peaks={"bf16": 1e9}, native_work=wk)
+        eng_sk = Engine([Resource(r, 1e6, units=1 if r == "hbm" else 4) for r in names], backend="python")
+        prog_sk = adapt_rows(HierarchicalMatmul(k_splits=2), op_sk).lower(ctx_sk)
+        eng_sk.advance(until=(prog_sk.start(eng_sk, "gsk", eng_sk.submit("r")),))
+        serviced_sk.append(eng_sk.serviced["hbm"])
+    assert serviced_sk[1] - serviced_sk[0] == pytest.approx(extra_hbm)
+
+
+def test_expected_grouped_scales_stream_refill_and_deterministic_topk_rows():
+    from mindie_sim.catalog.ops import QuantSpec, gemm_op
+    from mindie_sim.prediction.engine import Engine, Resource
+    from mindie_sim.prediction.operator_analysis import target_operators
+    from mindie_sim.prediction.operators.grouped_moe.expected_grouped import adapt as adapt_exp
+    from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul, TiledMatmul
+    from mindie_sim.prediction.structure import parse_case
+
+    names = {r: r for r in ("hbm", "cube", "mte1", "mte2", "mte3", "vector")}
+    meta = dict(routing_basis="probability_moments", matrix_mapping_domain="aggregate_experts",
+                expected_rows=2.0, expected_active_experts=1.5, matrix_weight_bank_groups=2)
+    op = gemm_op(
+        op_id="g", deps=(), stage=0, layer=0, requests=(), m=2, n=16, k=16, family="grouped_gemm",
+        quant=QuantSpec("bf16"), category="routed_expert", phase="prefill",
+        weight_bytes_override=1.5 * 16 * 16 * 2, metadata=tuple(meta.items()),
+    )
+    work = dict(hbm=op.hbm_bytes, mte2=op.mte2_bytes, mte3=op.mte3_bytes, cube=op.flops)
+    ctx = RecipeContext(op, work, names, dict.fromkeys(names, 1e6), 1,
+                        compute_peaks={"bf16": 1000.0}, native_work=work)
+    eng = Engine([Resource(r, 1e6) for r in names], backend="python")
+    eng.advance(until=(adapt_exp(HierarchicalMatmul(), op).lower(ctx).start(eng, "g", eng.submit("r")),))
+    assert eng.serviced["mte3"] == pytest.approx(op.mte3_bytes)
+    assert eng.serviced["hbm"] == pytest.approx(op.hbm_bytes)
+
+    model = dict(
+        name="two", layers=1, hidden_size=32, num_heads=2, num_kv_heads=2, head_dim=16,
+        intermediate_size=64, vocab_size=128, ffn="moe", num_experts=2, top_k=2, moe_intermediate_size=32,
+    )
+    case = parse_case(dict(
+        machine=dict(backend="ascend", sku="Ascend910B1", num_devices=1), model=model,
+        workload=dict(requests=[dict(prompt_tokens=16, output_tokens=1)]), runtime={},
+    ))
+    gate_op = next(o for o in target_operators(case, phase="prefill", tokens=16) if o.recipe == "grouped_gate_up")
+    gate_work = dict(hbm=gate_op.hbm_bytes, mte2=gate_op.mte2_bytes, mte3=gate_op.mte3_bytes, cube=gate_op.flops)
+    records = []
+    gate_ctx = RecipeContext(gate_op, gate_work, names, dict.fromkeys(names, 1e6), 1,
+                             compute_peaks={"bf16": 1e9}, record_mapping=records.append)
+    adapt_exp(TiledMatmul(), gate_op).lower(gate_ctx)
+    rec = next(r for r in records if "expected_active_experts" in r)
+    assert rec["padded_m"] == 32
+
+    # Fractional bank-count interpolation caps the 1-bank branch at routing_valid_tokens (never 17 > 16).
+    p_b = 1.0 - (15.0 / 16.0) ** 16
+    meta_cap = dict(
+        routing_basis="probability_moments", matrix_mapping_domain="aggregate_experts",
+        expected_rows=17.0, expected_active_experts=1.0 + p_b,
+        matrix_weight_bank_groups=2, routing_valid_tokens=16,
+    )
+    op_cap = gemm_op(
+        op_id="gcap", deps=(), stage=0, layer=0, requests=(), m=17, n=16, k=16, family="grouped_gemm",
+        quant=QuantSpec("bf16"), category="routed_expert", phase="prefill",
+        weight_bytes_override=(1.0 + p_b) * 16 * 16 * 2, metadata=tuple(meta_cap.items()),
+    )
+    w_cap = dict(hbm=op_cap.hbm_bytes, mte2=op_cap.mte2_bytes, mte3=op_cap.mte3_bytes, cube=op_cap.flops)
+    rec_cap = []
+    ctx_cap = RecipeContext(op_cap, w_cap, names, dict.fromkeys(names, 1e6), 1,
+                            compute_peaks={"bf16": 1e9}, record_mapping=rec_cap.append)
+    adapt_exp(TiledMatmul(), op_cap).lower(ctx_cap)
+    entry_cap = next(r for r in rec_cap if "expected_active_experts" in r)
+    assert entry_cap["padded_m"] == pytest.approx(16.0 * (1.0 + p_b))
+
+
+def test_grouped_moe_contract_abi_scales_msd_and_hifloat8():
+    from mindie_sim.catalog.ops import gemm_op
+    from mindie_sim.catalog.quant import quant_preset
+    from mindie_sim.prediction.engine import Engine, Resource
+    from mindie_sim.prediction.mechanism import Geometry, Work
+    from mindie_sim.prediction.operators.grouped_moe import build as build_gmoe
+    from mindie_sim.prediction.operators.grouped_moe.call_grouped_source import build_quantized_grouped_source_call
+    from mindie_sim.prediction.operators.mc2.arch22 import _rebind_fused_mc2_op
+    from mindie_sim.prediction.operators.mc2.megamoe import make_op as make_mc2_op
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.hardware import Hardware
+    from mindie_sim.schema.operators import OpSpec, TensorPrecisionABI
+
+    geo_a2 = hardware("Ascend910B1")
+    geo_a3 = Geometry.from_devices(Hardware.from_mapping(dict(backend="ascend", sku="Ascend910_9391", num_devices=2)).dies[:1])
+    geo_a5 = hardware("Ascend950DT_9581")
+
+    call = build_quantized_grouped_source_call(dict(
+        expert_rows=(1, 0), n=32, k=32, tiling=dict(base_m=16, base_n=32, base_k=32, used_cores=1),
+    ))
+    src_op, = call.ops
+    _, src_plan = call.recipes.prepare(src_op, geo_a5)
+    wave_i8 = next(x for x in geo_a5.datapath.subtile_wave if x.native_mode == "int8")
+    expected_flops = 2 * wave_i8.tile_m * 32 * wave_i8.tile_k
+    assert int(src_plan.work.matrix["int8"]) == expected_flops
+    roles = ("hbm", "cube", "mte1", "mte2_aic", "mte2_aiv", "mte3", "fixpipe", "vector")
+    rates = {r: (1.0 if r == "cube" else 1e9) for r in roles}
+    units = {r: int(geo_a5.resource_units.get(r, 1)) for r in roles}
+    src_ctx = RecipeContext(
+        src_op, {}, {r: r for r in roles}, rates, geo_a5.compute_units,
+        resource_units=units, compute_peaks={"int8": 1e6},
+        pool_names={p: p for p in geo_a5.buffers}, pool_capacities=dict(geo_a5.buffers),
+        pool_units=dict(geo_a5.buffer_units), datapath=geo_a5.datapath,
+    )
+    eng = Engine([Resource(r, rates[r], units=units[r]) for r in roles],
+                 pools=dict(geo_a5.buffers), pool_units=dict(geo_a5.buffer_units), backend="python")
+    eng.advance(until=(src_plan.program(src_ctx).start(eng, "src", eng.submit("r")),))
+    assert eng.serviced["cube"] == pytest.approx(src_ctx.bind(src_plan.work)["cube"])
+    assert eng.serviced["cube"] == pytest.approx(expected_flops * 1000.0 / 1e6)
+
+    # Uneven tail tile across 2 AICs (16 rows + 1 row) gives each owner its equal 32,768 issued FLOPs.
+    call2 = build_quantized_grouped_source_call(dict(
+        expert_rows=(17,), n=32, k=32, tiling=dict(base_m=16, base_n=32, base_k=32, used_cores=2),
+    ))
+    src2_op, = call2.ops
+    _, src2_plan = call2.recipes.prepare(src2_op, geo_a5)
+    assert int(src2_plan.work.matrix["int8"]) == 2 * expected_flops
+    src2_ctx = replace(src_ctx, op=src2_op)
+    eng2 = Engine([Resource(r, rates[r], units=units[r]) for r in roles],
+                  pools=dict(geo_a5.buffers), pool_units=dict(geo_a5.buffer_units), backend="python", trace_limit=200)
+    eng2.advance(until=(src2_plan.program(src2_ctx).start(eng2, "src2", eng2.submit("r")),))
+    cube_by_owner = {}
+    for ev in eng2.trace:
+        if ev["task"].endswith(":matrix"):
+            owner_key = ev["task"].split(":cores:program:")[1].split(":")[0]
+            cube_by_owner[owner_key] = cube_by_owner.get(owner_key, 0.0) + (ev["end_ms"] - ev["start_ms"])
+    assert len(cube_by_owner) == 2
+    per_aic_ms = expected_flops * 1000.0 / 1e6 * geo_a5.compute_units
+    assert all(dur == pytest.approx(per_aic_ms) for dur in cube_by_owner.values())
+    assert eng2.serviced["cube"] == pytest.approx(src2_ctx.bind(src2_plan.work)["cube"])
+
+    msd_op = make_mc2_op(op_id="moe", tokens=2, hidden=128, moe_inter=64, top_k=1, ep=2,
+                         routed_rows=2, w13_bytes=8192, w2_bytes=4096, compute_dtype="w4a8")
+    msd_op, = _rebind_fused_mc2_op([msd_op], 2, "int4", experts=2, ep=2)
+    msd_plan = build_gmoe(msd_op, geo_a3)
+    for prefix, expected_bytes in (("gmm1", 2048), ("gmm2", 1024)):
+        pub = sum(s.work.resources.get("fixpipe", 0) for s in msd_plan.program.demands if s.name.startswith(prefix + ":"))
+        con = sum(s.work.resources.get("mte2_aiv", 0) for s in msd_plan.program.demands if s.name.startswith(prefix + "_msd_recombine:"))
+        assert pub == con == expected_bytes
+
+    for routed_rows, expected_cube_max in ((1.25, 786432), (1.75, 786432)):
+        frac_op = make_mc2_op(op_id="moe", tokens=2, hidden=128, moe_inter=64, top_k=1,
+                              routed_rows=routed_rows, w13_bytes=128 * 128, w2_bytes=64 * 128, ep=2, compute_dtype="int8")
+        frac_op, = _rebind_fused_mc2_op([frac_op], 2, "int8", experts=2, ep=2)
+        cube_total = sum(build_gmoe(frac_op, geo_a3).work.matrix.values())
+        assert 0 < cube_total <= expected_cube_max
+
+    abi_i32 = TensorPrecisionABI("w8a8", "int8", "int8", "int32", "int8", "int32")
+    s_i32 = (8, 128, 64)
+    op_i32 = OpSpec("gmm", "grouped_gemm", "decode", 0, 0, (), s_i32, s_i32, s_i32, s_i32,
+                    recipe="grouped_gemm", dtype="int8", precision_abi=abi_i32, metadata=(("group_rows", (8,)),))
+    assert build_gmoe(op_i32, geo_a3).work.resources["fixpipe"] == 8 * 128 * 4
+
+    s_gl = (8, 64, 64)
+    for kind, groups in ((0, (2, 3)), (1, (2, 1)), (2, ((0, 2), (1, 1)))):
+        op_gl = OpSpec("g", "grouped_gemm", "decode", 0, 0, (), s_gl, s_gl, s_gl, s_gl,
+                       dtype="bf16", recipe="grouped_gemm", metadata=(("group_list_type", kind), ("group_list", groups)))
+        assert build_gmoe(op_gl, geo_a5).work.resources["fixpipe"] == 384
+    bad_sparse = OpSpec("g", "grouped_gemm", "decode", 0, 0, (), s_gl, s_gl, s_gl, s_gl, dtype="bf16",
+                        recipe="grouped_gemm", metadata=(("group_list_type", 2), ("group_list", ((0, 2), (3, 1))), ("num_experts", 2)))
+    with pytest.raises(ModelingError, match="sparse_group_index_out_of_range"):
+        build_gmoe(bad_sparse, geo_a5)
+
+    s_act = (1, 512)
+    for geo in (geo_a2, geo_a5):
+        for scaled in (False, True):
+            meta_act = dict(quant_mode=1, output_dtype="int8", has_quant_scale=scaled, quant_scale_dtype="fp32")
+            op_act = OpSpec("a", "grouped_moe", "decode", 0, 0, (), s_act, s_act, s_act, s_act,
+                            dtype="bf16", recipe="dequant_swiglu_quant", metadata=tuple(meta_act.items()))
+            assert build_gmoe(op_act, geo).work.resources["mte2_aiv"] == 1024 * (1 + scaled)
+    meta_static = dict(quant_mode=0, output_dtype="int8", has_quant_scale=True, quant_scale_dtype="fp32",
+                       has_quant_offset=True, quant_offset_dtype="fp32")
+    op_static = OpSpec("as", "grouped_moe", "decode", 0, 0, (), s_act, s_act, s_act, s_act,
+                       dtype="bf16", recipe="dequant_swiglu_quant", metadata=tuple(meta_static.items()))
+    assert build_gmoe(op_static, geo_a3).work.resources["mte2_aiv"] == 1024 + 8
+
+    s_hif = (16, 512, 256)
+    for dt in ("hifloat8", "hif8"):
+        md_hif = dict(group_rows=(16,), quant_mode=0, dequant_mode=0, output_dtype=dt, quant_dtype=dt,
+                      weight_scale_dtype="fp32", requested_abi="aclnnGroupedMatmulSwigluQuantV2")
+        op_hif = OpSpec("g", "grouped_moe", "prefill", 0, 0, (), s_hif, s_hif, s_hif, s_hif,
+                        dtype=dt, recipe="gmm_swiglu_quant", metadata=tuple(md_hif.items()))
+        ctx_hif = RecipeContext(op_hif, {}, {"cube": "cube"}, {}, 1, compute_peaks=geo_a5.compute_peaks)
+        assert ctx_hif.bind(Work(build_gmoe(op_hif, geo_a5).work.matrix))["cube"] > 0
+
+    w8_op = gemm_op(
+        op_id="g", deps=(), stage=0, layer=0, requests=(), m=16, n=128, k=128,
+        quant=quant_preset("w8a8_int8"), category="routed_expert", phase="prefill",
+        recipe="grouped_gemm", family="grouped_gemm", weight_count=2, metadata=(("group_rows", (8, 8)),),
+    )
+    _, w8_plan = RecipeBook().prepare(w8_op, geo_a5)
+    mte2_total = sum(v for k, v in w8_plan.work.resources.items() if k.startswith("mte2"))
+    assert mte2_total == int(w8_op.mte2_bytes) == 16 * 128 + 2 * 128 * 128 + 16 * 4 + 2 * 128 * 2
+    assert w8_plan.work.resources["vector"] == pytest.approx(w8_op.vector_ops)
+
+    # Block-scaled FP8 grouped GEMM uses 2D activation (16x2) and block weight (1x2) scale tensors (136 B).
+    abi_fp8 = TensorPrecisionABI(
+        "fp8", "fp8_e4m3", "fp8_e4m3", "bf16", "fp8_e4m3", "fp32",
+        weight_layout="fp8_block", weight_block=(128, 128), weight_scale_dtype="fp32",
+        act_group_size=128, act_scale_dtype="fp32", act_scale_pack="block",
+    )
+    s_fp8 = (16, 128, 256)
+    op_fp8 = OpSpec("gf8", "grouped_gemm", "prefill", 0, 0, (), s_fp8, s_fp8, s_fp8, s_fp8,
+                    recipe="grouped_gemm", dtype="fp8_e4m3", precision_abi=abi_fp8,
+                    metadata=(("group_rows", (16,)),))
+    assert build_gmoe(op_fp8, geo_a5).work.resources["mte2_aiv"] == (16 * 2 + 1 * 2) * 4
