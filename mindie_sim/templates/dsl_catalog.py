@@ -1034,6 +1034,7 @@ def _mqsmla(p, aic, aiv, datapath, variant):
 
 _DESCRIBE = dict(zip(DSL_KERNEL_IDS, (_flash, _mega, _commit, _mla, _attn_res, _qsli, _mqsmla)))
 _VECTOR_ONLY = {ATTN_RES, COMMIT_KDA}
+_ZERO_AIC_DSL_KERNELS = frozenset({ATTN_RES})
 _ALGORITHMS = {FLASH_KDA: "chunk_recurrence", MEGA_KDA: "chunk_recurrence",
                COMMIT_KDA: "chunk_recurrence", MQSMLA: "online_reduce"}
 
@@ -1045,7 +1046,8 @@ def describe_dsl_kernel(kernel_id, problem, datapath, *, aic_budget=None, aiv_bu
         raise unmodeled(name, "dsl_requires_arch35")
     aic = datapath.aic_count if aic_budget is None else aic_budget
     aiv = datapath.aiv_count if aiv_budget is None else aiv_budget
-    if not (1 <= aic <= datapath.aic_count and 1 <= aiv <= datapath.aiv_count):
+    min_aic = 0 if name in _ZERO_AIC_DSL_KERNELS else 1
+    if not (min_aic <= aic <= datapath.aic_count and 1 <= aiv <= datapath.aiv_count):
         raise ModelingError("dsl_core_budget_invalid")
     if name == COMMIT_KDA:
         aic = commit_aic_quota(aic)

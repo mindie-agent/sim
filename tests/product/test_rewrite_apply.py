@@ -1167,3 +1167,160 @@ def test_macro_wall_trigger_and_micro_split_collapse():
     assert scan_row.occurrence.op_id == "s0.l0.recurrent_scan"
     assert occ_pre in scan_row.predecessors and occ_ext in scan_row.predecessors
     assert scan_row.occurrence in post_row.predecessors
+
+
+def test_gemm_to_rmsnorm_ub_residency_uses_output_width():
+    from mindie_sim.catalog.ops import gemm_op
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.rewrite.apply import _die_path, _resident_savings_detail
+    from mindie_sim.schema.hardware import Hardware
+    from mindie_sim.schema.operators import OpSpec
+
+    hw = Hardware.from_mapping({"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a5"]})
+    path = _die_path(hw, hw.dies[0])
+    wide_n, narrow_k = 131072, 64
+    wide_gemm = gemm_op(
+        op_id="g", deps=(), requests=(), stage=0, layer=0, m=1, n=wide_n, k=narrow_k,
+        quant=QuantSpec("bf16"), category="dense", phase="decode",
+    )
+    wide_norm = OpSpec(
+        "r", "rmsnorm", "decode", 0, 0, (), *((1, wide_n),) * 4, dtype="bf16", deps=("g",),
+        hbm_bytes=4 * wide_n, mte2_bytes=2 * wide_n, mte3_bytes=2 * wide_n, vector_ops=4 * wide_n,
+    )
+    assert _resident_savings_detail((wide_gemm, wide_norm), {"g": 0, "r": 0}, set(), set(), path)[:2] == (0.0, 0.0)
+
+    small_n, wide_k = 128, 131072
+    fit_gemm = gemm_op(
+        op_id="g", deps=(), requests=(), stage=0, layer=0, m=1, n=small_n, k=wide_k,
+        quant=QuantSpec("bf16"), category="dense", phase="decode",
+    )
+    fit_norm = OpSpec(
+        "r", "rmsnorm", "decode", 0, 0, (), *((1, small_n),) * 4, dtype="bf16", deps=("g",),
+        hbm_bytes=4 * small_n, mte2_bytes=2 * small_n, mte3_bytes=2 * small_n, vector_ops=4 * small_n,
+    )
+    assert _resident_savings_detail((fit_gemm, fit_norm), {"g": 0, "r": 0}, set(), set(), path)[:2] == (
+        float(2 * small_n), float(2 * small_n),
+    )
+
+
+def test_packed_mla_prolog_ports_use_declared_slice_widths():
+    from mindie_sim.rewrite.algebra import _build_mla_prolog_ports, _typed_mla_role, classify_op_traits
+
+    case = compose_case("kimi-k2", REPRESENTATIVE_SKUS["a5"], layers=1, tp=1, dp=1, prompt_tokens=16, output_tokens=1)
+    ops = resolve_scenario(case, StepRequest("decode", context=16)).atomic_ops[0].ops
+    packed = next(op for op in ops if _typed_mla_role(op) == "qkv_a")
+    slice_widths = [item["shape"][-1] for item in dict(packed.metadata)["packed_projection_slices"]]
+    members = [op for op in ops if _typed_mla_role(op)]
+    roles = {op.op_id: _typed_mla_role(op) for op in members}
+    traits = {op.op_id: classify_op_traits(op) for op in members}
+    _, ports, _ = _build_mla_prolog_ports(members, roles, traits, soc_arch="A5", rope_dim=64)
+    k_dim = packed.local_shape[2]
+    assert [port.shape for port in ports if port.role in ("weight_dq", "weight_dkv_kr")] == [
+        (k_dim, slice_widths[0]), (k_dim, slice_widths[1]),
+    ]
+
+
+def test_resolve_scenario_validates_stack_domain_and_raw_eager_override():
+    from mindie_sim.compose.runtime import resolve_case_contracts
+    from mindie_sim.prediction.structure import parse_case
+
+    req = StepRequest("decode", tokens=1, context=8)
+    base_case = compose_case(
+        "qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1, prompt_tokens=8, output_tokens=1,
+    )
+    with pytest.raises(ModelingError, match="stack_domain_mismatch"):
+        resolve_scenario(base_case, req, stack_id="diffusion-native")
+
+    parsed_base = parse_case(base_case)
+    custom_facts = dict(parsed_base.model.catalog_facts)
+    custom_facts["workload_domain"] = "custom"
+    custom_case = replace(parsed_base, model=replace(parsed_base.model, catalog_facts=tuple(custom_facts.items())))
+    with pytest.raises(ModelingError, match="stack_domain_mismatch"):
+        resolve_scenario(custom_case, req, stack_id="vllm-ascend")
+
+    eager_case = compose_case(
+        "qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1,
+        prompt_tokens=8, output_tokens=1, runtime_stack="raw-eager",
+    )
+    forced = resolve_scenario(base_case, req, stack_id="raw-eager")
+    native = resolve_scenario(eager_case, req, stack_id="raw-eager")
+    forced_ops = forced.mainline_step.graph.executable[0].ops
+    native_ops = native.mainline_step.graph.executable[0].ops
+    assert len(forced_ops) == len(native_ops)
+    assert sum(op.family == "add_rmsnorm" for op in forced_ops) == 0
+    assert forced.mainline_step.case.runtime.graph_capture_mode == "none"
+    assert forced.case.runtime.graph_capture_mode == "none"
+
+    w8_case = parse_case(compose_case(
+        "qwen3-32b", REPRESENTATIVE_SKUS["a5"], quant="w8a8", tp=1, dp=1, layers=1,
+        prompt_tokens=8, output_tokens=1,
+    ))
+    w8_meta = dict(w8_case.runtime.metadata)
+    origins = dict(w8_meta.get("recipe_binding_origins") or {})
+    origins.pop("lowerings.add_rmsnorm", None)
+    w8_meta["recipe_binding_origins"] = origins
+    pinned_case = replace(w8_case, runtime=replace(w8_case.runtime, metadata=tuple(w8_meta.items())))
+    forced_pin = resolve_scenario(pinned_case, req, stack_id="raw-eager")
+    assert forced_pin.case.runtime.kernels.get("lowerings") == {"add_rmsnorm": "vllm_ascend_native_norm"}
+
+    sp_ship = compose_case(
+        "qwen3-30b-a3b", REPRESENTATIVE_SKUS["a5"], tp=2, ep=2, dp=1, layers=1, prompt_tokens=8, output_tokens=1,
+    )
+    sp_eager = compose_case(
+        "qwen3-30b-a3b", REPRESENTATIVE_SKUS["a5"], tp=2, ep=2, dp=1, layers=1,
+        prompt_tokens=8, output_tokens=1, runtime_stack="raw-eager",
+    )
+    forced_sp = resolve_scenario(sp_ship, req, stack_id="raw-eager")
+    native_sp = resolve_scenario(sp_eager, req, stack_id="raw-eager")
+    assert "sequence_parallel" not in forced_sp.case.runtime.kernels
+    assert dict(forced_sp.case.runtime.metadata).get("sp") is False
+    assert [(o.family, o.local_shape) for o in forced_sp.mainline_step.graph.executable[0].ops] == [
+        (o.family, o.local_shape) for o in native_sp.mainline_step.graph.executable[0].ops
+    ]
+    sc_c, qp_c, lp_c = resolve_case_contracts(forced_sp.case)
+    ss = dict(forced_sp.case.runtime.metadata)["single_spine"]
+    assert ss["stack_id"] == "raw-eager" and ss["stack_track"] == "eager"
+    assert ss["lowering_plan_digest"] == lp_c.plan_digest
+    assert ss["quant_plan_digest"] == qp_c.plan_digest
+    assert ss["scenario_contract_digest"] == sc_c.digest()
+
+
+def test_flash_kda_replay_infers_head_counts_and_zero_aic_dsl_discovery():
+    from mindie_sim.rewrite.catalog_replay import _dsl_declarations, select_dsl_candidates
+    from mindie_sim.schema.datapath import datapath_for_die
+    from mindie_sim.schema.hardware import Hardware
+    from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.templates import FlashKdaProblem, enumerate_dsl_specs, lower_dsl_spec
+
+    dp = datapath_for_die(Hardware.from_mapping({"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a5"], "num_devices": 1}).dies[0])
+    kda_op = OpSpec(
+        "kda", "kda_prefill", "prefill", 0, 0, (), (), (), (), (), dtype="bf16", layout="BNSD",
+        recipe="kda_prefill", metadata=(("dsl_kernel", "flash_kda"), ("lengths", (16,)), ("hv", 4), ("hq", 2)),
+    )
+    _, kernel_name, inferred, _ = next(_dsl_declarations(kda_op))
+    explicit = FlashKdaProblem((16,), value_heads=4, query_heads=2, has_initial_state=True)
+    assert (inferred.value_heads, inferred.query_heads, inferred.has_initial_state) == (4, 2, True)
+    spec_inf, = enumerate_dsl_specs(kernel_name, inferred, dp, aic_budget=1, aiv_budget=2, variant="persistent")
+    spec_exp, = enumerate_dsl_specs(kernel_name, explicit, dp, aic_budget=1, aiv_budget=2, variant="persistent")
+    sum_inf = lower_dsl_spec(spec_inf, inferred, dp).summary
+    sum_exp = lower_dsl_spec(spec_exp, explicit, dp).summary
+    flops_inf = sum(i.logical_ops for i in sum_inf.semantic_work if i.kind == "matrix_mac")
+    flops_exp = sum(i.logical_ops for i in sum_exp.semantic_work if i.kind == "matrix_mac")
+    assert flops_inf == flops_exp
+    init_bytes = sum(b - a for o in sum_inf.read_obligations if "initial_state" in o.allocation_id for a, b in o.ranges)
+    assert init_bytes == 4 * 128 * 128 * 4
+
+    mismatch_op = OpSpec(
+        "kda_bad", "kda_prefill", "prefill", 0, 0, (), (), (), (), (), dtype="bf16", layout="BNSD",
+        recipe="kda_prefill", metadata=(("dsl_kernel", "flash_kda"), ("lengths", (16,)), ("hv", 4), ("hq", 4), ("hk", 2)),
+    )
+    assert list(_dsl_declarations(mismatch_op)) == []
+
+    attn_op = OpSpec(
+        "ar", "attn_res_prefix", "decode", 0, 0, (), (1, 7168), (1, 7168), (1, 7168), (1, 7168),
+        dtype="bf16", layout="contiguous", recipe="block_attn_res_update_rms_norm",
+    )
+    discovered = select_dsl_candidates((attn_op,), dp, aic_budget=0, aiv_budget=2)
+    assert len(discovered) == 1
+    assert discovered[0][0].kernel_id == "dsl.block_attn_res_update_rms_norm.inplace"
+    assert discovered[0][0].aic_budget == 0 and discovered[0][0].aiv_budget == 2

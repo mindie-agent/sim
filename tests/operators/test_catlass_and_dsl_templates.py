@@ -28,13 +28,14 @@ from mindie_sim.prediction.runtime.reload_bounds import compute_compulsory_hbm_c
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.program import Allocation, Stage
 from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, ReuseKey
-from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileInfeasibleError
+from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileInfeasibleError, TileShape
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.device_input import MemoryAccessBurstPenalty
 from mindie_sim.templates import (
     CatlassProblem, SemanticWorkItem, TensorRangeObligation, builtin_template_catalog,
-    compile_fuse_region, compose_step_obligations, enumerate_dsl_specs, lower_catlass_spec, lower_dsl_spec,
+    compile_fuse_region, compose_step_obligations, enumerate_catlass_specs, enumerate_dsl_specs,
+    lower_catlass_spec, lower_dsl_spec,
 )
 from mindie_sim.templates import catlass_catalog as cat, dsl_catalog as dsl
 from mindie_sim.templates.catlass_lower import solve_catlass_tile
@@ -379,7 +380,13 @@ def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
     stages = _stages(result)
     widths = dict(wqa=1024 * 640, wkva=1024 * 576, wqb=640 * 2 * (128 + 64), wkb=2 * 128 * (576 - 64))
     assert spec.template_variant == mode.value
-    assert {k: _bytes(stages, f":{k}", "cube") for k in widths} == {k: 2 * p.tokens * v for k, v in widths.items()}
+    bf16_wave = next(w for w in direct.subtile_wave if w.native_mode == "bf16")
+    issued_m = ceil(p.tokens / bf16_wave.independently_issuable_m) * bf16_wave.independently_issuable_m
+    assert {k: _bytes(stages, f":{k}", "cube") for k in widths} == {k: 2 * issued_m * v for k, v in widths.items()}
+    assert {
+        k: sum(s.metadata.get("logical_flops", 0) for n, s in stages.items() if n.endswith(f":{k}"))
+        for k in widths
+    } == {k: 2 * p.tokens * v for k, v in widths.items()}
     # ws_qa writes exact q_lora=640 cols (4 partials x FP32 = 16 B/col) and reads 96-aligned 672 cols.
     for tensor, write_bytes, read_bytes, pipe in (
         ("ws_qa", 8 * 640 * 16, 8 * 672 * 16, "mte2_aiv"),
@@ -633,3 +640,155 @@ def test_scalar_gemm_logical_obligations_and_compulsory_sectors(direct):
         assert (summary.l2_hit_bytes, summary.dram_sector_bytes, summary.logical_transfer_bytes) == (hits, hbm, 6)
         assert (cut.read_bytes, cut.write_bytes) == (hbm - SECTOR, SECTOR) and engine.accel_status()["native_steps"] > steps and not engine.allocations
         assert {entry.initial_residency for entry in summary.read_obligations} == {"l2_warm" if hits else "hbm_cold"}
+
+
+def test_fused_pipeline_split_mte2_gates_cube_on_aic_load():
+    from mindie_sim.prediction.program.binding import RecipeContext
+    from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.templates.contracts import PipeStageSpec
+    from mindie_sim.templates.fuse_region import FusedPipelineRecipe
+
+    pipes = ("mte2_aic", "mte2_aiv", "vector", "cube")
+    work = dict(zip(pipes, (512, 512, 256, 8192)))
+    rates = dict(zip(pipes, (512 / 100, 512, 256, 8192 / 10)))
+    shape = (16, 16)
+    op = OpSpec(
+        "relu_gemm", "rewrite_fused", "decode", 0, 0, (), shape, shape, shape, shape,
+        dtype="bf16", mte2_bytes=1024, vector_ops=256, flops=8192, matrix_flops=(("bf16", 8192),),
+    )
+    ctx = RecipeContext(op, work, dict(zip(pipes, pipes)), rates, 1)
+    recipe = FusedPipelineRecipe(
+        pipe_stages=(PipeStageSpec("relu", "vector"), PipeStageSpec("gemm", "cube", after=("relu",))),
+    )
+    eng = Engine([Resource(k, v) for k, v in rates.items()], backend="python")
+    done = recipe.lower(ctx).start(eng, "fused", eng.submit("ready"))
+    eng.advance(until=(done,))
+    assert done.time == pytest.approx(110.0)
+
+
+def test_fuse_region_cube_obligations_bind_aic_pipes_and_owner(datapaths):
+    indirect, _ = datapaths
+    inp = lambda name: TensorRangeObligation(0, name, 0, ((0, 512),), "hbm_cold", "device")
+    out = TensorRangeObligation(0, "C", 1, ((0, 512),), "onchip_resident", "device")
+    mm = Stage("mm", {"cube": 8192}, placement={"cube": (1,)}, metadata={"cube_dtype": "bf16"})
+    _, result = compile_fuse_region(
+        "gemm", ("mm",), indirect, dependencies={"mm": ()}, op_stages={"mm": mm},
+        tile_shape=TileShape(16, 16, 16), edge_routes=(), edge_bytes={},
+        live_in_obligations=(inp("A"), inp("B")), live_out_obligations=(out,),
+    )
+    boundary = [(k, int(st.work[k]), v) for st in result.program.stages for k, v in st.placement.items() if k != "cube"]
+    assert boundary == [("mte2_aic", 512, (1,)), ("mte2_aic", 512, (1,)), ("fixpipe", 512, (1,))]
+
+    mm_dual = Stage("mm", {"cube": 8192}, placement={"cube": (0, 1)}, metadata={"cube_dtype": "bf16"})
+    _, dual_res = compile_fuse_region(
+        "gemm_dual", ("mm",), indirect, dependencies={"mm": ()}, op_stages={"mm": mm_dual},
+        tile_shape=TileShape(16, 16, 16), edge_routes=(), edge_bytes={},
+        live_in_obligations=(inp("A"), inp("B")), live_out_obligations=(out,),
+    )
+    dual_bnd = [(k, int(st.work[k]), v) for st in dual_res.program.stages for k, v in st.placement.items() if k != "cube"]
+    assert dual_bnd == [
+        ("mte2_aic", 256, (0,)), ("mte2_aic", 256, (1,)),
+        ("mte2_aic", 256, (0,)), ("mte2_aic", 256, (1,)),
+        ("fixpipe", 256, (0,)), ("fixpipe", 256, (1,)),
+    ]
+
+
+def test_periodic_catlass_mx_b_scale_matches_eager_pair_interleaved_layout(direct):
+    from mindie_sim.templates._catlass_periodic import lower_catlass_periodic
+
+    for k_dim in (512, 480):
+        prob = CatlassProblem(16, 64, k_dim, "fp8_e4m3", "fp8_e4m3", mx_mode="mxfp8")
+        spec, = enumerate_catlass_specs(
+            prob, direct, template_ids=("catlass.mx_matmul",), l1_tiles=((16, 16, 128),),
+            aic_budget=1, aiv_budget=2,
+        )
+        eager = lower_catlass_spec(spec, prob, direct)
+        fast = lower_catlass_periodic(spec, prob, direct, solve_catlass_tile(spec, prob, direct))
+        panel0_b = fast.program.waves[0][0].phases[0].panels[0].scale_b
+        sectors = {(2 * prob.n * (g // 2) + 2 * n + g % 2) // 32 for g in range(4) for n in range(16)}
+        assert panel0_b.pattern.runs.dram_sector_and_service()[0] == 32 * len(sectors)
+        assert fast.summary.issued_copy_bytes == eager.summary.issued_copy_bytes
+        assert fast.summary.dram_sector_bytes == eager.summary.dram_sector_bytes
+
+    for k_dim in (512, 640):
+        prob = CatlassProblem(16, 64, k_dim, "fp8_e4m3", "fp8_e4m3", mx_mode="mxfp8")
+        base_spec, = enumerate_catlass_specs(
+            prob, direct, template_ids=("catlass.mx_matmul",), l1_tiles=((16, 16, 128),),
+            aic_budget=1, aiv_budget=2,
+        )
+        spec_f2 = replace(base_spec, l1_scale_factor_k=2)
+        eager_f2 = lower_catlass_spec(spec_f2, prob, direct)
+        fast_f2 = lower_catlass_periodic(spec_f2, prob, direct, solve_catlass_tile(spec_f2, prob, direct))
+        assert fast_f2.summary.issued_copy_bytes == eager_f2.summary.issued_copy_bytes
+        assert fast_f2.summary.dram_sector_bytes == eager_f2.summary.dram_sector_bytes
+        assert fast_f2.stages_count == eager_f2.stages_count
+
+
+def test_mla_prolog_issued_padding_descale_outputs_and_strided_wkb_runs(direct):
+    from mindie_sim.prediction.program.binding import RecipeContext
+    from mindie_sim.schema.operators import OpSpec
+
+    p_nd = dsl.MlaPrologProblem(tokens=1, dim=1024, q_lora=640, heads=2, weight_format="nd")
+    s_nd, = enumerate_dsl_specs(dsl.MLA_PROLOG, p_nd, direct, aic_budget=1, aiv_budget=2)
+    r_nd = lower_dsl_spec(s_nd, p_nd, direct)
+    issued_wqa = sum(st.work.get("cube", 0) for st in r_nd.program.stages if st.name.endswith(":wqa"))
+    bf16_wave = next(w for w in direct.subtile_wave if w.native_mode == "bf16")
+    assert int(issued_wqa) == 2 * bf16_wave.independently_issuable_m * p_nd.q_lora * p_nd.dim
+
+    p_33 = dsl.MlaPrologProblem(tokens=33, dim=1024, q_lora=640, heads=2, weight_format="nd")
+    s_33, = enumerate_dsl_specs(dsl.MLA_PROLOG, p_33, direct, aic_budget=1, aiv_budget=2)
+    r_33 = lower_dsl_spec(s_33, p_33, direct)
+    wqb_33 = [st for st in r_33.program.stages if st.name.endswith(":wqb")]
+    qp_33 = p_33.heads * (p_33.q_nope + p_33.rope)
+    assert sum(int(st.work.get("cube", 0)) for st in wqb_33) == 2 * 64 * p_33.q_lora * qp_33
+    assert sum(int(st.metadata.get("logical_flops", 0)) for st in wqb_33) == 2 * 33 * p_33.q_lora * qp_33
+
+    p_fp8 = dsl.MlaPrologProblem(
+        tokens=8, dim=1024, q_lora=640, heads=2, mode=dsl.QkvQuantMode.FP8_TENSOR, return_qr=False,
+    )
+    s_fp8, = enumerate_dsl_specs(dsl.MLA_PROLOG, p_fp8, direct, aic_budget=1, aiv_budget=2)
+    res_fp8 = lower_dsl_spec(s_fp8, p_fp8, direct)
+    r_fp8 = res_fp8.summary
+    assert sorted(o.allocation_id for o in r_fp8.write_obligations) == ["mla:descale_q", "mla:kv_cache", "mla:q"]
+    assert sum(b - a for o in r_fp8.write_obligations for a, b in o.ranges) == p_fp8.tokens * (
+        p_fp8.kvr + p_fp8.heads * (p_fp8.kvr + 4)
+    )
+    desc_stages = [st for st in res_fp8.program.stages if ":descale_q:" in st.name]
+    assert sum(int(st.work.get("mte3", 0)) for st in desc_stages) == p_fp8.tokens * p_fp8.heads * 32
+    assert sorted(o for st in desc_stages for o in st.placement.get("mte3", ())) == [0, 1]
+    p_hif8 = replace(p_fp8, mode=dsl.QkvQuantMode.HiF8)
+    s_hif8, = enumerate_dsl_specs(dsl.MLA_PROLOG, p_hif8, direct, aic_budget=1, aiv_budget=2)
+    desc_hif8 = [o for o in lower_dsl_spec(s_hif8, p_hif8, direct).summary.write_obligations if o.allocation_id == "mla:descale_q"]
+    assert sum(b - a for o in desc_hif8 for a, b in o.ranges) == 4
+
+    roles = ("cube", "mte1", "mte2_aic", "mte2_aiv", "mte3", "fixpipe", "vec_alu", "vec_reduce", "vec_sfu", "l2", "hbm", "vector")
+    op = OpSpec("mla", "mla_prolog", "decode", 0, 0, (), (1, 1024), (1, 1024), (1, 1024), (1, 1024), dtype="bf16")
+    ctx = RecipeContext(
+        op, {}, dict(zip(roles, roles)), dict.fromkeys(roles, 1e6), 1,
+        resource_units=dict.fromkeys(roles, 1), compute_peaks={"bf16": 1e9},
+    )
+    live = lower_dsl_spec(
+        s_nd, p_nd, direct, context=ctx, memory_view=AdmissionMemoryView({0: direct.usable_bytes("l2")}),
+        live_admission=True,
+    )
+    wkb_run = next(st for st in live.program.stages if st.name.endswith(":t0:wkb:weight")).program.pattern.runs.runs[0]
+    assert (wkb_run.rows, wkb_run.row_bytes, wkb_run.stride_bytes) == (p_nd.q_nope, 256, 1024)
+
+
+def test_vector_only_dsl_attn_res_admits_zero_aic_stream_budget(direct):
+    from mindie_sim.prediction.streams import StreamCoreBudget
+
+    prob = dsl.AttnResProblem(1, 7168)
+    results = []
+    for aic in (1, 0):
+        budget = StreamCoreBudget(aic, 2)
+        spec, = enumerate_dsl_specs(dsl.ATTN_RES, prob, direct, aic_budget=budget.aic, aiv_budget=budget.aiv)
+        summary = lower_dsl_spec(spec, prob, direct).summary
+        results.append((
+            spec.execution_mode,
+            sum(n for _, n in summary.issued_cube_flops_by_dtype),
+            sum(n for _, n in summary.vector_ops_by_pipe),
+        ))
+    assert results[0] == results[1] == ("vector_only", 0, 129155)
+    with pytest.raises(ModelingError, match="dsl_core_budget_invalid"):
+        enumerate_dsl_specs(dsl.MLA_PROLOG, dsl.MlaPrologProblem(1, 7168), direct, aic_budget=0, aiv_budget=2)

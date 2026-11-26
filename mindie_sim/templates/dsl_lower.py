@@ -13,6 +13,7 @@ from collections import Counter
 from mindie_sim.prediction.program.stages import Stage
 from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
+from mindie_sim.prediction.runtime.tile_solver import DEFAULT_INST_BLOCK_DIM
 from mindie_sim.schema.common import ModelingError
 
 from .contracts import SemanticWorkItem, ceil_div
@@ -40,6 +41,9 @@ KDA_NORM_VECTORS = 2
 MEGA_OUT_TILE_N = 256
 MEGA_OUT_WAVE_ROWS = 128
 MLA_CACHE_INDEX_BYTES = 8
+MLA_FRONT_ACTUAL_ROWS_MAX = 64
+MLA_WKB_M_TAIL_ROWS = 16
+MLA_SINGLE_AIV_STRIDE_SPLITS = 2
 ATTN_RES_MERGE_OPS = 5
 ATTN_RES_NORM_OPS = 4
 ATTN_RES_SCORE_OPS = 5
@@ -576,12 +580,74 @@ def _lower_commit(lower, p, ready):
                 lower.plan.add_ring(ring, after=(item_ready,))
 
 
+def _dsl_issued_cube_flops(datapath, m: int, n: int, k: int, *, dtype: str = "bf16") -> int:
+    """Pad cube matrix dimensions to hardware ``subtile_wave`` instruction granules."""
+    native = next((wave for wave in datapath.subtile_wave if wave.native_mode == dtype), None)
+    bm, bn, bk = (
+        (native.independently_issuable_m, native.tile_n, native.tile_k)
+        if native is not None
+        else (DEFAULT_INST_BLOCK_DIM, DEFAULT_INST_BLOCK_DIM, DEFAULT_INST_BLOCK_DIM)
+    )
+    return 2 * (ceil_div(m, bm) * bm) * (ceil_div(n, bn) * bn) * (ceil_div(k, bk) * bk)
+
+
+def _mla_issued_m_rows(
+    datapath, rows: int, bm: int, *, actual_rows: bool = False, wkb_tail: bool = False, dtype: str = "bf16",
+) -> int:
+    """Compute physical M rows executed by an MLA projection across its launcher M tiles."""
+    native = next((wave for wave in datapath.subtile_wave if wave.native_mode == dtype), None)
+    subtile_m = native.independently_issuable_m if native is not None else DEFAULT_INST_BLOCK_DIM
+    m_tiles = ceil_div(rows, bm)
+    if actual_rows:
+        return sum(
+            ceil_div(min(bm, rows - idx * bm), subtile_m) * subtile_m
+            for idx in range(m_tiles)
+        )
+    if wkb_tail and bm > MLA_WKB_M_TAIL_ROWS:
+        return sum(
+            ceil_div(
+                MLA_WKB_M_TAIL_ROWS if idx * bm + MLA_WKB_M_TAIL_ROWS >= rows else bm,
+                subtile_m,
+            ) * subtile_m
+            for idx in range(m_tiles)
+        )
+    return m_tiles * ceil_div(bm, subtile_m) * subtile_m
+
+
+def _mla_emit_fp8_descale_writes(lower, name: str, start: int, rows: int, heads: int, after) -> tuple[str, ...]:
+    """Emit per-token/head 4 B FP32 ``descale_q`` writes across participating AIVs."""
+    items = rows * heads
+    active_aivs = min(items, lower.spec.aiv_budget)
+    base_item = start * heads
+    writes: list[str] = []
+    for lane in range(active_aivs):
+        count = ceil_div(items - lane, active_aivs)
+        if active_aivs > 1:
+            runs = (AddressRun((base_item + lane) * FP32_BYTES, count, FP32_BYTES, active_aivs * FP32_BYTES),)
+        elif count > 1:
+            even_count = ceil_div(count, MLA_SINGLE_AIV_STRIDE_SPLITS)
+            odd_count = count - even_count
+            stride = MLA_SINGLE_AIV_STRIDE_SPLITS * FP32_BYTES
+            runs = (
+                AddressRun(base_item * FP32_BYTES, even_count, FP32_BYTES, stride),
+                AddressRun((base_item + 1) * FP32_BYTES, odd_count, FP32_BYTES, stride),
+            )
+        else:
+            runs = (AddressRun((base_item + lane) * FP32_BYTES, 1, FP32_BYTES, FP32_BYTES),)
+        writes.append(lower.access(
+            f"{name}:descale_q:{lane}", "mla:descale_q", count * FP32_BYTES,
+            after=after, write=True, owner=lane, runs=runs,
+        ))
+    return tuple(writes)
+
+
 def _mla_project_groups(lower, prefix, proj_name, weight_id, rows, in_width, total_out, group_size,
-                        after, ready, a_spec, *, per_core_a_reuse=False):
+                        after, ready, a_spec, *, bm, actual_rows=False, per_core_a_reuse=False):
     a_tensor, a_offset, a_private, a_ws, a_version, a_obligation = a_spec
     aic = lower.spec.aic_budget
     core_prev, core_a, out = {}, {}, []
     a_full_bytes = rows * in_width * BF16_BYTES
+    issued_m = _mla_issued_m_rows(lower.plan.datapath, rows, bm, actual_rows=actual_rows)
     for group, col0 in enumerate(range(0, total_out, group_size)):
         g_out = min(group_size, total_out - col0)
         core = group % aic
@@ -604,7 +670,8 @@ def _mla_project_groups(lower, prefix, proj_name, weight_id, rows, in_width, tot
         )
         stage = lower.cube(
             f"{prefix}:g{group}:{proj_name}", 2 * rows * in_width * g_out, (a_dep, w_dep, *prev),
-            core, operands=(a_l0_bytes, w_bytes),
+            core, issued=_dsl_issued_cube_flops(lower.plan.datapath, issued_m, g_out, in_width),
+            operands=(a_l0_bytes, w_bytes),
         )
         core_prev[core] = stage
         out.append((core, stage, col0, g_out))
@@ -612,12 +679,13 @@ def _mla_project_groups(lower, prefix, proj_name, weight_id, rows, in_width, tot
 
 
 def _mla_project_wkb(lower, prefix, proj_name, rows, heads, q_nope, head_dim, padded_qp, latent,
-                     wkb_grouped, after, ready, *, ws_q_proj_bytes=None):
+                     wkb_grouped, after, ready, *, bm, ws_q_proj_bytes=None):
     aic = lower.spec.aic_budget
     chunks = 1 if wkb_grouped else MLA_WKB_N_CHUNKS
     chunk_cols = latent // chunks
     core_prev, stages = {}, []
     total_tasks = heads * chunks
+    issued_m = _mla_issued_m_rows(lower.plan.datapath, rows, bm, wkb_tail=not wkb_grouped)
     for task in range(total_tasks):
         n_chunk = task % chunks
         head = task // chunks
@@ -635,14 +703,18 @@ def _mla_project_wkb(lower, prefix, proj_name, rows, heads, q_nope, head_dim, pa
         else:
             cube_after = (*after, *prev)
         w_bytes = q_nope * chunk_cols * BF16_BYTES
-        w_off = (head * latent + n_chunk * chunk_cols) * q_nope * BF16_BYTES
+        w_run = AddressRun(
+            (head * q_nope * latent + n_chunk * chunk_cols) * BF16_BYTES,
+            q_nope, chunk_cols * BF16_BYTES, latent * BF16_BYTES,
+        )
         w_dep = lower.access(
             f"{prefix}:t{task}:{proj_name}:weight", "wkb", w_bytes,
-            after=(ready, *prev), cube=True, owner=core, offset=w_off,
+            after=(ready, *prev), cube=True, owner=core, runs=(w_run,),
         )
         stage = lower.cube(
             f"{prefix}:t{task}:{proj_name}", 2 * rows * q_nope * chunk_cols, (*cube_after, w_dep),
-            core, operands=(a_bytes, w_bytes),
+            core, issued=_dsl_issued_cube_flops(lower.plan.datapath, issued_m, chunk_cols, q_nope),
+            operands=(a_bytes, w_bytes),
         )
         core_prev[core] = stage
         stages.append(stage)
@@ -696,7 +768,10 @@ def _lower_mla(lower, p, ready):
         rows = min(scratch_rows, p.tokens - start)
         name = f"mla:{chunk}"
         core, vector = chunk % spec.aic_budget, chunk % spec.aiv_budget
-        wqa_w, wkva_w, wqb_w, qb_grouped, wkb_grouped, _ = mla_projection_widths(p, spec.aic_budget, rows)
+        wqa_w, wkva_w, wqb_w, qb_grouped, wkb_grouped, bm = mla_projection_widths(p, spec.aic_budget, rows)
+        direct_front = (
+            p.weight_format == "nz" and mode == QkvQuantMode.A16C16 and bm <= MLA_FRONT_ACTUAL_ROWS_MAX
+        )
         if "ws_x_pad" in workspace:
             x_raw = lower.access(name + ":x", "mla:x", rows * p.dim * BF16_BYTES, after=previous,
                                  offset=start * p.dim * BF16_BYTES, owner=vector)
@@ -708,9 +783,10 @@ def _lower_mla(lower, p, ready):
             front_after = previous
             front_a = ("mla:x", start * p.dim * BF16_BYTES, False, None, None, True)
         qa_groups = _mla_project_groups(lower, name, "wqa", "wqa", rows, p.dim, p.q_lora, wqa_w,
-                                        front_after, ready, front_a)
+                                        front_after, ready, front_a, bm=bm,
+                                        actual_rows=direct_front and not qa_partials)
         kva_groups = _mla_project_groups(lower, name, "wkva", "wkva", rows, p.dim, p.kvr, wkva_w,
-                                         front_after, ready, front_a)
+                                         front_after, ready, front_a, bm=bm, actual_rows=direct_front)
         qa_read = _mla_spill_groups(lower, name + ":ws_qa", "ws_qa", qa_ws_rows, padded_qa, qa_elem, qa_groups,
                                     vector, working_set=workspace["ws_qa"])
         kval = _mla_spill_groups(lower, name + ":ws_kva", "ws_kva", scratch_rows, padded_kva, BF16_BYTES, kva_groups,
@@ -752,11 +828,11 @@ def _lower_mla(lower, p, ready):
         cache = (lower.access(name + ":kv_cache", "mla:kv_cache", len(slots) * cache_row,
                               after=(index,), owner=vector, write=True, runs=runs) if slots else index)
         qb_groups = _mla_project_groups(lower, name, "wqb", "wqb", rows, p.q_lora, qp, wqb_w,
-                                        (norm, cache), ready, qb_a, per_core_a_reuse=qb_grouped)
+                                        (norm, cache), ready, qb_a, bm=bm, per_core_a_reuse=qb_grouped)
         proj_writes = _mla_spill_groups(lower, name + ":ws_q_proj", "ws_q_proj", scratch_rows, padded_qp, BF16_BYTES,
                                         qb_groups, core, cube_dst=True, working_set=workspace["ws_q_proj"], emit_read=False)
         kb_stages = _mla_project_wkb(lower, name, "wkb", rows, p.heads, p.q_nope, head_dim, padded_qp, latent,
-                                     wkb_grouped, proj_writes, ready, ws_q_proj_bytes=workspace["ws_q_proj"])
+                                     wkb_grouped, proj_writes, ready, bm=bm, ws_q_proj_bytes=workspace["ws_q_proj"])
         q_elements = rows * p.heads * p.kvr
         rope = lower.vector(name + ":q_rope", rows * p.heads * p.rope * ATTN_RES_NORM_OPS, kb_stages, vector)
         if mode in MLA_QUANTIZED_QUERY:
@@ -772,7 +848,7 @@ def _lower_mla(lower, p, ready):
                     maxima_by_core[worker].append(lower.vector(
                         f"{name}:partial_max:{worker}", base + (worker < tail), (q_value,), w_lane, "vec_reduce",
                     ))
-                quant_rows.append((name, core, vector, start, rows, q_elements, offset, size, wqb_w, qb_grouped, wkb_grouped))
+                quant_rows.append((name, core, vector, start, rows, q_elements, offset, size, wqb_w, qb_grouped, wkb_grouped, bm))
                 previous = tuple(values[-1] for values in maxima_by_core.values() if values)
                 continue
             q_value = lower.access(name + ":ws_q_fp_read", "ws_q_fp", size, after=(q_value,),
@@ -781,7 +857,11 @@ def _lower_mla(lower, p, ready):
         elem = 1 if mode == QkvQuantMode.FP8_TENSOR else BF16_BYTES
         output = lower.access(name + ":q_output", "mla:q", q_elements * elem, after=(rope,), write=True,
                               offset=start * p.heads * p.kvr * elem, owner=vector)
-        previous = (output,)
+        if mode == QkvQuantMode.FP8_TENSOR:
+            descales = _mla_emit_fp8_descale_writes(lower, name, start, rows, p.heads, (rope,))
+            previous = (output, *descales)
+        else:
+            previous = (output,)
     if not quant_rows:
         return
     max_events = []
@@ -797,7 +877,11 @@ def _lower_mla(lower, p, ready):
     barrier = lower.stage("q_global_quant_launch_barrier", max_events, launch_wide=True)
     maxima = lower.access("q_global_quant_amax_read", "ws_amax", workspace["ws_amax"],
                           after=(barrier,), private=True)
-    for name, core, vector, start, rows, elements, offset, size, wqb_w, qb_grouped, wkb_grouped in quant_rows:
+    lower.access(
+        "mla:descale_q", "mla:descale_q", FP32_BYTES,
+        after=(maxima,), owner=quant_rows[0][2], write=True, offset=0,
+    )
+    for name, core, vector, start, rows, elements, offset, size, wqb_w, qb_grouped, wkb_grouped, bm in quant_rows:
         after = (maxima,)
         if recompute:
             re_a = (
@@ -805,9 +889,9 @@ def _lower_mla(lower, p, ready):
                 start * p.q_lora * BF16_BYTES, not p.return_qr, None, 1 if p.return_qr else None, not p.return_qr,
             )
             qb_re = _mla_project_groups(lower, name, "wqb_recompute", "wqb", rows, p.q_lora, qp, wqb_w,
-                                        after, ready, re_a, per_core_a_reuse=qb_grouped)
+                                        after, ready, re_a, bm=bm, per_core_a_reuse=qb_grouped)
             after = _mla_project_wkb(lower, name, "wkb_recompute", rows, p.heads, p.q_nope, head_dim, padded_qp, latent,
-                                     wkb_grouped, tuple(stage for _, stage, _, _ in qb_re), ready)
+                                     wkb_grouped, tuple(stage for _, stage, _, _ in qb_re), ready, bm=bm)
         else:
             after = (lower.access(name + ":ws_q_fp_read", "ws_q_fp", size, after=after, private=True,
                                   offset=offset, owner=vector, working_set=workspace["ws_q_fp"]),)

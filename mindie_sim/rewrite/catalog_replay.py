@@ -337,6 +337,52 @@ def _dsl_problem_kwargs(
     return kw
 
 
+def _infer_flash_kda_problem(op: OpSpec, meta: Mapping[str, object]) -> FlashKdaProblem | None:
+    lengths = tuple(int(v) for v in meta["lengths"])
+    kw = _dsl_problem_kwargs(FlashKdaProblem, meta, exclude=frozenset({"lengths"}))
+    hv = kw.get("value_heads")
+    if hv is None:
+        raw_hv = next((meta[k] for k in ("hv", "heads") if meta.get(k) is not None), None)
+        if raw_hv is not None:
+            hv = int(raw_hv)
+            kw["value_heads"] = hv
+    eff_hv = int(hv) if hv is not None else 1
+    raw_hk = next((meta[k] for k in ("key_heads", "hk", "num_k_heads") if meta.get(k) is not None), None)
+    hq = kw.get("query_heads")
+    if hq is None:
+        raw_hq = next((meta[k] for k in ("hq", "q_heads") if meta.get(k) is not None), None)
+        if raw_hq is not None:
+            hq = int(raw_hq)
+    if raw_hk is not None:
+        hk = int(raw_hk)
+        eff_hq = int(hq) if hq is not None else hk
+        if eff_hq != hk:
+            return None
+        kw["query_heads"] = eff_hq
+    elif hq is not None:
+        eff_hq = int(hq)
+        if eff_hq < 1 or eff_hq > eff_hv or eff_hv % eff_hq != 0:
+            return None
+        kw["query_heads"] = eff_hq
+    elif hv is not None:
+        kw["query_heads"] = eff_hv
+    for alias, target in (
+        ("use_initial_state", "has_initial_state"),
+        ("output_final_state", "return_final_state"),
+        ("save_intermediate_state", "save_chunk_states"),
+        ("kda_template_request", "requested_template"),
+    ):
+        if target not in kw and meta.get(alias) is not None:
+            kw[target] = _freeze_dsl_field_value(meta[alias])
+    if "has_initial_state" not in kw and (
+        op.family == "kda_prefill"
+        or op.recipe == "kda_prefill"
+        or meta.get("operation") == "kda_prefill"
+    ):
+        kw["has_initial_state"] = True
+    return FlashKdaProblem(lengths, **kw)
+
+
 def _infer_dsl_problem(op: OpSpec, meta: Mapping[str, object], kernel: str):
     if kernel == ATTN_RES and len(op.local_shape) >= _PAIR_LEN and op.layout == "contiguous":
         tokens = int(meta.get("tokens") or meta.get("rows") or prod(op.local_shape[:-1]))
@@ -375,9 +421,7 @@ def _infer_dsl_problem(op: OpSpec, meta: Mapping[str, object], kernel: str):
             )
             return MixedQuantSparseMlaProblem(n_ori, n_cmp, queries=queries, **kw)
     if kernel == FLASH_KDA and meta.get("lengths"):
-        lengths = tuple(int(v) for v in meta["lengths"])
-        kw = _dsl_problem_kwargs(FlashKdaProblem, meta, exclude=frozenset({"lengths"}))
-        return FlashKdaProblem(lengths, **kw)
+        return _infer_flash_kda_problem(op, meta)
     if kernel == MEGA_KDA and {"batch", "tp", "sequence", "num_heads", "hidden_size"} <= meta.keys():
         kw = _dsl_problem_kwargs(
             MegaRecurrentKdaProblem, meta,
@@ -442,7 +486,7 @@ def _convex_members(ops: Sequence[OpSpec], ids: tuple[str, ...]) -> tuple[OpSpec
 
 
 def _dsl_candidates(ops, datapath, aic, aiv):
-    if not aic or not aiv:
+    if aic < 0 or aiv <= 0:
         return
     for op in ops:
         for index, identifier, problem, members in _dsl_declarations(op):
