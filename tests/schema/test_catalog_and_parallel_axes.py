@@ -57,28 +57,27 @@ from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import RequestView
 from mindie_sim.structure import export_structure
 from scripts.verify_m1 import CATALOG_MODELS, _manifest_reference_label
-from tools.bench_packets import PacketError, assert_public_provenance, build_packets
-from tools.bench_plan_builders import (
+from mindie_sim.export.operator_matrix import (
     BOUNDARY_BUILDER,
     BenchGeometryError,
     BenchTopologyError,
+    PlanError,
     UnmodeledCapabilityError,
+    build_fabric_cases as _fabric_cases,
+    build_hardware_view as _hardware_view,
+    build_v1_node_fields as _node_fields,
+    declared_implementation as _declared_implementation,
+    display_name as _display_name,
+    expert_bank_bytes as _expert_bank_bytes,
+    explicit_ledger as _explicit_ledger,
     fabric_route_ranks,
     resolve_builder_strict,
     resolve_collective_cosets,
     resolve_collective_group_ranks,
     resolve_fabric_collective_abi,
+    slot_plan_for,
 )
-from tools.bench_plan_parallel import PlanError, slot_plan_for
-from tools.export_subgraph_bench_plan import (
-    _declared_implementation,
-    _display_name,
-    _expert_bank_bytes,
-    _explicit_ledger,
-    _fabric_cases,
-    _hardware_view,
-    _node_fields,
-)
+from mindie_sim.observations.bench_packets import PacketError, assert_public_provenance, build_packets
 
 pytestmark = pytest.mark.tier0
 

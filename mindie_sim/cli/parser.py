@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from mindie_sim.feature_mechanisms import DEFAULT_WATERFALL_CONTEXT, DEFAULT_WATERFALL_SEQUENCES
 
 from .export import EXPORT_BOOLEAN_FLAGS, add_export_commands
+from .matrix import MATRIX_BOOLEAN_FLAGS
 from .onboarding import ONBOARDING_BOOLEAN_FLAGS, add_onboarding_commands
 from .options import add_runtime_arguments
 from .sku import add_sku_commands
@@ -42,6 +43,7 @@ CLI_HELP_DESCRIPTION = (
     "       report        One-shot auto-solve + Before/After .xlsx + trace_view.json + agent_brief.json (+ --from-script)\n"
     "       solve         One-shot PD/Colocated deployment solver + HBM ledger + 4-track waterfall\n"
     "       export        Fixed-parallel scenario export (.xlsx / msprof trace_view.json)\n"
+    "       matrix        Multi-model operator matrix, outward msprof package & deduplicated bench-plan/2\n"
     "       quickstart    <45-line golden commands, QuaRot quant defaults & 3-step Agent loop\n"
     "       catalog       List built-in models, hardware SKUs (--hardware), presets (--presets) & quant (--quant)\n"
     "  2. Calibration & Hardware Onboarding (实测对账与接入):\n"
@@ -75,12 +77,14 @@ _BOOLEAN_FLAGS = frozenset({
     "--enable-shared-expert-dp", "--no-enable-shared-expert-dp",
     *ONBOARDING_BOOLEAN_FLAGS,
     *EXPORT_BOOLEAN_FLAGS,
+    *MATRIX_BOOLEAN_FLAGS,
 })
 
 DELEGATED_COMMANDS = frozenset({
     "structure", "compare-cohorts", "extensions", "profile",
     "scoreboard", "subgraph-parity",
     "bench-packets", "reconcile-campaign", "diff-campaigns",
+    "matrix",
 })
 
 

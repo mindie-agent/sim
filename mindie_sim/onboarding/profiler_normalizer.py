@@ -28,18 +28,25 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import lru_cache
+import importlib
 import json
 import math
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
-from mindie_sim.backends.abi_registry import default_abi_registry
+from mindie_sim.export.operator_matrix import (
+    is_onboarding_family,
+    resolve_builder_strict as _canonical_resolve_builder_strict,
+    resolve_onboarding_builder_and_abi,
+)
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
@@ -53,45 +60,22 @@ from .contracts import (
 )
 from .whitebox_runner import resolve_sku_profile, temporary_scaffold_profile
 
-_DEFAULT_ATTENTION_HEADS = 16
-_INDEXER_ATTENTION_HEADS = 32
-_MLA_LATENT_DIM = 512
-_MLA_ROPE_DIM = 64
-_MLA_HEAD_DIM = 128
-_MLA_BLOCK_SIZE = 128
-_MLA_HIDDEN_WIDTH = 2048
-_MLA_BF16_BYTES = 2
-_MLA_DENSE_INTERMEDIATE = 10944
-_MLA_MOE_INTERMEDIATE = 1408
-_MLA_SHARED_EXPERTS = 2
-_MLA_PROBE_LAYERS = 2
-_MLA_PROBE_VOCAB = 102400
-_MLA_INDEX_Q_LORA_RANK = 1536
-_MLA_INDEX_DEFAULT_TOPK = 2048
-_MLA_FIRST_K_DENSE_REPLACE = 1
-_MOE_TOPK_EXPERTS = 6
-_MOE_EXPERT_BANK = 64
-_MOE_GATE_UP_WIDTH = 2816
-_DEFAULT_HEAD_DIM = 128
-_DEFAULT_HIDDEN_WIDTH = 4096
-_DEFAULT_CONTEXT_FALLBACK = 2048
-_L2_CONTEXT_MIN = 24576
-_L3_CONTEXT_MIN = 200000
-_MIN_COLLECTIVE_BYTES = 4
-_DEFAULT_COLLECTIVE_BYTES = 4096
-_RING_ALLREDUCE_FACTOR = 2
-_MIN_DCP_PARTIALS = 2
-_MIN_GEMM_RANK = 3
-_MIN_2D_RANK = 2
-_BLOCK_TABLE_PAIR_LEN = 2
-_LOWER_CACHE_MAXSIZE = 64
-_P50_Q = 0.50
-_P99_Q = 0.99
-_COORDINATOR_RPC_TIMEOUT_S = 45
-_DEFAULT_LEASE_TTL_S = 600
-_PARTIAL_ABI_EXIT_CODE = 2
+_DEFAULT_ATTENTION_HEADS, _INDEXER_ATTENTION_HEADS = 16, 32
+_MLA_LATENT_DIM, _MLA_ROPE_DIM, _MLA_HEAD_DIM, _MLA_BLOCK_SIZE = 512, 64, 128, 128
+_MLA_HIDDEN_WIDTH, _MLA_BF16_BYTES, _MLA_DENSE_INTERMEDIATE, _MLA_MOE_INTERMEDIATE = 2048, 2, 10944, 1408
+_MLA_SHARED_EXPERTS, _MLA_PROBE_LAYERS, _MLA_PROBE_VOCAB = 2, 2, 102400
+_MLA_INDEX_Q_LORA_RANK, _MLA_INDEX_DEFAULT_TOPK, _MLA_FIRST_K_DENSE_REPLACE = 1536, 2048, 1
+_MOE_TOPK_EXPERTS, _MOE_EXPERT_BANK, _MOE_GATE_UP_WIDTH = 6, 64, 2816
+_DEFAULT_HEAD_DIM, _DEFAULT_HIDDEN_WIDTH, _DEFAULT_CONTEXT_FALLBACK = 128, 4096, 2048
+_L2_CONTEXT_MIN, _L3_CONTEXT_MIN = 24576, 200000
+_MIN_COLLECTIVE_BYTES, _DEFAULT_COLLECTIVE_BYTES, _RING_ALLREDUCE_FACTOR = 4, 4096, 2
+_MIN_DCP_PARTIALS, _MIN_GEMM_RANK, _MIN_2D_RANK, _BLOCK_TABLE_PAIR_LEN = 2, 3, 2, 2
+_LOWER_CACHE_MAXSIZE, _P50_Q, _P99_Q = 64, 0.50, 0.99
+_COORDINATOR_RPC_TIMEOUT_S, _DEFAULT_LEASE_TTL_S, _PARTIAL_ABI_EXIT_CODE = 45, 600, 2
 _SUBGRAPH_PLAN_SCHEMA = "mindie-bench-subgraph-plan/1"
+_BENCH_PLAN_V2_SCHEMA = "mindie-bench-plan/2"
 _OBSERVATION_SCHEMA = "mindie-bench-observation/1"
+_OBSERVATION_V2_SCHEMA = "mindie-bench-observation/2"
 _RECEIPT_SCHEMA = "mindie-bench-receipt/1"
 _SUBGRAPH_RUN_SCHEMA = "mindie-bench-subgraph-run/1"
 _ARCH35_MARKER = "35"
@@ -103,38 +87,12 @@ _SPARSE_INDEXER_FAMILIES = frozenset({"sparse_indexer", "lightning_indexer", "in
 _GEMM_FAMILIES = frozenset({"gemm", "grouped_gemm", "gate_up_projection", "down_projection"})
 _RESIDUAL_ADD_RECIPES = frozenset({"residual_add", "vector_add", "add"})
 _COLLECTIVE_FAMILIES = frozenset({"dcp_allgather", "allgather", "allreduce", "alltoall", "reduce_scatter"})
+_DCP_PACK_RECIPES = frozenset({"dcp_query_pack", "dcp_output_pack"})
 _ABI_REJECT_STATUSES = frozenset({"unsupported_binding", "abi_rejected", "unmodeled"})
-_BUSY_UNION_MODES = frozenset({"stream_saturated", "busy_union", "event_busy_union", "eager_device", "aclgraph_device"})
+_BUSY_UNION_MODES = frozenset({"stream_saturated", "busy_union", "event_busy_union"})
+_HOST_FALLBACK_MODES = frozenset({"host_fallback", "perf_counter_host_fallback"})
 _VALID_LEASE_OUTCOMES = frozenset({"", "success", "ok"})
 _VALID_LEASE_STATUSES = frozenset({"", "ready", "granted", "acquired", "active", "ok"})
-_FAMILY_ABI_TABLE: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
-    "attention": ("attention", "latent_attention0", "absorbed_mla", ("aclnnFusedInferAttentionScore",)),
-    "indexer": ("indexer", "lightning_indexer", "lightning_indexer", ("aclnnLightningIndexer", "aclnnQuantLightningIndexerV2")),
-    "sparse_indexer": ("indexer", "lightning_indexer", "lightning_indexer", ("aclnnLightningIndexer", "aclnnQuantLightningIndexerV2")),
-    "lightning_indexer": ("indexer", "lightning_indexer", "lightning_indexer", ("aclnnLightningIndexer", "aclnnQuantLightningIndexerV2")),
-    "rmsnorm": ("rmsnorm", "rmsnorm", "rms_norm", ("torch_npu.npu_rms_norm", "aclnnGemmaRmsNorm")),
-    "add_rmsnorm": ("add_rmsnorm", "add_rmsnorm", "add_rms_norm", ("torch_npu.npu_add_rms_norm", "AddRmsNormBias")),
-    "layernorm": ("layernorm", "layernorm", "layer_norm", ("_layer_norm_fwd_1pass_kernel_npu",)),
-    "swiglu": ("swiglu", "swiglu", "swiglu", ("aclnnSwiGlu",)),
-    "rotary": ("elementwise", "rotary", "rotary_embedding", ("torch_npu.npu_rotary_mul",)),
-    "gemm": ("gemm", "linear", "matmul", ("aclnnMatmul",)),
-    "matmul": ("gemm", "linear", "matmul", ("aclnnMatmul",)),
-    "linear": ("gemm", "linear", "matmul", ("aclnnMatmul",)),
-    "grouped_gemm": ("grouped_gemm", "grouped_matmul", "grouped_matmul", ("aclnnGroupedMatmul",)),
-    "routing": ("moe_init_routing", "moe_init_routing_v3", "moe_init_routing", ("torch_npu.npu_moe_init_routing_v2",)),
-    "moe_init_routing": ("moe_init_routing", "moe_init_routing_v3", "moe_init_routing", ("torch_npu.npu_moe_init_routing_v2",)),
-    "kv_compress_epilog": ("kv_compress_epilog", "kv_store", "kv_compress_epilog", ("aclnnKvRmsNormRopeCacheV2",)),
-    "attention_merge": ("attention_merge", "dcp_lse_merge", "dcp_lse_attention_merge", ("aclnnRingAttentionUpdateV2",)),
-    "dcp_allgather": ("dcp_allgather", "dcp_allgather", "all_gather", ("hcom_allGather",)),
-    "allgather": ("allgather", "allgather", "all_gather", ("hcom_allGather",)),
-    "allreduce": ("allreduce", "allreduce", "all_reduce", ("hcom_allReduce",)),
-    "alltoall": ("alltoall", "alltoall", "all_to_all", ("hcom_alltoall", "hcom_alltoallv")),
-    "reduce_scatter": ("reduce_scatter", "reduce_scatter", "reduce_scatter", ("hcom_reduceScatter",)),
-}
-_DCP_PACK_ABI_TABLE: dict[str, tuple[str, tuple[str, ...]]] = {
-    "dcp_query_pack": ("dcp_query_pack", ("_q_gather_prep_head_major_kernel",)),
-    "dcp_output_pack": ("dcp_output_pack", ("_pack_dcp_output_lse_kernel", "_pack_dcp_output_lse_batched_kernel")),
-}
 _CAPTURE_SHAPE_KEYS = frozenset({
     "tokens", "sequences", "batch_size", "q_len", "query_tokens", "seq_len", "kv_len", "context_len",
     "page_count", "block_size", "block_table", "heads", "kv_heads", "head_dim", "latent", "rope", "width",
@@ -195,54 +153,11 @@ def _arch_for_sku(sku: str, *, profile_override: Mapping[str, Any] | None = None
     return "A3" if str(sku).startswith(_ARCH_A3_PREFIX) else "A2"
 
 
-def _resolve_abi_symbol(arch: str, candidates: Sequence[str], *, family: str) -> str:
-    reg = default_abi_registry()
-    for abi_id in candidates:
-        hits = reg.lookup(abi_id, arch, available_only=True)
-        if hits:
-            return str(hits[0].symbol_or_kernel)
-    raise UnmodeledCapabilityError(f"profiler_abi_unavailable:arch={arch}:family={family}:candidates={list(candidates)}")
-
-
 def _structural_mla_probe_config(*, indexed: bool = False, topk: int | None = None, hidden_size: int | None = None) -> dict[str, Any]:
+    base = {"model_type": "structural_mla", "intermediate_size": _MLA_DENSE_INTERMEDIATE, "kv_lora_rank": _MLA_LATENT_DIM, "qk_nope_head_dim": _MLA_HEAD_DIM, "qk_rope_head_dim": _MLA_ROPE_DIM, "v_head_dim": _MLA_HEAD_DIM, "vocab_size": _MLA_PROBE_VOCAB, "torch_dtype": "bfloat16"}
     if indexed:
-        return {
-            "name": "structural-indexed-mla-probe",
-            "model_type": "structural_mla",
-            "hidden_size": int(hidden_size or _DEFAULT_HIDDEN_WIDTH),
-            "intermediate_size": _MLA_DENSE_INTERMEDIATE,
-            "num_hidden_layers": 1,
-            "num_attention_heads": _INDEXER_ATTENTION_HEADS,
-            "num_key_value_heads": _INDEXER_ATTENTION_HEADS,
-            "q_lora_rank": _MLA_INDEX_Q_LORA_RANK,
-            "kv_lora_rank": _MLA_LATENT_DIM,
-            "qk_nope_head_dim": _MLA_HEAD_DIM,
-            "qk_rope_head_dim": _MLA_ROPE_DIM,
-            "v_head_dim": _MLA_HEAD_DIM,
-            "vocab_size": _MLA_PROBE_VOCAB,
-            "torch_dtype": "bfloat16",
-            "_probe_index_topk": int(topk or _MLA_INDEX_DEFAULT_TOPK),
-        }
-    return {
-        "name": "structural-mla-probe",
-        "model_type": "structural_mla",
-        "hidden_size": int(hidden_size or _MLA_HIDDEN_WIDTH),
-        "intermediate_size": _MLA_DENSE_INTERMEDIATE,
-        "num_hidden_layers": _MLA_PROBE_LAYERS,
-        "num_attention_heads": _DEFAULT_ATTENTION_HEADS,
-        "num_key_value_heads": 1,
-        "kv_lora_rank": _MLA_LATENT_DIM,
-        "qk_nope_head_dim": _MLA_HEAD_DIM,
-        "qk_rope_head_dim": _MLA_ROPE_DIM,
-        "v_head_dim": _MLA_HEAD_DIM,
-        "n_routed_experts": _MOE_EXPERT_BANK,
-        "n_shared_experts": _MLA_SHARED_EXPERTS,
-        "num_experts_per_tok": _MOE_TOPK_EXPERTS,
-        "moe_intermediate_size": _MLA_MOE_INTERMEDIATE,
-        "first_k_dense_replace": _MLA_FIRST_K_DENSE_REPLACE,
-        "vocab_size": _MLA_PROBE_VOCAB,
-        "torch_dtype": "bfloat16",
-    }
+        return {**base, "name": "structural-indexed-mla-probe", "hidden_size": int(hidden_size or _DEFAULT_HIDDEN_WIDTH), "num_hidden_layers": 1, "num_attention_heads": _INDEXER_ATTENTION_HEADS, "num_key_value_heads": _INDEXER_ATTENTION_HEADS, "q_lora_rank": _MLA_INDEX_Q_LORA_RANK, "_probe_index_topk": int(topk or _MLA_INDEX_DEFAULT_TOPK)}
+    return {**base, "name": "structural-mla-probe", "hidden_size": int(hidden_size or _MLA_HIDDEN_WIDTH), "num_hidden_layers": _MLA_PROBE_LAYERS, "num_attention_heads": _DEFAULT_ATTENTION_HEADS, "num_key_value_heads": 1, "n_routed_experts": _MOE_EXPERT_BANK, "n_shared_experts": _MLA_SHARED_EXPERTS, "num_experts_per_tok": _MOE_TOPK_EXPERTS, "moe_intermediate_size": _MLA_MOE_INTERMEDIATE, "first_k_dense_replace": _MLA_FIRST_K_DENSE_REPLACE}
 
 
 def _refresh_probe_single_spine(case_dict: dict[str, Any], *, indexed: bool, index_dtype: str) -> dict[str, Any]:
@@ -256,31 +171,13 @@ def _refresh_probe_single_spine(case_dict: dict[str, Any], *, indexed: bool, ind
         return case_dict
     ci_copy = dict(ci)
     if indexed:
-        req = dict(ci_copy.get("requested_options") or {})
-        req["indexer_kv_dtype"] = index_dtype
-        ci_copy["requested_options"] = req
+        ci_copy["requested_options"] = {**dict(ci_copy.get("requested_options") or {}), "indexer_kv_dtype": index_dtype}
     ss["contract_inputs"] = ci_copy
-    meta["single_spine"] = ss
-    rt["metadata"] = meta
-    updated = {**case_dict, "runtime": rt}
+    updated = {**case_dict, "runtime": {**rt, "metadata": {**meta, "single_spine": ss}}}
     sc, qp, lp = resolve_case_contracts(updated)
     if qp is not None and lp is not None:
-        ss.update({
-            "quant_plan_digest": qp.plan_digest,
-            "quant_provenance": qp.provenance,
-            "kv_cache_abi_count": len(qp.kv_cache_abi),
-            "index_cache_abi_count": len(qp.index_cache_abi),
-            "recurrent_state_abi_count": len(qp.recurrent_state_abi),
-            "prepared_weights": [item.allocation_id for item in qp.prepared_weights],
-            "packed_groups_count": len(qp.packed_groups),
-            "lowering_plan_digest": lp.plan_digest,
-            "allowed_rewrite_tracks": list(lp.allowed_rewrite_tracks),
-            "recipe_bindings_count": len(lp.recipe_bindings),
-            "scenario_contract_digest": sc.digest() if sc is not None else "",
-        })
-        meta["single_spine"] = ss
-        rt["metadata"] = meta
-        updated = {**updated, "runtime": rt}
+        ss.update({"quant_plan_digest": qp.plan_digest, "quant_provenance": qp.provenance, "kv_cache_abi_count": len(qp.kv_cache_abi), "index_cache_abi_count": len(qp.index_cache_abi), "recurrent_state_abi_count": len(qp.recurrent_state_abi), "prepared_weights": [i.allocation_id for i in qp.prepared_weights], "packed_groups_count": len(qp.packed_groups), "lowering_plan_digest": lp.plan_digest, "allowed_rewrite_tracks": list(lp.allowed_rewrite_tracks), "recipe_bindings_count": len(lp.recipe_bindings), "scenario_contract_digest": sc.digest() if sc is not None else ""})
+        updated = {**updated, "runtime": {**rt, "metadata": {**meta, "single_spine": ss}}}
     return updated
 
 
@@ -401,8 +298,7 @@ def _lowered_collective_node(
     raw_link = int(op_rec.get("link_bytes") or 0)
     grp_axis = "dcp" if fam == "dcp_allgather" else (str(op_rec.get("group_axis") or "") or ("dcp" if "dcp" in rec else ("pcp" if "pcp" in rec else "tp")))
     grp_sz = dcp if grp_axis in {"dcp", "cp"} else (pcp if grp_axis == "pcp" else tp)
-    _pf, _pr, bld, abi_cands = _FAMILY_ABI_TABLE[fam]
-    impl = _resolve_abi_symbol(arch, abi_cands, family=fam)
+    _pf, _pr, bld, impl = resolve_onboarding_builder_and_abi(arch, fam)
     if fam in {"dcp_allgather", "allgather"}:
         nbytes = max(_MIN_COLLECTIVE_BYTES, (raw_link // max(1, grp_sz - 1)) if raw_link > 0 else _DEFAULT_COLLECTIVE_BYTES)
     elif fam == "allreduce":
@@ -431,7 +327,7 @@ def _lowered_op_to_profiler_node(
             sh["query_layout"] = sh["input_layout"] = op_rec["query_layout"]
             sh["cache_layout"] = op_rec["cache_layout"] or "PA_BSND"
             sh["output_layout"] = op_rec["output_layout"] or "NBSD"
-        impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["attention"][3], family=fam)
+        impl = resolve_onboarding_builder_and_abi(arch, "attention")[3]
         return (
             {"node_id": nid, "op_id": oid, "kind": "operator", "op": "absorbed_mla", "builder": "absorbed_mla", "family": "attention", "recipe": rec, "implementation": impl, "dtype": dt, "paged": True, "layout": sh.get("query_layout", "TND"), "shape": sh},
             {"op_id": oid, "family": "attention", "recipe": rec, "builder": "absorbed_mla", "paged": True, "heads": sh["heads"], "kv_heads": 1, "latent": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "kv_len": sh["seq_len"], "page_count": sh["page_count"], "query_layout": sh.get("query_layout", "TND")},
@@ -440,7 +336,7 @@ def _lowered_op_to_profiler_node(
         m_d, n_d, k_d, mg = int(loc[0]), int(loc[1]), int(loc[2]), max(1, int(op_rec["matrix_groups"]))
         qm = str(op_rec.get("quant_mode") or "none").strip().lower()
         if mg > 1:
-            impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["grouped_gemm"][3], family="grouped_gemm")
+            impl = resolve_onboarding_builder_and_abi(arch, "grouped_gemm")[3]
             raw_gl = op_rec.get("matrix_group_rows") or ()
             q_base, q_rem = divmod(max(0, m_d), mg)
             glist = [int(x) for x in raw_gl] if (len(raw_gl) == mg and sum(int(x) for x in raw_gl) == max(0, m_d)) else ([q_base + 1] * q_rem + [q_base] * (mg - q_rem))
@@ -448,7 +344,7 @@ def _lowered_op_to_profiler_node(
                 {"node_id": nid, "op_id": oid, "kind": "operator", "op": "grouped_matmul", "builder": "grouped_matmul", "family": "grouped_gemm", "recipe": "grouped_matmul", "implementation": impl, "dtype": dt, "group_list": glist, "group_list_type": 1, "shape": {"m": m_d, "n": n_d, "k": k_d, "e": mg, "matrix_groups": mg, "dtype": dt}},
                 {"op_id": oid, "family": fam, "recipe": rec, "builder": "grouped_matmul", "dtype": dt, "quant_mode": qm, "m": m_d, "n": n_d, "k": k_d, "matrix_groups": mg},
             )
-        impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["gemm"][3], family="gemm")
+        impl = resolve_onboarding_builder_and_abi(arch, "gemm")[3]
         return (
             {"node_id": nid, "op_id": oid, "kind": "operator", "op": "matmul", "builder": "matmul", "family": fam, "recipe": rec, "implementation": impl, "dtype": dt, "shape": {"m": m_d, "n": n_d, "k": k_d, "matrix_groups": 1, "dtype": dt}},
             {"op_id": oid, "family": fam, "recipe": rec, "builder": "matmul", "dtype": dt, "quant_mode": qm, "m": m_d, "n": n_d, "k": k_d, "matrix_groups": 1},
@@ -456,15 +352,13 @@ def _lowered_op_to_profiler_node(
     if fam in {"rmsnorm", "add_rmsnorm", "swiglu"}:
         toks = int(loc[0]) if len(loc) >= _MIN_2D_RANK else total_tokens
         width = int(loc[-1]) if loc else _MLA_HIDDEN_WIDTH
-        _pf, _pr, bld, abi_cands = _FAMILY_ABI_TABLE[fam]
-        impl = _resolve_abi_symbol(arch, abi_cands, family=fam)
+        _pf, _pr, bld, impl = resolve_onboarding_builder_and_abi(arch, fam)
         return {"node_id": nid, "op_id": oid, "kind": "operator", "op": bld, "builder": bld, "family": fam, "recipe": rec, "implementation": impl, "dtype": dt, "shape": {"tokens": toks, "width": width}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": bld, "width": width}
     if fam == "elementwise" and rec == "rotary":
-        impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["rotary"][3], family="rotary")
+        impl = resolve_onboarding_builder_and_abi(arch, "rotary")[3]
         return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "rotary_embedding", "builder": "rotary_embedding", "family": "elementwise", "recipe": "rotary", "implementation": impl, "dtype": dt, "shape": {"tokens": total_tokens, "heads": local_heads, "head_dim": _MLA_ROPE_DIM}}, {"op_id": oid, "family": "elementwise", "recipe": "rotary", "builder": "rotary_embedding"}
-    if fam == "elementwise" and rec in _DCP_PACK_ABI_TABLE:
-        bld, abi_cands = _DCP_PACK_ABI_TABLE[rec]
-        impl = _resolve_abi_symbol(arch, abi_cands, family=rec)
+    if fam == "elementwise" and rec in _DCP_PACK_RECIPES:
+        _pf, _pr, bld, impl = resolve_onboarding_builder_and_abi(arch, rec)
         width = int(loc[-1]) if loc else _MLA_HIDDEN_WIDTH
         return {"node_id": nid, "op_id": oid, "kind": "operator", "op": bld, "builder": bld, "family": "elementwise", "recipe": rec, "implementation": impl, "dtype": dt, "shape": {"tokens": total_tokens, "width": width}}, {"op_id": oid, "family": "elementwise", "recipe": rec, "builder": bld, "width": width}
     if fam == "elementwise" and rec in _RESIDUAL_ADD_RECIPES:
@@ -474,7 +368,7 @@ def _lowered_op_to_profiler_node(
         toks = int(loc[0]) if len(loc) >= _MIN_2D_RANK else total_tokens
         bw = int(loc[-1]) if loc else (_MLA_LATENT_DIM + _MLA_ROPE_DIM) * _MLA_BF16_BYTES
         ew = max(1, int(bw / dtype_bytes(dt)))
-        impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["kv_compress_epilog"][3], family=fam)
+        impl = resolve_onboarding_builder_and_abi(arch, "kv_compress_epilog")[3]
         return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "kv_compress_epilog", "builder": "kv_compress_epilog", "family": fam, "recipe": rec, "implementation": impl, "dtype": dt, "shape": {"tokens": toks, "width": ew, "byte_width": bw}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": "kv_compress_epilog", "dtype": dt, "width": ew}
     if fam in _COLLECTIVE_FAMILIES:
         return _lowered_collective_node(nid, oid, fam, rec, dt, op_rec, arch=arch, topo_opts=topo_opts)
@@ -483,10 +377,10 @@ def _lowered_op_to_profiler_node(
         heads = int(loc[1]) if len(loc) >= _MIN_GEMM_RANK else local_heads
         hdim = int(loc[2]) if len(loc) >= _MIN_GEMM_RANK else _MLA_LATENT_DIM
         partials = int(op_rec.get("partial_count") or 0) or max(_MIN_DCP_PARTIALS, dcp)
-        impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["attention_merge"][3], family=fam)
+        impl = resolve_onboarding_builder_and_abi(arch, "attention_merge")[3]
         return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "dcp_lse_attention_merge", "builder": "dcp_lse_attention_merge", "family": fam, "recipe": rec, "implementation": impl, "dtype": dt, "shape": {"tokens": toks, "heads": heads, "kv_heads": 1, "head_dim": hdim, "partial_count": partials, "dtype": dt}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": "dcp_lse_attention_merge", "dtype": dt, "partial_count": partials}
     if fam in _SPARSE_INDEXER_FAMILIES:
-        impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["indexer"][3], family="indexer")
+        impl = resolve_onboarding_builder_and_abi(arch, "indexer")[3]
         return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "lightning_indexer", "builder": "lightning_indexer", "family": "indexer", "recipe": rec, "implementation": impl, "dtype": dt, "shape": {"tokens": total_tokens, "heads": _INDEXER_ATTENTION_HEADS, "head_dim": _DEFAULT_HEAD_DIM}}, {"op_id": oid, "family": "indexer", "recipe": rec, "builder": "lightning_indexer", "dtype": dt}
     raise UnmodeledCapabilityError(f"profiler_builder_unmodeled:family={fam}:recipe={rec}:op_id={oid}")
 
@@ -548,12 +442,11 @@ def resolve_point_binding_and_shape(
     custom_sim: Mapping[str, Any] | None = raw_custom if isinstance(raw_custom, Mapping) else None
     probe_indexed, probe_single_layer, probe_hidden, idx_dt = False, False, None, "bf16"
     if topk_val is not None or plan_family in _SPARSE_INDEXER_FAMILIES:
-        pfam, prec, pbld, abi_cands = _FAMILY_ABI_TABLE["indexer"]
         cm_q = custom_sim.get("model", {}).get("quant", {}) if isinstance(custom_sim, Mapping) and isinstance(custom_sim.get("model"), Mapping) and isinstance(custom_sim["model"].get("quant"), Mapping) else {}
         exp_dt = str(pt.get("query_dtype") or pt.get("cache_dtype") or plan_doc.get("query_dtype") or plan_doc.get("cache_dtype") or cm_q.get("index_dtype") or "").strip().lower()
         is_q_idx = (exp_dt in {"int8", "fp8", "fp8_e4m3"}) if exp_dt else (plan_family == "sparse_indexer" and arch == "A5")
         idx_dt = (exp_dt if exp_dt in {"int8", "fp8_e4m3"} else "fp8_e4m3") if is_q_idx else "bf16"
-        impl = _resolve_abi_symbol(arch, ("aclnnQuantLightningIndexerV2", "aclnnLightningIndexer") if is_q_idx else abi_cands, family="indexer")
+        pfam, prec, pbld, impl = resolve_onboarding_builder_and_abi(arch, "indexer", prefer_quant_indexer=is_q_idx)
         sim_fam, probe_indexed = "indexer", True
         ctx_len = val if axis == "context_len" else max(val, _DEFAULT_CONTEXT_FALLBACK)
         kv_len = ctx_len if is_abi_reject else (ctx_len + q_tok)
@@ -564,7 +457,7 @@ def resolve_point_binding_and_shape(
         is_single_q_local = q_tok == 1 and tp == 1 and dcp == 1 and pcp == 1
         attn_rec = _decode_mla_recipe_for_sku(sku, profile_override=profile_override) if is_single_q_local else "latent_attention0"
         pfam, prec, pbld = ("attention", attn_rec, "absorbed_mla")
-        impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["attention"][3], family="attention")
+        impl = resolve_onboarding_builder_and_abi(arch, "attention")[3]
         sim_fam = "attention"
         ctx_len = val if axis == "context_len" else _DEFAULT_CONTEXT_FALLBACK
         seqs = val if axis == "batch_x_kv_heads" else batch
@@ -579,13 +472,11 @@ def resolve_point_binding_and_shape(
             shape["batch_x_kv_heads"] = val
         probe_single_layer = level == "L3" and plan_family == "sku_suite"
     elif plan_family == "sku_suite":
-        pfam, prec, pbld, abi_cands = _FAMILY_ABI_TABLE["rmsnorm"]
-        impl = _resolve_abi_symbol(arch, abi_cands, family="rmsnorm")
+        pfam, prec, pbld, impl = resolve_onboarding_builder_and_abi(arch, "rmsnorm")
         sim_fam = "rmsnorm"
         shape = {"tokens": val, "width": _MLA_HIDDEN_WIDTH, "parallel_topology": topo}
-    elif plan_family in _FAMILY_ABI_TABLE:
-        pfam, prec, pbld, abi_cands = _FAMILY_ABI_TABLE[plan_family]
-        impl = _resolve_abi_symbol(arch, abi_cands, family=plan_family)
+    elif is_onboarding_family(plan_family):
+        pfam, prec, pbld, impl = resolve_onboarding_builder_and_abi(arch, plan_family)
         sim_fam = pfam
         width = _structural_width_for_point(plan_doc, pt, sim_fam=sim_fam, custom_sim=custom_sim)
         probe_hidden = width
@@ -631,7 +522,7 @@ def _build_case_nodes(
     if level == "L2":
         attn_id = "s0.l0.paged_mla_decode" if prec in {"ascend_paged_mla_decode_arch22", "ascend_paged_mla_decode_arch35"} else "s0.l0.latent_attention0"
         v_m = total_tokens * local_heads
-        gmm_impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["grouped_gemm"][3], family="grouped_gemm")
+        gmm_impl = resolve_onboarding_builder_and_abi(arch, "grouped_gemm")[3]
         nodes = [
             {"node_id": f"{pid}:{attn_id}", "op_id": attn_id, "kind": "operator", "op": pbld, "builder": pbld, "family": pfam, "recipe": prec, "implementation": impl, "dtype": node_dt, "paged": True, "layout": str(shape.get("query_layout") or "TND"), "shape": dict(shape)},
             {"node_id": f"{pid}:s0.l0.v_expand", "op_id": "s0.l0.v_expand", "kind": "operator", "op": "grouped_matmul", "builder": "grouped_matmul", "family": "grouped_gemm", "recipe": "grouped_matmul", "implementation": gmm_impl, "dtype": node_dt, "group_list": [total_tokens] * local_heads, "group_list_type": 1, "shape": {"m": v_m, "n": _MLA_HEAD_DIM, "k": _MLA_LATENT_DIM, "e": local_heads, "matrix_groups": local_heads, "dtype": node_dt}},
@@ -702,8 +593,8 @@ def _plan_backend_kind(plan_doc: Mapping[str, Any], pt: Mapping[str, Any]) -> st
         if isinstance(mdl := sc.get("model"), Mapping) and (att := str(mdl.get("attention") or "").strip().lower()):
             return att
         if sc.get("compose_model"):
-            from mindie_sim.compose.inputs import _resolve_model_spec
-            return str(getattr(_resolve_model_spec(sc["compose_model"]), "attention", "") or "").lower()
+            from mindie_sim.export.operator_matrix import resolve_model_spec_public
+            return str(getattr(resolve_model_spec_public(sc["compose_model"]), "attention", "") or "").lower()
     return ""
 
 
@@ -909,6 +800,46 @@ def _resolve_attributed_event_ids(
     raise ModelingError(f"profiler_observation_event_ids_missing:{cid}")
 
 
+def _is_qualified_observation(row: Mapping[str, Any]) -> bool:
+    if row.get("qualified") is False:
+        return False
+    tmode = str(row.get("timing_mode") or "").strip().lower()
+    tsrc = str(row.get("timer_source") or "").strip().lower()
+    return tmode not in _HOST_FALLBACK_MODES and tsrc not in _HOST_FALLBACK_MODES
+
+
+def _expected_ranks_for_case(plan_doc: Mapping[str, Any], cid: str, plan_pt: Mapping[str, Any] | None) -> tuple[int, set[int] | None]:
+    world = max(1, int(plan_doc.get("world_size") or 1))
+    for case in (plan_doc.get("cases") or ()):
+        if not isinstance(case, Mapping) or str(case.get("case_id") or "") != cid:
+            continue
+        ck = case.get("canonical_key") if isinstance(case.get("canonical_key"), Mapping) else {}
+        grp = case.get("group_ranks") or ck.get("ordered_rank_placement") or next(
+            (nd["group_ranks"] for nd in (case.get("nodes") or ()) if isinstance(nd, Mapping) and nd.get("group_ranks")), None,
+        )
+        if isinstance(grp, Sequence) and not isinstance(grp, (str, bytes)) and grp:
+            rset = {int(r) for r in grp}
+            return max(world, max(rset) + 1), rset
+        return world, (set(range(world)) if world > 1 else None)
+    topo_w = validate_parallel_topology(str(plan_pt.get("parallel_topology") or "tp1")) if plan_pt is not None else 1
+    if topo_w > 1:
+        return max(world, topo_w), set(range(topo_w))
+    return world, (set(range(world)) if world > 1 else None)
+
+
+def _row_clock_and_modes(row: Mapping[str, Any], cid: str) -> tuple[str, str, str]:
+    tmode = str(row.get("timing_mode") or "").strip().lower()
+    cap = str(row.get("capture_mode") or ("aclgraph" if "aclgraph" in tmode else "eager")).strip().lower()
+    raw_clock = str(row.get("clock_operator") or "").strip()
+    if raw_clock:
+        if raw_clock not in VALID_CLOCK_OPERATORS:
+            raise ModelingError(f"profiler_clock_operator_invalid:{cid}:{raw_clock!r}")
+        return tmode, cap, raw_clock
+    if not tmode:
+        raise ModelingError(f"profiler_clock_operator_missing:{cid}")
+    return tmode, cap, ("busy_union" if tmode in _BUSY_UNION_MODES else DEFAULT_CLOCK_OPERATOR)
+
+
 def normalize_profiler_records(
     raw_records: Sequence[Mapping[str, Any]], *, plan_doc: Mapping[str, Any], sku: str,
     endpoint_alias: str = "", capture_out_dir: str | Path | None = None,
@@ -916,14 +847,14 @@ def normalize_profiler_records(
     """Normalize raw ``mindie-profiler`` JSONL/receipt rows into sealed onboarding rows & ABI rows."""
     if not raw_records:
         return [], []
-    is_prof = any(str(r.get("schema") or "") in {_OBSERVATION_SCHEMA, _RECEIPT_SCHEMA, _SUBGRAPH_RUN_SCHEMA} or r.get("record_type") in {"observation", "case_complete", "receipt"} for r in raw_records)
+    is_prof = any(str(r.get("schema") or "") in {_OBSERVATION_SCHEMA, _OBSERVATION_V2_SCHEMA, _RECEIPT_SCHEMA, _SUBGRAPH_RUN_SCHEMA} or r.get("record_type") in {"observation", "case_complete", "receipt"} for r in raw_records)
     if not is_prof:
         return [dict(r) for r in raw_records if str(r.get("status") or "").lower() not in _ABI_REJECT_STATUSES], [
             {"point_id": str(r.get("point_id") or r.get("case_id") or ""), "rejected": True, "abi_error": str(r.get("abi_error") or r.get("reason") or ""), "executed_shape": dict(r.get("executed_shape") or r.get("actual_shape") or {})}
             for r in raw_records if str(r.get("status") or "").lower() in _ABI_REJECT_STATUSES
         ]
     plan_pts = {str(p["point_id"]): p for sk in ("train_points", "heldout_points") for p in (plan_doc.get(sk) or ()) if isinstance(p, Mapping) and p.get("point_id")}
-    buckets: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    raw_by_case: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     receipts: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     abi_rows: list[dict[str, Any]] = []
     for rec in raw_records:
@@ -936,20 +867,28 @@ def normalize_profiler_records(
         acq_k = str(rec.get("acquisition_id") or rec.get("acquisition_root") or "").strip()
         if rtype == "receipt" or str(rec.get("schema") or "") == _SUBGRAPH_RUN_SCHEMA:
             receipts.setdefault((cid, split, acq_k), []).append(rec)
-        elif rtype == "observation" or rec.get("duration_ms") is not None:
+        elif rtype == "observation" or rec.get("duration_ms") is not None or rec.get("duration_us") is not None:
             if status not in {"", "ok", "passed", "pass"}:
                 raise ModelingError(f"profiler_observation_status_invalid:{cid}:status={status}")
-            buckets.setdefault((cid, split, acq_k), []).append(rec)
+            raw_by_case.setdefault((cid, split, acq_k), []).append(rec)
+
+    buckets: dict[tuple[str, str, str, str, str, str], list[Mapping[str, Any]]] = {}
+    for (cid, split, acq_k), raw_group in sorted(raw_by_case.items()):
+        qual_group = [r for r in raw_group if _is_qualified_observation(r)]
+        if not qual_group:
+            raise ModelingError(f"profiler_observation_unqualified:{cid}")
+        for r in qual_group:
+            tmode, cap, ck = _row_clock_and_modes(r, cid)
+            buckets.setdefault((cid, split, acq_k, tmode, cap, ck), []).append(r)
 
     clean_ep, plan_family, out_rows = sanitize_public_alias(endpoint_alias or sku, sku), str(plan_doc.get("family") or "").strip(), []
-    for (cid, split, acq_k), group in sorted(buckets.items()):
+    for (cid, split, acq_k, _tmode, _cap, clock_op), group in sorted(buckets.items()):
         plan_pt = plan_pts.get(cid)
         binfo = resolve_point_measured_binding(plan_doc, plan_pt, sku=sku) if plan_pt is not None else None
         rcpts = receipts.get((cid, split, acq_k)) or []
         if not rcpts and acq_k and (unkeyed := receipts.get((cid, split, ""))):
             obs_rids = {_TRIAL_SUFFIX_RE.sub("", str(g.get("run_id") or "").strip()) for g in group}
             rcpts = [r for r in unkeyed if not (rr := _TRIAL_SUFFIX_RE.sub("", str(r.get("run_id") or "").strip())) or any(o == rr or o.startswith(f"{rr}.") for o in obs_rids)]
-        # Extract executed shape + top-level node_shapes (matching profiler@57dc39c1 _with_node_shapes)
         actual_shape: dict[str, Any] = {}
         for src in (*rcpts, *group):
             cand = src.get("actual_shape") or src.get("executed_shape")
@@ -961,10 +900,11 @@ def normalize_profiler_records(
                 break
         if plan_pt is not None and binfo is not None:
             verify_actual_geometry_matches_plan(actual_shape, plan_pt, expected_shape=binfo["expected_shape"], cid=cid, measured_binding=binfo["measured_binding"])
+        exp_world, exp_ranks = _expected_ranks_for_case(plan_doc, cid, plan_pt)
         by_slot: dict[Any, list[tuple[int, int, Mapping[str, Any]]]] = {}
         ranks_seen: set[int] = set()
         for idx_g, row in enumerate(group):
-            dur_ms = float(row.get("duration_ms") or 0.0)
+            dur_ms = float(row["duration_ms"]) if row.get("duration_ms") is not None else (float(row.get("duration_us") or 0.0) / 1000.0)
             if dur_ms <= 0.0:
                 raise ModelingError(f"profiler_sample_duration_invalid:{cid}:duration_ms={dur_ms}")
             raw_rank = row.get("rank")
@@ -972,32 +912,22 @@ def normalize_profiler_records(
                 raise ModelingError(f"profiler_observation_rank_missing:{cid}")
             try:
                 rank_int = int(raw_rank)
-                ranks_seen.add(rank_int)
             except (TypeError, ValueError) as exc:
                 raise ModelingError(f"profiler_observation_rank_invalid:{cid}:rank={raw_rank!r}") from exc
-            if "trial" in row or "repeat_index" in row:
-                slot_key: Any = (row.get("trial"), row.get("repeat_index"))
-            else:
-                slot_key = idx_g
+            if rank_int < 0 or (exp_ranks is not None and rank_int not in exp_ranks) or (exp_world > 1 and rank_int >= exp_world):
+                raise ModelingError(f"profiler_observation_rank_invalid:{cid}:rank={raw_rank!r}")
+            ranks_seen.add(rank_int)
+            slot_key: Any = (row.get("trial"), row.get("repeat_index")) if ("trial" in row or "repeat_index" in row) else idx_g
             by_slot.setdefault(slot_key, []).append((int(round(dur_ms * NS_PER_MS)), rank_int, row))
-        slot_peaks = sorted(
-            (max(entries, key=lambda item: (item[0], item[1])) for entries in by_slot.values()),
-            key=lambda item: (item[0], item[1]),
-        )
+        if exp_ranks is not None:
+            for entries in by_slot.values():
+                got_r = {item[1] for item in entries}
+                if got_r != exp_ranks:
+                    raise ModelingError(f"profiler_observation_rank_set_incomplete:{cid}:expected={sorted(exp_ranks)}:got={sorted(got_r)}")
+        slot_peaks = sorted((max(entries, key=lambda item: (item[0], item[1])) for entries in by_slot.values()), key=lambda item: (item[0], item[1]))
         durs_ns = [item[0] for item in slot_peaks]
         p50_ns, p99_ns = _quantile_ns(durs_ns, _P50_Q), _quantile_ns(durs_ns, _P99_Q)
-        p50_row = min(slot_peaks, key=lambda item: abs(item[0] - p50_ns))[2]
-        first = group[0]
-        raw_clock = p50_row.get("clock_operator") or first.get("clock_operator")
-        if raw_clock is not None and str(raw_clock).strip():
-            clock_op = str(raw_clock).strip()
-            if clock_op not in VALID_CLOCK_OPERATORS:
-                raise ModelingError(f"profiler_clock_operator_invalid:{cid}:{clock_op!r}")
-        else:
-            tmode = str(p50_row.get("timing_mode") or first.get("timing_mode") or "").strip().lower()
-            if not tmode:
-                raise ModelingError(f"profiler_clock_operator_missing:{cid}")
-            clock_op = "busy_union" if tmode in _BUSY_UNION_MODES else DEFAULT_CLOCK_OPERATOR
+        p50_row, first = min(slot_peaks, key=lambda item: abs(item[0] - p50_ns))[2], group[0]
         event_ids = _resolve_attributed_event_ids(p50_row, rcpts, group, cid)
         level = binfo["level"] if binfo is not None else str(first.get("level") or "L1").upper()
         explicit_acq = acq_k or str(first.get("acquisition_id") or first.get("acquisition_root") or ((rcpts[0].get("acquisition_id") or rcpts[0].get("acquisition_root")) if rcpts else "") or "").strip()
@@ -1033,18 +963,15 @@ def normalize_profiler_records(
 
 
 def validate_host_queue_grant(lease_info: Mapping[str, Any] | None, *, required_devices: int, min_ttl_seconds: int) -> tuple[str, int, list[int], int]:
-    req_npus = int(required_devices)
-    info = dict(lease_info or {})
-    lease_id, fence = str(info.get("lease_id") or "").strip(), info.get("fence_token")
+    req_npus, info = int(required_devices), dict(lease_info or {})
+    lease_id, fence, raw_devs, ttl = str(info.get("lease_id") or "").strip(), info.get("fence_token"), info.get("devices"), info.get("ttl_seconds")
     if req_npus < 1 or not lease_id or type(fence) is not int or fence <= 0:
         raise ModelingError("host_queue_lease_missing_lease_id_or_positive_fence_token")
-    raw_devs = info.get("devices")
     if not isinstance(raw_devs, Sequence) or isinstance(raw_devs, (str, bytes)):
         raise ModelingError("host_queue_lease_missing_granted_devices")
     devs = [int(d) for d in raw_devs if type(d) is int and d >= 0]
     if len(devs) != len(raw_devs) or len(set(devs)) != req_npus:
         raise ModelingError(f"host_queue_lease_device_count_mismatch:expected={req_npus}:granted={devs}")
-    ttl = info.get("ttl_seconds")
     if type(ttl) is not int or ttl < max(1, int(min_ttl_seconds)):
         raise ModelingError(f"host_queue_lease_ttl_below_subprocess_plus_grace:ttl={ttl!r}:required={min_ttl_seconds}")
     return lease_id, fence, devs, ttl
@@ -1085,15 +1012,13 @@ def acquire_coordinator_host_queue_lease(
     acq = _run_coordinator_lease_cmd(action="acquire", endpoint_alias=alias, payload=req_pl, timeout_s=int(rpc_timeout_s), coordinator_bin=coordinator_bin)
     data = acq.get("data") if isinstance(acq.get("data"), Mapping) else acq
     lease_id, fence = str(data.get("lease_id") or "").strip(), data.get("fence_token")
-    rec: dict[str, Any] = {"lease_mode": "coordinator_host_queue", "lease_id": lease_id, "fence_token": fence if type(fence) is int else 0, "devices": [], "ttl_seconds": eff_ttl, "receipt_unconfirmed": False, "receipt_warning": ""}
-    if bool(acq.get("receipt_unconfirmed") or data.get("receipt_unconfirmed")) or acq.get("receipt_warning") or data.get("receipt_warning"):
-        rec["receipt_unconfirmed"] = True
-        rec["receipt_warning"] = sanitize_public_warning(acq.get("receipt_warning") or data.get("receipt_warning") or "host_queue_lease_acquire_unconfirmed")
+    warn = acq.get("receipt_warning") or data.get("receipt_warning")
+    unconf = bool(acq.get("receipt_unconfirmed") or data.get("receipt_unconfirmed") or warn)
+    rec: dict[str, Any] = {"lease_mode": "coordinator_host_queue", "lease_id": lease_id, "fence_token": fence if type(fence) is int else 0, "devices": [], "ttl_seconds": eff_ttl, "receipt_unconfirmed": unconf, "receipt_warning": sanitize_public_warning(warn or "host_queue_lease_acquire_unconfirmed") if unconf else ""}
     try:
         if str(acq.get("outcome") or "").lower() not in _VALID_LEASE_OUTCOMES or str(acq.get("status") or "").lower() not in _VALID_LEASE_STATUSES:
             raise ModelingError("host_queue_lease_acquire_rejected")
-        _, _, devs, val_ttl = validate_host_queue_grant({**dict(data), "lease_id": lease_id, "fence_token": fence, "ttl_seconds": data.get("ttl_seconds", eff_ttl)}, required_devices=req_npus, min_ttl_seconds=min_req)
-        rec["devices"], rec["ttl_seconds"] = devs, val_ttl
+        _, _, rec["devices"], rec["ttl_seconds"] = validate_host_queue_grant({**dict(data), "lease_id": lease_id, "fence_token": fence, "ttl_seconds": data.get("ttl_seconds", eff_ttl)}, required_devices=req_npus, min_ttl_seconds=min_req)
         yield rec
     finally:
         if lease_id and type(fence) is int and fence > 0:
@@ -1102,55 +1027,111 @@ def acquire_coordinator_host_queue_lease(
             except TimeoutError:
                 raise
             except (ModelingError, OSError) as exc:
-                rec["receipt_unconfirmed"] = True
-                rec["receipt_warning"] = sanitize_public_warning(f"host_queue_lease_release_unconfirmed:{exc}")
+                rec["receipt_unconfirmed"], rec["receipt_warning"] = True, sanitize_public_warning(f"host_queue_lease_release_unconfirmed:{exc}")
+
+
+def _plan_required_ranks(plan_doc: Mapping[str, Any]) -> int:
+    req = max(required_ranks_for_plan(plan_doc), int(plan_doc.get("world_size") or 1))
+    for case in (plan_doc.get("cases") or ()):
+        if not isinstance(case, Mapping):
+            continue
+        ck = case.get("canonical_key") if isinstance(case.get("canonical_key"), Mapping) else {}
+        for grp in (case.get("group_ranks"), ck.get("ordered_rank_placement"), *(nd.get("group_ranks") for nd in (case.get("nodes") or ()) if isinstance(nd, Mapping))):
+            if isinstance(grp, Sequence) and not isinstance(grp, (str, bytes)) and grp:
+                req = max(req, max(int(r) for r in grp) + 1, len(grp))
+    return req
+
+
+def _collect_rank_outputs(tmp: Path, out_f: Path, obs_f: Path, world: int, cdir: Path | None = None) -> list[Mapping[str, Any]]:
+    raw: list[Mapping[str, Any]] = []
+    mf_path = (out_f if out_f.is_file() else (cdir / "campaign_manifest.json")) if cdir is not None else None
+    if cdir is not None and mf_path is not None and mf_path.is_file():
+        doc = json.loads(mf_path.read_text(encoding="utf-8"))
+        if isinstance(doc, Mapping) and str(doc.get("schema") or "") == "mindie-bench-campaign/1":
+            from mindie_sim.observations.campaign_reconcile import verify_campaign_integrity
+            camp = verify_campaign_integrity(doc, base_dir=cdir)
+            for sp in sorted({(cdir / rel).resolve() for rel in [camp.observations_jsonl, *(s.path for s in camp.run_shards)]}):
+                if sp.is_file():
+                    raw.extend(json.loads(ln) for ln in sp.read_text(encoding="utf-8").splitlines() if ln.strip())
+            if raw:
+                return raw
+    for rk in range(world):
+        rk_obs, rk_out = (tmp / f"obs.rank{rk}.jsonl" if world > 1 else obs_f), (Path(f"{out_f}.rank{rk}.json") if world > 1 else out_f)
+        if rk_obs.is_file():
+            raw.extend(json.loads(ln) for ln in rk_obs.read_text(encoding="utf-8").splitlines() if ln.strip())
+        if rk_out.is_file():
+            doc = json.loads(rk_out.read_text(encoding="utf-8"))
+            raw.extend({**dict(r), "schema": _SUBGRAPH_RUN_SCHEMA, "record_type": "receipt", "run_id": doc.get("run_id", ""), "rank": rk} for r in (doc.get("records") or ()) if isinstance(r, Mapping))
+    return raw
+
+
+def _launch_ranks_concurrent(world: int, cmd_for_rank: Any, *, env: Mapping[str, str], tmp: Path, timeout_s: int) -> None:
+    mport = ""
+    if world > 1:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            mport = str(int(sock.getsockname()[1]))
+    procs, fhs, deadline = [], [], time.monotonic() + float(timeout_s)
+    try:
+        for rk in range(world):
+            rk_env = {**env, "RANK": str(rk), "LOCAL_RANK": str(rk), "WORLD_SIZE": str(world), **({"MASTER_ADDR": "127.0.0.1", "MASTER_PORT": mport} if world > 1 else {})}
+            fo, fe = (tmp / f"rk{rk}.out.log").open("w", encoding="utf-8"), (tmp / f"rk{rk}.err.log").open("w", encoding="utf-8")
+            fhs.extend([fo, fe])
+            procs.append((rk, subprocess.Popen(cmd_for_rank(rk), env=rk_env, stdout=fo, stderr=fe, text=True, **subprocess_window_kwargs()), tmp / f"rk{rk}.err.log"))
+        for rk, proc, err_log in procs:
+            try:
+                rc = proc.wait(timeout=max(0.05, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f"profiler_bench_timeout:{timeout_s}s:rank={rk}") from exc
+            if rc not in (0, _PARTIAL_ABI_EXIT_CODE):
+                raise ModelingError(f"profiler_bench_failed:rank={rk}:rc={rc}:{err_log.read_text(encoding='utf-8', errors='replace').strip() if err_log.is_file() else ''}")
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ModelingError(f"profiler_bench_os_error:{exc}") from exc
+    finally:
+        for _, proc, _ in procs:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+        for fh in fhs:
+            try:
+                fh.close()
+            except OSError:
+                pass
 
 
 def run_profiler_bench_subprocess(
     plan_doc: Mapping[str, Any], *, sku: str, profiler_root: str | Path | None = None,
     endpoint_alias: str = "", allowed_phy_ids: Sequence[int] = (), fence_token: int | None = None,
     timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S, capture_out_dir: str | Path | None = None,
-    profile_override: Mapping[str, Any] | None = None,
+    profile_override: Mapping[str, Any] | None = None, campaign_dir: str | Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Execute ``mindie_profiler bench subgraph`` locally and normalize observations & ABI rejections."""
-    sg_plan = build_profiler_subgraph_plan(plan_doc, sku=sku, profile_override=profile_override)
-    world = max(1, int(sg_plan.get("world_size") or 1))
-    env = dict(os.environ)
+    """Execute coordinated ``mindie_profiler bench`` (concurrent S1 ranks; zero pipe/rank deadlock)."""
+    is_v2 = str(plan_doc.get("schema") or "") == _BENCH_PLAN_V2_SCHEMA
+    sg_plan = dict(plan_doc) if is_v2 else build_profiler_subgraph_plan(plan_doc, sku=sku, profile_override=profile_override)
+    world, env = _plan_required_ranks(sg_plan), dict(os.environ)
     if profiler_root is not None:
         env["PYTHONPATH"] = str(Path(profiler_root).resolve()) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     if allowed_phy_ids:
         env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(str(int(d)) for d in allowed_phy_ids)
     if fence_token is not None:
         env["MINDIE_LEASE_FENCE_TOKEN"] = str(int(fence_token))
-    raw_records: list[Mapping[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="msim-prof-") as tmp_dir:
         tmp = Path(tmp_dir)
-        plan_f = write_atomic_json(tmp / "plan.json", sg_plan)
-        obs_f, out_f = tmp / "obs.jsonl", tmp / "out.json"
-        for rk in range(world):
-            rk_env = {**env, "RANK": str(rk), "WORLD_SIZE": str(world)}
-            rk_obs = tmp / f"obs.rank{rk}.jsonl" if world > 1 else obs_f
-            try:
-                done = subprocess.run([sys.executable, "-B", "-m", "mindie_profiler", "bench", "subgraph", "--plan", str(plan_f), "--observations", str(rk_obs), "--out", str(out_f)], env=rk_env, capture_output=True, text=True, timeout=timeout_s, check=False, **subprocess_window_kwargs())
-            except subprocess.TimeoutExpired as exc:
-                raise TimeoutError(f"profiler_bench_timeout:{timeout_s}s") from exc
-            except TimeoutError:
-                raise
-            except OSError as exc:
-                raise ModelingError(f"profiler_bench_os_error:{exc}") from exc
-            if done.returncode not in (0, _PARTIAL_ABI_EXIT_CODE):
-                raise ModelingError(f"profiler_bench_failed:rc={done.returncode}:{(done.stderr or '').strip()}")
-            if rk_obs.is_file():
-                for line in rk_obs.read_text(encoding="utf-8").splitlines():
-                    if line.strip():
-                        raw_records.append(json.loads(line))
-            rk_out = Path(f"{out_f}.rank{rk}.json") if world > 1 else out_f
-            if rk_out.is_file():
-                doc = json.loads(rk_out.read_text(encoding="utf-8"))
-                for rec in doc.get("records") or ():
-                    if isinstance(rec, Mapping):
-                        raw_records.append({**dict(rec), "schema": _SUBGRAPH_RUN_SCHEMA, "record_type": "receipt", "run_id": doc.get("run_id", ""), "rank": rk})
-    return normalize_profiler_records(raw_records, plan_doc=plan_doc, sku=sku, endpoint_alias=endpoint_alias, capture_out_dir=capture_out_dir)
+        plan_f, obs_f, out_f = write_atomic_json(tmp / "plan.json", sg_plan), tmp / "obs.jsonl", tmp / "out.json"
+        cdir = (Path(campaign_dir) if campaign_dir is not None else (tmp / "campaign")) if (is_v2 or campaign_dir is not None) else None
+        if cdir is not None:
+            cdir.mkdir(parents=True, exist_ok=True)
+            _launch_ranks_concurrent(world, lambda _rk: [sys.executable, "-B", "-m", "mindie_profiler", "bench", "run-plan", "--plan", str(plan_f), "--world-size", str(world), "--campaign-dir", str(cdir), "--out", str(out_f)], env=env, tmp=tmp, timeout_s=timeout_s)
+        else:
+            _launch_ranks_concurrent(world, lambda rk: [sys.executable, "-B", "-m", "mindie_profiler", "bench", "subgraph", "--plan", str(plan_f), "--observations", str(tmp / f"obs.rank{rk}.jsonl" if world > 1 else obs_f), "--out", str(out_f)], env=env, tmp=tmp, timeout_s=timeout_s)
+        raw = _collect_rank_outputs(tmp, out_f, obs_f, world, cdir=cdir)
+    return normalize_profiler_records(raw, plan_doc=plan_doc, sku=sku, endpoint_alias=endpoint_alias, capture_out_dir=capture_out_dir)
 
 
 def acquire_stage3_observations(
@@ -1161,13 +1142,10 @@ def acquire_stage3_observations(
     lease_acquirer: Any = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], int]:
     """Acquire and normalize Stage-3 silicon rows via custom runner, live profiler + HostQueue, or offline replay."""
-    req_npus = required_ranks_for_plan(plan_doc)
-    lease_pub: dict[str, Any] = {}
-    rows: list[dict[str, Any]] = []
+    req_npus, lease_pub, rows = _plan_required_ranks(plan_doc), {}, []
     abi_obs = [dict(r) for r in (abi_rejection_results or ()) if isinstance(r, Mapping)]
     if custom_runner is not None:
-        raw_out = list(custom_runner(plan_doc))
-        rows, norm_abi = normalize_profiler_records(raw_out, plan_doc=plan_doc, sku=sku, endpoint_alias=endpoint_alias, capture_out_dir=capture_root)
+        rows, norm_abi = normalize_profiler_records(list(custom_runner(plan_doc)), plan_doc=plan_doc, sku=sku, endpoint_alias=endpoint_alias, capture_out_dir=capture_root)
         abi_obs = abi_obs or norm_abi
     elif live_profiler:
         min_ttl = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S + DEFAULT_CLEANUP_GRACE_S
@@ -1186,30 +1164,31 @@ def acquire_stage3_observations(
 
 
 def resolve_profiler_builder_strict(family: str, recipe: str, impl: str, *, dtypes: Sequence[str] = (), meta: Mapping[str, Any] | None = None, profiler_root: str | Path | None = None) -> tuple[str, str]:
-    added_path, saved = "", {}
-    if profiler_root is not None:
-        rstr = str(Path(profiler_root).resolve())
-        for mn in list(sys.modules):
-            if mn == "mindie_profiler" or mn.startswith("mindie_profiler."):
-                saved[mn] = sys.modules.pop(mn)
-        if rstr not in sys.path:
-            sys.path.insert(0, rstr)
-            added_path = rstr
-    try:
+    if profiler_root is None:
         try:
-            from mindie_profiler.bench.operators import BenchUnmodeledOperatorError, resolve_builder_strict
-        except ImportError as exc:
-            raise ModelingError(f"profiler_owner_unavailable:{exc}") from exc
-        try:
-            b, abi = resolve_builder_strict(family, recipe, impl, dtypes=tuple(dtypes), meta=meta or {})
-        except BenchUnmodeledOperatorError as exc:
+            b, abi = _canonical_resolve_builder_strict(family, recipe, impl, tuple(dtypes), meta or {})
+            return str(b), str(abi)
+        except UnmodeledCapabilityError as exc:
             raise ModelingError(f"profiler_builder_unmodeled:{exc}") from exc
-        return str(b), str(abi)
+    root_path = Path(profiler_root).resolve()
+    if not (root_path / "mindie_profiler" / "bench" / "operators.py").is_file():
+        raise ModelingError("profiler_owner_unavailable:missing:operators.py")
+    saved_path, saved_mods = list(sys.path), {k: sys.modules.pop(k) for k in list(sys.modules) if k == "mindie_profiler" or k.startswith("mindie_profiler.")}
+    sys.path.insert(0, str(root_path))
+    try:
+        mod = importlib.import_module(".".join(("mindie_profiler", "bench", "operators")))
+    except Exception as exc:
+        raise ModelingError(f"profiler_owner_unavailable:{exc}") from exc
     finally:
-        if added_path and added_path in sys.path:
-            sys.path.remove(added_path)
-        if profiler_root is not None:
-            for mn in list(sys.modules):
-                if mn == "mindie_profiler" or mn.startswith("mindie_profiler."):
-                    sys.modules.pop(mn, None)
-            sys.modules.update(saved)
+        sys.path[:] = saved_path
+        for k in [m for m in sys.modules if m == "mindie_profiler" or m.startswith("mindie_profiler.")]:
+            sys.modules.pop(k, None)
+        sys.modules.update(saved_mods)
+    err_cls, resolver = getattr(mod, "BenchUnmodeledOperatorError", RuntimeError), getattr(mod, "resolve_builder_strict", None)
+    if not callable(resolver):
+        raise ModelingError("profiler_owner_unavailable:resolve_builder_strict_missing")
+    try:
+        b, abi = resolver(family, recipe, impl, dtypes=tuple(dtypes), meta=meta or {})
+        return str(b), str(abi)
+    except err_cls as exc:
+        raise ModelingError(f"profiler_builder_unmodeled:{exc}") from exc

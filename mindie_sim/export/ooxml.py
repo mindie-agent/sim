@@ -28,11 +28,20 @@ from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 import zipfile
 
-#: OOXML SpreadsheetML and Relationships XML namespaces.
+#: OOXML SpreadsheetML, DrawingML, Chart, and Relationships XML namespaces.
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL_DOC = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_REL_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS_CONTENT_TYPES = "http://schemas.openxmlformats.org/package/2006/content-types"
+NS_CHART = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+NS_DRAWING_MAIN = "http://schemas.openxmlformats.org/drawingml/2006/main"
+NS_DRAWING_XDR = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+DEFAULT_CHART_COLORS: tuple[str, ...] = (
+    "1F4E78", "D97706", "059669", "DC2626", "7C3AED", "0284C7",
+)
+CHART_CAT_AXIS_ID = 1001
+CHART_VAL_AXIS_ID = 1002
+CHART_LINE_WIDTH_EMU = 25400
 
 #: Excel column alphabet radix, ASCII anchor, and formula limits.
 EXCEL_COL_RADIX = 26
@@ -112,6 +121,28 @@ class _DataValidation:
     formula2: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ChartSeries:
+    """One plotted series in a native OOXML line chart."""
+
+    name: str
+    categories_ref: str
+    values_ref: str
+    color_hex: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LineChartSpec:
+    """Native OOXML line chart specification anchored by 0-based ``(col, row)`` bounds."""
+
+    title: str
+    x_title: str
+    y_title: str
+    anchor_from: tuple[int, int]
+    anchor_to: tuple[int, int]
+    series: tuple[ChartSeries, ...]
+
+
 def column_letter(col_index: int) -> str:
     """Convert 1-based Excel column index to letters (``1 -> 'A'``, ``27 -> 'AA'``)."""
     if col_index < 1:
@@ -156,6 +187,17 @@ class Worksheet:
         self._col_widths: dict[int, float] = {}
         self._row_heights: dict[int, float] = {}
         self._freeze: tuple[int, int] | None = None
+        self._charts: list[LineChartSpec] = []
+
+    @property
+    def charts(self) -> tuple[LineChartSpec, ...]:
+        return tuple(self._charts)
+
+    def add_line_chart(self, chart: LineChartSpec) -> None:
+        """Attach a native OOXML line chart rendered via ``xl/charts/chart*.xml``."""
+        if not chart.series:
+            raise ValueError("line_chart_requires_at_least_one_series")
+        self._charts.append(chart)
 
     @property
     def merged_ranges(self) -> tuple[str, ...]:
@@ -274,7 +316,13 @@ class Worksheet:
         max_c = max(c for _, c in self._cells)
         return f"A1:{cell_ref(max_r, max_c)}"
 
-    def to_xml(self, shared_strings: _SharedStringTable, *, tab_selected: bool = False) -> str:
+    def to_xml(
+        self,
+        shared_strings: _SharedStringTable,
+        *,
+        tab_selected: bool = False,
+        drawing_rel_id: str | None = None,
+    ) -> str:
         parts = [
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
             f'<worksheet xmlns="{NS_MAIN}" xmlns:r="{NS_REL_DOC}">',
@@ -296,6 +344,8 @@ class Worksheet:
             f'top="{PAGE_MARGIN_TOP_BOTTOM}" bottom="{PAGE_MARGIN_TOP_BOTTOM}" '
             f'header="{PAGE_MARGIN_HEADER_FOOTER}" footer="{PAGE_MARGIN_HEADER_FOOTER}"/>'
         )
+        if drawing_rel_id is not None:
+            parts.append(f'<drawing r:id="{drawing_rel_id}"/>')
         parts.append("</worksheet>")
         return "".join(parts)
 
@@ -422,10 +472,24 @@ class Workbook:
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         sst = _SharedStringTable()
-        sheet_xmls = [
-            ws.to_xml(sst, tab_selected=(idx == 0))
-            for idx, ws in enumerate(self.worksheets)
-        ]
+        drawing_specs: list[tuple[int, int, tuple[tuple[int, LineChartSpec], ...]]] = []
+        sheet_xmls: list[str] = []
+        next_drawing_idx = 1
+        next_chart_idx = 1
+        for idx, ws in enumerate(self.worksheets, start=1):
+            if ws.charts:
+                d_idx = next_drawing_idx
+                next_drawing_idx += 1
+                chart_pairs: list[tuple[int, LineChartSpec]] = []
+                for chart in ws.charts:
+                    chart_pairs.append((next_chart_idx, chart))
+                    next_chart_idx += 1
+                drawing_specs.append((idx, d_idx, tuple(chart_pairs)))
+                sheet_xmls.append(ws.to_xml(sst, tab_selected=(idx == 1), drawing_rel_id="rId1"))
+            else:
+                sheet_xmls.append(ws.to_xml(sst, tab_selected=(idx == 1)))
+        drawing_count = next_drawing_idx - 1
+        chart_count = next_chart_idx - 1
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent),
         )
@@ -433,7 +497,10 @@ class Workbook:
         tmp_path = Path(tmp_name)
         try:
             with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("[Content_Types].xml", _content_types_xml(len(self.worksheets)))
+                zf.writestr(
+                    "[Content_Types].xml",
+                    _content_types_xml(len(self.worksheets), drawing_count=drawing_count, chart_count=chart_count),
+                )
                 zf.writestr("_rels/.rels", _root_rels_xml())
                 zf.writestr("xl/workbook.xml", _workbook_xml(self.worksheets))
                 zf.writestr("xl/_rels/workbook.xml.rels", _workbook_rels_xml(len(self.worksheets)))
@@ -441,6 +508,24 @@ class Workbook:
                 zf.writestr("xl/sharedStrings.xml", sst.to_xml())
                 for idx, xml_text in enumerate(sheet_xmls, start=1):
                     zf.writestr(f"xl/worksheets/sheet{idx}.xml", xml_text)
+                for sheet_idx, draw_idx, chart_pairs in drawing_specs:
+                    zf.writestr(
+                        f"xl/worksheets/_rels/sheet{sheet_idx}.xml.rels",
+                        _worksheet_rels_xml(draw_idx),
+                    )
+                    zf.writestr(
+                        f"xl/drawings/drawing{draw_idx}.xml",
+                        _drawing_xml(chart_pairs),
+                    )
+                    zf.writestr(
+                        f"xl/drawings/_rels/drawing{draw_idx}.xml.rels",
+                        _drawing_rels_xml(chart_pairs),
+                    )
+                    for chart_idx, chart_spec in chart_pairs:
+                        zf.writestr(
+                            f"xl/charts/chart{chart_idx}.xml",
+                            _line_chart_xml(chart_spec),
+                        )
             size = int(tmp_path.stat().st_size)
             os.replace(tmp_path, target)
             return size
@@ -461,7 +546,9 @@ def _unlink_quiet(path: Path) -> None:
         pass
 
 
-def _content_types_xml(sheet_count: int) -> str:
+def _content_types_xml(
+    sheet_count: int, *, drawing_count: int = 0, chart_count: int = 0,
+) -> str:
     overrides = [
         '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
         '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
@@ -472,12 +559,134 @@ def _content_types_xml(sheet_count: int) -> str:
             f'<Override PartName="/xl/worksheets/sheet{idx}.xml" '
             'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
         )
+    for idx in range(1, drawing_count + 1):
+        overrides.append(
+            f'<Override PartName="/xl/drawings/drawing{idx}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+        )
+    for idx in range(1, chart_count + 1):
+        overrides.append(
+            f'<Override PartName="/xl/charts/chart{idx}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>'
+        )
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         f'<Types xmlns="{NS_CONTENT_TYPES}">'
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         f'{"".join(overrides)}</Types>'
+    )
+
+
+def _worksheet_rels_xml(drawing_idx: int) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{NS_REL_PKG}">'
+        f'<Relationship Id="rId1" Type="{NS_REL_DOC}/drawing" Target="../drawings/drawing{drawing_idx}.xml"/>'
+        "</Relationships>"
+    )
+
+
+def _drawing_rels_xml(chart_pairs: Sequence[tuple[int, LineChartSpec]]) -> str:
+    rels = "".join(
+        f'<Relationship Id="rId{rel_idx}" Type="{NS_REL_DOC}/chart" Target="../charts/chart{chart_idx}.xml"/>'
+        for rel_idx, (chart_idx, _spec) in enumerate(chart_pairs, start=1)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{NS_REL_PKG}">{rels}</Relationships>'
+    )
+
+
+def _drawing_xml(chart_pairs: Sequence[tuple[int, LineChartSpec]]) -> str:
+    anchors: list[str] = []
+    for rel_idx, (_chart_idx, spec) in enumerate(chart_pairs, start=1):
+        c1, r1 = int(spec.anchor_from[0]), int(spec.anchor_from[1])
+        c2, r2 = int(spec.anchor_to[0]), int(spec.anchor_to[1])
+        name = xml_escape(_sanitize_xml_text(spec.title or f"Chart {rel_idx}"), {'"': "&quot;", "'": "&apos;"})
+        anchors.append(
+            "<xdr:twoCellAnchor>"
+            f"<xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff>"
+            f"<xdr:row>{r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+            f"<xdr:to><xdr:col>{c2}</xdr:col><xdr:colOff>0</xdr:colOff>"
+            f"<xdr:row>{r2}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+            "<xdr:graphicFrame macro=\"\">"
+            f'<xdr:nvGraphicFramePr><xdr:cNvPr id="{rel_idx + 1}" name="{name}"/>'
+            "<xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>"
+            "<xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>"
+            "<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">"
+            f'<c:chart xmlns:c="{NS_CHART}" xmlns:r="{NS_REL_DOC}" r:id="rId{rel_idx}"/>'
+            "</a:graphicData></a:graphic>"
+            "</xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<xdr:wsDr xmlns:xdr="{NS_DRAWING_XDR}" xmlns:a="{NS_DRAWING_MAIN}">'
+        f'{"".join(anchors)}</xdr:wsDr>'
+    )
+
+
+def _chart_title_xml(text: str) -> str:
+    clean = xml_escape(_sanitize_xml_text(text))
+    return (
+        "<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/>"
+        f"<a:p><a:r><a:t>{clean}</a:t></a:r></a:p>"
+        "</c:rich></c:tx><c:overlay val=\"0\"/></c:title>"
+    )
+
+
+def _line_chart_xml(spec: LineChartSpec) -> str:
+    series_chunks: list[str] = []
+    for idx, ser in enumerate(spec.series):
+        color = (ser.color_hex or DEFAULT_CHART_COLORS[idx % len(DEFAULT_CHART_COLORS)]).lstrip("#").upper()
+        name = xml_escape(_sanitize_xml_text(ser.name))
+        cat_f = xml_escape(_sanitize_xml_text(ser.categories_ref))
+        val_f = xml_escape(_sanitize_xml_text(ser.values_ref))
+        series_chunks.append(
+            f"<c:ser><c:idx val=\"{idx}\"/><c:order val=\"{idx}\"/>"
+            f"<c:tx><c:v>{name}</c:v></c:tx>"
+            f"<c:spPr><a:ln w=\"{CHART_LINE_WIDTH_EMU}\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
+            "<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/></c:marker>"
+            f"<c:cat><c:numRef><c:f>{cat_f}</c:f></c:numRef></c:cat>"
+            f"<c:val><c:numRef><c:f>{val_f}</c:f></c:numRef></c:val>"
+            "<c:smooth val=\"0\"/></c:ser>"
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<c:chartSpace xmlns:c="{NS_CHART}" xmlns:a="{NS_DRAWING_MAIN}" xmlns:r="{NS_REL_DOC}">'
+        '<c:lang val="en-US"/><c:roundedCorners val="0"/>'
+        "<c:chart>"
+        f"{_chart_title_xml(spec.title)}"
+        '<c:autoTitleDeleted val="0"/>'
+        "<c:plotArea><c:layout/>"
+        "<c:lineChart>"
+        '<c:grouping val="standard"/><c:varyColors val="0"/>'
+        f'{"".join(series_chunks)}'
+        f'<c:axId val="{CHART_CAT_AXIS_ID}"/><c:axId val="{CHART_VAL_AXIS_ID}"/>'
+        "</c:lineChart>"
+        "<c:catAx>"
+        f'<c:axId val="{CHART_CAT_AXIS_ID}"/>'
+        '<c:scaling><c:orientation val="minMax"/></c:scaling>'
+        '<c:delete val="0"/><c:axPos val="b"/>'
+        f"{_chart_title_xml(spec.x_title)}"
+        '<c:tickLblPos val="nextTo"/>'
+        f'<c:crossAx val="{CHART_VAL_AXIS_ID}"/><c:crosses val="autoZero"/>'
+        '<c:auto val="1"/><c:lblAlgn val="ctr"/>'
+        "</c:catAx>"
+        "<c:valAx>"
+        f'<c:axId val="{CHART_VAL_AXIS_ID}"/>'
+        '<c:scaling><c:orientation val="minMax"/></c:scaling>'
+        '<c:delete val="0"/><c:axPos val="l"/>'
+        "<c:majorGridlines/>"
+        f"{_chart_title_xml(spec.y_title)}"
+        '<c:tickLblPos val="nextTo"/>'
+        f'<c:crossAx val="{CHART_CAT_AXIS_ID}"/><c:crosses val="autoZero"/>'
+        '<c:crossBetween val="between"/>'
+        "</c:valAx>"
+        "</c:plotArea>"
+        '<c:legend><c:legendPos val="b"/><c:overlay val="0"/></c:legend>'
+        '<c:plotVisOnly val="1"/>'
+        "</c:chart></c:chartSpace>"
     )
 
 
@@ -492,7 +701,7 @@ def _root_rels_xml() -> str:
 
 def _workbook_xml(sheets: Sequence[Worksheet]) -> str:
     entries = "".join(
-        f'<sheet name="{xml_escape(ws.title)}" sheetId="{idx}" r:id="rId{idx}"/>'
+        f'<sheet name="{xml_escape(ws.title, {chr(34): "&quot;", chr(39): "&apos;"})}" sheetId="{idx}" r:id="rId{idx}"/>'
         for idx, ws in enumerate(sheets, start=1)
     )
     return (
