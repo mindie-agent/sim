@@ -174,7 +174,7 @@ def test_shipping_regression_reports_measured_leave_one_out_culprit():
     assert _shipping_regression(shipping.verification, unmerge.wall_ns,
                                 unmerge.wall_ns + SHIPPING_REGRESSION_TOLERANCE_NS) is None
 
-    report = api.optimize_ladder(_case(REPRESENTATIVE_SKUS["a5"], tp=4), step, max_trials=2)
+    report = api.optimize_ladder(_case(REPRESENTATIVE_SKUS["a2"], tp=4), step, max_trials=2)
     ladder = report.ladder
     regression = report.waterfall.shipping_regression
     assert ladder.m_mainline_ns - ladder.u_unmerge_ns > SHIPPING_REGRESSION_TOLERANCE_NS
@@ -200,7 +200,7 @@ def test_mainline_seed_screens_against_its_own_faster_wall():
     assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 2500
 
 def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
-    case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
+    case = _case(REPRESENTATIVE_SKUS["a2"], tp=1)
     step = StepRequest("prefill", tokens=64)
     dossier = prepare_scenario(ScenarioRequest(case, step))
     report = api.optimize_ladder(case, step, max_trials=0)
@@ -208,7 +208,7 @@ def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     assert report.waterfall.loo_impacts == ()
     regression = report.waterfall.shipping_regression
     assert regression == report.verification.shipping_regression
-    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 3517
+    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 8582
     assert report.ladder.delta_shipping_ns == -regression.delta_ns
     assert regression.loo_culprits == ((SHIPPING_OVERLAY, -regression.delta_ns),)
 
@@ -266,9 +266,11 @@ def test_feature_waterfall_uses_unit_rate_occurrence_roofline():
     sku = REPRESENTATIVE_SKUS["a5"]
     result = compare_feature_tracks(MODEL, sku, tp=1, dp=1, pp=1, layers=1,
                                     context=64, sequences=1, ablate_prs=False)
-    case = _case(sku, tp=1, feature_track="expected_ideal", _stack_phase="decode",
+    case = _case(sku, tp=1, feature_track="target", _stack_phase="decode",
                  runtime_stack="vllm-ascend")
-    baseline = efficiency.analyze_network_efficiency(case, context=64, sequences=1, _retain_graph=True)
+    baseline = efficiency.analyze_network_efficiency(
+        case, context=64, sequences=1, scope="model", _retain_graph=True,
+    )
     graph = baseline["_occurrence_graph"]
     physical = critical_path_roofline(graph, RooflineTargets())
     reference = result["efficiency_reference"]
@@ -297,7 +299,7 @@ def test_feature_waterfall_checks_both_limits(monkeypatch, shared_die):
                     network_cube_mfu=1, network_vec_mfu=0, network_link_util=0,
                     network_roofline_efficiency=1)
 
-    monkeypatch.setattr(feature_waterfall, "analyze_network_efficiency", analyze)
+    monkeypatch.setattr(efficiency, "analyze_network_efficiency", analyze)
     report = compare_feature_tracks(MODEL, REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1, ablate_prs=False)
     assert report["waterfall"]["hardware_roofline"]["physical_ideal_1p0x_ms"] == 20
 
@@ -424,6 +426,7 @@ def test_work_gate_rejects_unary_swiglu_recipe_in_screening_and_replay(monkeypat
         return replace(replay, execution_evidence=evidence)
 
     monkeypatch.setattr(oracle, "_evaluation", match_aggregate_service)
+    dossier.handle._finalized.clear()
     gate = finalize_plan(dossier.handle, plan).verification.gates[3]
     assert not gate.passed and gate.reason == "WORK_CONSERVATION_MISMATCH"
     assert gate.detail == f"{swiglu.op_id}:executed_mte2"

@@ -140,7 +140,7 @@ def test_capacity_gate_aggregates_overlapping_prefetch_leases(real_graph):
     scenario, applied = real_graph
     anchor, first, *rest = scenario.atomic_ops[0].ops
     second = next(op for op in rest if op.family == "output_projection")
-    capacity = scenario.datapath.usable_bytes("l1")
+    capacity = scenario.datapath.usable_bytes("l1") * scenario.datapath.aic_count
     leases = (PrefetchLease("first", first.op_id, "weight", anchor.op_id, "l1", capacity // 2),
               PrefetchLease("second", second.op_id, "weight", anchor.op_id, "l1", capacity // 2))
     planned = replace(applied, prefetch_leases=leases)
@@ -545,8 +545,13 @@ def test_catlass_scheduler_choices_preserve_workspace_and_dispatch_constraints(m
     path = resolve_scenario(case, StepRequest("decode", context=64)).datapath
     specs = select_catlass_candidates(matrix_op, path, 4, 8)
     by_id = {spec.template_id: spec for spec in specs}
-    assert {"catlass.basic_pingpong", "catlass.mutex_block_mmad", "catlass.streamk",
-            "catlass.multi_core_splitk", "catlass.swizzle", "catlass.evg"} <= by_id.keys()
+    expected = {"catlass.basic_pingpong", "catlass.streamk",
+                "catlass.multi_core_splitk", "catlass.swizzle", "catlass.evg"}
+    if path.has_l0c_to_ub:
+        expected.add("catlass.mutex_block_mmad")
+    else:
+        assert "catlass.mutex_block_mmad" not in by_id
+    assert expected <= by_id.keys()
     assert {s.splitk_factor for s in specs if s.template_id == "catlass.multi_core_splitk"} == {2, 3}
     assert {s.swizzle_direction for s in specs if s.template_id == "catlass.swizzle"} == {"Zn", "Nz"}
     assert {s.epilogue_kind for s in specs if s.template_id == "catlass.evg"} == (

@@ -885,6 +885,7 @@ def test_exporter_rebound_primitives_horizon_pp_conservation_formulas_and_brief_
         component="draft_state",
         max_stage_layers=0,
         bytes_per_token_per_layer=0.0,
+        bytes_per_token_by_dtype=(), per_request_bytes_by_dtype=(),
         per_request_bytes=4 * 1024 * 1024,
         batch_total_bytes=16 * 1024 * 1024,
         scales_with_tokens=False,

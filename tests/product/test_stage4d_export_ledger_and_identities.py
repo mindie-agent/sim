@@ -449,7 +449,7 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
         d_kb = resolve_ascend_kernel_identity(spec_kb.op_id, spec_kb, fam, fam, (), "bf16", case_ds, None, ())
         assert d_kb.ascend_kernel in {kern_sym, f"aclnn{kern_sym}"}
 
-    # 3. kimi-k3.1 @ A3 C8 vs A5: A3 projects shipping V2 MC2 + QSFA ABI; A5 projects V3 MC2 ABI.
+    # 3. kimi-k3.1 @ A3 C8 vs A5: A3 projects shipping AllToAll/Unpermute + QSFA ABI; A5 projects V3 MC2 ABI.
     raw_k3_a3, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
         tp=8, ep=32, dp=4, dcp=8, quant="w4a8", kv_cache_dtype="int8",
@@ -457,9 +457,9 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
     b_k3_a3 = build_export_bundle(raw_k3_a3, request=req)
     k3_a3_ops = {o.op_id: o for o in b_k3_a3.operators}
     assert k3_a3_ops["s0.l3.latent_attention_batch"].ascend_kernel == "aclnnKvQuantSparseFlashAttentionVllm"
-    assert k3_a3_ops["s0.l3.dispatch"].ascend_kernel == "aclnnMoeDistributeDispatchV2"
-    assert k3_a3_ops["s0.l3.combine"].ascend_kernel == "aclnnMoeDistributeCombineV2"
-    assert k3_a3_ops["s0.l3.unpack"].ascend_kernel == "aclnnMoeDistributeCombineV2"
+    assert k3_a3_ops["s0.l3.dispatch"].ascend_kernel == "HcclAlltoAll"
+    assert k3_a3_ops["s0.l3.combine"].ascend_kernel == "HcclAlltoAll"
+    assert k3_a3_ops["s0.l3.unpack"].ascend_kernel == "aclnnMoeTokenUnpermute"
     assert k3_a3_ops["s0.l1.expert_act"].ascend_kernel == "aclnnDequantSituQuant"
     assert k3_a3_ops["s0.l1.shared.situ"].ascend_kernel == "aclnnDequantSituQuant"
 
@@ -521,7 +521,8 @@ def test_sparse_mla_a3_situ_wo_a_w4a16_parity_and_gemma4_decode_read_conservatio
     g53_c8_ops = {o.op_id: o for o in b_g53_c8.operators}
     assert g53_c8_ops["s0.l0.latent_attention_batch"].ascend_kernel == "aclnnSparseFlashAttention"
     assert g53_c8_ops["s0.l0.latent_attention_batch"].is_shipping_abi is True
-    assert "dispatch" in g53_c8_ops["s0.l3.unpack"].ascend_kernel.lower()
+    assert g53_c8_ops["s0.l3.unpack"].ascend_kernel == "aclnnMoeTokenUnpermute"
+    assert g53_c8_ops["s0.l3.unpack"].is_shipping_abi is True
 
     # 2. DeepSeek-V4 grouped_output_a projects verified probed CANN ABI symbol read-only.
     raw_v4, _ = compose_export_case(

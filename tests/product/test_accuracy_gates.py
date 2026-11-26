@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 from pathlib import Path
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import predict
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.weights import cache_row_bytes_by_layer, weight_breakdown
 from mindie_sim.compose import compose_case
@@ -109,7 +111,14 @@ def test_attention_head_tiling_rejection_has_explicit_reason():
     assert "mqsmla_local_heads_outside_source_tp_tiling" in reasons
     assert all(note["family"] != "mqsmla_decode" for note in summary["selected_native"])
     assert any("mqsmla_decode->analytical" in warning for warning in summary["selection_warnings"])
-    assert attention_natives(raw) == {MIXED_QUANT_NATIVE}
+    with pytest.raises(ModelingError, match="catalog_engram_heads_not_divisible:24%16"):
+        attention_natives(raw)
+    no_engram = copy.deepcopy(raw)
+    for lp in no_engram["model"]["layer_plans"]:
+        lp["engram"] = False
+    no_engram["model"].pop("engram", None)
+    no_engram["model"]["metadata"].pop("engram", None)
+    assert attention_natives(no_engram) == {MIXED_QUANT_NATIVE}
 
 def test_explicit_bf16_cache_override_preserves_declared_dtype():
     from mindie_sim.compose.operator_defaults import (CACHE_OVERRIDE_REASON, apply_compose_v41_a5_defaults,)
@@ -468,9 +477,9 @@ def test_shared_expert_dp_mc2_conserves_weights_and_hccl_bytes():
     assert _rel(plain_eff["graph_duration_ms"], MC2_PLAIN_REF_MS) <= REL_TOL
     assert _rel(mc2_eff["graph_duration_ms"], MC2_SCHEDULED_REF_MS) <= REL_TOL
     assert _rel(plain_eff["graph_duration_ms"], MC2_SCHEDULED_REF_MS) > REL_TOL
-    # A3 decode EP>1 selects shipping MC2 V2 (adding 24 B/layer count_network + peer rounding: +120 B vs chunked mc2).
-    assert plain_eff["total_link_bytes"] == pytest.approx(233616.0)
-    assert mc2_eff["total_link_bytes"] == pytest.approx(233496.0)
+    # A3 decode EP>1 selects shipping MC2 V2 (+120 B vs chunked mc2) alongside TP-sharded shared-expert AllReduce.
+    assert plain_eff["total_link_bytes"] == pytest.approx(430224.0)
+    assert mc2_eff["total_link_bytes"] == pytest.approx(430104.0)
     plain_step = _step(plain, "decode", 8, 128, 1)
     # A3 decode EP>1 overlaps MC2 V2 network streams against dispatch count streams;
     # enforce exact bounded timing conservation (overlap equals overlapped network stream time).

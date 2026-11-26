@@ -84,7 +84,7 @@ def test_composable_local_tp_all_axes_model_scope_and_idle_ffn_symmetry():
     assert float(rep_m["duration_ms"]) > 0.0
     lm_head = next(op for op in g_model[0] if op.recipe == "vocab_logits")
     assert lm_head.local_shape[1] == 32_320
-    assert lm_head.mte2_bytes == pytest.approx(463_339_520.0 + 4 * 7168 * 2, rel=1e-6)
+    assert lm_head.mte2_bytes == pytest.approx(463_339_520.0 + 8 * 7168 * 2, rel=1e-6)
     from mindie_sim.schema.common import dtype_bytes
 
     def _assert_local_tp_wire_floor(ops_list: list, label: str) -> None:
@@ -137,12 +137,15 @@ def test_composable_local_tp_all_axes_model_scope_and_idle_ffn_symmetry():
     slices = [(s["name"], tuple(s["shape"])) for s in dict(qkv.metadata)["packed_projection_slices"]]
     assert slices == [("q", (8, 512)), ("k", (8, 128)), ("v", (8, 128))]
 
-    # 3) Active/idle [1, 0] and ragged [1, 3] FFN Local-TP padded-row parity on dense mlp_tp & MoE shared_expert_tp.
-    for model_id, kw in (
-        ("qwen3-32b", dict(dp=2, tp=1, ep=1, mlp_tp=2, num_devices=2, layers=1)),
-        ("deepseek-v3", dict(dp=2, tp=1, ep=2, shared_expert_tp=2, num_devices=2, layers=4)),
+    # 3) Local-TP forbids pure-dense models (local_tp_requires_moe_model), while MoE dense-prefix mlp_tp &
+    #    shared_expert_tp keep active/idle [1, 0] parity and ragged [1, 3] padded-row parity.
+    with pytest.raises(ModelingError, match="local_tp_requires_moe_model"):
+        parse_case(compose_case("qwen3-32b", hardware=HW_DEFAULT, va_recommended=False, dp=2, tp=1, ep=1, mlp_tp=2, num_devices=2, layers=1))
+    for target_layer, kw in (
+        (0, dict(dp=2, tp=1, ep=2, mlp_tp=2, num_devices=2, layers=4)),
+        (3, dict(dp=2, tp=1, ep=2, shared_expert_tp=2, num_devices=2, layers=4)),
     ):
-        c_ffn = compose_case(model_id, hardware=HW_DEFAULT, va_recommended=False, **kw)
+        c_ffn = compose_case("deepseek-v3", hardware=HW_DEFAULT, va_recommended=False, **kw)
         g_ffn, _, _ = _lower_and_run_graph(
             parse_case(c_ffn), phase="decode", tokens=1, context=512, sequences=[1, 0],
             scope="body", include_submission=False, fast_span_only=True,
@@ -155,21 +158,27 @@ def test_composable_local_tp_all_axes_model_scope_and_idle_ffn_symmetry():
             scope="body", include_submission=False, fast_span_only=True,
         )
         for r in (0, 1):
-            gu = next(op for op in g_rag[r] if op.op_id.endswith("gate_up:local_tp:gemm") and op.layer == kw["layers"] - 1)
-            dn_rs = next(op for op in g_rag[r] if op.family == "reduce_scatter" and op.layer == kw["layers"] - 1)
+            gu = next(op for op in g_rag[r] if op.op_id.endswith("gate_up:local_tp:gemm") and op.layer == target_layer)
+            dn_rs = next(op for op in g_rag[r] if op.family == "reduce_scatter" and op.layer == target_layer)
             assert gu.local_shape[0] == 6 and dn_rs.local_shape[0] == 3
 
 
 def test_matched_global_workload_local_tp_vs_dcp_physics_and_kv_crossover():
+    # KeyPool indexer models (glm-5.3-flash) explicitly forbid DCP > 1 upstream.
+    with pytest.raises(ModelingError, match="kpool_indexer_requires_dcp_1"):
+        compose_case(
+            "glm-5.3-flash", hardware=HW_DEFAULT, dp=1, tp=8, ep=8, dcp=8,
+            num_devices=8, layers=AUDIT_LAYERS, va_recommended=False,
+        )
     # Identical 8-die hardware and IDENTICAL global workloads (B=8 @ ctx=2048 and B=64 @ ctx=65536):
-    # DP8 * local_seqs == global_seqs vs DP1/TP8/DCP8 * global_seqs.
+    # DP8 * local_seqs == global_seqs vs DP1/TP8/DCP8 * global_seqs on DCP-capable deepseek-v3.2.
     raw_ltp = compose_case(
-        "glm-5.3-flash", hardware=HW_DEFAULT, dp=8, tp=1, ep=8, dcp=1,
-        linear_proj_tp=8, o_proj_tp=8, lm_head_tp=8,
+        "deepseek-v3.2", hardware=HW_DEFAULT, dp=8, tp=1, ep=8, dcp=1,
+        q_proj_tp=8, o_proj_tp=8, lm_head_tp=8,
         num_devices=8, layers=AUDIT_LAYERS, va_recommended=False,
     )
     raw_dcp = compose_case(
-        "glm-5.3-flash", hardware=HW_DEFAULT, dp=1, tp=8, ep=8, dcp=8,
+        "deepseek-v3.2", hardware=HW_DEFAULT, dp=1, tp=8, ep=8, dcp=8,
         num_devices=8, layers=AUDIT_LAYERS, va_recommended=False,
     )
     cs_ltp, cs_dcp = parse_case(raw_ltp), parse_case(raw_dcp)
@@ -250,7 +259,7 @@ def test_per_sku_tutorial_profiles_kpool_dtypes_and_gated_pr_mechanisms():
         compose_case("glm-5.3-flash", hardware=HW_DEFAULT, dp=1, tp=1, ep=1, num_devices=1, layers=AUDIT_LAYERS, va_recommended=False, indexer_kv_dtype="int8")
 
     # 3) quantized_allreduce: NEVER active on A5; on A2 BF16 TP=4 compresses ONLY above 16M-element threshold!
-    raw_a5_pr = compose_case("deepseek-v3.2", hardware=HW_DEFAULT, dp=1, tp=4, pcp=2, dcp=4, ep=8, num_devices=8, layers=AUDIT_LAYERS, feature_track="unmerged_pr", _stack_phase="decode")
+    raw_a5_pr = compose_case("deepseek-v3.2", hardware=HW_DEFAULT, dp=1, tp=4, pcp=2, dcp=4, ep=8, num_devices=8, layers=AUDIT_LAYERS, feature_track="proposed", _stack_phase="decode")
     a5_active = {e["id"] for e in raw_a5_pr["runtime"]["metadata"]["feature_track_report"]["active_mechanisms"]}
     assert {"universal_dcp_query_gather", "sfa_dcp_sharded_indexer", "pcp_w8a8_quantized_allgather"} <= a5_active
     assert "quantized_allreduce" not in a5_active

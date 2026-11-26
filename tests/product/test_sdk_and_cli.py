@@ -135,8 +135,13 @@ def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
     request = LoweringRequest(step=StepRequest("decode", context=64, sequences=2), tier="mainline",
                               production_capture=True, stack="raw_eager")
     resolved = default_stack_registry().resolve_base(replace(case, runtime=eager), request)
+    from mindie_sim.stacks.vllm_ascend.speculative import build_capture_bucket_rule
     assert resolved.case.runtime.graph_capture_mode == "full"
-    assert resolved.case.runtime.graph_capture_keys == tuple(capture_keys(max(16, case.runtime.max_num_seqs or 16), 2))
+    expected_keys = build_capture_bucket_rule(
+        cudagraph_mode="FULL_DECODE_ONLY", num_speculative_tokens=2,
+        max_num_seqs=max(16, case.runtime.max_num_seqs or 16),
+    ).full_keys
+    assert resolved.case.runtime.graph_capture_keys == expected_keys
     step_ev = sdk_api.evaluate_step(case, StepRequest("decode", context=64))
     with_preds = [row for row in step_ev.operators if row.predecessors and row.predecessors[0].op_id != "analysis_input"]
     assert with_preds and all(pred.rank == 0 for pred in with_preds[0].predecessors)
@@ -382,7 +387,7 @@ def _assert_sequence_parallel_work(sp, plain, sp_ops, plain_ops, tp):
             wire.append(sum(op.link_bytes for op in links))
         assert wire[0] == pytest.approx(wire[1], rel=1e-12)
     enabled, disabled = map(_prefill_efficiency, (sp, plain))
-    assert enabled["operator_sum_ms"] - disabled["operator_sum_ms"] == pytest.approx(0.0183449315728843, abs=1e-8)
+    assert enabled["operator_sum_ms"] - disabled["operator_sum_ms"] == pytest.approx(0.01346781157288457, abs=1e-8)
     assert enabled["total_link_bytes"] > disabled["total_link_bytes"]
 
 def test_pipeline_preserves_compute_and_activation_bank_traffic():
@@ -396,7 +401,7 @@ def test_pipeline_preserves_compute_and_activation_bank_traffic():
     stage_work = [sum(op.flops for op in partitioned if op.stage == stage and op.layer >= 0) for stage in range(4)]
     assert 0 < min(stage_work) and max(stage_work) < sum(stage_work) / 2
     assert sum(stage_work) == pytest.approx(sum(op.flops for op in partitioned if op.layer >= 0), rel=1e-12)
-    shape = (PREFILL["tokens"] // 4, pipeline["model"]["hidden_size"])
+    shape = (PREFILL["tokens"], pipeline["model"]["hidden_size"])
     payload = shape[0] * shape[1] * 2
     for recipe, count in (("pipeline_send", 3), ("pipeline_residual_send", 6)):
         sends = [op for op in partitioned if op.family == "pp_p2p" and op.recipe == recipe]
@@ -698,6 +703,7 @@ def test_public_graph_mapping_cli_geometry_and_report_parity(tmp_path, capsys):
     from mindie_sim.structure.export import _structure_inputs
     media_case_path = Path(__file__).resolve().parents[2] / "examples/cases/qwen3.8-27b-media.json"
     media_raw = json.loads(media_case_path.read_text(encoding="utf-8"))
+    media_raw["workload"]["requests"][0]["prompt_tokens"] = 5
     graphs_media, opts_media = _structure_inputs(
         media_raw, phase="prefill", tokens=5, context=0, sequences=1, media_tokens_per_sequence=4,
     )
