@@ -250,11 +250,12 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     b_bef = build_export_bundle(raw_bef, request=req)
     b_aft = build_export_bundle(raw_aft, request=req)
 
-    # Real target track natively fuses target_arch_2 MLA Prolog (7 ops -> 1 aclnnMlaPrologV3WeightNz).
+    # target_arch_2 sets mla_use_nope=True and mla_qkv_a_gate_fused=True, so upstream vllm-ascend
+    # forbids aclnnMlaPrologV3WeightNz fusion and preserves the decomposed MLA Prolog graph.
     mla_bef = [op for op in b_bef.operators if op.archetype_id == "target_arch_2" and "MLA Prolog" in op.submodule]
     mla_aft = [op for op in b_aft.operators if op.archetype_id == "target_arch_2" and "MLA Prolog" in op.submodule]
-    assert len(mla_bef) >= 7 and any(
-        op.ascend_kernel == "aclnnMlaPrologV3WeightNz" and "mla_prolog" in op.op_id
+    assert len(mla_bef) >= 7 and len(mla_aft) >= 7 and not any(
+        op.ascend_kernel == "aclnnMlaPrologV3WeightNz"
         for op in mla_aft
     )
 

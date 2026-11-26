@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 from typing import Any
 
 from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
@@ -72,6 +73,12 @@ from .xlsx_summary import (
 
 #: Default Sheet 3 quant mode preserving every row's evaluated format and scale bytes.
 QUANT_MODE_AS_EVALUATED = "As evaluated"
+#: Weight table group label for routed MoE experts eligible for DDR offload scaling.
+_ROUTED_EXPERT_WEIGHT_GROUP = "MoE Routed Experts"
+#: Minimum byte delta separating DDR expert offload from float rounding noise.
+_EXPERT_OFFLOAD_BYTES_EPS = 1.0
+#: Percentage display multiplier for partial DDR offload residency annotations.
+_OFFLOAD_PCT_SCALE = 100
 
 #: Sheet 3 structural layout constants (24 columns A..X).
 MEMORY_COLS = 24
@@ -110,6 +117,7 @@ MEM_CTL_OVERRIDE_IGN_REF = "$T$6"
 MEM_CTL_VIT_REF = "$T$7"
 MEM_CTL_CONC_REF = "$T$18"
 MEM_CTL_LOCAL_TOK_REF = "$T$21"
+MEM_CTL_GPU_UTIL_REF = "$T$23"
 MEM_CTL_USABLE_HBM_REF = "$T$24"
 
 MEMORY_COL_WIDTHS = (
@@ -361,14 +369,94 @@ def _populate_cache_block(
     return c_tot
 
 
+def _weight_row_stage_bytes(wrow: Any, stage_idx: int) -> tuple[float, float]:
+    """Compute gross ``(payload_bytes, scale_aux_bytes)`` for one weight row on ``stage_idx``."""
+    st_rep = int(wrow.stage_repeats[stage_idx]) if stage_idx < len(wrow.stage_repeats) else 0
+    if st_rep <= 0:
+        return 0.0, 0.0
+    if wrow.peak_stage_repeats > 0:
+        scale = float(st_rep) / float(wrow.peak_stage_repeats)
+        return float(wrow.payload_bytes) * scale, float(wrow.scale_bytes + wrow.aux_bytes) * scale
+    spec = _weight_format_storage_spec(wrow.quant_format)
+    bpe = float(spec["bytes"])
+    grp = int(spec["group"])
+    aux = int(spec["aux"])
+    row_p = float(wrow.local_rows * math.ceil(wrow.local_cols * bpe) * st_rep)
+    row_s = float(
+        (wrow.local_rows * math.ceil(wrow.local_cols / grp) * st_rep if grp > 0 else 0)
+        + wrow.local_rows * aux * st_rep
+    )
+    return row_p, row_s
+
+
+def _stage_expert_hbm_ratios(
+    mem: MemoryCalculatorLedger, stage_idx: int,
+) -> tuple[float, float, float]:
+    """Return ``(payload_hbm_ratio, scale_hbm_ratio, scale_deduct_in_payload)`` for routed experts."""
+    st_budget = next((s for s in mem.stage_budgets if int(s.stage) == int(stage_idx)), None)
+    if st_budget is None:
+        return 1.0, 1.0, 0.0
+    gross_non_exp_p = gross_non_exp_s = gross_exp_p = gross_exp_s = 0.0
+    for wrow in mem.weight_rows:
+        if wrow.is_engram_or_ple or (wrow.is_vision and not mem.include_vision_tower):
+            continue
+        row_p, row_s = _weight_row_stage_bytes(wrow, stage_idx)
+        if row_p <= 0.0 and row_s <= 0.0:
+            continue
+        if wrow.group == _ROUTED_EXPERT_WEIGHT_GROUP:
+            gross_exp_p += row_p
+            gross_exp_s += row_s
+        else:
+            gross_non_exp_p += row_p
+            gross_non_exp_s += row_s
+    if gross_exp_p <= MIN_DENOM_EPS and gross_exp_s <= MIN_DENOM_EPS:
+        return 1.0, 1.0, 0.0
+    offload_p = (gross_non_exp_p + gross_exp_p) - float(st_budget.weight_payload_bytes)
+    offload_s = (gross_non_exp_s + gross_exp_s) - float(st_budget.weight_scale_aux_bytes)
+    if offload_p <= _EXPERT_OFFLOAD_BYTES_EPS and offload_s <= _EXPERT_OFFLOAD_BYTES_EPS:
+        return 1.0, 1.0, 0.0
+    ratio_p, scale_deduct = 1.0, 0.0
+    if gross_exp_p > MIN_DENOM_EPS and offload_p > _EXPERT_OFFLOAD_BYTES_EPS:
+        if offload_p <= gross_exp_p:
+            ratio_p = max(0.0, min(1.0, (gross_exp_p - offload_p) / gross_exp_p))
+        else:
+            ratio_p = 0.0
+            scale_deduct = (
+                max(0.0, min(1.0, (offload_p - gross_exp_p) / gross_exp_s))
+                if gross_exp_s > MIN_DENOM_EPS else 0.0
+            )
+    ratio_s = (
+        max(0.0, min(1.0, (gross_exp_s - offload_s) / gross_exp_s))
+        if (gross_exp_s > MIN_DENOM_EPS and offload_s > _EXPERT_OFFLOAD_BYTES_EPS)
+        else (ratio_p if gross_exp_s <= MIN_DENOM_EPS else 1.0)
+    )
+    return ratio_p, ratio_s, scale_deduct
+
+
+def _join_signed_terms(terms: Sequence[str]) -> str:
+    if not terms:
+        return "0"
+    return "".join(term if (idx == 0 or term.startswith("-")) else f"+{term}" for idx, term in enumerate(terms))
+
+
 def _stage_weight_formulas(
     mem: MemoryCalculatorLedger, stage_idx: int, weight_start_row: int, lookup_ref: str,
 ) -> tuple[str | None, str | None]:
     """Build live Excel formulas for one PP stage's HBM weight payload & scale+aux (GiB)."""
     if weight_start_row <= 0 or not mem.weight_rows:
         return None, None
+    exp_ratio_p, exp_ratio_s, exp_scale_deduct = _stage_expert_hbm_ratios(mem, stage_idx)
+    has_exp_offload = (
+        exp_ratio_p < 1.0 - MIN_DENOM_EPS
+        or exp_ratio_s < 1.0 - MIN_DENOM_EPS
+        or exp_scale_deduct > MIN_DENOM_EPS
+    )
     payload_terms: list[str] = []
     scale_terms: list[str] = []
+    zero_peak_p_terms: list[str] = []
+    zero_peak_s_terms: list[str] = []
+    known_peak_p = 0.0
+    known_peak_s = 0.0
     run_start: int | None = None
     run_end: int | None = None
 
@@ -393,7 +481,17 @@ def _stage_weight_formulas(
             _flush_run()
             continue
         wr = weight_start_row + idx
-        if not wrow.is_vision and wrow.peak_stage_repeats == st_rep:
+        is_offloaded_exp = has_exp_offload and wrow.group == _ROUTED_EXPERT_WEIGHT_GROUP
+        p_scale = exp_ratio_p if is_offloaded_exp else 1.0
+        s_scale = exp_ratio_s if is_offloaded_exp else 1.0
+        if wrow.peak_stage_repeats > 0:
+            rep_ratio = float(st_rep) / float(wrow.peak_stage_repeats)
+            if not (wrow.is_vision and not mem.include_vision_tower):
+                row_p = float(wrow.payload_bytes) * rep_ratio
+                row_s = float(wrow.scale_bytes + wrow.aux_bytes) * rep_ratio
+                known_peak_p += row_p * p_scale - (row_s * exp_scale_deduct if is_offloaded_exp else 0.0)
+                known_peak_s += row_s * s_scale
+        if not wrow.is_vision and not is_offloaded_exp and wrow.peak_stage_repeats == st_rep:
             if run_start is None:
                 run_start = run_end = wr
             elif run_end == wr - 1:
@@ -404,24 +502,55 @@ def _stage_weight_formulas(
             continue
         _flush_run()
         if wrow.peak_stage_repeats > 0:
-            ratio = float(st_rep) / float(wrow.peak_stage_repeats)
-            p_term = f"K{wr}" if st_rep == wrow.peak_stage_repeats else f"K{wr}*{ratio!r}"
-            s_term = f"(L{wr}+M{wr})" if st_rep == wrow.peak_stage_repeats else f"(L{wr}+M{wr})*{ratio!r}"
+            rep_ratio = float(st_rep) / float(wrow.peak_stage_repeats)
+            eff_p = rep_ratio * p_scale
+            eff_s = rep_ratio * s_scale
+            p_base = f"K{wr}"
+            s_base = f"(L{wr}+M{wr})"
+            p_term = "" if eff_p <= MIN_DENOM_EPS else (p_base if abs(eff_p - 1.0) <= MIN_DENOM_EPS else f"{p_base}*{eff_p!r}")
+            s_term = "" if eff_s <= MIN_DENOM_EPS else (s_base if abs(eff_s - 1.0) <= MIN_DENOM_EPS else f"{s_base}*{eff_s!r}")
+            deduct_base = s_base if abs(rep_ratio - 1.0) <= MIN_DENOM_EPS else f"{s_base}*{rep_ratio!r}"
+            target_p, target_s = payload_terms, scale_terms
         else:
-            p_term = f"F{wr}*ROUNDUP(G{wr}*VLOOKUP(J{wr},{lookup_ref},2,FALSE),0)*{st_rep}"
-            s_term = (
+            p_raw = f"F{wr}*ROUNDUP(G{wr}*VLOOKUP(J{wr},{lookup_ref},2,FALSE),0)*{st_rep}"
+            s_raw = (
                 f"(IF(VLOOKUP(J{wr},{lookup_ref},3,FALSE)>0,"
                 f"F{wr}*ROUNDUP(G{wr}/VLOOKUP(J{wr},{lookup_ref},3,FALSE),0)*{st_rep},0)"
                 f"+F{wr}*VLOOKUP(J{wr},{lookup_ref},4,FALSE)*{st_rep})"
             )
+            p_term = "" if p_scale <= MIN_DENOM_EPS else (p_raw if abs(p_scale - 1.0) <= MIN_DENOM_EPS else f"({p_raw})*{p_scale!r}")
+            s_term = "" if s_scale <= MIN_DENOM_EPS else (s_raw if abs(s_scale - 1.0) <= MIN_DENOM_EPS else f"({s_raw})*{s_scale!r}")
+            deduct_base = s_raw
+            target_p, target_s = zero_peak_p_terms, zero_peak_s_terms
         if wrow.is_vision:
-            p_term = f'IF({MEM_CTL_VIT_REF}="ON",{p_term},0)'
-            s_term = f'IF({MEM_CTL_VIT_REF}="ON",{s_term},0)'
-        payload_terms.append(p_term)
-        scale_terms.append(s_term)
+            p_term = f'IF({MEM_CTL_VIT_REF}="ON",{p_term},0)' if p_term else ""
+            s_term = f'IF({MEM_CTL_VIT_REF}="ON",{s_term},0)' if s_term else ""
+        if p_term:
+            target_p.append(p_term)
+        if is_offloaded_exp and exp_scale_deduct > MIN_DENOM_EPS:
+            d_term = deduct_base if abs(exp_scale_deduct - 1.0) <= MIN_DENOM_EPS else f"({deduct_base})*{exp_scale_deduct!r}"
+            target_p.append(f"-{d_term}")
+        if s_term:
+            target_s.append(s_term)
     _flush_run()
-    payload_f = f"=({'+'.join(payload_terms) or '0'})/{GIB_BYTES}"
-    scale_f = f"=({'+'.join(scale_terms) or '0'})/{GIB_BYTES}"
+    if zero_peak_p_terms or zero_peak_s_terms:
+        st_budget = next((s for s in mem.stage_budgets if int(s.stage) == int(stage_idx)), None)
+        if zero_peak_p_terms:
+            v_p = _join_signed_terms(zero_peak_p_terms)
+            if st_budget is not None:
+                rem_p = int(round(max(0.0, float(st_budget.weight_payload_bytes) - known_peak_p)))
+                payload_terms.append(f'IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}",{rem_p},{v_p})')
+            else:
+                payload_terms.append(v_p)
+        if zero_peak_s_terms:
+            v_s = _join_signed_terms(zero_peak_s_terms)
+            if st_budget is not None:
+                rem_s = int(round(max(0.0, float(st_budget.weight_scale_aux_bytes) - known_peak_s)))
+                scale_terms.append(f'IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}",{rem_s},{v_s})')
+            else:
+                scale_terms.append(v_s)
+    payload_f = f"=({_join_signed_terms(payload_terms)})/{GIB_BYTES}"
+    scale_f = f"=({_join_signed_terms(scale_terms)})/{GIB_BYTES}"
     return payload_f, scale_f
 
 
@@ -495,6 +624,14 @@ def _populate_stage_budget_block(
         raw_engram_gib = (st.engram_ple_hbm_bytes + st.engram_ple_host_bytes) / float(GIB_BYTES)
         cache_f = _stage_cache_formula(mem, st.stage, cache_tot_row)
         w_payload_f, w_scale_f = _stage_weight_formulas(mem, st.stage, weight_start_row, lookup_ref)
+        t24_bytes = float(mem.die_hbm_capacity_bytes) * float(mem.gpu_memory_utilization)
+        if abs(float(st.usable_hbm_budget_bytes) - t24_bytes) <= _EXPERT_OFFLOAD_BYTES_EPS:
+            stage_hbm_f: str | None = f"={MEM_CTL_USABLE_HBM_REF}"
+        elif float(mem.gpu_memory_utilization) > MIN_DENOM_EPS:
+            st_cap_gib = float(st.usable_hbm_budget_bytes) / (float(GIB_BYTES) * float(mem.gpu_memory_utilization))
+            stage_hbm_f = f"={st_cap_gib!r}*{MEM_CTL_GPU_UTIL_REF}"
+        else:
+            stage_hbm_f = None
         write_row(ws, r, (
             (f"Stage {st.stage}", None, STYLE_MERGED),
             (st.owned_layers, None, STYLE_INT),
@@ -506,7 +643,7 @@ def _populate_stage_budget_block(
             (st.workspace_peak_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.reserve_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.total_hbm_bytes / float(GIB_BYTES), f"=SUM(C{r}:E{r},G{r}:I{r})", STYLE_FLOAT3),
-            (st.usable_hbm_budget_bytes / float(GIB_BYTES), f"={MEM_CTL_USABLE_HBM_REF}", STYLE_FLOAT3),
+            (st.usable_hbm_budget_bytes / float(GIB_BYTES), stage_hbm_f, STYLE_FLOAT3),
             (st.headroom_bytes / float(GIB_BYTES), f"=K{r}-J{r}", STYLE_FLOAT3),
             ("PASS" if st.fits_hbm else "OOM", f'=IF(J{r}<=K{r},"PASS","OOM")', STYLE_ALERT_OK if st.fits_hbm else STYLE_ALERT_HIGH),
             (raw_engram_gib, None, STYLE_FLOAT3),
@@ -545,7 +682,7 @@ def _populate_stage_budget_block(
     ws.set_cell(
         max_row, MEMORY_STAGE_STATUS_COL,
         "PASS" if mem.fits_hbm else "OOM",
-        formula=f'=IF(J{max_row}<=K{max_row},"PASS","OOM")',
+        formula=f'=IF(L{max_row}>=0,"PASS","OOM")',
         style=STYLE_ALERT_OK if mem.fits_hbm else STYLE_ALERT_HIGH,
     )
     raw_engram_vals = [(s.engram_ple_hbm_bytes + s.engram_ple_host_bytes) / GIB_BYTES for s in mem.stage_budgets]
@@ -582,16 +719,31 @@ def _populate_weight_block(
     write_headers(ws, MEMORY_TABLE_HEADER_ROW, w_headers)
 
     w_start = MEMORY_TABLE_HEADER_ROW + 1
+    peak_exp_p, _, _ = _stage_expert_hbm_ratios(mem, mem.peak_weight_stage)
+    full_exp_offload = peak_exp_p <= MIN_DENOM_EPS
+    partial_exp_offload = MIN_DENOM_EPS < peak_exp_p < 1.0 - MIN_DENOM_EPS
+    exp_offload_frac = max(0.0, min(1.0, 1.0 - peak_exp_p))
+    exp_row_indices: list[int] = []
     group_spans: list[list[Any]] = []
     for idx, row in enumerate(mem.weight_rows):
         r = w_start + idx
         extend_span(group_spans, row.group, r, r)
+        is_exp_row = row.group == _ROUTED_EXPERT_WEIGHT_GROUP
+        if is_exp_row:
+            exp_row_indices.append(r)
         if row.is_engram_or_ple:
             res_text = "Host DRAM (Offload)" if mem.engram_host_offload else "NPU HBM (Engram/PLE)"
             res_formula: str | None = f'=IF({MEM_CTL_OFFLOAD_REF}="ON","Host DRAM (Offload)","NPU HBM (Engram/PLE)")'
         elif row.is_vision:
             res_text = "NPU HBM (Vision ViT)" if mem.include_vision_tower else "Excluded Vision (Text-Only)"
             res_formula = f'=IF({MEM_CTL_VIT_REF}="ON","NPU HBM (Vision ViT)","Excluded Vision (Text-Only)")'
+        elif is_exp_row and full_exp_offload:
+            res_text = "Host DRAM (Expert DDR Offload)"
+            res_formula = None
+        elif is_exp_row and partial_exp_offload:
+            off_pct = int(round(exp_offload_frac * _OFFLOAD_PCT_SCALE))
+            res_text = f"NPU HBM ({_OFFLOAD_PCT_SCALE - off_pct}% HBM / {off_pct}% DDR Offload)"
+            res_formula = None
         else:
             res_text = f"NPU HBM ({row.quant_note})" if row.quant_note else "NPU HBM"
             res_formula = None
@@ -643,39 +795,68 @@ def _populate_weight_block(
     w_tot_host = w_end + 2
     w_tot_vit = w_end + 3
 
+    def _exp_rows_sum_expr(col_let: str) -> str:
+        if not exp_row_indices:
+            return ""
+        ranges: list[tuple[int, int]] = []
+        s_r = e_r = exp_row_indices[0]
+        for rr in exp_row_indices[1:]:
+            if rr == e_r + 1:
+                e_r = rr
+            else:
+                ranges.append((s_r, e_r))
+                s_r = e_r = rr
+        ranges.append((s_r, e_r))
+        parts = [f"{col_let}{a}" if a == b else f"SUM({col_let}{a}:{col_let}{b})" for a, b in ranges]
+        return "+".join(parts)
+
     def _sumifs_row(
         r_idx: int, label: str, crit: str, pred_fn: Any, note_txt: str,
-        t_st: int, n_st: int,
+        t_st: int, n_st: int, *, exp_delta_sign: float = 0.0,
     ) -> None:
         ws.set_cell(r_idx, 1, label, style=t_st)
         ws.merge_range(r_idx, 1, r_idx, MEMORY_WEIGHT_MERGE_END_COL)
         matched = [x for x in mem.weight_rows if pred_fn(x)]
+        exp_matched = [x for x in mem.weight_rows if x.group == _ROUTED_EXPERT_WEIGHT_GROUP]
+        adj_factor = exp_delta_sign * exp_offload_frac if (partial_exp_offload and exp_delta_sign != 0.0) else 0.0
         vals = (
-            sum(x.payload_bytes for x in matched),
-            sum(x.scale_bytes for x in matched),
-            sum(x.aux_bytes for x in matched),
-            sum(x.native_bf16_bytes for x in matched) / float(GIB_BYTES),
-            sum(x.per_die_bytes for x in matched) / float(GIB_BYTES),
+            sum(x.payload_bytes for x in matched) + adj_factor * sum(x.payload_bytes for x in exp_matched),
+            sum(x.scale_bytes for x in matched) + adj_factor * sum(x.scale_bytes for x in exp_matched),
+            sum(x.aux_bytes for x in matched) + adj_factor * sum(x.aux_bytes for x in exp_matched),
+            (sum(x.native_bf16_bytes for x in matched) + adj_factor * sum(x.native_bf16_bytes for x in exp_matched)) / float(GIB_BYTES),
+            (sum(x.per_die_bytes for x in matched) + adj_factor * sum(x.per_die_bytes for x in exp_matched)) / float(GIB_BYTES),
         )
         for offset, tot_v in enumerate(vals):
             col = MEMORY_WEIGHT_SUM_START_COL + offset
             c_let = column_letter(col)
-            f_str = (
-                f'=SUMIFS({c_let}{w_start}:{c_let}{w_end},$P${w_start}:$P${w_end},"{crit}")'
-                if w_end >= w_start else "=0"
-            )
+            if w_end >= w_start:
+                base_f = f'SUMIFS({c_let}{w_start}:{c_let}{w_end},$P${w_start}:$P${w_end},"{crit}")'
+                exp_e = _exp_rows_sum_expr(c_let) if abs(adj_factor) > MIN_DENOM_EPS else ""
+                if exp_e:
+                    op_sign = "+" if adj_factor > 0.0 else "-"
+                    f_str = f"={base_f}{op_sign}({exp_e})*{abs(adj_factor)!r}"
+                else:
+                    f_str = f"={base_f}"
+            else:
+                f_str = "=0"
             ws.set_cell(r_idx, col, tot_v, formula=f_str, style=n_st)
         ws.set_cell(r_idx, MEMORY_TABLE_END_COL, note_txt, style=t_st)
 
     _sumifs_row(
         w_tot_hbm, "NPU HBM Weights Total (GiB, 仅计入 NPU HBM 驻留张量)", "NPU HBM*",
-        lambda x: (not (x.is_engram_or_ple and mem.engram_host_offload)) and (not (x.is_vision and not mem.include_vision_tower)),
+        lambda x: (
+            not (x.is_engram_or_ple and mem.engram_host_offload)
+            and not (x.is_vision and not mem.include_vision_tower)
+            and not (full_exp_offload and x.group == _ROUTED_EXPERT_WEIGHT_GROUP)
+        ),
         f"压缩比 {mem.weight_compression_ratio:.2f}x (vs 原生 BF16)", STYLE_TOTAL_TEXT, STYLE_TOTAL_NUM,
+        exp_delta_sign=-1.0,
     )
     _sumifs_row(
         w_tot_host, "Host DRAM Offload Total (GiB, Engram/PLE 卸载至主机内存)", "Host DRAM*",
-        lambda x: x.is_engram_or_ple and mem.engram_host_offload,
+        lambda x: (x.is_engram_or_ple and mem.engram_host_offload) or (full_exp_offload and x.group == _ROUTED_EXPERT_WEIGHT_GROUP),
         "不计入 NPU HBM 预算", STYLE_SUBTOTAL_TEXT, STYLE_SUBTOTAL_NUM,
+        exp_delta_sign=1.0,
     )
     _sumifs_row(
         w_tot_vit, "Excluded Vision Tower Total (GiB, 纯文本默认不加载 ViT)", "Excluded*",

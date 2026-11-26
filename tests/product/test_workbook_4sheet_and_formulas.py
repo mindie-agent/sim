@@ -199,7 +199,12 @@ def _range_coords(r1: str, r2: str) -> list[str]:
 
 
 def _match_criteria(val: object, crit: object) -> bool:
-    c_str = str(crit)
+    c_str = str(crit).strip()
+    if c_str.startswith(">") and not c_str.startswith(">="):
+        try:
+            return float(str(val)) > float(c_str[1:])
+        except (TypeError, ValueError):
+            return False
     v_str = "" if val is None else str(val)
     if "*" in c_str:
         pat = "^" + re.escape(c_str).replace(r"\*", ".*") + "$"
@@ -285,8 +290,21 @@ def _eval_call(
     if u_fn == "ROUNDUP":
         num = float(str(_eval_expr(args_raw[0], sheet, all_sheets, overrides=overrides, memo=memo)))
         return float(math.ceil(num - 1e-12))
-    if u_fn == "MAX":
-        return max(float(str(_eval_expr(a, sheet, all_sheets, overrides=overrides, memo=memo))) for a in args_raw)
+    if u_fn == "ABS":
+        return abs(float(str(_eval_expr(args_raw[0], sheet, all_sheets, overrides=overrides, memo=memo))))
+    if u_fn in {"MAX", "MIN"}:
+        vals: list[float] = []
+        for arg in args_raw:
+            m = _CELL_REF_SCAN_RE.fullmatch(arg.strip())
+            if m and m.group(5):
+                tgt_s = m.group(1) or m.group(2) or sheet
+                for cell in _range_coords(f"{m.group(3)}{m.group(4)}", f"{m.group(5)}{m.group(6)}"):
+                    v = _eval_workbook_cell(tgt_s, cell, all_sheets, overrides=overrides, memo=memo)
+                    if isinstance(v, (int, float)):
+                        vals.append(float(v))
+            else:
+                vals.append(float(str(_eval_expr(arg, sheet, all_sheets, overrides=overrides, memo=memo))))
+        return (max(vals) if u_fn == "MAX" else min(vals)) if vals else 0.0
     raise ValueError(f"unsupported_excel_fn:{fn}")
 
 
@@ -305,7 +323,7 @@ def _eval_expr(
         return text[1:-1]
     # Replace outermost Excel function calls first.
     while True:
-        m = re.search(r"\b(SUMIFS|SUMIF|VLOOKUP|ROUNDUP|SUM|MAX|IF)\(", text)
+        m = re.search(r"\b(SUMIFS|SUMIF|VLOOKUP|ROUNDUP|SUM|MAX|MIN|ABS|IF)\(", text)
         if m is None:
             break
         start = m.start()
@@ -833,3 +851,126 @@ def test_sheet2_attnres_depth_slices_recoverssm_b69_codesign_cards_and_after_tra
     root_ev = next(e for e in events if e.get("cat") == "Framework" and "ModelRunner.execute_model" in str(e.get("name", "")))
     if b_post.step_span_us < b_pre.step_span_us - 10.0:
         assert float(root_ev["dur"]) < b_pre.step_span_us
+
+
+def test_workbook_expert_offload_heterogeneous_pp_and_receipt_waterfall(tmp_path):
+    from _support.memory_cases import budget_memory
+    from mindie_sim.export.xlsx_memory import _populate_stage_budget_block
+
+    # 1. Sheet 3 DDR expert offload scales routed-expert HBM weight rows and Section 1 totals accurately.
+    raw_moe = compose_case("qwen3-30b-a3b", REPRESENTATIVE_SKUS["a3"], layers=2, tp=2, ep=2, quant="bf16")
+    raw_moe["runtime"].setdefault("memory", {})["expert_ddr_ratio"] = 0.75
+    raw_moe["runtime"]["gpu_memory_utilization"] = 0.02
+    b_off = build_export_bundle(parse_case(raw_moe), request=StepRequest("decode", 1, 128, 1, "model"), apply_target_envelope=False)
+    off_xlsx = tmp_path / "expert_offload.xlsx"
+    export_comparison_xlsx(b_off, off_xlsx)
+    meta, roots, shared = _inspect_xlsx(off_xlsx)
+    sheets = {name: _sheet_cells(roots[name], shared) for name, _ in meta}
+    mws = sheets[SHEET_MEMORY]
+    st0_r = next(int(ref[1:]) for ref, (v, _) in mws.items() if ref.startswith("A") and ref[1:].isdigit() and v == "Stage 0")
+    hbm_tot_r = next(int(ref[1:]) for ref, (v, _) in mws.items() if ref.startswith("A") and ref[1:].isdigit() and "NPU HBM Weights Total" in str(v))
+    ddr_tot_r = next(int(ref[1:]) for ref, (v, _) in mws.items() if ref.startswith("A") and ref[1:].isdigit() and "Host DRAM Offload Total" in str(v))
+    assert float(_eval_workbook_cell(SHEET_MEMORY, f"C{st0_r}", sheets)) == pytest.approx(float(mws[f"C{st0_r}"][0]), abs=1e-4)
+    assert float(_eval_workbook_cell(SHEET_MEMORY, f"J{st0_r}", sheets)) == pytest.approx(float(mws[f"J{st0_r}"][0]), abs=1e-4)
+    assert float(_eval_workbook_cell(SHEET_MEMORY, f"O{hbm_tot_r}", sheets)) == pytest.approx(float(mws[f"C{st0_r}"][0]), abs=1e-3)
+    assert float(_eval_workbook_cell(SHEET_MEMORY, f"O{ddr_tot_r}", sheets)) > 0.0
+    assert _eval_workbook_cell(SHEET_MEMORY, f"M{st0_r}", sheets) == "PASS"
+
+    # 2. Sheet 3 heterogeneous PP and intra-stage die budgets scale with $T$23 (not $T$24) and evaluate OOM via MIN headroom.
+    het_case = budget_memory((2**28, 4096), pp=2).case
+    het_led = compute_memory_quant_ledger(het_case, seq_len=128, concurrency=1)
+    ws_het = Worksheet("Memory")
+    _populate_stage_budget_block(ws_het, 1, het_led)
+    assert ws_het._cells[4, 11].formula is not None and "$T$23" in ws_het._cells[4, 11].formula and "$T$24" not in ws_het._cells[4, 11].formula
+    assert float(ws_het._cells[4, 11].value) == pytest.approx(het_led.stage_budgets[1].usable_hbm_budget_bytes / float(1 << 30), abs=1e-9)
+    assert ws_het._cells[5, 13].formula == 'IF(L5>=0,"PASS","OOM")'
+    intra_case = budget_memory((64 * (1 << 30), 2 * (1 << 30)), pp=1, tp=2).case
+    ws_intra = Worksheet("Memory")
+    _populate_stage_budget_block(ws_intra, 1, compute_memory_quant_ledger(intra_case, seq_len=128, concurrency=1))
+    assert ws_intra._cells[3, 11].formula is not None and "$T$23" in ws_intra._cells[3, 11].formula and "$T$24" not in ws_intra._cells[3, 11].formula
+
+    c_pp = parse_case(compose_case("deepseek-v3", REPRESENTATIVE_SKUS["a3"], dp=1, tp=2, ep=1, pp=2, layers=4, quant="w4a8_dynamic"))
+    b_pp = build_export_bundle(c_pp, request=StepRequest("decode", 1, 128, 1, "model"), apply_target_envelope=False)
+    sb0, sb1 = b_pp.memory_ledger.stage_budgets[0], b_pp.memory_ledger.stage_budgets[1]
+    small_b = float(1 << 29)
+    sb1_oom = replace(sb1, usable_hbm_budget_bytes=small_b, headroom_bytes=small_b - sb1.total_hbm_bytes, fits_hbm=False)
+    b_het = replace(b_pp, memory_ledger=replace(b_pp.memory_ledger, stage_budgets=(sb0, sb1_oom), fits_hbm=False))
+    het_xlsx = tmp_path / "het_pp.xlsx"
+    export_comparison_xlsx(b_het, het_xlsx)
+    meta_h, roots_h, shared_h = _inspect_xlsx(het_xlsx)
+    sheets_h = {name: _sheet_cells(roots_h[name], shared_h) for name, _ in meta_h}
+    mws_h = sheets_h[SHEET_MEMORY]
+    for st_i in (0, 1):
+        sr_i = next(int(ref[1:]) for ref, (v, _) in mws_h.items() if ref.startswith("A") and ref[1:].isdigit() and v == f"Stage {st_i}")
+        for col in ("C", "D", "E", "J"):
+            assert float(_eval_workbook_cell(SHEET_MEMORY, f"{col}{sr_i}", sheets_h)) == pytest.approx(float(mws_h[f"{col}{sr_i}"][0]), abs=1e-4)
+    s1_r = next(int(ref[1:]) for ref, (v, _) in mws_h.items() if ref.startswith("A") and ref[1:].isdigit() and v == "Stage 1")
+    assert _eval_workbook_cell(SHEET_MEMORY, f"M{s1_r}", sheets_h) == "OOM"
+    assert _eval_workbook_cell(SHEET_MEMORY, f"M{s1_r + 1}", sheets_h) == "OOM"
+
+    # 3. Sheet 4 Waterfall honors committed 4-stage engine_step_receipt and links reactively to Sheet 2 totals.
+    c_wf = compose_case("qwen3-30b-a3b", REPRESENTATIVE_SKUS["a3"], tp=4, ep=1, layers=4, feature_track="target", prompt_tokens=256, output_tokens=32)
+    r_wf = StepRequest("decode", 1, 256, 4, "model")
+    b_wf, a_wf = (build_export_bundle(c_wf, request=r_wf, apply_target_envelope=flag) for flag in (False, True))
+    wf_xlsx = tmp_path / "receipt_waterfall.xlsx"
+    export_comparison_xlsx(b_wf, wf_xlsx, after_bundle=a_wf)
+    meta_w, roots_w, shared_w = _inspect_xlsx(wf_xlsx)
+    sheets_w = {name: _sheet_cells(roots_w[name], shared_w) for name, _ in meta_w}
+    stages = a_wf.engine_step_receipt.stages
+    assert all(st.status == "committed" for st in stages) and stages[0].span_ns == b_wf.step_span_ns
+    exp_kernel_ms = (stages[2].span_ns - stages[3].span_ns) / 1e6
+    assert SHEET_BREAKDOWN in str(sheets_w[SHEET_PENDING_KERNELS]["B6"][1] or "")
+    assert SHEET_BREAKDOWN in str(sheets_w[SHEET_PENDING_KERNELS]["E6"][1] or "")
+    assert float(_eval_workbook_cell(SHEET_PENDING_KERNELS, "B6", sheets_w)) == pytest.approx(exp_kernel_ms, abs=1e-6)
+    assert float(_eval_workbook_cell(SHEET_PENDING_KERNELS, "B7", sheets_w)) == pytest.approx(0.0, abs=1e-6)
+    assert float(_eval_workbook_cell(SHEET_PENDING_KERNELS, "D10", sheets_w)) == pytest.approx(0.0, abs=1e-6)
+    assert float(_eval_workbook_cell(SHEET_PENDING_KERNELS, "E10", sheets_w)) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_workbook_calibration_sumif_pd_dies_and_zero_accept_tpot(tmp_path):
+    from mindie_sim.export import SHEET_MEASURED
+    from mindie_sim.prediction.results import RequestView
+
+    # 1. Sheet 5 total APE formula sums only matched simulated rows via SUMIF.
+    c_m = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=2, layers=2, prompt_tokens=256, output_tokens=32, concurrency=1)
+    obs_csv = Path(__file__).resolve().parents[1] / "fixtures" / "observations" / "shared-dequant-swiglu-kernel.csv"
+    b_meas = build_export_bundle(c_m, request=StepRequest("decode", 1, 256, 1, "model"), observations_path=obs_csv, apply_target_envelope=False)
+    meas_xlsx = tmp_path / "measured_sumif.xlsx"
+    export_comparison_xlsx(b_meas, meas_xlsx)
+    meta_m, roots_m, shared_m = _inspect_xlsx(meas_xlsx)
+    sheets_m = {name: _sheet_cells(roots_m[name], shared_m) for name, _ in meta_m}
+    mws = sheets_m[SHEET_MEASURED]
+    tot_r = next(int(ref[1:]) for ref, (v, _) in mws.items() if ref.startswith("A") and ref[1:].isdigit() and v == "TOTAL")
+    assert "SUMIF" in str(mws[f"M{tot_r}"][1] or "")
+    assert float(_eval_workbook_cell(SHEET_MEASURED, f"M{tot_r}", sheets_m)) == pytest.approx(float(mws[f"M{tot_r}"][0]), abs=1e-6)
+
+    # 2. PD pool used_dies lands in Summary G4 while conserving single-die TPS and N_tok_per_die formulas.
+    c1 = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], dp=1, tp=2, layers=1))
+    req1 = StepRequest("decode", 1, 128, 4, "model")
+    b_bef = build_export_bundle(c1, request=req1, apply_target_envelope=False)
+    pd_pool = {"used_dies": 4, "prefill_instances": 1, "decode_instances": 1, "prefill_used_dies": 2, "decode_used_dies": 2, "e2e_total_tps": 1234.5}
+    b_pd = build_export_bundle(c1, request=req1, pd_pool_summary=pd_pool, deployment_total_dies=4, apply_target_envelope=False)
+    pd_xlsx = tmp_path / "pd_dies.xlsx"
+    export_comparison_xlsx(b_pd, pd_xlsx)
+    meta_p, roots_p, shared_p = _inspect_xlsx(pd_xlsx)
+    sheets_p = {name: _sheet_cells(roots_p[name], shared_p) for name, _ in meta_p}
+    sws_p = sheets_p[SHEET_SUMMARY]
+    assert int(sws_p["G4"][0] or "0") == 4
+    assert sws_p["C26"][1] is not None and "$G$7" in str(sws_p["C26"][1])
+    assert float(_eval_workbook_cell(SHEET_SUMMARY, "C17", sheets_p)) == pytest.approx(float(sws_p["C17"][0]), rel=1e-4)
+    assert float(_eval_workbook_cell(SHEET_SUMMARY, "C26", sheets_p)) == pytest.approx(float(sws_p["C26"][0]), abs=1e-6)
+
+    # 3. Padding-only decode comparison baseline (avg_accepted_tokens == 0.0) never emits /0.0 in Summary B15 or nonzero us/(tok*die).
+    pad_views = (RequestView(request_id="pad0", phase="decode", q_len=1, context=0, samples=1, padding=True),)
+    b_pad = build_export_bundle(c1, request=StepRequest("decode", 1, 0, 1, "model", requests=pad_views), apply_target_envelope=False)
+    assert b_pad.avg_accepted_tokens == 0.0
+    pad_xlsx = tmp_path / "pad_baseline.xlsx"
+    export_comparison_xlsx(b_pad, pad_xlsx, after_bundle=b_bef)
+    meta_z, roots_z, shared_z = _inspect_xlsx(pad_xlsx)
+    sheets_z = {name: _sheet_cells(roots_z[name], shared_z) for name, _ in meta_z}
+    b15_val, b15_f = sheets_z[SHEET_SUMMARY]["B15"]
+    assert "/0" not in str(b15_f or "")
+    assert float(_eval_workbook_cell(SHEET_SUMMARY, "B15", sheets_z)) == pytest.approx(float(b15_val), abs=1e-6)
+    bd_z = sheets_z[SHEET_BREAKDOWN]
+    gt_z = max(int(ref[1:]) for ref, (v, _) in bd_z.items() if ref.startswith("X") and ref[1:].isdigit() and v is not None)
+    assert float(bd_z[f"X{gt_z}"][0]) == 0.0 and float(_eval_workbook_cell(SHEET_BREAKDOWN, f"X{gt_z}", sheets_z)) == 0.0

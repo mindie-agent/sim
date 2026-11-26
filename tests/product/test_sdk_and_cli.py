@@ -1010,5 +1010,34 @@ def test_report_shipping_defaults_partial_pins_and_script_free_purity(tmp_path, 
         assert "optimized_serve_sh" in sa_payload["agent_brief"]["generated_files"]
 
 
+def test_cli_body_graph_view_and_zero_context_export_parsing(tmp_path):
+    import argparse
+    from mindie_sim.cli.commands import _dispatch_predict_step
+    from mindie_sim.cli.export import _parse_nonneg_token_shorthand
+    from mindie_sim.cli.parser import build_parser
+
+    parser = build_parser()
+    case_path = tmp_path / "body_case.json"
+    case_path.write_text(json.dumps(compose_raw_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], **SDK_DEFAULTS)), encoding="utf-8")
+    ns_body = parser.parse_args([
+        "predict-step", str(case_path),
+        "--phase", "decode", "--tokens", "1", "--context", "64", "--sequences", "1",
+        "--scope", "body", "--view", "graph",
+    ])
+    res_body = _dispatch_predict_step(ns_body)
+    assert res_body["duration_ms"] > 0.0 and res_body["graph_scope"] == "body"
+
+    assert _parse_nonneg_token_shorthand("0") == 0
+    assert _parse_nonneg_token_shorthand("0k") == 0
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_nonneg_token_shorthand("-1")
+    for cmd in ("export-trace", "export-xlsx"):
+        ns_exp = parser.parse_args([
+            cmd, str(case_path), "--phase", "prefill", "--tokens", "128",
+            "--context", "0", "--scope", "body", "--out", str(tmp_path / f"{cmd}.out"),
+        ])
+        assert ns_exp.context == 0
+
+
 
 
