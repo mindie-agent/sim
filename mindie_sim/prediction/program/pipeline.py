@@ -784,6 +784,17 @@ def _start_template_direct(
 ) -> Event:
     """Execute a PipelineTemplate losslessly with full binding scopes and lags."""
     scoped_at = _build_template_scoper(template, name)
+    explicit_keys = ("identity", "physical", "physical_name", "external")
+    reusable_alloc_names = frozenset(
+        str(row["name"])
+        for row in template.bindings
+        if isinstance(row, Mapping) and row.get("name")
+        and (
+            row.get("scope") == "slot"
+            or any(isinstance(row.get(k), str) and row.get(k) for k in explicit_keys)
+        )
+    )
+    slot_alloc_free: dict[str, Event] = {}
     current = (
         engine.submit(name + ":setup", after=(ready,), latency=template.setup_ms, owner=owner)
         if template.setup_ms else ready
@@ -812,12 +823,31 @@ def _start_template_direct(
     last_events: tuple[Event, ...] = (current,)
     drain_coords = (0, 0, 0)
 
+    def _reusable_deps(scoped, stage) -> list[Event]:
+        if not reusable_alloc_names or not stage.acquire:
+            return []
+        extra: list[Event] = []
+        for raw, bound in zip(stage.acquire, scoped(stage.acquire)):
+            if raw.name in reusable_alloc_names:
+                prior = slot_alloc_free.get(bound.name)
+                if prior is not None:
+                    extra.append(prior)
+        return extra
+
+    def _note_reusable_frees(scoped, stage, event: Event) -> None:
+        if not reusable_alloc_names or not stage.free:
+            return
+        for raw, bound in zip(stage.free, scoped(stage.free)):
+            if raw.name in reusable_alloc_names:
+                slot_alloc_free[bound.name] = event
+
     def finalize() -> None:
         stage_tail_snap = dict(stage_tail)
         stage_tail.clear()
         tile_events.clear()
         live_tiles.clear()
         if not template.drain:
+            slot_alloc_free.clear()
             engine.resolve(complete)
             return
         local_drain: dict[str, Event] = {}
@@ -825,11 +855,16 @@ def _start_template_direct(
         for stage in template.drain:
             deps = [local_drain[key] for key in stage.after]
             deps.extend(stage_tail_snap[key] for key in stage.previous if key in stage_tail_snap)
-            local_drain[stage.name] = stage.submit(
+            scoped_drain = scoped_at(f"{name}:drain:{stage.name}", drain_index, drain_coords)
+            deps.extend(_reusable_deps(scoped_drain, stage))
+            ev = stage.submit(
                 engine, f"{name}:drain:{stage.name}",
                 tuple(dict.fromkeys(deps)) or last_events,
-                scoped_at(f"{name}:drain:{stage.name}", drain_index, drain_coords), owner,
+                scoped_drain, owner,
             )
+            local_drain[stage.name] = ev
+            _note_reusable_frees(scoped_drain, stage, ev)
+        slot_alloc_free.clear()
         engine.submit(
             name + ":drain_complete", after=tuple(local_drain.values()) or last_events,
             on_complete=lambda _ev: engine.resolve(complete), owner=owner,
@@ -875,11 +910,13 @@ def _start_template_direct(
                         deps.append(prior_tile[dep_name])
             if stage.name in stage_tail:
                 deps.append(stage_tail[stage.name])
+            deps.extend(_reusable_deps(scoped, stage))
             ev = stage.submit(
                 engine, f"{name}:tile{index}:{stage.name}",
                 tuple(dict.fromkeys(deps)) or (current,), scoped, owner,
             )
             local[stage.name] = stage_tail[stage.name] = ev
+            _note_reusable_frees(scoped, stage, ev)
         tile_events[index] = local
         live_tiles.add(index)
         cutoff = index - max(template.slots, max_lag)

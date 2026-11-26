@@ -596,3 +596,106 @@ def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation
     dp2_case = _case_for(dp=2)
     with pytest.raises(ModelingError, match="stream_plan_unmatched_rank:1"):
         graph_costs(dp2_case, {0: (op_a,)}, stream_plans=(bad_plan,))
+
+
+def test_shared_cap_overlaps_stage_latency_and_disjoint_lanes_rebind_queued_store():
+    from mindie_sim.prediction.program import ParallelProgram
+    from mindie_sim.prediction.streams import StreamOwners, apply_stream_owners_to_program, validate_program_owners
+    from mindie_sim.prediction.transactions import QueuedStore
+    from mindie_sim.schema.datapath import ArchId, ComputeArchIdentity, DatapathCapabilitySpec
+
+    dp = DatapathCapabilitySpec(ComputeArchIdentity(ArchId("generic"), None), 2, 2, (), (), frozenset(), (), None)
+    shared_owners = StreamOwners((), (), 1, 1, "shared_cap")
+    stage = Stage("copy", {"vector": 4, "hbm": 4}, latency=4)
+    bound = bind_stage_to_stream(
+        stage, shared_owners, dp, resource_names={}, resource_units={"vector": 2},
+        rates={"vector": 2, "hbm": 1}, quota_resources={"vector": "quota"},
+    )
+    eng = Engine([Resource("vector", 2, units=2), Resource("hbm", 1), Resource("quota", 1)], backend="python")
+    done = KernelProgram((bound,)).start(eng, "copy", eng.submit("ready"))
+    eng.advance(until=(done,))
+    assert done.time == pytest.approx(4.0)
+
+    # First-service latency floor anchors to the earliest positive service across split branches.
+    fs_stage = Stage("fs_copy", {"vector": 1, "hbm": 1}, latency=4, latency_from_first_service=True)
+    fs_bound = bind_stage_to_stream(
+        fs_stage, shared_owners, dp, resource_names={}, resource_units={"vector": 2},
+        rates={"vector": 2, "hbm": 1}, quota_resources={"vector": "quota"},
+    )
+    eng_fs = Engine(
+        [Resource("vector", 2, policy="fifo", units=2), Resource("hbm", 1, policy="fifo"), Resource("quota", 1)],
+        backend="python",
+    )
+    eng_fs.submit("block_v", {"vector": 10})
+    eng_fs.submit("block_h", {"hbm": 5})
+    fs_done = KernelProgram((fs_bound,)).start(eng_fs, "fs", eng_fs.submit("ready"))
+    eng_fs.advance(until=(fs_done,))
+    assert fs_done.time == pytest.approx(9.0)
+
+    # Deliveries attach to the first positive-demand branch, never to a leading zero-work entry.
+    deliv_stage = Stage("deliv", {"cube": 0, "vector": 4, "hbm": 4}, deliveries=(("tok", 4.0),))
+    deliv_bound = bind_stage_to_stream(
+        deliv_stage, shared_owners, dp, resource_names={}, resource_units={"cube": 2, "vector": 2},
+        rates={"cube": 2, "vector": 2, "hbm": 1}, quota_resources={"vector": "quota"},
+    )
+    eng_d = Engine(
+        [Resource("cube", 2, units=2), Resource("vector", 2, units=2), Resource("hbm", 1), Resource("quota", 1)],
+        backend="python",
+    )
+    d_done = KernelProgram((deliv_bound,)).start(eng_d, "deliv", eng_d.submit("ready"))
+    eng_d.advance(horizon=1.0)
+    assert eng_d.delivered.get("tok", 0.0) == pytest.approx(1.0)
+    eng_d.advance(until=(d_done,))
+    assert eng_d.delivered["tok"] == pytest.approx(4.0)
+
+    store = QueuedStore(1, 1, 2, 2, 0, 1, "scalar_store_issue", 1, "hbm", 32, 1, 0, issue_placement=(0,))
+    lanes = tuple(
+        apply_stream_owners_to_program(
+            KernelProgram((Stage("store", program=store),)),
+            StreamOwners((idx,), (idx,), 1, 1), dp,
+            resource_names={}, resource_units={"scalar_store_issue": 2},
+            rates={"scalar_store_issue": 2},
+        ).stages[0].program
+        for idx in (0, 1)
+    )
+    assert tuple(prog.issue_placement for prog in lanes) == ((0,), (1,))
+    validate_program_owners(
+        lanes[1], dp, resource_names={}, resource_units={"scalar_store_issue": 2},
+        owners=StreamOwners((1,), (1,), 1, 1),
+    )
+    with pytest.raises(ModelingError, match="stage_placement_outside_stream_owners"):
+        validate_program_owners(
+            store, dp, resource_names={}, resource_units={"scalar_store_issue": 2},
+            owners=StreamOwners((1,), (1,), 1, 1),
+        )
+    eng_s = Engine([Resource("scalar_store_issue", 2, units=2), Resource("hbm", 4)], backend="python")
+    done_s = ParallelProgram(lanes).start(eng_s, "stores", eng_s.submit("ready"))
+    eng_s.advance(until=(done_s,))
+    assert done_s.time == pytest.approx(2.0)
+
+    # 4 AIVs with 2 scalar issue units project lane AIV 2 to issue unit 1 via unit_group,
+    # and empty zero-row QueuedStore returns cleanly even on a zero-AIV lane.
+    dp4 = DatapathCapabilitySpec(ComputeArchIdentity(ArchId("generic"), None), 2, 4, (), (), frozenset(), (), None)
+    proj_owners = StreamOwners((0,), (2,), 1, 1)
+    proj_store = apply_stream_owners_to_program(
+        store, proj_owners, dp4,
+        resource_names={}, resource_units={"scalar_store_issue": 2},
+        rates={"scalar_store_issue": 2},
+    )
+    assert proj_store.issue_placement == (1,)
+    validate_program_owners(
+        proj_store, dp4, resource_names={}, resource_units={"scalar_store_issue": 2},
+        owners=proj_owners,
+    )
+    eng_p = Engine([Resource("scalar_store_issue", 2, units=2), Resource("hbm", 4)], backend="python")
+    done_p = proj_store.start(eng_p, "proj", eng_p.submit("ready"))
+    eng_p.advance(until=(done_p,))
+    assert done_p.time == pytest.approx(1.5)
+
+    empty_store = QueuedStore(0, 1, 2, 2, 0, 1, "scalar_store_issue", 1, "hbm", 32, 1, 0, issue_placement=(0,))
+    zero_aiv = StreamOwners((0,), (), 1, 0)
+    assert apply_stream_owners_to_program(
+        empty_store, zero_aiv, dp4,
+        resource_names={}, resource_units={"scalar_store_issue": 2},
+        rates={"scalar_store_issue": 2},
+    ) is empty_store

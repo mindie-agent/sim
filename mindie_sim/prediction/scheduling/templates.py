@@ -235,6 +235,15 @@ class _PipelineTemplateRun:
         self._tile_events: dict[int, dict[str, Event]] = {}
         self._uses_slot_scope = (not indexed) and any(
             scope == "slot" for scope in allocation_bindings.values())
+        self._reusable_alloc_names = frozenset(
+            alloc_name for alloc_name, row in indexed_binding_rows.items()
+            if row.get("scope") == "slot"
+            or any(
+                isinstance(row.get(key), str) and row.get(key)
+                for key in ("identity", "physical", "physical_name", "external")
+            )
+        ) if indexed else frozenset()
+        self._slot_alloc_free: dict[str, Event] = {}
         self._free_slots: deque[int] = deque(range(slots))
         self._retire_slot: dict[int, int] = {}
         self._last_slot: int = 0
@@ -469,9 +478,28 @@ class _PipelineTemplateRun:
         period = len(residue) if residue else 1
         return selected, None, period
 
+    def _reusable_acquire_deps(self, scoped, stage) -> list[Event]:
+        if not self._reusable_alloc_names or not stage.acquire:
+            return []
+        result: list[Event] = []
+        for raw, bound in zip(stage.acquire, scoped(stage.acquire)):
+            if raw.name in self._reusable_alloc_names:
+                prior = self._slot_alloc_free.get(bound.name)
+                if prior is not None:
+                    result.append(prior)
+        return result
+
+    def _record_reusable_frees(self, scoped, stage, event: Event) -> None:
+        if not self._reusable_alloc_names or not stage.free:
+            return
+        for raw, bound in zip(stage.free, scoped(stage.free)):
+            if raw.name in self._reusable_alloc_names:
+                self._slot_alloc_free[bound.name] = event
+
     def _finish(self, _event: Event) -> None:
         self._tile_events.clear()
         self._retire_slot.clear()
+        self._slot_alloc_free.clear()
         self.engine.resolve(self.complete)
         if self._track_periodic:
             _drop_periodic_run(self.engine, self.run_id)
@@ -499,10 +527,15 @@ class _PipelineTemplateRun:
                         deps.append(prior_tile[dep_name])
             scoped = self._scoped_at(name + ":drain:" + stage.name, drain_index,
                                drain_output, drain_panel, drain_slot)
-            local[stage.name] = stage.submit(
+            if self.indexed:
+                deps.extend(self._reusable_acquire_deps(scoped, stage))
+            event = stage.submit(
                 engine, f"{name}:drain:{stage.name}",
                 tuple(dict.fromkeys(deps)) or periodic_run["last_events"], scoped, owner,
                 prepared=self._prepared_for(stage))
+            local[stage.name] = event
+            if self.indexed:
+                self._record_reusable_frees(scoped, stage, event)
         engine.submit(name + ":drain_complete", after=tuple(local.values()),
                       on_complete=self._finish, owner=owner)
 
@@ -542,6 +575,7 @@ class _PipelineTemplateRun:
             output, panel, slot = coordinates
             scoped = self._scoped_at(label, index, output, panel, slot)
         else:
+            slot = None
             assigned_slot = self._free_slots.popleft()
             self._last_slot = assigned_slot
             scoped = self._scoped_at(label, index, None, None, assigned_slot)
@@ -550,6 +584,8 @@ class _PipelineTemplateRun:
             suffix += f":r{index % period}"
         if self._uses_slot_scope:
             suffix += f":s{assigned_slot}"
+        elif indexed and self._reusable_alloc_names:
+            suffix += f":s{slot}"
         stage_kind = f"stage{suffix}"
         retire_kind = f"retire{suffix}"
         for stage in stages:
@@ -564,12 +600,16 @@ class _PipelineTemplateRun:
                         deps.append(prior_tile[dep_name])
             if stage.name in previous:
                 deps.append(previous[stage.name])
+            if indexed:
+                deps.extend(self._reusable_acquire_deps(scoped, stage))
             event = stage.submit(
                 engine, f"{label}:{stage.name}",
                 tuple(dict.fromkeys(deps)) or (current,), scoped, owner,
                 prepared=self._prepared_for(stage))
             local[stage.name] = event
             periodic_run["stage_tail"][stage.name] = event
+            if indexed:
+                self._record_reusable_frees(scoped, stage, event)
             if self._track_periodic:
                 engine._periodic_tasks[event.sequence] = (
                     run_id, index, len(local) - 1, stage_kind)

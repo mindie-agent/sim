@@ -269,6 +269,8 @@ class _EngineLifecycleMixin:
                 self._wake(task.event, native=native)
         elif waiters:
             self._wake_python_task_waiters(task, now, waiters)
+        if self.state_ledger is not None:
+            self.state_ledger._propagate_event_commits(key, at=now)
         if task.callback is not None:
             task.callback(task.event)
 

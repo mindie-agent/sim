@@ -578,3 +578,46 @@ def test_split_periodic_residency_runs_stay_memory_bounded():
         counts = {item.initial_residency: sum(hi - lo for lo, hi in item.ranges)
                   + sum(run.rows * run.row_bytes for run in item.address_runs) for item in split}
         assert counts == expected
+
+
+def test_reparsing_media_case_with_text_workload_clears_vision_work():
+    import json
+    from dataclasses import replace
+    from pathlib import Path
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.schema.model import WorkloadSpec
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    raw = json.loads(Path("examples/quickstart.json").read_text(encoding="utf-8"))
+    raw["model"].update(
+        layers=1,
+        vision=dict(
+            kind="vit", layers=1, hidden_size=8, num_heads=1,
+            intermediate_size=16, qkv_width=24, patch_size=2, out_hidden_size=512,
+        ),
+    )
+    raw["workload"] = {"requests": [dict(id="r", prompt_tokens=5, media_tokens=4, output_tokens=1)]}
+    image_case = parse_case(raw)
+    assert dict(image_case.runtime.metadata).get("media_tokens_by_request") == {"r": 4}
+    text_workload = WorkloadSpec.from_mapping({"requests": [dict(id="r", prompt_tokens=5, output_tokens=1)]})
+    plan = IterationPlan((RequestView("r", 5, 0, True, "prefill"),))
+    reused = parse_case(replace(image_case, workload=text_workload))
+    fresh = parse_case({**raw, "workload": text_workload.to_dict()})
+    assert "media_tokens_by_request" not in dict(reused.runtime.metadata)
+    for case in (reused, fresh):
+        ops = Frontend()(plan, case.model, case.runtime, case.machine).ops
+        assert sum(op.flops for op in ops if op.op_id.startswith("media0:")) == 0
+
+    # Pure-model assembly without concrete workload requests preserves explicit media_tokens_by_request.
+    from mindie_sim.prediction.structure import parse_model
+
+    pure_raw = {
+        "model": raw["model"],
+        "machine": raw["machine"],
+        "runtime": {**raw["runtime"], "metadata": {"media_tokens_by_request": {"model0:0": 4}}},
+    }
+    pure_case = parse_model(pure_raw)
+    assert dict(pure_case.runtime.metadata).get("media_tokens_by_request") == {"model0:0": 4}
+    pure_plan = IterationPlan((RequestView("model0:0", 5, 0, True, "prefill"),))
+    pure_ops = Frontend()(pure_plan, pure_case.model, pure_case.runtime, pure_case.machine).ops
+    assert sum(op.flops for op in pure_ops if op.op_id.startswith("media0:")) > 0

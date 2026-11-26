@@ -217,11 +217,53 @@ def _group_list_input_value(
     )
 
 
-def _weight_input_value(op, metadata, weight_dtype, repeats, explicit, add):
+def _active_bank_runs(active_indices):
+    """Partition sorted active bank indices into exact affine ``(start, count, step)`` runs."""
+    if not active_indices:
+        return ()
+    if len(active_indices) == 1:
+        return ((active_indices[0], 1, 1),)
+    steps = {b - a for a, b in zip(active_indices, active_indices[1:])}
+    if len(steps) == 1:
+        return ((active_indices[0], len(active_indices), next(iter(steps))),)
+    runs = []
+    start = prev = active_indices[0]
+    count = 1
+    for idx in active_indices[1:]:
+        if idx == prev + 1:
+            count += 1
+        else:
+            runs.append((start, count, 1))
+            start = idx
+            count = 1
+        prev = idx
+    runs.append((start, count, 1))
+    return tuple(runs)
+
+
+def _weight_input_values(op, metadata, weight_dtype, repeats, explicit, add):
     weight_n, weight_k = op.local_shape[1], op.local_shape[2]
+    col_span = metadata.get("deepep_column_span")
+    col_cut = metadata.get("deepep_column_cut")
+    has_col_split = (
+        isinstance(col_span, (tuple, list)) and len(col_span) == 2
+        and isinstance(col_span[0], int) and isinstance(col_span[1], int)
+        and col_span[0] >= 0 and col_span[1] >= col_span[0]
+    )
+    col_start = int(col_span[0]) if has_col_split else 0
+    if has_col_split and isinstance(col_cut, (tuple, list)) and col_cut:
+        full_n = max(int(sum(int(c) for c in col_cut)), int(col_span[1]), weight_n)
+    elif has_col_split:
+        full_n = max(int(col_span[1]), weight_n)
+    else:
+        full_n = weight_n
+    bank_elems = weight_n * weight_k
+    full_bank_elems = full_n * weight_k
+    total_write_bytes = metadata.get("weight_bytes") or metadata.get("packed_weight_bytes")
+    total_explicit = explicit.get("weight")
+    weight_repeats = repeats.get("weight", 1)
     expected_weight_elements = None
-    storage_shape = (weight_n, weight_k)
-    offset = 0
+    storage_shape = (full_n, weight_k)
     if op.family == "grouped_gemm" and metadata.get("group_type") != _GROUP_TYPE_K:
         seg_rows = metadata.get("deepep_segment_expert_bank_rows")
         if isinstance(seg_rows, (tuple, list)):
@@ -234,7 +276,7 @@ def _weight_input_value(op, metadata, weight_dtype, repeats, explicit, add):
             )
             if raw_groups is not None:
                 active_groups = float(raw_groups)
-                if "deepep_weight_scale" in metadata:
+                if "deepep_weight_scale" in metadata and not has_col_split:
                     active_groups *= float(metadata["deepep_weight_scale"])
             else:
                 active_groups = None
@@ -242,37 +284,89 @@ def _weight_input_value(op, metadata, weight_dtype, repeats, explicit, add):
             group_dim = int(math.ceil(active_groups)) if active_groups > 0 else 0
             shape = (group_dim, weight_n, weight_k)
             if active_groups != group_dim:
-                expected_weight_elements = active_groups * weight_n * weight_k
+                expected_weight_elements = active_groups * bank_elems
             bank_groups = metadata.get("matrix_weight_bank_groups")
-            resident_banks = (
-                max(int(bank_groups), group_dim)
-                if bank_groups is not None and int(bank_groups) > 0
-                else group_dim
-            )
-            storage_shape = (resident_banks, weight_n, weight_k)
             group_rows = seg_rows if isinstance(seg_rows, (tuple, list)) else metadata.get("matrix_group_rows")
-            if isinstance(group_rows, (tuple, list)) and group_dim > 0:
-                first_active = next(
-                    (idx for idx, rows in enumerate(group_rows) if int(rows) > 0), 0
-                )
-                offset = first_active * weight_n * weight_k
+            active_indices = (
+                [idx for idx, rows in enumerate(group_rows) if int(rows) > 0]
+                if isinstance(group_rows, (tuple, list)) else []
+            )
+            min_banks = max(
+                group_dim,
+                (active_indices[-1] + 1) if active_indices else 0,
+                len(group_rows) if isinstance(group_rows, (tuple, list)) else 0,
+            )
+            resident_banks = (
+                max(int(bank_groups), min_banks)
+                if bank_groups is not None and int(bank_groups) > 0
+                else min_banks
+            )
+            storage_shape = (resident_banks, full_n, weight_k)
+            if active_indices and len(active_indices) == group_dim:
+                runs = _active_bank_runs(active_indices)
+                results = []
+                for run_idx, (start, count, step) in enumerate(runs):
+                    run_shape = (count, weight_n, weight_k)
+                    run_strides = (step * full_bank_elems, weight_k, 1)
+                    run_offset = start * full_bank_elems + col_start * weight_k
+                    share = float(count) / float(group_dim)
+                    out_name = "weight" if len(runs) == 1 else f"weight_slice{run_idx}"
+                    run_write = (
+                        float(total_write_bytes) * share
+                        if total_write_bytes is not None else None
+                    )
+                    run_explicit = (
+                        float(total_explicit) * share
+                        if total_explicit is not None else None
+                    )
+                    weight = typed_value(
+                        producer="", dtype=str(weight_dtype), shape=run_shape,
+                        storage_shape=storage_shape, strides=run_strides,
+                        offset=run_offset, output=out_name, role="weight",
+                        source=f"{op.op_id}:weight_format", materialized=True,
+                        write_bytes=run_write, contract="parameter_value",
+                    )
+                    run_expected = (
+                        expected_weight_elements * share
+                        if expected_weight_elements is not None else None
+                    )
+                    results.append(add(
+                        weight, role="weight", field=out_name, shape=run_shape,
+                        dependency="", repeats_value=weight_repeats,
+                        explicit_bytes=run_explicit,
+                        expected_elements=run_expected,
+                    ))
+                return tuple(results)
         else:
             shape = (weight_n, weight_k)
     else:
         shape = (weight_n, weight_k)
+    default_offset = col_start * weight_k
+    default_strides = (
+        (full_bank_elems, weight_k, 1) if len(shape) == 3 and has_col_split else None
+    )
     weight = typed_value(
         producer="", dtype=str(weight_dtype), shape=shape,
-        storage_shape=storage_shape, offset=offset, output="weight", role="weight",
+        storage_shape=storage_shape, strides=default_strides,
+        offset=default_offset, output="weight", role="weight",
         source=f"{op.op_id}:weight_format", materialized=True,
-        write_bytes=metadata.get("weight_bytes")
-        or metadata.get("packed_weight_bytes"),
-        contract="parameter_value")
-    return add(
+        write_bytes=total_write_bytes, contract="parameter_value")
+    return (add(
         weight, role="weight", field="weight", shape=shape,
-        dependency="", repeats_value=repeats.get("weight", 1),
-        explicit_bytes=explicit.get("weight"),
+        dependency="", repeats_value=weight_repeats,
+        explicit_bytes=total_explicit,
         expected_elements=expected_weight_elements,
-    )
+    ),)
+
+
+def _declared_producer(metadata, keys, op_deps):
+    for key in keys:
+        raw = metadata.get(key)
+        if isinstance(raw, str) and raw and (not op_deps or raw in op_deps):
+            raw_out = metadata.get(f"{key}_output")
+            out_name = raw_out if isinstance(raw_out, str) and raw_out else None
+            return raw, out_name
+    return "", None
 
 
 def _matmul_input_values(
@@ -287,8 +381,53 @@ def _matmul_input_values(
         raw_gl_producer if isinstance(raw_gl_producer, str) and raw_gl_producer else ""
     )
     activation_deps = tuple(dep for dep in op.deps if dep != group_list_producer)
-    dependency = activation_deps[0] if activation_deps else ""
-    primary, primary_output = selected(dependency) if dependency else (None, None)
+    payload_producer, payload_output = _declared_producer(
+        metadata, ("activation_payload_producer", "payload_producer"),
+        op.deps,
+    )
+    scale_producer, scale_output = _declared_producer(
+        metadata, ("activation_scale_producer", "input_scale_producer"),
+        op.deps,
+    )
+    if not scale_producer:
+        for dep in activation_deps:
+            for entry in ports_by_dep.get(dep, ()):
+                port_out = entry.get("output")
+                if port_out in {"activation_scales", "scale"}:
+                    scale_producer = dep
+                    scale_output = port_out
+                    break
+            if scale_producer:
+                break
+    if payload_producer:
+        dependency = payload_producer
+    else:
+        non_scale_deps = (
+            tuple(dep for dep in activation_deps if dep != scale_producer)
+            if scale_producer else activation_deps
+        )
+        candidates = non_scale_deps or activation_deps
+        port_dep = next(
+            (
+                dep for dep in candidates
+                if any(
+                    entry.get("output")
+                    and entry.get("output") not in {"activation_scales", "scale", "group_list"}
+                    for entry in ports_by_dep.get(dep, ())
+                )
+            ),
+            "",
+        )
+        dependency = port_dep or (candidates[0] if candidates else "")
+    if dependency and payload_output:
+        primary = _select_named_value(op, dependency, payload_output, produced_by_dep)
+        primary_output = payload_output if primary is not None else None
+        if primary is None:
+            primary, primary_output = selected(dependency)
+    elif dependency:
+        primary, primary_output = selected(dependency)
+    else:
+        primary, primary_output = (None, None)
     logical, storage = _row_shape(metadata, (shape_rows, k))
     expected_elements = (
         expected_rows * k
@@ -330,12 +469,18 @@ def _matmul_input_values(
                               dependency=dependency,
                               repeats_value=repeats.get(entry.get("output"), 1),
                               explicit_bytes=explicit.get(entry.get("output"))))
-    scale = next((value for value in produced_by_dep.get(dependency, ())
-                  if value.get("output") == "activation_scales"), None)
+    scale_dep = scale_producer or dependency
+    if scale_output:
+        scale = _select_named_value(op, scale_dep, scale_output, produced_by_dep)
+    else:
+        scale = next((value for value in produced_by_dep.get(scale_dep, ())
+                      if value.get("output") == "activation_scales"), None)
+        if scale is None and scale_producer and scale_producer != dependency:
+            scale, _ = selected(scale_producer)
     if scale is None and metadata.get("activation_scale_format"):
         shape = tuple(metadata.get("activation_scale_shape") or ())
         scale = typed_value(
-            producer=dependency,
+            producer=scale_dep,
             dtype=str(metadata["activation_scale_format"]), shape=shape,
             storage_shape=_row_shape(metadata, shape)[1],
             output="activation_scales", role="scale",
@@ -343,12 +488,16 @@ def _matmul_input_values(
             materialized=True,
             write_bytes=metadata.get("activation_scale_bytes"),
             contract="declared_scale_operand")
-    if scale is not None and "activation_scales" not in seen_outputs:
+    scale_already_seen = (
+        scale_dep == dependency
+        and (scale_output or "activation_scales") in seen_outputs
+    )
+    if scale is not None and not scale_already_seen:
         values.append(add(scale, role="scale", field="activation_scales",
                           shape=tuple(scale.get("logical_shape") or ()),
-                          dependency=dependency,
-                          repeats_value=repeats.get("activation_scales", 1),
-                          explicit_bytes=explicit.get("activation_scales")))
+                          dependency=scale_dep,
+                          repeats_value=repeats.get("activation_scales", repeats.get(scale_dep, 1)),
+                          explicit_bytes=explicit.get("activation_scales", explicit.get(scale_dep))))
     if group_list_producer:
         values.append(_group_list_input_value(
             op, metadata, group_list_producer, produced_by_dep,
@@ -356,7 +505,7 @@ def _matmul_input_values(
         ))
     weight_dtype = metadata.get("weight_format") or metadata.get("weight_dtype")
     if weight_dtype:
-        values.append(_weight_input_value(
+        values.extend(_weight_input_values(
             op, metadata, weight_dtype, repeats, explicit, add,
         ))
     return tuple(values)

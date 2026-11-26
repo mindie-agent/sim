@@ -23,6 +23,7 @@ import heapq
 import math
 from typing import Any, Literal, TypeAlias
 
+from mindie_sim.prediction.ownership import unit_group
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import DatapathCapabilitySpec
 from mindie_sim.schema.operators import OpSpec
@@ -497,6 +498,8 @@ def _proportional_pair(
 
 
 def _remap_units(existing: tuple[int, ...] | None, pool: tuple[int, ...]) -> tuple[int, ...]:
+    if not pool:
+        return ()
     if not existing:
         return pool
     pool_len = len(pool)
@@ -725,6 +728,63 @@ def _rebind_cohort_metadata(
     return kept_widened, members
 
 
+@dataclass(frozen=True, slots=True)
+class _FirstServiceLatencyProgram:
+    """Run split work branches in parallel while anchoring latency to first positive service."""
+
+    stages: tuple[Any, ...]
+    latency: float
+    priority: int = 0
+
+    def start(self, engine: Any, name: str, ready: Any, *, owner: str = "") -> Any:
+        if not self.stages:
+            if self.latency > 0.0:
+                return engine.submit(
+                    f"{name}:latency", after=(ready,), latency=self.latency,
+                    priority=self.priority, owner=owner,
+                )
+            return ready
+        done = engine.future(f"{name}:done")
+        remaining = [len(self.stages)]
+        branch_tasks: list[tuple[Any, Any]] = []
+
+        def _on_branch_done(_ev: Any) -> None:
+            remaining[0] -= 1
+            if remaining[0] > 0:
+                return
+            now = float(engine.now)
+            first_times = [
+                float(task.first_service)
+                for task, _ in branch_tasks
+                if task is not None and task.first_service is not None
+            ]
+            if first_times:
+                anchor = min(first_times)
+            else:
+                started_times = [
+                    float(ev.started)
+                    for _, ev in branch_tasks
+                    if ev.started is not None
+                ]
+                anchor = min(started_times) if started_times else now
+            tail = (anchor + float(self.latency)) - now
+            if tail > 0.0:
+                tail_ev = engine.submit(
+                    f"{name}:latency_tail", latency=tail,
+                    priority=self.priority, owner=owner,
+                )
+                engine.on_complete(tail_ev, lambda _t: engine.resolve(done))
+            else:
+                engine.resolve(done)
+
+        for idx, branch in enumerate(self.stages):
+            ev = branch.submit(engine, f"{name}:b{idx}", (ready,), lambda items: items, owner)
+            task_ref = engine._tasks.get(ev.sequence)
+            branch_tasks.append((task_ref, ev))
+            engine.on_complete(ev, _on_branch_done)
+        return done
+
+
 def _split_shared_uncoupled_stage(
     stage: Any, aic_res: list[str], aiv_res: list[str],
     placement: dict[str, tuple[int, ...]], caps: dict[str, float],
@@ -735,8 +795,13 @@ def _split_shared_uncoupled_stage(
 ) -> Any:
     from mindie_sim.prediction.program.stages import KernelProgram, ParallelProgram, Stage
 
-    branches = []
-    for idx, (res, amt) in enumerate(stage.work.items()):
+    work_items = tuple(stage.work.items())
+    delivery_idx = next(
+        (idx for idx, (_, amt) in enumerate(work_items) if amt > 0.0),
+        0,
+    )
+    work_stages = []
+    for idx, (res, amt) in enumerate(work_items):
         sub_work = {res: amt}
         sub_pl = {res: placement[res]} if res in placement else {}
         sub_caps = {res: caps[res]} if res in caps else {}
@@ -760,11 +825,25 @@ def _split_shared_uncoupled_stage(
                 if pool:
                     sub_pl[res] = _remap_units(orig, pool)
                 _cap_rate(sub_caps, res, rates, min(len(orig), limit) if orig else limit, total)
-        branches.append(KernelProgram((Stage(
+        sub_units = {res: stage.work_units[res]} if res in stage.work_units else {}
+        work_stages.append(Stage(
             f"{stage.name}:b{idx}", sub_work, caps=sub_caps,
-            placement=sub_pl, coupled=sub_coupled, priority=stage.priority,
-        ),)))
-    work_prog = ParallelProgram(tuple(branches))
+            placement=sub_pl, coupled=sub_coupled, work_units=sub_units,
+            priority=stage.priority,
+            deliveries=stage.deliveries if idx == delivery_idx else (),
+        ))
+    if stage.latency > 0.0 and stage.latency_from_first_service:
+        work_prog: Any = _FirstServiceLatencyProgram(
+            tuple(work_stages), float(stage.latency), stage.priority,
+        )
+    else:
+        branches = [KernelProgram((sub_stage,)) for sub_stage in work_stages]
+        if stage.latency > 0.0:
+            branches.append(KernelProgram((Stage(
+                f"{stage.name}:latency", latency=stage.latency,
+                priority=stage.priority,
+            ),)))
+        work_prog = ParallelProgram(tuple(branches))
     nested_inner = (
         apply_stream_owners_to_program(stage.program, owners, datapath, **bind_kw)
         if stage.program is not None else None
@@ -781,7 +860,9 @@ def _split_shared_uncoupled_stage(
     rel = bind_allocations_to_stream(stage.free, owners, datapath, pool_names=pool_names,
                                      pool_units=pool_units, stream_id=stream_id, label=stage.name)
     return replace(
-        stage, work={}, placement={}, caps={}, acquire=acq, free=rel,
+        stage, work={}, latency=0.0, placement={}, caps={}, work_units={},
+        deliveries=(), latency_from_first_service=False,
+        acquire=acq, free=rel,
         cohort_widened=(), cohort_members={}, program=final_prog,
     )
 
@@ -919,6 +1000,161 @@ def _bind_pipeline_phase(phase: Any, owners: StreamOwners, datapath: DatapathCap
     return replace(phase, stages=stages, residue_stages=residues)
 
 
+def _queued_store_axis(
+    program: Any,
+    owners: StreamOwners | None,
+    datapath: DatapathCapabilitySpec | None,
+    *,
+    resource_names: Mapping[str, str],
+    resource_units: Mapping[str, int],
+) -> tuple[Literal["aic", "aiv"] | None, str]:
+    aic_roles, aiv_roles, dual_roles = _role_executors_for_datapath(datapath)
+    role_by_res = {phys: role for role, phys in resource_names.items()}
+    res = program.issue_resource
+    role = role_by_res.get(res, res)
+    if role in aic_roles:
+        return "aic", role
+    if role in aiv_roles:
+        return "aiv", role
+    if role in dual_roles:
+        return _dual_role_axis(role, res, owners, datapath, resource_units), role
+    return None, role
+
+
+def _project_owner_pool(
+    pool: tuple[int, ...], owner_total: int, res_units: int,
+) -> tuple[int, ...]:
+    """Project AIC/AIV owner indices into a resource's physical unit space."""
+    if not pool or owner_total <= 0 or res_units <= 0 or res_units == owner_total:
+        return pool
+    projected: list[int] = []
+    for owner_idx in pool:
+        for unit in unit_group(owner_idx, owner_total, res_units):
+            if unit not in projected:
+                projected.append(unit)
+    return tuple(projected)
+
+
+def _bind_queued_store(
+    program: Any,
+    owners: StreamOwners,
+    datapath: DatapathCapabilitySpec,
+    *,
+    resource_names: Mapping[str, str],
+    resource_units: Mapping[str, int],
+    rates: Mapping[str, float],
+    stream_id: StreamId,
+    quota_resources: Mapping[str, str] | None,
+) -> Any:
+    if int(program.rows) * int(program.cols) <= 0 or int(program.participants) <= 0:
+        return program
+    axis, role = _queued_store_axis(
+        program, owners, datapath,
+        resource_names=resource_names, resource_units=resource_units,
+    )
+    if axis is None:
+        return program
+    limit = owners.aic_limit if axis == "aic" else owners.aiv_limit
+    owner_total = datapath.aic_count if axis == "aic" else datapath.aiv_count
+    if limit == 0:
+        raise ModelingError(f"stream_zero_{axis}_budget:{stream_id}:{program.issue_resource}")
+    res_units = int(resource_units.get(role, resource_units.get(program.issue_resource, owner_total)))
+    pool = _project_owner_pool(owners.units_for(axis), owner_total, res_units)
+    orig_placement = tuple(program.issue_placement)
+    new_placement = orig_placement
+    new_rate = float(program.issue_rate)
+    orig_quota = str(getattr(program, "issue_quota_resource", ""))
+    new_quota = orig_quota
+    participants = float(max(1, int(program.participants)))
+    if owners.isolation == "disjoint":
+        new_placement = _remap_units(orig_placement, pool)
+        if orig_placement and len(new_placement) < len(orig_placement):
+            new_rate = new_rate * (float(len(new_placement)) / float(len(orig_placement)))
+    else:
+        qmap = quota_resources or {}
+        base_rate = rates.get(program.issue_resource)
+        orig_frac = (
+            float(len(orig_placement)) / float(res_units)
+            if orig_placement and res_units > 0 else 1.0
+        )
+        budget_frac = float(limit) / float(owner_total) if owner_total > 0 else 1.0
+        eff_frac = min(orig_frac, budget_frac)
+        if program.issue_resource in qmap:
+            new_quota = qmap[program.issue_resource]
+            if orig_placement and res_units > 0 and len(orig_placement) < res_units and base_rate and base_rate > 0.0:
+                bound = float(base_rate) * eff_frac
+                new_rate = min(new_rate, bound / participants)
+            new_placement = _remap_units(orig_placement, pool) if pool else ()
+        else:
+            if eff_frac < 1.0 and base_rate and base_rate > 0.0:
+                bound = float(base_rate) * eff_frac
+                new_rate = min(new_rate, bound / participants)
+            if pool:
+                new_placement = _remap_units(orig_placement, pool)
+    if (
+        new_placement == orig_placement
+        and new_rate == float(program.issue_rate)
+        and new_quota == orig_quota
+    ):
+        return program
+    return replace(
+        program,
+        issue_placement=new_placement,
+        issue_rate=new_rate,
+        issue_quota_resource=new_quota,
+    )
+
+
+def _validate_queued_store(
+    program: Any,
+    datapath: DatapathCapabilitySpec | None,
+    *,
+    resource_names: Mapping[str, str],
+    resource_units: Mapping[str, int],
+    owners: StreamOwners | None,
+    stream_id: StreamId,
+    require_placement: bool,
+) -> None:
+    if int(program.rows) * int(program.cols) <= 0 or int(program.participants) <= 0:
+        return
+    runits = dict(resource_units) if resource_units else {}
+    axis, role = _queued_store_axis(
+        program, owners, datapath,
+        resource_names=resource_names, resource_units=runits,
+    )
+    if axis is None:
+        return
+    owner_total = (
+        (datapath.aic_count if axis == "aic" else datapath.aiv_count)
+        if datapath is not None else int(runits.get(role, runits.get(program.issue_resource, 0)))
+    )
+    res_units = int(runits.get(role, runits.get(program.issue_resource, owner_total)))
+    limit = (owners.aic_limit if axis == "aic" else owners.aiv_limit) if owners is not None else owner_total
+    raw_allowed = owners.units_for(axis) if owners is not None else ()
+    allowed = _project_owner_pool(raw_allowed, owner_total, res_units) if raw_allowed else ()
+    if owners is not None and limit == 0:
+        raise ModelingError(f"stream_zero_{axis}_budget:{stream_id}:{program.issue_resource}")
+    placed = tuple(program.issue_placement)
+    has_quota = bool(getattr(program, "issue_quota_resource", ""))
+    if not placed:
+        if owners is not None and owners.isolation == "shared_cap" and not allowed:
+            if has_quota or limit < owner_total or not require_placement:
+                return
+        if owners is None and not require_placement:
+            return
+        raise ModelingError(f"stage_missing_per_owner_placement:queued_store:{role}")
+    unit_bound = res_units if res_units > 0 else owner_total
+    if allowed:
+        if not set(placed).issubset(allowed):
+            raise ModelingError(
+                f"stage_placement_outside_stream_owners:{stream_id}:queued_store:{role}:{placed}"
+            )
+    elif unit_bound > 0 and any(u < 0 or u >= unit_bound for u in placed):
+        raise ModelingError(
+            f"stage_placement_owner_out_of_range:queued_store:{role}:{placed}"
+        )
+
+
 def apply_stream_owners_to_program(
     program: Any, owners: StreamOwners, datapath: DatapathCapabilitySpec, *,
     resource_names: Mapping[str, str], resource_units: Mapping[str, int],
@@ -933,6 +1169,7 @@ def apply_stream_owners_to_program(
     from mindie_sim.prediction.program.stages import (
         KernelProgram, NativeProgram, ParallelProgram, Stage,
     )
+    from mindie_sim.prediction.transactions import QueuedStore
 
     kwargs = dict(
         resource_names=resource_names, resource_units=resource_units, rates=rates,
@@ -942,6 +1179,12 @@ def apply_stream_owners_to_program(
     binder = getattr(program, "bind_stream_owners", None)
     if callable(binder):
         return binder(owners, datapath, **kwargs)
+    if isinstance(program, QueuedStore):
+        return _bind_queued_store(
+            program, owners, datapath,
+            resource_names=resource_names, resource_units=resource_units,
+            rates=rates, stream_id=stream_id, quota_resources=quota_resources,
+        )
     if isinstance(program, KernelProgram):
         return replace(program, stages=tuple(bind_stage_to_stream(s, owners, datapath, **kwargs) for s in program.stages))
     if isinstance(program, ParallelProgram):
@@ -1200,12 +1443,21 @@ def validate_program_owners(
     from mindie_sim.prediction.program.stages import (
         KernelProgram, NativeProgram, ParallelProgram, Stage,
     )
+    from mindie_sim.prediction.transactions import QueuedStore
 
     vkw = dict(
         resource_names=resource_names, resource_units=resource_units, owners=owners,
         stream_id=stream_id, pool_names=pool_names, pool_units=pool_units,
         require_placement=require_placement,
     )
+    if isinstance(program, QueuedStore):
+        _validate_queued_store(
+            program, datapath,
+            resource_names=resource_names, resource_units=resource_units,
+            owners=owners, stream_id=stream_id,
+            require_placement=require_placement,
+        )
+        return
     if isinstance(program, KernelProgram):
         _validate_stage_sequence_grants(program.stages, stream_id=stream_id)
         for stage in program.stages:
