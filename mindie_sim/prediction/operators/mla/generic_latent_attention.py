@@ -114,7 +114,33 @@ def _schedule(op):
     active = tuple((q, keys) for q, keys in sequences if q > 0)
     if not active:
         return None
-    return heads, qk_dim, latent_dim, dv, kv_row, active
+    return_lse = bool(raw.get("return_lse", False))
+    return heads, qk_dim, latent_dim, dv, kv_row, active, return_lse
+
+
+def _bf16_subtile_wave(geometry):
+    datapath = getattr(geometry, "datapath", None)
+    waves = tuple(getattr(datapath, "subtile_wave", ()) or ()) if datapath is not None else ()
+    for wave in waves:
+        if getattr(wave, "native_mode", "") == "bf16":
+            return wave
+    return None
+
+
+def _tile_cube_issued_flops(
+    m_rows: int, count: int, qk_dim: int, latent_dim: int, wave=None,
+) -> tuple[int, int]:
+    """Issued BF16 Cube FLOPs for one QK + PV key tile using device subtile wave geometry."""
+    if wave is not None:
+        qk_m, qk_n, qk_k = wave.issued_shape(m_rows, count, qk_dim)
+        pv_m, pv_n, pv_k = wave.issued_shape(m_rows, latent_dim, count)
+        return 2 * qk_m * qk_n * qk_k, 2 * pv_m * pv_n * pv_k
+    align = _CUBE_HEAD_ALIGNMENT
+    m_al = ((m_rows + align - 1) // align) * align
+    k_al = ((count + align - 1) // align) * align
+    qk_k_al = ((qk_dim + align - 1) // align) * align
+    pv_n_al = ((latent_dim + align - 1) // align) * align
+    return 2 * m_al * k_al * qk_k_al, 2 * m_al * pv_n_al * k_al
 
 
 def _alloc(context, core, cores, tag, heads, q, q_bytes, kv_tile, latent_dim, dv, qk_dim):
@@ -141,7 +167,7 @@ def _alloc(context, core, cores, tag, heads, q, q_bytes, kv_tile, latent_dim, dv
 
 
 def _item_stages(context, core, cores, tag, heads, qk_dim, latent_dim, dv,
-                 q, keys, kv_row, q_bytes, out_bytes, *, after=()):
+                 q, keys, kv_row, q_bytes, out_bytes, *, after=(), wave=None):
     read = read_role(context.resource_names)
     place = context.owned(core, cores, (read, "vector", "mte3", "cube"))
     if keys == 0:
@@ -152,14 +178,12 @@ def _item_stages(context, core, cores, tag, heads, qk_dim, latent_dim, dv,
     kv_tile = min(KEY_TILE, keys) * kv_row
     alloc = _alloc(context, core, cores, tag, heads, q, q_bytes, kv_tile, latent_dim, dv, qk_dim)
     m_rows = q * heads
-    ham = ((m_rows + _CUBE_HEAD_ALIGNMENT - 1) // _CUBE_HEAD_ALIGNMENT) * _CUBE_HEAD_ALIGNMENT
 
     def tile(index):
         start = index * KEY_TILE
         count = min(KEY_TILE, keys - start)
         load = count * kv_row
-        qk_i = 2 * count * ham * qk_dim
-        pv_i = 2 * count * ham * latent_dim
+        qk_i, pv_i = _tile_cube_issued_flops(m_rows, count, qk_dim, latent_dim, wave)
         return (
             Stage(f"key_load{tag}_{index}", context.bind(Work(
                 resources={"hbm": load, read: load})), placement=place),
@@ -242,19 +266,20 @@ def build(op, geometry):
     if parsed is None:
         return OperatorPlan(Work(), lambda context: KernelProgram(()),
                             metadata={"generic_latent_attention": {"idle": 1}})
-    heads, qk_dim, latent_dim, dv, kv_row, sequences = parsed
+    heads, qk_dim, latent_dim, dv, kv_row, sequences, return_lse = parsed
     declared_roles = set(getattr(geometry, "resource_units", ()) or ()) or {"mte2"}
     read = read_role(declared_roles)
+    wave = _bf16_subtile_wave(geometry)
+    lse_row_bytes = FP32_BYTES if return_lse else 0
     total = Work()
     logical = issued = 0
     total_q = total_kv = total_out = 0
-    alignment = _CUBE_HEAD_ALIGNMENT
     vector_ops_per_pair = (_QK_VECTOR_OPS_PER_HEAD_PAIR + _ONLINE_VECTOR_OPS_PER_HEAD_PAIR
                            + _PV_VECTOR_OPS_PER_HEAD_PAIR)
     owner_items = []
     for q, keys in sequences:
         if keys == 0:
-            out_bytes = q * heads * latent_dim * 2
+            out_bytes = q * heads * (latent_dim * 2 + lse_row_bytes)
             owner_items.append((q, 0, heads))
             total_out += out_bytes
             total += Work(resources={"hbm": out_bytes, "mte3": out_bytes})
@@ -265,16 +290,19 @@ def build(op, geometry):
             m_cur = q * h_cur
             owner_items.append((q, keys, h_cur))
             q_bytes = m_cur * qk_dim * 2
-            out_bytes = m_cur * latent_dim * 2
+            out_bytes = m_cur * (latent_dim * 2 + lse_row_bytes)
             total_q += q_bytes
             total_kv += keys * kv_row
             total_out += out_bytes
             logical += 2 * keys * m_cur * (qk_dim + latent_dim)
-            ham = ((m_cur + alignment - 1) // alignment) * alignment
-            issued += 2 * keys * ham * (qk_dim + latent_dim)
+            item_issued = sum(
+                sum(_tile_cube_issued_flops(m_cur, min(KEY_TILE, keys - start), qk_dim, latent_dim, wave))
+                for start in range(0, keys, KEY_TILE)
+            )
+            issued += item_issued
             total += Work(resources={"hbm": q_bytes, read: q_bytes})
             total += Work(resources={"hbm": keys * kv_row, read: keys * kv_row})
-            total += Work(matrix={"bf16": 2 * keys * ham * (qk_dim + latent_dim)})
+            total += Work(matrix={"bf16": item_issued})
             owners = (keys + KEY_TILE - 1) // KEY_TILE
             vector = (vector_ops_per_pair * keys * m_cur + 2 * m_cur * owners
                       + _UPDATE_VECTOR_OPS_PER_OUTPUT_ELEMENT * m_cur * dv * owners
@@ -292,8 +320,9 @@ def build(op, geometry):
                 q, keys, h_cur = owner_items[tag]
                 stages, fin = _item_stages(
                     context, core, cores, tag, h_cur, qk_dim, latent_dim, dv,
-                    q, keys, kv_row, q * h_cur * qk_dim * 2, q * h_cur * latent_dim * 2,
-                    after=prev)
+                    q, keys, kv_row, q * h_cur * qk_dim * 2,
+                    q * h_cur * (latent_dim * 2 + lse_row_bytes),
+                    after=prev, wave=wave)
                 chain.extend(stages)
                 prev = (fin,)
             per_core.append(KernelProgram(tuple(chain)))
@@ -308,6 +337,7 @@ def build(op, geometry):
             "q_bytes": total_q, "kv_unique_bytes": total_kv,
             "output_bytes": total_out, "logical_flops": logical,
             "issued_flops": issued,
+            "return_lse": return_lse,
             "source_scope": "generic_one_query_owner_online_qk_softmax_pv",
         }},
     )
@@ -357,6 +387,7 @@ def batch_ops(ops, outputs, *, runtime, views, prefix):
     activation_bytes = dtype_bytes(members[0].dtype or "bf16")
     qk_width = int(schedule["qk_dim"])
     latent_width = int(schedule["latent_dim"])
+    lse_row_bytes = FP32_BYTES if bool(schedule.get("return_lse", False)) else 0
     schedule.update({"sequences": sequences, "batch": len(sequences),
                      "query_rows": sum(q for q, _ in sequences),
                      "keys": max(keys for _, keys in sequences),
@@ -365,8 +396,9 @@ def batch_ops(ops, outputs, *, runtime, views, prefix):
                                             for _, keys in sequences),
                      "q_bytes": sum(q * schedule["heads"] * qk_width * activation_bytes
                                     for q, _ in sequences),
-                     "output_bytes": sum(q * schedule["heads"] * latent_width * activation_bytes
-                                         for q, _ in sequences)})
+                     "output_bytes": sum(
+                         q * schedule["heads"] * (latent_width * activation_bytes + lse_row_bytes)
+                         for q, _ in sequences)})
     meta["latent_attention_schedule"] = schedule
     view = dict(meta.get("attention_tensor_view", {}))
     if view:

@@ -60,6 +60,58 @@ def _is_gbsa_fp8_quant(contract: AttentionContract) -> bool:
     return contract.abi == GBSA_ABI and contract.quant_mode in {QUANT_MODE_FP8_C8, QUANT_MODE_MXFP8}
 
 
+def _merged_interval_len(intervals: list[tuple[int, int]]) -> int:
+    """Count distinct integer positions across possibly overlapping [lo, hi) spans."""
+    ordered = sorted((lo, hi) for lo, hi in intervals if hi > lo)
+    if not ordered:
+        return 0
+    total = 0
+    cur_lo, cur_hi = ordered[0]
+    for lo, hi in ordered[1:]:
+        if lo <= cur_hi:
+            cur_hi = max(cur_hi, hi)
+        else:
+            total += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+    return total + (cur_hi - cur_lo)
+
+
+def _contract_io_seq_vis(contract: AttentionContract) -> list[int]:
+    seq_vis: list[int] = []
+    for idx, (q, kv) in enumerate(contract.sequences):
+        if q <= 0 or kv <= 0:
+            continue
+        selected = kv if contract.selected_tokens is None else contract.selected_tokens
+        spans = (
+            contract.sequence_query_spans[idx]
+            if idx < len(contract.sequence_query_spans) else ()
+        )
+        eff_kv = (
+            min(kv, max((hi for _, hi in spans), default=0))
+            if (contract.causal and spans) else kv
+        )
+        if contract.window_size:
+            if spans:
+                if contract.causal:
+                    clipped = [
+                        (max(0, lo + 1 - contract.window_size), min(eff_kv, hi))
+                        for lo, hi in spans
+                    ]
+                else:
+                    radius = contract.window_size - 1
+                    clipped = [
+                        (max(0, lo - radius), min(kv, hi + radius))
+                        for lo, hi in spans
+                    ]
+                win_vis = min(eff_kv, _merged_interval_len(clipped))
+            else:
+                win_vis = contract.window_size + max(0, q - 1)
+            seq_vis.append(min(eff_kv, selected, win_vis))
+        else:
+            seq_vis.append(min(eff_kv, selected))
+    return seq_vis
+
+
 def _minimum_contract_io(contract: AttentionContract, dtype: str) -> tuple[float, float, float, float]:
     """Conservative physical lower bound on (hbm, mte2, mte3, vector_ops) for L* soundness."""
     out_elem = float(dtype_bytes(dtype))
@@ -81,11 +133,7 @@ def _minimum_contract_io(contract: AttentionContract, dtype: str) -> tuple[float
     if contract.selection_lists:
         unique_rows = len({addr for rows in contract.selection_lists for addr in rows})
     elif contract.sequences:
-        seq_vis = [
-            min(kv, kv if contract.selected_tokens is None else contract.selected_tokens,
-                (contract.window_size + max(0, q - 1)) if contract.window_size else kv)
-            for q, kv in contract.sequences
-        ]
+        seq_vis = _contract_io_seq_vis(contract)
         unique_rows = (max(seq_vis, default=0)
                        if (contract.shared_prefix or contract.block_table)
                        else sum(seq_vis))

@@ -9,7 +9,7 @@
 """
 from math import ceil
 from mindie_sim.schema.common import dtype_bytes
-from mindie_sim.catalog.cache_format import CacheFormat, cache_format
+from mindie_sim.catalog.cache_format import CacheFormat, _lookup_region_decl, cache_format
 
 
 FP4_SCALE_VALUES_PER_BLOCK = 4
@@ -37,10 +37,14 @@ def index_representation(b, name, value, rows, width, *, quant, model, rotate_ba
             metadata=(("basis", "hadamard"), ("normalization", "inverse_sqrt_width")),
         )
     elements = rows * width
-    declarations = dict(getattr(model, "metadata", ())).get(
-        "cache_representations", {})
-    if "index_k" in declarations:
-        fmt = cache_format(model, "index_k")
+    metadata = dict(getattr(model, "metadata", ()) or ())
+    plan = getattr(b, "plan", None)
+    owner_id = int(getattr(plan, "index_k_owner_layer_id", -1)) if plan is not None else -1
+    layer_plans = getattr(model, "layer_plans", ()) or ()
+    fmt_plan = layer_plans[owner_id] if (0 <= owner_id < len(layer_plans)) else plan
+    phase = getattr(b, "common", {}).get("phase")
+    if _lookup_region_decl(metadata, "index_k", plan=fmt_plan, phase=phase) is not None:
+        fmt = cache_format(model, "index_k", plan=fmt_plan, phase=phase)
     else:
         # Missing explicit source region restores the original plan logical
         # query/key representation; cache_format's kv fallback is not storage.

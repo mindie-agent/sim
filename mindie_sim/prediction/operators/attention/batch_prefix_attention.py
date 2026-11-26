@@ -135,6 +135,31 @@ def _scale_work(work: dict[str, float], factor: float) -> dict[str, float]:
     return {k: v * factor for k, v in work.items() if v * factor > 0.0}
 
 
+_MIN_5D_SHAPE = 5
+_MIN_4D_SHAPE = 4
+
+
+def _qk_pv_share(op: Any, metadata: dict[str, Any]) -> float:
+    """Resolve QK share ``Dk / (Dk + Dv)`` from 5D shape or explicit GQA contract."""
+    shape = tuple(getattr(op, "semantic_shape", ()) or ())
+    if len(shape) >= _MIN_5D_SHAPE and shape[3] > 0 and shape[4] > 0:
+        return float(shape[3]) / max(1.0, float(shape[3] + shape[4]))
+    shape_dk = float(shape[3]) if (len(shape) >= _MIN_4D_SHAPE and shape[3] > 0) else 0.0
+    for key in ("gqa_decode", "gqa_prefill", "attention_tensor_view"):
+        contract = metadata.get(key)
+        if not isinstance(contract, dict):
+            continue
+        dk = float(contract.get("head_dim") or shape_dk or 0.0)
+        dv = float(contract.get("v_head_dim") or 0.0)
+        if dk > 0.0 and dv > 0.0:
+            return dk / max(1.0, dk + dv)
+    dk = float(metadata.get("head_dim") or shape_dk or 0.0)
+    dv = float(metadata.get("v_head_dim") or 0.0)
+    if dk > 0.0 and dv > 0.0:
+        return dk / max(1.0, dk + dv)
+    return 0.5
+
+
 @dataclass(frozen=True)
 class BatchPrefixAttention:
     """Shared key/value tile traversal with causal QK -> softmax -> PV order."""
@@ -192,11 +217,7 @@ class BatchPrefixAttention:
                 key_fill_work[name] = val - q_in_b
             else:
                 key_fill_work[name] = val
-        shape = tuple(getattr(context.op, "semantic_shape", ()) or ())
-        qk_share = (
-            float(shape[3]) / max(1.0, float(shape[3] + shape[4]))
-            if len(shape) >= 5 else 0.5
-        )
+        qk_share = _qk_pv_share(context.op, metadata)
         qk_work = _scale_work(matrix_work, qk_share)
         pv_work = {k: v - qk_work.get(k, 0.0) for k, v in matrix_work.items()
                    if v - qk_work.get(k, 0.0) > 0.0}

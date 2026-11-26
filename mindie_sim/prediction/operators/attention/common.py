@@ -117,7 +117,8 @@ def sequence_layout_spans(
     spans = []
     for request in requests:
         q, kv = request.logical_q_len, request.kv_len
-        if not request.padding and (q <= 0 or kv <= 0):
+        pcp_empty = (not request.padding and q == 0 and kv > 0 and int(request.global_q_len) > 0)
+        if not request.padding and not pcp_empty and (q <= 0 or kv <= 0):
             raise ModelingError("attention_nonpositive_length")
         spans.append((q, kv, q_offset, kv_offset, request.padding))
         q_offset += request.physical_q_len if rectangular else q
@@ -250,6 +251,7 @@ class AttentionContract:
     query_block_size: int | None = None
     dst_type_max: float = 0.0
     block_table: tuple[tuple[int, ...], ...] = ()
+    sequence_query_spans: tuple[tuple[tuple[int, int], ...], ...] = ()
 
     def __post_init__(self) -> None:
         if any(type(value) is not int or value < 1 for value in (
@@ -313,17 +315,52 @@ class AttentionContract:
                for p in cp_plans):
             raise ModelingError("attention_cp_consumer_contract_mismatch")
         object.__setattr__(self, "cp_plan", cp_plans or None)
+        q_spans = tuple(
+            tuple(tuple(int(bound) for bound in span) for span in req_spans)
+            for req_spans in (self.sequence_query_spans or ())
+        )
+        if q_spans and (
+            not sequences or len(q_spans) != len(sequences)
+            or any(
+                len(span) != 2 or span[0] < 0 or span[1] < span[0] or span[1] > kv
+                for (_, kv), req_spans in zip(sequences, q_spans)
+                for span in req_spans
+            )
+            or any(
+                req_spans and sum(hi - lo for lo, hi in req_spans) != q
+                for (q, _), req_spans in zip(sequences, q_spans)
+            )
+        ):
+            raise ModelingError("attention_sequence_geometry_invalid")
+        object.__setattr__(self, "sequence_query_spans", q_spans)
+
+    def _query_visible_count(self, pos: int, kv: int) -> int:
+        if self.sequences and self.causal:
+            visible = pos + 1
+            return min(visible, self.window_size) if self.window_size else visible
+        if self.sequences and self.window_size:
+            radius = self.window_size - 1
+            return max(0, min(kv, pos + self.window_size) - max(0, pos - radius))
+        if self.window_size:
+            band = self.window_size if self.causal else (2 * self.window_size - 1)
+            return min(kv, band)
+        return kv
 
     def row_counts(self) -> Iterable[int]:
         """Yield the cardinality of each query's visible selection."""
         if self.selection_lists:
             yield from map(len, self.selection_lists)
             return
-        for q, kv in self.sequences or ((self.query_tokens, self.selected_tokens),):
+        seqs = self.sequences or ((self.query_tokens, self.selected_tokens),)
+        for idx, (q, kv) in enumerate(seqs):
             selected = kv if self.selected_tokens is None else self.selected_tokens
-            for index in range(q):
-                visible = kv - q + index + 1 if self.sequences and self.causal else kv
-                yield min(visible, selected, self.window_size or visible)
+            if self.sequences and idx < len(self.sequence_query_spans) and self.sequence_query_spans[idx]:
+                spans = self.sequence_query_spans[idx]
+            else:
+                spans = ((kv - q, kv),) if self.sequences else ((0, q),)
+            for lo, hi in spans:
+                for pos in range(lo, hi):
+                    yield min(self._query_visible_count(pos, kv), selected)
 
     @property
     def useful_flops(self) -> int:
@@ -348,8 +385,27 @@ def contract_for_requests(contract: AttentionContract, ctx: OperatorPlanningCont
     if table and len(table) == sum(not span[-1] for span in spans) < len(spans):
         rows = iter(table)
         table = tuple(() if span[-1] else next(rows) for span in spans)
+    if any(
+        not getattr(request, "padding", False)
+        and int(request.logical_q_len) > 0
+        and getattr(request, "query_ranges", ())
+        for request in ctx.requests
+    ):
+        q_spans = tuple(
+            () if (getattr(request, "padding", False) or int(request.logical_q_len) <= 0)
+            else tuple(
+                (int(request.context) + int(lo), int(request.context) + int(hi))
+                for lo, hi in (getattr(request, "query_ranges", ()) or ())
+                if hi > lo
+            )
+            for request in ctx.requests
+        )
+    elif len(contract.sequence_query_spans) == len(spans):
+        q_spans = contract.sequence_query_spans
+    else:
+        q_spans = ()
     return replace(contract, query_tokens=tokens, sequences=sequences, batch_size=len(spans),
-                   selection_lists=lists, block_table=table)
+                   selection_lists=lists, block_table=table, sequence_query_spans=q_spans)
 
 
 def sparse_kv_extents(contract: AttentionContract, ctx: OperatorPlanningContext):

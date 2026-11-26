@@ -522,7 +522,7 @@ class _Arch35SfaProgram:
             n_al = _align_up(rows, FRACTAL_ALIGN)
             k_al = _align_up(c.head_dim, FRACTAL_ALIGN)
             return Work(
-                {self.dtype: FLOPS_PER_FMA * pairs * c.head_dim},
+                {self.dtype: FLOPS_PER_FMA * m_al * n_al * k_al},
                 {"mte1": (m_al + n_al) * k_al * BF16_BYTES},
             )
         if phase_name == "score_fixpipe":
@@ -539,7 +539,7 @@ class _Arch35SfaProgram:
             k_al = _align_up(rows, FRACTAL_ALIGN)
             n_al = _align_up(c.v_head_dim, FRACTAL_ALIGN)
             return Work(
-                {self.dtype: FLOPS_PER_FMA * pairs * c.v_head_dim},
+                {self.dtype: FLOPS_PER_FMA * m_al * n_al * k_al},
                 {"mte1": (m_al * k_al + k_al * n_al) * BF16_BYTES},
             )
         if phase_name == "pv_fixpipe":

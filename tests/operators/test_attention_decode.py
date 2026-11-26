@@ -980,3 +980,173 @@ def test_staged_gqa_decode_respects_disjoint_and_shared_stream_core_partitions()
     eng_sh.advance(until=(done_sh,))
     assert any(k.startswith("stream_quota@") and v > 0.0 for k, v in eng_sh.serviced.items())
     assert all(v == 0 for v in eng_sh.allocated.values())
+
+
+def test_attention_decode_mxfp8_mixed_format_scale_conservation_and_alias():
+    from _support.hardware import hardware_case
+    from mindie_sim.prediction.graph_analysis import verify_operator
+    from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
+
+    a5_sku = REPRESENTATIVE_SKUS["a5"]
+    # FP32-scaled FP8 keys + BF16 values must keep 256 B BF16 value rows instead of MXFP8 halving.
+    raw_mixed = hardware_case()
+    raw_mixed["machine"] = {"backend": "ascend", "sku": a5_sku, "num_devices": 1}
+    raw_mixed["model"].update(hidden_size=128, head_dim=128, kv_dtype="fp8_e4m3")
+    raw_mixed["runtime"]["attention_policy"] = {"kv_storage": "paged"}
+    raw_mixed["model"]["metadata"] = {"cache_representations": {
+        "gqa_kv_key": {"dtype": "fp8_e4m3", "group_size": 128, "scale_dtype": "fp32"},
+        "gqa_kv_value": {"dtype": "bf16"},
+    }}
+    case_mixed = parse_case(raw_mixed)
+    op_mixed = next(
+        x for x in target_graphs(case_mixed, phase="decode", tokens=1, context=1, scope="body")[0]
+        if x.family == "attention"
+    )
+    recipe = StagedGQADecode(kv_mapping="fai_host_arch35", target_cores=2)
+    cache_mixed = recipe.spec(op_mixed).kv_cache
+    assert cache_mixed.value_payload_row == cache_mixed.value_format.row_bytes(128) == 256
+
+    # Tagged MXFP8 must conserve KV payload + scale bytes across native plan and Engine replay.
+    raw_mx = hardware_case()
+    raw_mx["machine"] = {"backend": "ascend", "sku": a5_sku, "num_devices": 1}
+    raw_mx["model"].update(
+        hidden_size=128, head_dim=128, kv_dtype="fp8_e4m3",
+        metadata={"kv_cache_tag": "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"},
+    )
+    raw_mx["runtime"]["attention_policy"] = {"kv_storage": "paged"}
+    case_mx = parse_case(raw_mx)
+    op_mx = next(
+        x for x in target_graphs(case_mx, phase="decode", tokens=1, context=1, scope="body")[0]
+        if x.family == "attention"
+    )
+    plan_mx = recipe.native_plan(op_mx)
+    assert plan_mx["kind"] == "paged_qfa_mxfp8"
+    assert plan_mx["work"]["kv_valid_bytes"] == 2 * (128 + 128 + 4) + 128
+    assert verify_operator(case_mx, op_mx, recipe.build)["work_mismatches"] == {}
+
+    # Matching mxfp8 spelling across gqa_decode and attention_tensor_view builds packed 132 B keys.
+    raw_alias = hardware_case()
+    raw_alias["machine"] = {"backend": "ascend", "sku": a5_sku, "num_devices": 1}
+    raw_alias["model"].update(hidden_size=128, head_dim=128, kv_dtype="mxfp8")
+    raw_alias["runtime"]["attention_policy"] = {"kv_storage": "paged"}
+    case_alias = parse_case(raw_alias)
+    op_alias = next(
+        x for x in target_graphs(case_alias, phase="decode", tokens=1, context=1, scope="body")[0]
+        if x.family == "attention"
+    )
+    assert recipe.spec(op_alias).kv_cache.key_payload_row == 132
+
+    # Explicit BF16 key + FP8 value overrides must not be rewritten into direct MXFP8 even with kv_dtype=mxfp8.
+    raw_asym = hardware_case()
+    raw_asym["machine"] = {"backend": "ascend", "sku": a5_sku, "num_devices": 1}
+    raw_asym["model"].update(
+        hidden_size=128, head_dim=128, kv_dtype="mxfp8",
+        metadata={"cache_representations": {
+            "gqa_kv_key": {"dtype": "bf16"},
+            "gqa_kv_value": {"dtype": "fp8_e4m3"},
+        }},
+    )
+    raw_asym["runtime"]["attention_policy"] = {"kv_storage": "paged"}
+    case_asym = parse_case(raw_asym)
+    op_asym = next(
+        x for x in target_graphs(case_asym, phase="decode", tokens=1, context=1, scope="body")[0]
+        if x.family == "attention"
+    )
+    spec_asym = recipe.spec(op_asym)
+    assert not spec_asym.mxfp8_qfa and spec_asym.kv_cache.key_payload_row == 256
+
+    # Unaligned MXFP8 split tiles conserve absolute V-scale group counts and query E8M0 scale bytes.
+    op_split = next(
+        x for x in target_graphs(case_alias, phase="decode", tokens=1, context=79, scope="body")[0]
+        if x.family == "attention"
+    )
+    r_split = StagedGQADecode(key_tile=48, kv_splits=2, kv_mapping="uniform")
+    assert verify_operator(case_alias, op_split, r_split.build)["work_mismatches"] == {}
+
+
+def test_shared_prefix_asymmetric_qk_pv_and_sfa_cube_alignment():
+    from _support.builders import dense_layer
+    from mindie_sim.prediction.graph_analysis import verify_operator
+    from mindie_sim.prediction.operators.attention.attention import gqa
+    from mindie_sim.prediction.operators.attention.batch_prefix_attention import RECIPE
+    from mindie_sim.prediction.operators.attention.common import SFA_V1_ABI
+
+    # Asymmetric head_dim vs v_head_dim allocates proportional Cube work across QK and PV stages.
+    c = dense_case(layers=1, prefix_cache_mode="shared", prefix_read_mode="batch_shared", kv_block_size=16)
+    layer = dense_layer(0, head_dim=128, v_head_dim=32, kv_cache_elements=320)
+    model = replace(c.model, head_dim=128, layer_plans=(layer,))
+    views = tuple(
+        RequestView(req_id, 1, 32, True, "decode", prefix_tokens=32, prefix_cache_key="p")
+        for req_id in ("a", "b")
+    )
+    ops = gqa(
+        prefix="x", plan=layer, views=views, stage=0, deps="in", model=model,
+        parallel=c.runtime.parallel, quant=model.quant, mode="decode", padded_tokens=2,
+        runtime=c.runtime, machine=c.machine,
+    ).ops
+    op = next(x for x in ops if x.recipe == "batch_prefix_attention")
+    ctx = RecipeContext(op, {"cube": op.flops}, {"cube": "cube"}, {"cube": 1}, 1)
+    stage_flops = [s.work["cube"] for s in RECIPE.lower(ctx).stages if s.name in ("qk", "pv")]
+    assert stage_flops == [2 * 2 * 33 * 4 * 128, 2 * 2 * 33 * 4 * 32]
+
+    # Single-row Arch35 SFA rounds QK N and PV K to 16-element MMAD fractal alignment.
+    a5_case = sku_case(REPRESENTATIVE_SKUS["a5"])
+    g_a5 = Geometry.from_devices(a5_case.machine.dies)
+    contract = governed.AttentionContract(
+        1, 64, 1, 576, 512, selected_tokens=128, sequences=((1, 1),),
+        causal=True, abi=SFA_V1_ABI, kv_layout="PA_BLK_BSND",
+    )
+    op_sfa = governed.make_attention_op(contract, op_id="sfa")
+    plan_sfa = governed.build(op_sfa, g_a5)
+    assert int(sum(plan_sfa.work.matrix.values())) == 2 * 64 * 16 * (576 + 512)
+    assert verify_operator(a5_case, op_sfa, governed.build)["work_mismatches"] == {}
+
+
+def test_generic_latent_decode_subtile_cube_dcp_lse_and_mtp_history_conservation():
+    from math import prod
+    from mindie_sim.prediction.graph_analysis import verify_operator
+    from mindie_sim.prediction.operators.mla import generic_latent_attention as gla
+
+    # Subtile-wave BF16 rounding applies to short key tails in both declared and executed Cube work.
+    c_single = parse_case(compose_case(
+        "deepseek-v2-lite", hardware="a2", layers=1, tp=1, dp=1, ep=1,
+        num_devices=1, prompt_tokens=2, output_tokens=1, va_recommended=False,
+    ))
+    o_single = next(
+        o for o in target_operators(c_single, phase="decode", tokens=1, context=1)
+        if "latent_attention" in o.op_id
+    )
+    die = c_single.machine.dies[0]
+    wave = next(w for w in die.subtile_wave if w.native_mode == "bf16")
+    plan_meta = gla.build(o_single, Geometry.from_devices((die,))).metadata["generic_latent_attention"]
+    qk_shape = wave.issued_shape(16, 2, plan_meta["qk_dim"])
+    pv_shape = wave.issued_shape(16, plan_meta["latent_dim"], 2)
+    assert plan_meta["issued_flops"] == 2 * (prod(qk_shape) + prod(pv_shape))
+    assert verify_operator(c_single, o_single, gla.build)["work_mismatches"] == {}
+
+    # DCP decode attention writes FP32 LSE consumed by dcp_output_pack with Engine conservation.
+    c_dcp = parse_case(compose_case(
+        "deepseek-v2-lite", hardware="a2", layers=1, tp=2, dcp=2, dp=1, ep=1,
+        num_devices=2, prompt_tokens=2, output_tokens=1, va_recommended=False,
+    ))
+    ops_dcp = target_operators(c_dcp, phase="decode", tokens=1, context=1, physical_rank=0)
+    pack = next(o for o in ops_dcp if o.op_id.endswith("dcp_output_pack"))
+    src = next(o for o in ops_dcp if o.op_id == pack.deps[0])
+    assert int(src.mte3_bytes) == int(pack.mte2_bytes) == 16 * (512 * 2 + 4)
+    plan_dcp = gla.build(src, Geometry.from_devices((c_dcp.machine.dies[0],)))
+    assert int(plan_dcp.work.resources["mte3"]) == 16 * (512 * 2 + 4)
+    assert verify_operator(c_dcp, src, gla.build)["work_mismatches"] == {}
+
+    # MTP DCP history split refills only historical rows (zero current-chunk rows) per rank.
+    c_mtp = compose_case(
+        "deepseek-v2-lite", hardware="a2", layers=1, tp=2, dcp=2, dp=1, ep=1,
+        num_devices=2, prompt_tokens=1, output_tokens=3, va_recommended=False,
+    )
+    ops_r0 = target_operators(c_mtp, phase="decode", tokens=2, context=1, physical_rank=0)
+    hist_r0 = next(o for o in ops_r0 if "latent_attention" in o.op_id)
+    cur_r0 = next(o for o in ops_r0 if o.op_id.endswith("mtp_current_attention"))
+    assert int(dict(hist_r0.metadata)["attention_traffic_plan"]["private_refill_bytes"]) == (512 + 64) * 2
+    assert cur_r0.semantic_shape[:2] == (2, 2)
+    ops_r1 = target_operators(c_mtp, phase="decode", tokens=2, context=1, physical_rank=1)
+    hist_r1 = next(o for o in ops_r1 if "latent_attention" in o.op_id)
+    assert int(dict(hist_r1.metadata)["attention_traffic_plan"]["private_refill_bytes"]) == 0

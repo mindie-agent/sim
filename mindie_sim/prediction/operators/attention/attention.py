@@ -452,7 +452,10 @@ def _prepare_gqa_inputs(plan, views, model, parallel, quant, mode, policy, runti
             )
         selected.module.validate(views=views, plan=plan, parallel=parallel, policy=policy,
                                  quant=quant, model=model, **selected.options)
-    key_fmt, value_fmt, _cache_regions, shared_format = _gqa_formats(model, plan=plan, phase=mode)
+    owner_id = int(getattr(plan, "kv_owner_layer_id", -1))
+    layer_plans = getattr(model, "layer_plans", ()) or ()
+    fmt_plan = layer_plans[owner_id] if (0 <= owner_id < len(layer_plans)) else plan
+    key_fmt, value_fmt, _cache_regions, shared_format = _gqa_formats(model, plan=fmt_plan, phase=mode)
     if cacheless:
         key_fmt = value_fmt = CacheFormat(model.activation_dtype)
         shared_format = True
@@ -646,9 +649,21 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         store_ids=store_ids, query_producer=query_producer,
         dcp_query_producer=dcp_query_producer,
         key_fmt=key_fmt, value_fmt=value_fmt, shared_format=shared_format)
+    published_cache_id: str | None = None
+    if not cacheless and store_ids:
+        if len(store_ids) == 1:
+            published_cache_id = store_ids[0]
+        else:
+            kv_ready = barrier_op(
+                op_id=prefix + ".kv_cache_ready", deps=tuple(store_ids),
+                stage=stage, layer=plan.index, requests=requests, phase=mode,
+                recipe="kv_cache_ready", shape=(),
+            )
+            ops.append(kv_ready)
+            published_cache_id = kv_ready.op_id
     if idle_dcp_owner:
         return AttentionResult(ops=ops, last=attention[-1],
-                               cache_store_id=(store_ids[0] if store_ids else None),
+                               cache_store_id=published_cache_id,
                                index_store_id=None,
                                topk_id=None, candidate_id=None)
     last = _gqa_output(
@@ -656,7 +671,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         width, model, mode, split_copies, qkv, quant, parallel, shared, normalized, rope,
         split_views, gate_separate, views=views, runtime=runtime, deps=deps)
     return AttentionResult(ops=ops, last=last,
-                           cache_store_id=None if cacheless else store_ids[0],
+                           cache_store_id=published_cache_id,
                            index_store_id=index_store_id, topk_id=topk_id,
                            candidate_id=candidate_id)
 
@@ -744,19 +759,24 @@ def _gqa_projections(
     ready = qkv.op_id
     separate_gate = None
     if gate_separate:
+        gate_width = (
+            heads
+            if getattr(plan, "q_output_gate_kind", "elementwise") == "headwise"
+            else heads * v_width
+        )
         gate_proj = gemm_op(
             op_id=prefix + ".g_proj", deps=(deps,), stage=stage, layer=plan.index,
-            requests=requests, m=padded_tokens, n=heads, k=model.hidden_size,
+            requests=requests, m=padded_tokens, n=gate_width, k=model.hidden_size,
             quant=quant, category="attn.gate", phase=mode,
             family="gate_projection", recipe="attention_q_gate_projection",
         )
         gate_sigmoid = vector_op(
             op_id=prefix + ".g_sigmoid", deps=(gate_proj.op_id,), stage=stage,
-            layer=plan.index, requests=requests, elements=padded_tokens * heads,
+            layer=plan.index, requests=requests, elements=padded_tokens * gate_width,
             ops_per_element=GATE_SIGMOID_OPS_PER_ELEMENT, dtype="fp32",
             family="sigmoid", phase=mode,
             recipe="attention_q_gate_sigmoid",
-            shape=(padded_tokens, heads),
+            shape=(padded_tokens, gate_width),
         )
         ops.extend((gate_proj, gate_sigmoid))
         separate_gate = gate_sigmoid.op_id
@@ -767,7 +787,8 @@ def _gqa_projections(
     if plan.qk_norm:
         split_views = _qkv_views(
             padded_tokens, heads, projected_kv_heads, width,
-            plan.q_output_gate and not gate_separate, False, v_width=v_width)
+            plan.q_output_gate and not gate_separate, False, v_width=v_width,
+            gate_width=(1 if getattr(plan, "q_output_gate_kind", "elementwise") == "headwise" else width))
         if mrope_active:
             normalized = vector_op(
                 op_id=prefix + ".qk_norm", deps=(ready,), stage=stage, layer=plan.index,
@@ -929,14 +950,15 @@ def _publish_gqa_cache(
         and any(v.phase == "prefill" and _view_store_q(v) > 0 for v in views)
     )
     if pcp_prefill:
+        pf_views = tuple(v for v in views if v.phase == "prefill" and _view_store_q(v) > 0)
+        pcp_kv_local, _ = pcp_uniform_peer_rows(pf_views, parallel.pcp, local_rows=0)
         gather = comm_op(
             op_id=prefix + ".kv_gather",
             deps=(rope.op_id, value_ready) if value_ready else (rope.op_id,),
             stage=stage, layer=plan.index,
             requests=requests, family="allgather", phase=mode, recipe="pcp_kv_gather",
-            link_bytes=kv_plane_width * kv_heads * dtype_bytes(quant.kv_dtype)
-                       * sum(_view_store_q(v) for v in views if v.phase == "prefill")
-                       * (parallel.pcp - 1) / parallel.pcp,
+            link_bytes=kv_plane_width * kv_heads * dtype_bytes(model.activation_dtype)
+                       * pcp_kv_local * (parallel.pcp - 1),
             shape=(valid, kv_heads, width), metadata=(("group_axis", "pcp"),))
         ops.append(gather)
         store_ready = gather.op_id
@@ -949,6 +971,12 @@ def _publish_gqa_cache(
         tuple(v for v in views if v.phase == "prefill") + tuple(cohort_dec_views)
         if (dp_width > 1 and store_dcp > 1 and cohort_dec_views)
         else views
+    )
+    store_ranks = resolve_cp_rank_candidates(
+        parallel, eff_cp=store_dcp, pcp_factor=pcp_factor, tp_gather=tp_gather,
+        dp_width=dp_width, local_dp_pos=local_dp_pos, physical_rank=physical_rank,
+        explicit_dp_cohort=explicit_dp_cohort,
+        explicit_physical_rank=explicit_physical_rank,
     )
     store_rows = _dcp_store_rows(
         store_views, store_dcp=store_dcp, parallel=parallel,
@@ -965,7 +993,8 @@ def _publish_gqa_cache(
         extra, owner_ready = shared_kv_input(
             prefix=prefix, plan=plan, stage=stage, views=views,
             cache_ids=cache_ids or {}, stage_of=stage_of,
-            parallel=parallel, quant=quant, mode=mode)
+            parallel=parallel, quant=quant, mode=mode, model=model,
+            rank_candidates=store_ranks, cp_interleave_size=cp_interleave_size)
         ops.extend(extra)
         readiness = barrier_op(
             op_id=prefix + ".shared_cache_ready", deps=(rope.op_id, owner_ready),
@@ -2023,7 +2052,9 @@ def _gqa_output(
     v_width = int(getattr(plan, "v_head_dim", 0) or width)
     act_bytes = dtype_bytes(model.activation_dtype)
     gate_elems = padded_tokens * heads * v_width
+    is_headwise_gate = getattr(plan, "q_output_gate_kind", "elementwise") == "headwise"
     if gate_separate:
+        sep_gate_in_elems = padded_tokens * heads if is_headwise_gate else gate_elems
         gate = vector_op(
             op_id=prefix + ".output_gate", deps=tuple(attention) + (separate_gate,),
             stage=stage, layer=plan.index, requests=requests,
@@ -2031,7 +2062,7 @@ def _gqa_output(
             ops_per_element=GATE_APPLY_OPS_PER_ELEMENT,
             dtype=model.activation_dtype, family="elementwise", phase=mode,
             recipe="attention_gate",
-            read_bytes_override=gate_elems * act_bytes + padded_tokens * heads * dtype_bytes("fp32"),
+            read_bytes_override=gate_elems * act_bytes + sep_gate_in_elems * dtype_bytes("fp32"),
             write_bytes_override=gate_elems * act_bytes,
             metadata=(("input_tensor_count", 2),),
         )
@@ -2039,12 +2070,15 @@ def _gqa_output(
         attention = [gate.op_id]
     elif plan.q_output_gate:
         gate_ready = split_copies[-1].op_id if split_copies else qkv.op_id
+        packed_gate_in_elems = (
+            padded_tokens * heads if is_headwise_gate else padded_tokens * heads * width
+        )
         gate = vector_op(
             op_id=prefix + ".output_gate", deps=tuple(attention) + (gate_ready,),
             stage=stage, layer=plan.index, requests=requests,
             elements=gate_elems, ops_per_element=OUTPUT_GATE_OPS_PER_ELEMENT,
             dtype=model.activation_dtype, family="elementwise", phase=mode, recipe="attention_gate",
-            read_bytes_override=2 * gate_elems * act_bytes,
+            read_bytes_override=(gate_elems + packed_gate_in_elems) * act_bytes,
             write_bytes_override=gate_elems * act_bytes,
             metadata=(("input_tensor_count", 2),),
         )

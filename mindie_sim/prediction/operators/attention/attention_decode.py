@@ -43,6 +43,8 @@ DEFAULT_DECODE_QUERY_TILE = 64
 FP32_BYTES = 4
 _MX_SCALE_GROUP_SIZE = 32
 _MX_V_SCALE_TOKEN_GROUP = 32
+_MX_SCALE_DTYPES = frozenset({"fp8_e8m0", "e8m0"})
+_FP8_E4M3_DTYPES = frozenset({"fp8_e4m3", "mxfp8"})
 _QFA_MXFP8_ENTRY = "cann_ops_transformer.ops.quant_flash_attn"
 _MXFP8_KV_TAGS = frozenset({"mxfp8", "qk_mxfp8_dynamic_v_mxfp8_per_channel"})
 
@@ -66,18 +68,54 @@ _DTYPE_ALIASES = {
 }
 
 
+def _is_mxfp8_cache_format(fmt) -> bool:
+    if fmt is None:
+        return False
+    dtype = str(getattr(fmt, "dtype", "") or "").strip().lower()
+    scale_dtype = str(getattr(fmt, "scale_dtype", "") or "").strip().lower()
+    group_size = int(getattr(fmt, "group_size", 0) or 0)
+    suffix_elements = int(getattr(fmt, "suffix_elements", 0) or 0)
+    packed_elements = int(getattr(fmt, "packed_elements", 1) or 1)
+    return (
+        dtype in _FP8_E4M3_DTYPES
+        and group_size == _MX_SCALE_GROUP_SIZE
+        and scale_dtype in _MX_SCALE_DTYPES
+        and suffix_elements == 0
+        and packed_elements == 1
+    )
+
+
+def _is_mxfp8_compatible_plane(fmt) -> bool:
+    if fmt is None:
+        return True
+    dtype = str(getattr(fmt, "dtype", "") or "").strip().lower()
+    scale_dtype = str(getattr(fmt, "scale_dtype", "") or "").strip().lower()
+    group_size = int(getattr(fmt, "group_size", 0) or 0)
+    suffix_elements = int(getattr(fmt, "suffix_elements", 0) or 0)
+    packed_elements = int(getattr(fmt, "packed_elements", 1) or 1)
+    if dtype not in _FP8_E4M3_DTYPES or suffix_elements != 0 or packed_elements != 1:
+        return False
+    return group_size == 0 or (group_size == _MX_SCALE_GROUP_SIZE and scale_dtype in _MX_SCALE_DTYPES)
+
+
 def _resolve_arch35_mxfp8_access(
     raw_kv_dtype: Any, query_dtype: str, kv_dtype: str, dim: int, v_dim: int,
     cache: KVCacheAccess, recipe: StagedGQADecode,
 ) -> tuple[str, KVCacheAccess, bool]:
     """Use direct PA_NZ MXFP8 Cube MMA without AIV BF16 dequant writeback on Arch35."""
     raw_norm = str(raw_kv_dtype or "").strip().lower()
-    is_mxfp8_kv = (
+    explicit_mxfp8_tag = (
         raw_norm in _MXFP8_KV_TAGS
-        or (recipe.kv_mapping == "fai_host_arch35" and kv_dtype == "fp8_e4m3"
-            and cache.scale_scope == "row" and cache.key_scale_row > 0)
+        and _is_mxfp8_compatible_plane(cache.key_format)
+        and _is_mxfp8_compatible_plane(cache.value_format)
     )
-    if not is_mxfp8_kv:
+    inferred_mxfp8 = (
+        recipe.kv_mapping == "fai_host_arch35"
+        and kv_dtype == "fp8_e4m3"
+        and _is_mxfp8_cache_format(cache.key_format)
+        and _is_mxfp8_cache_format(cache.value_format)
+    )
+    if not (explicit_mxfp8_tag or inferred_mxfp8):
         return query_dtype, cache, False
     k_row_bytes = dim + _ceil_div(dim, _MX_SCALE_GROUP_SIZE)
     direct = replace(
@@ -336,6 +374,24 @@ def _output_row_tiles(output: _Output, context: int, group: int,
                for token in range(output.token_first, output.token_last + 1))
 
 
+def _mxfp8_v_scale_bytes(output: _Output, key_tile: int, v_dim: int) -> int:
+    """Per-tile E8M0 V-scale bytes matching ``_decode_tile_stages`` on absolute tile spans."""
+    total = 0
+    for contribution in output.contributions:
+        for tile_idx in range(contribution.tile_count):
+            start = (contribution.tile_start + tile_idx) * key_tile
+            valid = min(key_tile, max(0, output.horizon - start))
+            if valid > 0:
+                end = start + valid
+                groups = (
+                    (end - 1) // _MX_V_SCALE_TOKEN_GROUP
+                    - start // _MX_V_SCALE_TOKEN_GROUP
+                    + 1
+                )
+                total += groups * v_dim
+    return total
+
+
 def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
                 vread: str | None = None, write: str | None = "mte3",
                 operand: str | None = "mte1",
@@ -345,25 +401,19 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
     producer_reads = vector_reads = writes = mte3_extra = vector = mte1 = 0
     handoff_bytes = 0
     flops = 0
+    q_scale_row = _ceil_div(spec.head_dim, _MX_SCALE_GROUP_SIZE) if spec.mxfp8_qfa else 0
     for output in spec.outputs:
         _query, context = spec.requests[output.request]
         pairs = _output_pairs(output, context, spec.group)
         row_tiles = _output_row_tiles(output, context, spec.group, spec.key_tile)
         contributions = len(output.contributions)
-        q_bytes = contributions * output.rows * spec.head_dim * spec.query_bytes
+        q_bytes = contributions * output.rows * (spec.head_dim * spec.query_bytes + q_scale_row)
         key_payload = output.horizon * cache.key_payload_row
         value_payload = output.horizon * cache.value_payload_row
         v_dim = spec.v_head_dim or spec.head_dim
         if spec.mxfp8_qfa:
             # Per-channel E8M0 V scales are broadcast per 32-token group across all v_dim channels.
-            value_payload += sum(
-                _ceil_div(
-                    max(0, min((c.tile_start + c.tile_count) * spec.key_tile, output.horizon)
-                        - c.tile_start * spec.key_tile),
-                    _MX_V_SCALE_TOKEN_GROUP,
-                ) * v_dim
-                for c in output.contributions
-            )
+            value_payload += _mxfp8_v_scale_bytes(output, spec.key_tile, v_dim)
         output_bytes = output.rows * v_dim * spec.output_bytes
         partial = contributions * output.rows * _partial_row_bytes(v_dim)
         page_meta = 0
@@ -645,13 +695,17 @@ class StagedGQADecode:
                 "shape": (total_pages, v_scale_groups, spec.kv_heads, v_dim),
                 "dtype": "fp8_e8m0", "layout": "PA_NZ", "required": True,
             }
+            kv_payload_bytes = sum(
+                kv * spec.kv_heads * (spec.head_dim + v_dim)
+                for kv in kv_lens
+            )
             kv_scale_bytes = sum(
                 kv * spec.kv_heads * k_scale_groups
                 + _ceil_div(kv, _MX_V_SCALE_TOKEN_GROUP) * spec.kv_heads * v_dim
                 for kv in kv_lens
             )
             plan["work"]["kv_scale_bytes"] = kv_scale_bytes
-            plan["work"]["kv_valid_bytes"] += kv_scale_bytes
+            plan["work"]["kv_valid_bytes"] = kv_payload_bytes + kv_scale_bytes
         outputs = []
         full_tiles = tail_tiles = 0
         for output in spec.outputs:
