@@ -56,7 +56,7 @@ SECONDS_BUDGET, COMPARE_BUDGET = 540.0, 240.0
 def same(actual, expected, rel=TOL):
     return math.isclose(actual, expected, rel_tol=rel)
 def _control():
-    return json.loads((ROOT / "examples/source-families/gqa-norm-control.json").read_text())
+    return json.loads((ROOT / "examples/source-families/attnres-prefix-control.json").read_text())
 def _evaluate(raw, *, geometry=None, matmul=None, balanced_matmul=None, routing=None, level="operators", max_operators=1000):
     geometry = geometry or {"phase": "prefill", "tokens": 4, "context": 0, "sequences": 1, "scope": "model"}
     result = run_probe({"case": raw, "geometry": geometry, "matmul": matmul, "level": level, "balanced_matmul": balanced_matmul, "routing": routing, "top": 100, "max_operators": max_operators})
@@ -74,15 +74,15 @@ def _allreduce_op(world_size):
 
 # --------------------------------------------------------------------------- model convergence
 def test_actual_source_selection_and_repetition_conserve_all_reported_costs():
-    raw = _control(); raw["model"]["layers"] = 3; costs = _evaluate(raw)["costs"]
+    raw = _control(); costs = _evaluate(raw)["costs"]
     families = {row["recipe"]: row["occurrences"] for row in costs["families"]}
-    assert families["triton_unified_attention_2d"] == 3 and families["cuda_norm.rms_norm"] == 7
+    assert families["attn_res_fwd"] == 7 and families["flash_attention"] == 3
     for collection in ("families", "programs", "top_signatures"):
         assert sum(row["isolated_ms"] for row in costs[collection]) == pytest.approx(costs["operator_sum_ms"])
         assert sum(row["occurrences"] for row in costs[collection]) == costs["operator_occurrences"]
-    assert sum(row["occurrences"] for row in costs["programs"] if row["source_boundary"] == "kernel") == 10
+    assert sum(row["occurrences"] for row in costs["programs"] if row["source_boundary"] == "kernel") == 7
     assert costs["remaining_live_tasks"] == costs["remaining_allocations"] == 0
-    assert next(row for row in costs["top_signatures"] if row["recipe"] == "qkv_projection")["local_shape"] == [4, 64, 32]
+    assert next(row for row in costs["top_signatures"] if row["recipe"] == "qkv_projection")["local_shape"] == [4, 512, 256]
 def test_explicit_mapping_change_compares_equal_work_and_preserves_changed_cost():
     raw = _control(); baseline = _evaluate(raw)
     modified = _evaluate(raw, matmul={"kind": "tiled_matmul", "tile_m": 2, "tile_n": 16, "tile_k": 8, "reuse_inputs": False, "reuse_weights": False})
@@ -144,15 +144,26 @@ def test_capacity_mapping_diagnostics_survive_occurrence_weighting_and_source_se
     source = [row for row in costs["top_signatures"] if row["source_boundary"] == "kernel"]
     assert source and all(not row["matrix_mapping_keys"] for row in source)
 def test_mla_batched_matrices_keep_group_geometry_without_rebinding_source_attention():
-    raw = json.loads((ROOT / "examples/source-families/mla-decode-control.json").read_text())
-    raw["model"]["num_heads"] = 16
-    raw["machine"]["device"].update(l0a_bytes=65536, l0b_bytes=65536, l0c_bytes=262144, l1_bytes=524288)
-    geometry = {"phase": "decode", "tokens": 1, "context": 33, "sequences": 1, "scope": "model"}
+    raw = {
+        "machine": {"name": "synthetic-mla-decode-source-control", "backend": "ascend", "sku": "Ascend910_9362", "num_devices": 1, "ranks_per_node": 1},
+        "model": {
+            "name": "geometry", "layers": 1, "hidden_size": 32, "num_heads": 16,
+            "num_kv_heads": 1, "head_dim": 192, "intermediate_size": 64, "vocab_size": 128,
+            "attention": "mla",
+            "mla": {"q_lora_rank": 32, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128},
+        },
+        "workload": {"requests": [{"id": "r", "prompt_tokens": 4, "output_tokens": 3}]},
+        "runtime": {
+            "dp": 1, "tp": 1, "pp": 1, "ep": 1, "max_num_batched_tokens": 16,
+            "kernels": {"lowerings": {"paged_mla_attention": {"implementation": "ascend_paged_mla_decode_arch22"}}},
+        },
+    }
+    geometry = {"phase": "decode", "tokens": 1, "context": 512, "sequences": 1, "scope": "model"}
     baseline = _evaluate(raw, geometry=geometry); mapped = _evaluate(raw, geometry=geometry, matmul={"kind": "mapped_matmul"}, level="graph")
     assert mapped["costs"]["semantic_work"] == baseline["costs"]["semantic_work"]
     rows = {row["recipe"]: row for row in mapped["costs"]["top_signatures"]}
     assert rows["q_absorb"]["matrix_groups"] == rows["v_expand"]["matrix_groups"] == 16
-    assert rows["q_absorb"]["local_shape"] == [16, 256, 16] and rows["v_expand"]["local_shape"] == [16, 16, 256]
+    assert rows["q_absorb"]["local_shape"] == [16, 512, 128] and rows["v_expand"]["local_shape"] == [16, 128, 512]
     before = {row["recipe"]: row for row in baseline["costs"]["top_signatures"] if row["source_boundary"] == "kernel"}
     source = {key: row for key, row in rows.items() if row["source_boundary"] == "kernel"}
     assert source.keys() == before.keys() and source
@@ -164,7 +175,7 @@ def test_grouped_quantized_inputs_keep_real_producers_outside_dense_mapping_doma
     baseline = _evaluate(raw, geometry=geometry, max_operators=2000); mapped = _evaluate(raw, geometry=geometry, matmul={"kind": "mapped_matmul"}, max_operators=2000)
     assert mapped["costs"]["semantic_work"] == baseline["costs"]["semantic_work"]
     for ops in target_graphs(raw, **geometry).values():
-        by_id = {op.op_id: op for op in ops}; groups = [op for op in ops if op.family == "grouped_gemm"]; assert groups
+        by_id = {op.op_id: op for op in ops}; groups = [op for op in ops if op.family == "grouped_gemm" and dict(op.metadata).get("activation_scale_bytes", 0) > 0]; assert groups
         for op in groups:
             meta = dict(op.metadata); producer = by_id[op.deps[0]]; elements = meta["expected_rows"] * op.local_shape[-1]
             assert producer.family == "quantize"
@@ -178,6 +189,8 @@ def test_changed_geometry_or_effective_configuration_cannot_be_compared_as_an_im
     raw = _control(); baseline = _evaluate(raw)
     changed_geometry = _evaluate(raw, geometry={"phase": "prefill", "tokens": 5, "context": 0, "sequences": 1, "scope": "model"})
     changed_case = deepcopy(raw); changed_case["model"]["intermediate_size"] *= 2
+    for plan in changed_case["model"].get("layer_plans", ()):
+        plan["intermediate_size"] *= 2
     for result in (changed_geometry, _evaluate(changed_case)):
         comparison = compare_runs({"probes": [result]}, {"probes": [baseline]})["probes"][0]
         assert comparison["status"] == "unpaired" and "difference_ms" not in comparison

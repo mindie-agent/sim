@@ -212,25 +212,34 @@ def test_pd_framing_and_switch_capacity_are_one_physical_transmission(nested):
     assert result["requests"][0]["finish_ms"] == 5 + 1 + 640 / 64
     assert (execution["handoff_bytes"], execution["connector"]["wire_bytes"], execution["connector"]["transactions"]) == (384, 640, 2)
     assert all(execution["serviced"][f"{pool}:memory@r0:s0"] == 384 for pool in ("prefill", "decode"))
-    transfer = next(event for event in result["events"] if event["task"] == "pd:r:wire")
-    assert (transfer["start_ms"], transfer["end_ms"]) == (4, 14)
+    transfers = [event for event in result["events"] if event["task"].startswith("pd:r:transport:") and event["task"].endswith(":service")]
+    assert transfers and (min(event["start_ms"] for event in transfers), max(event["end_ms"] for event in transfers)) == (4, 14)
 def test_pd_full_duplex_endpoint_capacity_is_shared_across_ready_handoffs():
     raw = _physical_case(semantics="per_port")
     raw["workload"]["requests"] = [{"id": name, "prompt_tokens": 3, "output_tokens": 3} for name in ("a", "b")]
     for pool in raw["pools"].values():
         pool["runtime"]["dp"], pool["machine"]["num_devices"] = 2, 2; pool["machine"]["links"][0]["members"] = [0, 1]
     result = predict_pd(raw, lower=linear_work); service = result["execution"]["serviced"]
-    assert [row["finish_ms"] for row in result["requests"]] == [11, 11]
-    assert (service["pd:link:handoff:tx:port0"], service["pd:link:handoff:rx:port1"]) == (768, 768)
-    assert service["pd:link:handoff:rx:port0"] == service["pd:link:handoff:tx:port1"] == 0
+    assert [row["finish_ms"] for row in result["requests"]] == [8, 8]
+    assert (service["pd:link:handoff:tx:port0"], service["pd:link:handoff:tx:port1"], service["pd:link:handoff:rx:port2"], service["pd:link:handoff:rx:port3"]) == (384, 384, 384, 384)
+    assert service["pd:link:handoff:rx:port0"] == service["pd:link:handoff:rx:port1"] == service["pd:link:handoff:tx:port2"] == service["pd:link:handoff:tx:port3"] == 0
     assert result["execution"]["connector"]["wire_bytes"] == 768
+    shared = _physical_case(semantics="per_port")
+    shared["workload"]["requests"] = [{"id": name, "prompt_tokens": 3, "output_tokens": 3} for name in ("a", "b")]
+    for pool in shared["pools"].values():
+        pool["runtime"]["max_num_seqs"] = 2
+    shared_res = predict_pd(shared, lower=linear_work); shared_svc = shared_res["execution"]["serviced"]
+    assert [row["finish_ms"] for row in shared_res["requests"]] == [16, 16]
+    assert (shared_svc["pd:link:handoff:tx:port0"], shared_svc["pd:link:handoff:rx:port1"]) == (768, 768)
+    assert shared_svc["pd:link:handoff:rx:port0"] == shared_svc["pd:link:handoff:tx:port1"] == 0
+    assert shared_res["execution"]["connector"]["wire_bytes"] == 768
 def test_pd_destination_layout_keeps_each_representative_stage_memory_once():
     raw = _physical_case(transaction_bytes=256, protocol_overhead_bytes=64); destination = case(tp=2, pp=2)
     raw["pools"]["decode"] = {key: deepcopy(destination[key]) for key in ("machine", "runtime")}
     result = predict_pd(raw, lower=linear_work); service = result["execution"]["serviced"]
     assert result["execution"]["handoff_bytes"] == 384
     assert (service["prefill:memory@r0:s0"], service["decode:memory@r0:s0"], service["decode:memory@r0:s1"]) == (384, 96, 96)
-    assert result["execution"]["connector"]["wire_bytes"] == 640
+    assert (result["execution"]["connector"]["wire_bytes"], result["execution"]["connector"]["transactions"]) == (3840, 12)
 def test_pd_framed_handoff_waits_for_source_readiness_and_destination_admission():
     raw = _physical_case(transaction_bytes=256, protocol_overhead_bytes=64, switch_hops=2, switch_hop_latency_us=500)
     raw["workload"]["requests"] = [{"id": name, "prompt_tokens": 3, "output_tokens": 3, "arrival_ms": 7} for name in ("a", "b")]
@@ -238,21 +247,28 @@ def test_pd_framed_handoff_waits_for_source_readiness_and_destination_admission(
     result = predict_pd(raw, lower=linear_work)
     assert [row["first_token_abs_ms"] for row in result["requests"]] == [10, 13]
     assert [row["finish_ms"] for row in result["requests"]] == [18, 26]
-    transfers = {event["task"]: event for event in result["events"] if event["task"] in {"pd:a:wire", "pd:b:wire"}}
-    assert (transfers["pd:a:wire"]["start_ms"], transfers["pd:b:wire"]["start_ms"]) == (11, 19)
+    starts = {req: min(event["start_ms"] for event in result["events"] if event["task"].startswith(f"pd:{req}:transport:") and event["task"].endswith(":service")) for req in ("a", "b")}
+    assert (starts["a"], starts["b"]) == (11, 19)
     assert result["execution"]["connector"]["wire_bytes"] == 1280
     assert all(value == 0 for pool in result["memory"].values() for stage in pool["live_cache_bytes_per_replica_stage"] for value in stage)
 def test_pd_handoff_pairs_replicated_heads_with_every_token_shard():
     raw = pd_model_case(4, 2); bind_pd_pool(raw, "prefill", (0, 1, 2, 3), tp=4, cp=2); bind_pd_pool(raw, "decode", (4,), tp=1, cp=1)
+    for pool in raw["pools"].values():
+        pool["runtime"]["kv_block_size"] = 2
     transfers = _handoff(raw)[1]
-    assert len(transfers) == 4 and sum(row["payload_bytes"] for row in transfers) == pytest.approx(512.0)
-    assert all(row["payload_bytes"] == pytest.approx(128.0) for row in transfers)
-    assert {(row["source_rank"], tuple(row["source_token_span"])) for row in transfers} == {(0, (0, 2)), (1, (2, 4)), (2, (0, 2)), (3, (2, 4))}
+    assert len(transfers) == 8 and sum(row["payload_bytes"] for row in transfers) == pytest.approx(512.0)
+    assert all(row["payload_bytes"] == pytest.approx(64.0) for row in transfers)
+    assert {(row["source_rank"], tuple(row["source_token_span"])) for row in transfers} == {
+        (0, (0, 1)), (0, (1, 2)), (1, (2, 3)), (1, (3, 4)),
+        (2, (0, 1)), (2, (1, 2)), (3, (2, 3)), (3, (3, 4)),
+    }
     assert {(row["source_rank"], tuple(row["source_heads"])) for row in transfers} == {(0, (0, 1)), (1, (0, 1)), (2, (1, 2)), (3, (1, 2))}
 def test_pd_handoff_weights_destination_shards_by_exact_token_rows():
     raw = pd_model_case(5, 1); bind_pd_pool(raw, "prefill", (0,), tp=1, cp=1); bind_pd_pool(raw, "decode", (1, 2), tp=2, cp=2)
+    for pool in raw["pools"].values():
+        pool["runtime"]["kv_block_size"] = 2
     transfers = _handoff(raw)[1]
-    assert {(row["destination_rank"], tuple(row["destination_token_span"]), row["payload_bytes"]) for row in transfers} == {(1, (0, 2), 128.0), (2, (2, 5), 192.0)}
+    assert {(row["destination_rank"], tuple(row["destination_token_span"]), row["payload_bytes"]) for row in transfers} == {(1, (0, 2), 128.0), (1, (4, 5), 64.0), (2, (2, 4), 128.0)}
     assert sum(row["payload_bytes"] for row in transfers) == pytest.approx(320.0)
 def test_public_baseline_round_trips_the_occurrence_dag():
     raw = case(prompt=4, output=2); raw["model"]["layers"] = 1
@@ -263,6 +279,8 @@ def test_pd_handoff_clips_the_window_tail_before_charging():
     raw = pd_model_case(10, 1)
     raw["model"]["layer_plans"] = [{"index": 0, "attention": "gqa", "ffn": "dense", "window": 4, "num_heads": 4, "num_kv_heads": 1, "head_dim": 16, "intermediate_size": 64}]
     bind_pd_pool(raw, "prefill", (2,), tp=1, cp=1); bind_pd_pool(raw, "decode", (0, 1), tp=2, cp=2)
+    for pool in raw["pools"].values():
+        pool["runtime"]["kv_block_size"] = 5
     transfers = _handoff(raw)[1]
     assert len(transfers) == 1
     row = transfers[0]
@@ -278,6 +296,7 @@ def test_pd_dense_mla_window_owns_only_the_intersected_source_rows():
     raw = _composed_pd_case(10, (("prefill", (0, 1)), ("decode", (2, 3))))
     for pool in ("prefill", "decode"):
         raw["pools"][pool]["runtime"]["parallel"].update(tp=2, cp=2, dcp=2, cp_plan="dcp")
+        raw["pools"][pool]["runtime"]["kv_block_size"] = 5
     raw["model"]["layer_plans"][0].update(num_kv_heads=0, window=8)
     rows = [(row["source_rank"], tuple(row["source_token_span"]), tuple(row["destination_token_span"]), row["payload_bytes"]) for row in _handoff(raw)[1] if row["component"] == "mla_kv" and row["destination_rank"] == 3]
     # Decode rank 3 owns [5, 10) (five 1,152 B rows); prefill rank 0 owns the
@@ -592,7 +611,7 @@ def test_b1_screen_never_runs_the_graph(monkeypatch):
 def test_finalist_top_k_ranks_the_global_screen():
     rows = list(sweep_topologies_iter(_stream_case(), two_stage=True, finalist_top_k=1, num_devices_grid=(1, 2), **SWEEP))
     screened = [row for row in rows if row["evaluation_stage"] == "b1_screen"]; full = [row for row in rows if row["evaluation_stage"] == "full_sla"]
-    best = min(screened, key=lambda row: (row["operator_sum_screen_ms"], row["candidate_id"]))
+    best = min(screened, key=sweep_engine.finalist_rank_key)
     assert len(screened) >= 2 and len(full) == 1 and full[0]["candidate_id"] == best["candidate_id"] and full[0]["graph_step_ms"] == pytest.approx(full[0]["step_ms_at_b1"])
 def test_sweep_cli_exposes_the_bounded_flags(tmp_path):
     args = parser().parse_args(["sweep", "case.json", "--two-stage", "--finalist-top-k", "3", "--checkpoint-jsonl", str(tmp_path / "c.jsonl"), "--isolate-workers", "--resume"])

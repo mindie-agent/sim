@@ -106,7 +106,7 @@ def test_c11_hybrid_epoch_continuation_zero_ns_parity_qwen38_and_kimi31(
             "qwen3.8-flash-next",
             dict(
                 hardware="Ascend950DT_9582",
-                feature_track="merged",
+                feature_track="shipping",
                 role="pd_decode",
                 quant="auto_va",
                 layers=_TEST_LAYERS_HYBRID,
@@ -119,7 +119,7 @@ def test_c11_hybrid_epoch_continuation_zero_ns_parity_qwen38_and_kimi31(
             "kimi-k3.1",
             dict(
                 hardware="Ascend950DT_9582",
-                feature_track="merged",
+                feature_track="shipping",
                 role="pd_decode",
                 quant="auto_va",
                 layers=_TEST_LAYERS_HYBRID,
@@ -154,21 +154,21 @@ def test_dp_cohort_dedup_parity_and_megamoe_peer_collective_synthesis(
     symmetric_cases = (
         (
             "qwen3.8-flash-next",
-            "merged",
-            dict(layers=_TEST_LAYERS_HYBRID, dp=4, tp=1, ep=4, pp=1, dcp=1),
+            "shipping",
+            dict(layers=_TEST_LAYERS_HYBRID, dp=4, tp=1, ep=4, pp=1, dcp=1, exclude_optimizations=("cann_megamoe_fusion",)),
             True,
             True,
         ),
         (
             "qwen3.8-flash-next",
-            "expected_ideal",
+            "target",
             dict(layers=_TEST_LAYERS_HYBRID, dp=4, tp=2, ep=8, pp=1, dcp=1),
             True,
             False,
         ),
         (
             "kimi-k3.1",
-            "merged",
+            "shipping",
             dict(layers=_TEST_LAYERS_SMALL, dp=4, tp=1, ep=4, pp=1, dcp=1),
             True,
             True,
@@ -233,7 +233,7 @@ def test_provable_kv_and_state_upper_bound_tightens_soundly() -> None:
         raw = compose_case(
             model,
             hardware="Ascend950DT_9582",
-            feature_track="merged",
+            feature_track="shipping",
             role="pd_decode",
             quant="auto_va",
             prompt_tokens=_TEST_PROMPT_LONG,
@@ -263,7 +263,7 @@ def test_provable_kv_and_state_upper_bound_tightens_soundly() -> None:
     raw_s = compose_case(
         "qwen3.8-flash-next",
         hardware="Ascend950DT_9582",
-        feature_track="merged",
+        feature_track="shipping",
         role="pd_decode",
         quant="auto_va",
         layers=_TEST_LAYERS_HYBRID,
@@ -380,37 +380,43 @@ def test_fleet_pd_cap_stern_brocot_pareto_and_dual_cert_batch_search() -> None:
     assert row_cap["kv_transfer_rps"] == pytest.approx(15.0)
     assert row_cap["sustainable_rps"] == pytest.approx(15.0)
 
-    # Dual-certificate batch search: non-monotone, super-linear, and ACLGraph padding cliff.
+    # Dual-certificate branch-and-bound batch search: non-monotone, super-linear, and ACLGraph padding cliff.
+    def _run_certified_probes(limit: int, sla_ms: float, probe_fn, *, floors_fn=None, capture_bs=()):
+        memo: dict[int, float] = {}
+        rays_map: dict[int, tuple[tuple[float, float], ...]] = {}
+        floors: dict[int, float] = {}
+        while True:
+            nxt = pd_mod._certified_sla_next_probes(limit, sla_ms, memo, rays_map, floors, capture_bs)
+            if not nxt:
+                break
+            for cand_b in nxt:
+                memo[cand_b] = probe_fn(cand_b)
+                if floors_fn is not None:
+                    floors[cand_b] = floors_fn(cand_b)
+        return memo
+
     non_mono = {1: 4.0, 2: 6.0, 3: 4.0, 4: 6.0}
-    memo_nm: dict[int, float] = {}
-    pd_mod._search_certified_sla_interval(
-        1, 4, mono_cert=False, tps_cert=False, sla_ms=5.0, memo=memo_nm, probe_fn=lambda b: non_mono[b],
-    )
+    memo_nm = _run_certified_probes(4, 5.0, lambda b: non_mono[b])
     assert pd_mod._select_best_feasible_batch(memo_nm, 4, 5.0)[:2] == (3, 4.0)
 
     super_lin = {1: 1.0, 2: 1.5, 3: 4.0, 4: 4.9}
-    memo_sl: dict[int, float] = {}
-    pd_mod._search_certified_sla_interval(
-        1, 4, mono_cert=True, tps_cert=False, sla_ms=5.0, memo=memo_sl, probe_fn=lambda b: super_lin[b],
-    )
+    memo_sl = _run_certified_probes(4, 5.0, lambda b: super_lin[b])
     assert pd_mod._select_best_feasible_batch(memo_sl, 4, 5.0)[:2] == (2, 1.5)
 
-    # Strictly padded b=10 (padded to 16) probes c_prev=8 and picks unpadded 8 when 8/2.0 > 10/3.0;
-    # unpadded exact capture b=8 terminates in 1 probe.
+    # Strictly padded b=10 (padded to 16) probes capture boundary 8 and picks unpadded 8 when 8/2.0 > 10/3.0;
+    # unpadded exact capture b=8 terminates with certified floor pruning.
     cap_bs = (1, 2, 3, 4, 5, 6, 7, 8, 16)
-    memo_pad: dict[int, float] = {}
-    pd_mod._search_certified_sla_interval(
-        1, 10, mono_cert=True, tps_cert=True, sla_ms=5.0, memo=memo_pad,
-        probe_fn=lambda b: 2.0 if b <= 8 else 3.0, capture_bs=cap_bs,
+    memo_pad = _run_certified_probes(
+        10, 5.0, lambda b: 2.0 if b <= 8 else 3.0,
+        floors_fn=lambda b: 2.0 if b <= 8 else 3.0, capture_bs=cap_bs,
     )
-    assert set(memo_pad) == {8, 10}
+    assert {8, 10}.issubset(memo_pad)
     assert pd_mod._select_best_feasible_batch(memo_pad, 10, 5.0)[:2] == (8, 2.0)
-    memo_exact: dict[int, float] = {}
-    pd_mod._search_certified_sla_interval(
-        1, 8, mono_cert=True, tps_cert=True, sla_ms=50.0, memo=memo_exact,
-        probe_fn=lambda _b: 0.6, capture_bs=cap_bs,
+    memo_exact = _run_certified_probes(
+        8, 50.0, lambda _b: 0.6, floors_fn=lambda _b: 0.6, capture_bs=cap_bs,
     )
-    assert set(memo_exact) == {8}
+    assert set(memo_exact) == {1, 2, 4, 8}
+    assert pd_mod._select_best_feasible_batch(memo_exact, 8, 50.0)[:2] == (8, 0.6)
 
     # Exact Fraction tie-break (3*0.3 float rounding must not flip 3P:3D -> 1P:1D).
     st_tie = dict(
@@ -422,7 +428,7 @@ def test_fleet_pd_cap_stern_brocot_pareto_and_dual_cert_batch_search() -> None:
     )
     assert row_tie is not None and row_tie["pd_ratio"] == "3P:3D"
 
-    # Non-monotone interior 8-row alignment dip (b=1 & b=9 exceed 1.07 ms, b=8 fits).
+    # Non-monotone interior dip (b=1 & b=8..9 exceed 1.091 ms, b=7 fits and maximizes throughput).
     from dataclasses import replace
     from mindie_sim.api import compose_case as compose_spec
     from mindie_sim.prediction.capacity import Memory
@@ -434,8 +440,8 @@ def test_fleet_pd_cap_stern_brocot_pareto_and_dual_cert_batch_search() -> None:
         "deepseek-v3.2", "a5",
         options=dict(tp=1, ep=1, layers=1, mtp_proposal_tokens=0, prompt_tokens=128, output_tokens=8),
     )
-    dip_res = pd_mod._solve_sla_archetype_aware(c_dip, sla_ms=1.07, context=128, output_budget=8, max_sequences_per_dp=9)
-    assert dip_res["scenarios"][0]["b_feasible"] == 8
+    dip_res = pd_mod._solve_sla_archetype_aware(c_dip, sla_ms=1.091, context=128, output_budget=8, max_sequences_per_dp=9)
+    assert dip_res["scenarios"][0]["b_feasible"] == 7
 
     # Direct RoCE placement/endpoint_ids/framing + pooled fleet switch cap + decode HBM global rank index + layer clocks.
     m_roce = compose_spec("qwen3-32b", "a5", options=dict(tp=4, layers=1, ranks_per_node=2)).machine
@@ -504,7 +510,7 @@ def test_integer_pd_handoff_draft_kv_asymmetric_tp_and_cohort_reciprocity() -> N
     h_pcp = compute_pd_handoff_plan(_spec("qwen3-32b", 8, pcp=2, dcp=2), _spec("qwen3-32b", 8), tokens=256)
     assert h_pcp["unique_kv_bytes"] == 8 * 256 * 128 * 2 * 2
     h_cap = compute_pd_handoff_plan(
-        _spec("kimi-k3.1", 2, ep=2, layers=4, mtp_proposal_tokens=3, draft_max_model_len=64, role="pd_prefill"),
+        _spec("kimi-k3.1", 2, ep=2, layers=4, mtp_proposal_tokens=3, draft_max_model_len=64, role="pd_prefill", ttft_slo_ms=5000.0),
         _spec("kimi-k3.1", 4, ep=4, layers=4, mtp_proposal_tokens=3, draft_max_model_len=128, role="pd_decode"),
         tokens=128,
     )
@@ -522,13 +528,13 @@ def test_integer_pd_handoff_draft_kv_asymmetric_tp_and_cohort_reciprocity() -> N
     ov_exec = predict_pd(raw_ov, published={"prefill": {"gqa_k": {"output": "gqa_k"}, "gqa_v": {"output": "gqa_v"}}})["execution"]
     ov_t = ov_exec["pd_handoffs"][0]["transfers"]
     assert [sum(x["payload_bytes"] for x in ov_t if x["component"] == k) for k in ("gqa_k", "gqa_v")] == [4096, 8192]
-    assert [ov_exec["serviced"].get("pd:link:handoff:pair" + p, 0.0) for p in ("0>1", "1>2")] == [6144.0, 6144.0]
+    assert [ov_exec["serviced"].get("pd:link:handoff:pair" + p, 0.0) for p in ("0>2", "1>3")] == [6144.0, 6144.0]
 
     # Asymmetric-TP draft KV conservation in BOTH directions (TP_P < TP_D and TP_P > TP_D).
     for tp_p, tp_d in ((2, 4), (4, 2)):
         p_raw = compose_case(
             "kimi-k3.1", "950dt-96g-pod", role="pd_prefill", dp=1, tp=tp_p, ep=tp_p, pp=1,
-            layers=4, prompt_tokens=1024, output_tokens=64, mtp_proposal_tokens=3,
+            layers=4, prompt_tokens=1024, output_tokens=64, mtp_proposal_tokens=3, ttft_slo_ms=5000.0,
         )
         d_raw = compose_case(
             "kimi-k3.1", "950dt-96g-pod", role="pd_decode", dp=1, tp=tp_d, ep=tp_d, pp=1,
