@@ -140,8 +140,10 @@ class _EngineSubmitMixin:
         if needs_hbm_split and task.start_callback is None:
             task.start_callback = _hbm_bus_split_start_hook
         tasks[event.sequence] = task
-        if self.state_ledger is not None and after:
-            self.state_ledger._note_event_predecessors(event.sequence, after)
+        ledger_state = self.state_ledger
+        if (ledger_state is not None and after
+                and (ledger_state._event_commits or ledger_state._causal_stack)):
+            ledger_state._inherit_event_commits(event.sequence, after, at=now)
         if deliv_tuple:
             self._delivery_live += 1
         if prepared.hbm_accounting:
@@ -500,14 +502,25 @@ class _EngineSubmitMixin:
     def resolve(self, event: Event) -> None:
         del self._promises[event.sequence]
         event.time = self.now
-        if self.state_ledger is not None:
-            self.state_ledger._propagate_event_commits(event.sequence, at=event.time)
+        ledger_state = self.state_ledger
+        saved_waiters = (
+            tuple(event._waiters)
+            if (ledger_state is not None and event._waiters
+                and (ledger_state._event_commits or ledger_state._causal_stack
+                     or event._callbacks))
+            else ()
+        )
         self._wake(event)
         callbacks = event._callbacks
         if callbacks:
             event._callbacks = None
             for callback in callbacks:
                 callback(event)
+        if (ledger_state is not None
+                and (ledger_state._event_commits or ledger_state._causal_stack)):
+            ledger_state._propagate_to_waiters(
+                event.sequence, saved_waiters, at=event.time,
+            )
 
     def on_complete(
         self, event: Event, callback: Callable[[Event], None], *,

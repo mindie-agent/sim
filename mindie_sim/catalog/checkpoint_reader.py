@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import codecs
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
 from functools import lru_cache
@@ -56,6 +56,7 @@ CURATED_DATA_FILENAME = "curated_checkpoints.json"
 DEFAULT_STREAM_CHUNK_BYTES = 65536
 MAX_SINGLE_MEMBER_CHARS = 16 * 1024 * 1024
 MAX_CONFIG_FILE_BYTES = 16 * 1024 * 1024
+QUANT_MAP_CACHE_MAXSIZE = 64
 
 MXFP_GROUP_SIZE = 32
 MXFP_SCALE_PACK = 2
@@ -1985,8 +1986,57 @@ def resolve_checkpoint_tensor_tag(
     return None
 
 
-def infer_arch_flags_from_patterns(patterns: Sequence[str]) -> tuple[bool, bool, bool]:
-    """Detect MLA / KDA / GDN architecture presence via exact path components."""
+_VISION_PARTS = frozenset({"vision_tower", "vision_model", "visual"})
+_PROJECTOR_PARTS = frozenset({
+    "mm_projector", "multi_modal_projector", "merger", "aligner",
+    "patch_merge_mlp", "vit_large_projector", "deepstack_merger_list",
+})
+_EMBED_PARTS = frozenset({"embed_tokens", "word_embeddings"})
+_MHC_PARTS = frozenset({
+    "attn_hyper_connection", "mlp_hyper_connection", "hyper_connection_mixer",
+    "attn_hc", "ffn_hc",
+})
+_MHC_PREFIXES = ("hc_attn_", "hc_ffn_", "hc_head_")
+_PLE_PARTS = frozenset({"ple", "ple_embedding"})
+_PLE_PROJ_LAST = frozenset({"key_proj", "value_proj"})
+_PLE_TABLE_PARTS = frozenset({"ngram_embedding", "ple_embedding"})
+_CONV_LAST_PARTS = frozenset({"conv1d", "q_conv1d", "k_conv1d", "v_conv1d"})
+_ROUTER_LAST_PARTS = frozenset({"shared_expert_gate", "router_bias", "e_score_correction_bias", "gate"})
+_LATENT_MOE_LAST = frozenset({"routed_expert_down_proj", "routed_expert_up_proj"})
+_SHARED_EXPERT_PARTS = frozenset({"shared_experts", "shared_expert", "share_expert"})
+_MOE_EXPERT_LAST_PARTS = frozenset({"gate_proj", "up_proj", "down_proj", "gate_up_proj", "w1", "w2", "w3"})
+_GDN_BETA_ALPHA_LAST = frozenset({"in_proj_a", "in_proj_b", "in_proj_ba"})
+_INDEXER_LAST_PARTS = frozenset({"index_q_proj", "index_k_proj", "qkv_indexer_proj"})
+_INDEXER_WK_LAST = frozenset({"wk", "index_k_proj"})
+_INDEXER_WQ_LAST = frozenset({"wq_b", "index_qk_proj", "index_q_proj", "wq"})
+_ATTN_PARENT_PARTS = frozenset({"self_attn", "attn"})
+_QKV_LAST_PARTS = frozenset({"q_proj", "k_proj", "v_proj", "qkv_proj"})
+_MLP_PARENT_PARTS = frozenset({"mlp", "ffn"})
+_MLP_GATE_LAST = frozenset({"gate_proj", "w1"})
+_MLP_UP_LAST = frozenset({"up_proj", "w3"})
+_MLP_DOWN_LAST = frozenset({"down_proj", "w2"})
+_EXACT_ATTN_MLP_MAP: dict[str, str] = {
+    "kv_b_proj": "mla_absorb",
+    "kv_a_proj_with_mqa": "mla.kv_a",
+    "wkv": "mla.kv_a",
+    "q_a_proj": "mla.q_a",
+    "wq_a": "mla.q_a",
+    "q_b_proj": "mla.q_b",
+    "wq_b": "mla.q_b",
+    "wo_b": "mla.o",
+    "f_a_proj": "kda.f_a",
+    "f_b_proj": "kda.f_b",
+    "b_proj": "kda.b",
+}
+
+_ARCH_FLAGS_ID_CACHE: OrderedDict[int, tuple[CheckpointQuantMap, tuple[bool, bool, bool]]] = OrderedDict()
+_QUANT_SPEC_ID_CACHE: OrderedDict[
+    tuple[int, str, int, str, str, str], tuple[CheckpointQuantMap, QuantSpec]
+] = OrderedDict()
+
+
+@lru_cache(maxsize=QUANT_MAP_CACHE_MAXSIZE)
+def _infer_arch_flags_cached(patterns: tuple[str, ...]) -> tuple[bool, bool, bool]:
     has_mla = False
     has_kda = False
     has_gdn = False
@@ -2003,6 +2053,29 @@ def infer_arch_flags_from_patterns(patterns: Sequence[str]) -> tuple[bool, bool,
     return has_mla, has_kda, has_gdn
 
 
+def _arch_flags_for_checkpoint_map(qmap: CheckpointQuantMap) -> tuple[bool, bool, bool]:
+    """O(1)-amortized MLA / KDA / GDN architecture flags for a frozen CheckpointQuantMap."""
+    key = id(qmap)
+    cached = _ARCH_FLAGS_ID_CACHE.get(key)
+    if cached is not None and cached[0] is qmap:
+        return cached[1]
+    flags = _infer_arch_flags_cached(tuple(r.pattern for r in qmap.rules))
+    _ARCH_FLAGS_ID_CACHE[key] = (qmap, flags)
+    _ARCH_FLAGS_ID_CACHE.move_to_end(key)
+    while len(_ARCH_FLAGS_ID_CACHE) > QUANT_MAP_CACHE_MAXSIZE:
+        _ARCH_FLAGS_ID_CACHE.popitem(last=False)
+    return flags
+
+
+def infer_arch_flags_from_patterns(patterns: Sequence[str]) -> tuple[bool, bool, bool]:
+    """Detect MLA / KDA / GDN architecture presence via exact path components."""
+    tup = patterns if type(patterns) is tuple else tuple(patterns)
+    try:
+        return _infer_arch_flags_cached(tup)
+    except TypeError:
+        return _infer_arch_flags_cached(tuple(str(pat) for pat in tup))
+
+
 def classify_tensor_categories(
     tensor_name: str, *, has_mla: bool, has_kda: bool,
 ) -> tuple[str, ...]:
@@ -2014,50 +2087,50 @@ def classify_tensor_categories(
 
     if "mtp" in parts or "mtp_block" in parts:
         return ("mtp",)
-    if any(lower.startswith(pref) for pref in _VISION_PREFIXES) or "vision_tower" in parts or "vision_model" in parts or "visual" in parts:
+    if lower.startswith(_VISION_PREFIXES) or not parts.isdisjoint(_VISION_PARTS):
         return ("vision",)
-    if any(p in parts for p in ("mm_projector", "multi_modal_projector", "merger", "aligner", "patch_merge_mlp", "vit_large_projector", "deepstack_merger_list")):
+    if not parts.isdisjoint(_PROJECTOR_PARTS):
         return ("projector",)
     if "lm_head" in parts or last == "head":
         return ("lm_head",)
-    if "embed_tokens" in parts or "word_embeddings" in parts or last == "embed" or ({"engram", "embed"} <= parts):
+    if not parts.isdisjoint(_EMBED_PARTS) or last == "embed" or ("engram" in parts and "embed" in parts):
         return ("embedding",)
     if last in _ATTN_RES_PROJ_COMPONENTS or last.endswith("_res_proj"):
         return ("attn_res_proj",)
-    if any(t in parts for t in ("attn_hyper_connection", "mlp_hyper_connection", "hyper_connection_mixer", "attn_hc", "ffn_hc")) or last.startswith(("hc_attn_", "hc_ffn_", "hc_head_")):
+    if not parts.isdisjoint(_MHC_PARTS) or last.startswith(_MHC_PREFIXES):
         return ("mhc",)
-    if "ple" in parts or "ple_embedding" in parts:
-        if last in {"key_proj", "value_proj"}:
+    if not parts.isdisjoint(_PLE_PARTS):
+        if last in _PLE_PROJ_LAST:
             return ("ple_proj", "ple")
-        if "ngram_embedding" in parts or "ple_embedding" in parts:
+        if not parts.isdisjoint(_PLE_TABLE_PARTS):
             return ("ple_table", "ple")
         return ("ple",)
-    if last in {"conv1d", "q_conv1d", "k_conv1d", "v_conv1d"}:
+    if last in _CONV_LAST_PARTS:
         return ("conv_weight_f32",) if has_kda else ("conv_weight_bf16",)
     if last in _NORM_EXACT_COMPONENTS or last.endswith("layernorm") or last.endswith("_norm"):
         return ("norm",)
-    if last in {"shared_expert_gate", "router_bias", "e_score_correction_bias"} or last == "gate" or "router" in parts:
+    if last in _ROUTER_LAST_PARTS or "router" in parts:
         return ("router",)
-    if last in {"routed_expert_down_proj", "routed_expert_up_proj"}:
+    if last in _LATENT_MOE_LAST:
         return ("latent_moe",)
     if "experts" in parts:
         return ("routed_expert",)
-    if "shared_experts" in parts or "shared_expert" in parts or "share_expert" in parts:
+    if not parts.isdisjoint(_SHARED_EXPERT_PARTS):
         return ("shared_expert",)
-    if "moe" in parts and last in {"gate_proj", "up_proj", "down_proj", "gate_up_proj", "w1", "w2", "w3"}:
+    if "moe" in parts and last in _MOE_EXPERT_LAST_PARTS:
         return ("routed_expert",)
     if "linear_attn" in parts:
         if last == "out_proj":
             return ("gdn.o", "gdn")
-        if last in {"in_proj_a", "in_proj_b", "in_proj_ba"}:
+        if last in _GDN_BETA_ALPHA_LAST:
             return ("gdn.beta_alpha", "gdn")
         return ("gdn.qkvz", "gdn")
-    if "indexer" in parts or last in {"index_q_proj", "index_k_proj", "qkv_indexer_proj"}:
+    if "indexer" in parts or last in _INDEXER_LAST_PARTS:
         if last == "weights_proj":
             return ("indexer.weights",)
-        if last in {"wk", "index_k_proj"}:
+        if last in _INDEXER_WK_LAST:
             return ("indexer.wk",)
-        if last in {"wq_b", "index_qk_proj", "index_q_proj", "wq"}:
+        if last in _INDEXER_WQ_LAST:
             return ("indexer_fp8", "indexer.wq")
         return ("indexer",)
     return _classify_attn_mlp_component(raw_parts, parts, last, has_mla=has_mla, has_kda=has_kda)
@@ -2072,43 +2145,31 @@ def _classify_attn_mlp_component(
     has_kda: bool,
 ) -> tuple[str, ...]:
     del raw_parts
-    exact_map = {
-        "kv_b_proj": "mla_absorb",
-        "kv_a_proj_with_mqa": "mla.kv_a",
-        "wkv": "mla.kv_a",
-        "q_a_proj": "mla.q_a",
-        "wq_a": "mla.q_a",
-        "q_b_proj": "mla.q_b",
-        "wq_b": "mla.q_b",
-        "wo_b": "mla.o",
-        "f_a_proj": "kda.f_a",
-        "f_b_proj": "kda.f_b",
-        "b_proj": "kda.b",
-    }
-    if last in exact_map:
-        return (exact_map[last],)
+    exact = _EXACT_ATTN_MLP_MAP.get(last)
+    if exact is not None:
+        return (exact,)
     if last == "g_proj":
         if has_mla and has_kda:
             return ("kda.g", "mla.g")
         return ("kda.g",) if has_kda else ("mla.g",)
-    if last == "o_proj" and ({"self_attn", "attn"} & parts):
+    if last == "o_proj" and not parts.isdisjoint(_ATTN_PARENT_PARTS):
         if has_mla and has_kda:
             return ("mla.o", "kda.o")
         if has_mla:
             return ("mla.o",)
         return ("kda.o",) if has_kda else ("attn.o",)
-    if last in {"q_proj", "k_proj", "v_proj", "qkv_proj"} and ({"self_attn", "attn"} & parts):
+    if last in _QKV_LAST_PARTS and not parts.isdisjoint(_ATTN_PARENT_PARTS):
         if has_kda:
             if last == "qkv_proj":
                 return ("kda.q", "kda.k", "kda.v")
             return ("kda.q",) if last == "q_proj" else (("kda.k",) if last == "k_proj" else ("kda.v",))
         return ("attn.qkv",)
-    if {"mlp", "ffn"} & parts:
-        if last in {"gate_proj", "w1"}:
+    if not parts.isdisjoint(_MLP_PARENT_PARTS):
+        if last in _MLP_GATE_LAST:
             return ("dense_mlp.gate",)
-        if last in {"up_proj", "w3"}:
+        if last in _MLP_UP_LAST:
             return ("dense_mlp.up",)
-        if last in {"down_proj", "w2"}:
+        if last in _MLP_DOWN_LAST:
             return ("dense_mlp.down",)
         if last == "gate_up_proj":
             return ("dense_mlp.gate", "dense_mlp.up")
@@ -2460,6 +2521,7 @@ def _quant_spec_from_hf_map(
     index_override: str,
     checkpoint_url: str,
     base_config: Mapping[str, Any] | None = None,
+    expert_count_hint: int | None = None,
 ) -> QuantSpec:
     default_rule = next((r for r in qmap.rules if r.pattern == "*"), None)
     expert_rule = next((r for r in qmap.rules if r.pattern == "*.experts.*"), None)
@@ -2502,8 +2564,12 @@ def _quant_spec_from_hf_map(
         act_pack = 1
         w_sym = True
 
+    eff_expert_hint = (
+        _extract_expert_count_hint(base_config)
+        if expert_count_hint is None else int(expert_count_hint)
+    )
     overrides, layer_overrides, extra_exclusions = _hf_layer_and_category_overrides(
-        qmap, native=native, expert_count_hint=_extract_expert_count_hint(base_config),
+        qmap, native=native, expert_count_hint=eff_expert_hint,
     )
     if expert_rule is not None and "routed_expert" not in overrides:
         exp_w = str(expert_rule.weight_dtype or "").strip().lower()
@@ -2636,28 +2702,44 @@ def _layer_quant_overrides_from_exceptions(
         }
         seen_coords: set[tuple[str, str, int]] = set()
         layer_cat_tags: dict[tuple[int, str], list[str]] = defaultdict(list)
+        cats_memo: dict[tuple[str, bool, bool], tuple[str, ...]] = {}
         for rule in qmap.rules:
             pres = rule.presence
             if pres is None or pres.scope != "target" or not pres.layer_indices or rule.pattern.endswith(".quant_type"):
                 continue
+            pat = rule.pattern
             for layer_id in pres.layer_indices:
-                coord = (pres.scope, rule.pattern, int(layer_id))
+                coord = (pres.scope, pat, int(layer_id))
                 seen_coords.add(coord)
                 eff_tag = full_exc_lookup.get(coord, rule.raw_tag)
                 l_mla = (layer_id in mla_layers) if per_layer_arch else has_mla
                 l_kda = (layer_id in kda_layers) if per_layer_arch else has_kda
-                for cat in classify_tensor_categories(rule.pattern, has_mla=l_mla, has_kda=l_kda):
-                    if cat not in _SKIP_OVERRIDE_CATS:
-                        layer_cat_tags[(int(layer_id), cat)].append(eff_tag)
+                ckey = (pat, l_mla, l_kda)
+                cats_t = cats_memo.get(ckey)
+                if cats_t is None:
+                    cats_t = tuple(
+                        cat for cat in classify_tensor_categories(pat, has_mla=l_mla, has_kda=l_kda)
+                        if cat not in _SKIP_OVERRIDE_CATS
+                    )
+                    cats_memo[ckey] = cats_t
+                for cat in cats_t:
+                    layer_cat_tags[(int(layer_id), cat)].append(eff_tag)
         for coord, exc_tag in full_exc_lookup.items():
             if coord in seen_coords:
                 continue
             _, pat, layer_id = coord
             l_mla = (layer_id in mla_layers) if per_layer_arch else has_mla
             l_kda = (layer_id in kda_layers) if per_layer_arch else has_kda
-            for cat in classify_tensor_categories(pat, has_mla=l_mla, has_kda=l_kda):
-                if cat not in _SKIP_OVERRIDE_CATS:
-                    layer_cat_tags[(int(layer_id), cat)].append(exc_tag)
+            ckey = (pat, l_mla, l_kda)
+            cats_t = cats_memo.get(ckey)
+            if cats_t is None:
+                cats_t = tuple(
+                    cat for cat in classify_tensor_categories(pat, has_mla=l_mla, has_kda=l_kda)
+                    if cat not in _SKIP_OVERRIDE_CATS
+                )
+                cats_memo[ckey] = cats_t
+            for cat in cats_t:
+                layer_cat_tags[(int(layer_id), cat)].append(exc_tag)
         for (layer_id, cat), tags in sorted(layer_cat_tags.items()):
             layer_tag = _pick_category_majority_tag(tags)
             if category_defaults.get(cat) not in (None, layer_tag):
@@ -2732,36 +2814,48 @@ def _collect_modelslim_category_tags(
 
     per_layer_arch = bool(mla_layers or kda_layers)
     cat_tags: dict[str, list[str]] = defaultdict(list)
+    cats_memo: dict[tuple[str, bool, bool], tuple[str, ...]] = {}
     for rule in qmap.rules:
         if rule.pattern.endswith(".quant_type"):
             continue
+        pat = rule.pattern
         pres = rule.presence
         if pres is not None and pres.scope == "target" and pres.layer_indices:
             for lid in pres.layer_indices:
-                eff_tag = full_exc_lookup.get((pres.scope, rule.pattern, int(lid)), rule.raw_tag)
+                eff_tag = full_exc_lookup.get((pres.scope, pat, int(lid)), rule.raw_tag)
                 l_mla = (lid in mla_layers) if per_layer_arch else has_mla
                 l_kda = (lid in kda_layers) if per_layer_arch else has_kda
-                for cat in classify_tensor_categories(rule.pattern, has_mla=l_mla, has_kda=l_kda):
+                ckey = (pat, l_mla, l_kda)
+                cats_t = cats_memo.get(ckey)
+                if cats_t is None:
+                    cats_t = classify_tensor_categories(pat, has_mla=l_mla, has_kda=l_kda)
+                    cats_memo[ckey] = cats_t
+                for cat in cats_t:
                     cat_tags[cat].append(eff_tag)
             continue
-        for cat in classify_tensor_categories(rule.pattern, has_mla=has_mla, has_kda=has_kda):
+        ckey = (pat, has_mla, has_kda)
+        cats_t = cats_memo.get(ckey)
+        if cats_t is None:
+            cats_t = classify_tensor_categories(pat, has_mla=has_mla, has_kda=has_kda)
+            cats_memo[ckey] = cats_t
+        for cat in cats_t:
             cat_tags[cat].append(rule.raw_tag)
     return cat_tags
 
 
-def quant_spec_from_checkpoint_map(
+@lru_cache(maxsize=QUANT_MAP_CACHE_MAXSIZE)
+def _quant_spec_from_checkpoint_map_cached(
     qmap: CheckpointQuantMap,
-    *,
-    base_config: Mapping[str, Any] | None = None,
-    kv_dtype_override: str = "",
-    index_dtype_override: str = "",
-    checkpoint_url: str = "",
+    native: str,
+    expert_count_hint: int,
+    kv_dtype_override: str,
+    index_dtype_override: str,
+    checkpoint_url: str,
 ) -> QuantSpec:
-    """Project a lossless ``CheckpointQuantMap`` into an effective ``QuantSpec``.
+    """Bounded value-keyed projection over a frozen ``CheckpointQuantMap``.
 
     [Cohesive-Pipeline] Single-pass projection over checkpoint rules, layer exceptions, and cache tags.
     """
-    native = _extract_native_float_dtype(base_config) or qmap.native_float_dtype or "bf16"
     if qmap.source_format == "unquantized_native":
         return QuantSpec(
             name=native, weight_format=native, activation_format=native,
@@ -2778,11 +2872,10 @@ def quant_spec_from_checkpoint_map(
         return _quant_spec_from_hf_map(
             qmap, native=native, kv_override=kv_dtype_override,
             index_override=index_dtype_override, checkpoint_url=checkpoint_url,
-            base_config=base_config,
+            expert_count_hint=expert_count_hint,
         )
 
-    patterns = tuple(r.pattern for r in qmap.rules)
-    has_mla, has_kda, _ = infer_arch_flags_from_patterns(patterns)
+    has_mla, has_kda, _ = _arch_flags_for_checkpoint_map(qmap)
     mla_layers, kda_layers = _layer_arch_sets(qmap)
     cat_tags = _collect_modelslim_category_tags(
         qmap, has_mla=has_mla, has_kda=has_kda, mla_layers=mla_layers, kda_layers=kda_layers,
@@ -2909,7 +3002,7 @@ def quant_spec_from_checkpoint_map(
             extra_exclusions=ign_exclusions,
             partial_by_layer_cat=ign_partial,
             expert_count_by_layer_cat=ign_exp_cnt,
-            expert_count_hint=_extract_expert_count_hint(base_config),
+            expert_count_hint=expert_count_hint,
         )
         _attach_partial_expert_overrides(ign_native, ign_partial, ign_exp_cnt)
         for ex in ign_exclusions:
@@ -2963,6 +3056,43 @@ def quant_spec_from_checkpoint_map(
             f"linear={linear_tag}, expert={expert_tag}, kv={kv_dtype}",
         ),
     )
+
+
+def quant_spec_from_checkpoint_map(
+    qmap: CheckpointQuantMap,
+    *,
+    base_config: Mapping[str, Any] | None = None,
+    kv_dtype_override: str = "",
+    index_dtype_override: str = "",
+    checkpoint_url: str = "",
+) -> QuantSpec:
+    """Project a lossless ``CheckpointQuantMap`` into an effective ``QuantSpec``."""
+    native = _extract_native_float_dtype(base_config) or qmap.native_float_dtype or "bf16"
+    expert_count_hint = _extract_expert_count_hint(base_config) if base_config is not None else 0
+    cache_key = (
+        id(qmap),
+        native,
+        expert_count_hint,
+        kv_dtype_override,
+        index_dtype_override,
+        checkpoint_url,
+    )
+    cached = _QUANT_SPEC_ID_CACHE.get(cache_key)
+    if cached is not None and cached[0] is qmap:
+        return cached[1]
+    result = _quant_spec_from_checkpoint_map_cached(
+        qmap,
+        native,
+        expert_count_hint,
+        kv_dtype_override,
+        index_dtype_override,
+        checkpoint_url,
+    )
+    _QUANT_SPEC_ID_CACHE[cache_key] = (qmap, result)
+    _QUANT_SPEC_ID_CACHE.move_to_end(cache_key)
+    while len(_QUANT_SPEC_ID_CACHE) > QUANT_MAP_CACHE_MAXSIZE:
+        _QUANT_SPEC_ID_CACHE.popitem(last=False)
+    return result
 
 
 __all__ = [

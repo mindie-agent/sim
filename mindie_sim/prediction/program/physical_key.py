@@ -36,6 +36,7 @@ Details:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -166,55 +167,78 @@ def is_reference_key(key: str) -> bool:
     return key.endswith(REFERENCE_SUFFIXES)
 
 
+_REF_CACHE_MAXSIZE = 4096
+
+
+@lru_cache(maxsize=_REF_CACHE_MAXSIZE)
+def _normalize_reference_cached(value: str, stage: int, layer: int) -> str:
+    renamed = value
+    if ".l" in renamed:
+        renamed = _OCCURRENCE.sub(
+            lambda m: (f"{m.group('draft') or ''}s{int(m.group(_STAGE_GROUP)) - stage}"
+                       f".l{int(m.group(_LAYER_GROUP)) - layer}"),
+            renamed,
+        )
+    if ".layer[" in renamed:
+        renamed = _LAYER_REFERENCE.sub(
+            lambda m: (f"{m.group(_STATE_FAMILY_GROUP)}.layer["
+                       f"{int(m.group(_LAYER_REFERENCE_GROUP)) - layer}]"),
+            renamed,
+        )
+    if "context_kv" in renamed:
+        renamed = _CONTEXT_KV_OCCURRENCE.sub(
+            lambda m: (f"{m.group('draft') or ''}context_kv"
+                       f"{int(m.group(_CONTEXT_KV_GROUP)) - layer}"),
+            renamed,
+        )
+    if "layer" in renamed:
+        renamed = _STATE_LAYER_TOKEN.sub(
+            lambda m: f"layer{int(m.group(_STATE_LAYER_TOKEN_GROUP)) - layer}",
+            renamed,
+        )
+    return renamed
+
+
 def normalize_reference(value: str, stage: int, layer: int) -> str:
     """Rename occurrence prefixes relative to one anchor, preserving offsets."""
-    has_occ = ".l" in value
-    has_layer_ref = ".layer[" in value
-    has_ctx_kv = "context_kv" in value
-    has_layer_tok = "layer" in value
-    if not (has_occ or has_layer_ref or has_ctx_kv or has_layer_tok):
+    if ".l" not in value and "layer" not in value and "context_kv" not in value:
         return value
-
-    def _rename(match: "re.Match[str]") -> str:
-        return (f"{match.group('draft') or ''}s{int(match.group(_STAGE_GROUP)) - int(stage)}"
-                f".l{int(match.group(_LAYER_GROUP)) - int(layer)}")
-
-    def _layer(match: "re.Match[str]") -> str:
-        family = match.group(_STATE_FAMILY_GROUP)
-        return (f"{family}.layer["
-                f"{int(match.group(_LAYER_REFERENCE_GROUP)) - int(layer)}]")
-
-    def _context_kv(match: "re.Match[str]") -> str:
-        return (f"{match.group('draft') or ''}context_kv"
-                f"{int(match.group(_CONTEXT_KV_GROUP)) - int(layer)}")
-
-    def _layer_token(match: "re.Match[str]") -> str:
-        return f"layer{int(match.group(_STATE_LAYER_TOKEN_GROUP)) - int(layer)}"
-
-    renamed = _OCCURRENCE.sub(_rename, value) if has_occ else value
-    if has_layer_ref:
-        renamed = _LAYER_REFERENCE.sub(_layer, renamed)
-    if has_ctx_kv:
-        renamed = _CONTEXT_KV_OCCURRENCE.sub(_context_kv, renamed)
-    if has_layer_tok:
-        renamed = _STATE_LAYER_TOKEN.sub(_layer_token, renamed)
-    return renamed
+    return _normalize_reference_cached(value, int(stage), int(layer))
 
 
 def _normalize_mapping_entry(key: Any, item: Any, stage: int,
                              layer: int) -> tuple[str, Any]:
     """One mapping leaf: relative anchor for stage/layer ordinals."""
-    name = str(key)
+    name = key if type(key) is str else str(key)
     if type(item) is int and item >= NONNEGATIVE_ANCHOR_FLOOR:
         if name == STATE_STAGE_FIELD:
-            return name, int(item) - int(stage)
-        if name in {STATE_LAYER_FIELD, "layer_index"}:
-            return name, int(item) - int(layer)
+            return name, item - stage
+        if name == STATE_LAYER_FIELD or name == "layer_index":
+            return name, item - layer
     return name, normalize_graph_value(item, stage, layer)
 
 
 def normalize_graph_value(value: Any, stage: int, layer: int) -> Any:
     """Recursively normalize declared reference leaves into a hashable value."""
+    kind = type(value)
+    if kind is str:
+        if ".l" not in value and "layer" not in value and "context_kv" not in value:
+            return value
+        return _normalize_reference_cached(value, stage, layer)
+    if kind is int or kind is float or kind is bool or value is None:
+        return value
+    if kind is tuple or kind is list:
+        return tuple(normalize_graph_value(item, stage, layer) for item in value)
+    if kind is dict:
+        if not value:
+            return ()
+        return tuple(sorted(
+            (_normalize_mapping_entry(key, item, stage, layer)
+             for key, item in value.items()),
+            key=lambda item: item[0]))
+    if kind is set or kind is frozenset:
+        return frozenset(normalize_graph_value(item, stage, layer)
+                         for item in value)
     if isinstance(value, str):
         return normalize_reference(value, stage, layer)
     if isinstance(value, Mapping):
@@ -232,44 +256,69 @@ def normalize_graph_value(value: Any, stage: int, layer: int) -> Any:
 
 def _relative_state_accesses(value: Any, stage: int, layer: int) -> Any:
     """Normalize the integer stage/layer leaves of declared state accesses."""
-    if not isinstance(value, (list, tuple)):
+    kind = type(value)
+    if kind is not tuple and kind is not list and not isinstance(value, (list, tuple)):
         return normalize_graph_value(value, stage, layer)
     entries = []
     for item in value:
-        if not isinstance(item, Mapping):
+        ikind = type(item)
+        if ikind is not dict and not isinstance(item, Mapping):
             entries.append(normalize_graph_value(item, stage, layer))
             continue
-        row = {}
+        pairs = []
         for key, leaf in item.items():
-            if key == STATE_STAGE_FIELD and isinstance(leaf, int):
-                row[key] = int(leaf) - int(stage)
-            elif key == STATE_LAYER_FIELD and isinstance(leaf, int):
-                row[key] = int(leaf) - int(layer)
+            lkind = type(leaf)
+            if key == STATE_STAGE_FIELD and (lkind is int or (isinstance(leaf, int) and not isinstance(leaf, bool))):
+                pairs.append((key, int(leaf) - stage))
+            elif key == STATE_LAYER_FIELD and (lkind is int or (isinstance(leaf, int) and not isinstance(leaf, bool))):
+                pairs.append((key, int(leaf) - layer))
             else:
-                row[key] = normalize_graph_value(leaf, stage, layer)
-        entries.append(tuple(sorted(row.items(), key=lambda pair: str(pair[0]))))
+                pairs.append((key, normalize_graph_value(leaf, stage, layer)))
+        pairs.sort(key=lambda pair: pair[0] if type(pair[0]) is str else str(pair[0]))
+        entries.append(tuple(pairs))
     return tuple(entries)
 
 
 def _normalized_metadata(metadata: Any, stage: int, layer: int) -> tuple:
     """Hashable occurrence-relative projection of one operator's metadata."""
-    items = metadata.items() if isinstance(metadata, Mapping) else tuple(metadata or ())
+    stage_i = int(stage)
+    layer_i = int(layer)
+    mkind = type(metadata)
+    items = (
+        metadata.items()
+        if (mkind is dict or isinstance(metadata, Mapping))
+        else (metadata if mkind is tuple else tuple(metadata or ()))
+    )
     normalized = []
     for key, value in items:
-        name = str(key)
+        name = key if type(key) is str else str(key)
         if name in PAIRING_ONLY_KEYS:
             continue
-        if name in {STATE_ACCESS_KEY, "fused_origin_scopes"}:
-            normalized.append((name, _relative_state_accesses(value, stage, layer)))
+        if name == STATE_ACCESS_KEY or name == "fused_origin_scopes":
+            normalized.append((name, _relative_state_accesses(value, stage_i, layer_i)))
         elif is_reference_key(name):
-            normalized.append((name, normalize_graph_value(value, stage, layer)))
+            normalized.append((name, normalize_graph_value(value, stage_i, layer_i)))
         else:
             normalized.append((name, _hashable(value)))
-    return tuple(sorted(normalized, key=lambda item: item[0]))
+    normalized.sort(key=lambda item: item[0])
+    return tuple(normalized)
 
 
 def _hashable(value: Any) -> Any:
     """Non-reference leaf projection; preserves value, only makes it hashable."""
+    kind = type(value)
+    if kind is str or kind is int or kind is float or kind is bool or value is None:
+        return value
+    if kind is tuple or kind is list:
+        return tuple(_hashable(item) for item in value)
+    if kind is dict:
+        if not value:
+            return ()
+        return tuple(sorted(((key if type(key) is str else str(key), _hashable(item))
+                             for key, item in value.items()),
+                            key=lambda item: item[0]))
+    if kind is set or kind is frozenset:
+        return frozenset(_hashable(item) for item in value)
     if isinstance(value, Mapping):
         return tuple(sorted(((str(key), _hashable(item))
                              for key, item in value.items()),

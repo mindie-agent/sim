@@ -264,15 +264,24 @@ class _EngineLifecycleMixin:
             if self._native_active > 0:
                 self._native_active -= 1
         waiters = task.event._waiters
+        ledger_state = self.state_ledger
+        saved_waiters = (
+            tuple(waiters)
+            if (ledger_state is not None and waiters
+                and (ledger_state._event_commits or ledger_state._causal_stack
+                     or task.callback is not None))
+            else ()
+        )
         if native or self._native_seqs:
             if waiters:
                 self._wake(task.event, native=native)
         elif waiters:
             self._wake_python_task_waiters(task, now, waiters)
-        if self.state_ledger is not None:
-            self.state_ledger._propagate_event_commits(key, at=now)
         if task.callback is not None:
             task.callback(task.event)
+        if (ledger_state is not None
+                and (ledger_state._event_commits or ledger_state._causal_stack)):
+            ledger_state._propagate_to_waiters(key, saved_waiters, at=now)
 
     def _release_task_allocations(self, task: _Task, now: float) -> None:
         # A grant belongs to the live allocation and its real last use, not to
