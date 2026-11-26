@@ -44,10 +44,13 @@ def _emitted_stage_read_hbm(stage, hbm_name: str, mte3_name: str | None) -> floa
 
 def _emitted_program_read_hbm(program, hbm_name: str, mte3_name: str | None) -> float:
     """Sum emitted read-side HBM bytes (including operand rereads) in a lowered program."""
+    from mindie_sim.prediction.operators.matrix.matrix import _StreamRefillProgram
     from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
     from mindie_sim.prediction.program.pipeline import PipelineProgram, PipelineTemplateProgram
     from mindie_sim.prediction.program.stages import KernelProgram, ParallelProgram
 
+    if isinstance(program, _StreamRefillProgram):
+        return _emitted_program_read_hbm(program.pipeline, hbm_name, mte3_name)
     if isinstance(program, KernelProgram):
         return math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in program.stages)
     if isinstance(program, ParallelProgram):
@@ -69,9 +72,23 @@ def _emitted_program_read_hbm(program, hbm_name: str, mte3_name: str | None) -> 
         tmpl = program.template
         total = math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in tmpl.setup)
         total += math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in tmpl.drain)
+        if tmpl.indexed_panels is not None:
+            for idx in range(tmpl.indexed_panels):
+                total += math.fsum(
+                    _emitted_stage_read_hbm(s, hbm_name, mte3_name)
+                    for s in tmpl.stage_for(idx)
+                )
+            return total
         for ph in tmpl.phases:
-            phase_sum = math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in ph.stages)
-            total += float(ph.repeat) * phase_sum
+            if ph.residue_stages:
+                for idx in range(ph.count):
+                    total += math.fsum(
+                        _emitted_stage_read_hbm(s, hbm_name, mte3_name)
+                        for s in ph.stages_for(idx)
+                    )
+            else:
+                phase_sum = math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in ph.stages)
+                total += float(ph.count) * phase_sum
         return total
     return 0.0
 
@@ -89,12 +106,27 @@ def _scale_stage_read_hbm(stage, hbm_name: str, mte3_name: str | None, factor: f
     return replace(stage, work=work, program=nested)
 
 
+def _scale_phase_read_hbm(phase, hbm_name: str, mte3_name: str | None, factor: float):
+    scaled_stages = tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in phase.stages)
+    scaled_residue = tuple(
+        tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in group)
+        for group in phase.residue_stages
+    )
+    return replace(phase, stages=scaled_stages, residue_stages=scaled_residue)
+
+
 def _scale_program_read_hbm(program, hbm_name: str, mte3_name: str | None, factor: float):
-    """Apply partitioned L2 read-hit credit to wrapped non-SteadyMatmul read stages."""
+    """Apply partitioned L2 read-hit credit to wrapped custom read stages."""
+    from mindie_sim.prediction.operators.matrix.matrix import _StreamRefillProgram
     from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
     from mindie_sim.prediction.program.pipeline import PipelineProgram, PipelineTemplateProgram
     from mindie_sim.prediction.program.stages import KernelProgram, ParallelProgram
 
+    if isinstance(program, _StreamRefillProgram):
+        return replace(
+            program,
+            pipeline=_scale_program_read_hbm(program.pipeline, hbm_name, mte3_name, factor),
+        )
     if isinstance(program, KernelProgram):
         return replace(
             program,
@@ -127,14 +159,19 @@ def _scale_program_read_hbm(program, hbm_name: str, mte3_name: str | None, facto
     if isinstance(program, PipelineTemplateProgram):
         tmpl = program.template
         scaled_phases = tuple(
-            replace(ph, stages=tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in ph.stages))
+            _scale_phase_read_hbm(ph, hbm_name, mte3_name, factor)
             for ph in tmpl.phases
+        )
+        scaled_motif = tuple(
+            _scale_phase_read_hbm(ph, hbm_name, mte3_name, factor)
+            for ph in tmpl.motif_phases
         )
         scaled_tmpl = replace(
             tmpl,
             setup=tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in tmpl.setup),
             drain=tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in tmpl.drain),
             phases=scaled_phases,
+            motif_phases=scaled_motif,
         )
         return replace(program, template=scaled_tmpl)
     return program
@@ -187,7 +224,7 @@ def split_context(context, rows_per_expert, experts):
                  if role != "cube"}
     resources["mte2"] = read + (context.native_work.get("mte2", op.mte2_bytes) - op.mte2_bytes) * row_fraction
     resources["mte3"] = write + (context.native_work.get("mte3", op.mte3_bytes) - op.mte3_bytes) * row_fraction
-    resources["hbm"] = max(0.0, read + write - child_hit) + parent_extra * row_fraction
+    resources["hbm"] = max(0.0, read + write - child_hit)
     phase = context.for_phase(Work(matrix, resources), kernel="integer_expert_row_class")
     # Work.apply canonicalizes extended resource roles. Keep its scaled values,
     # rather than reintroducing the parent invocation's unscaled metadata.
@@ -209,6 +246,9 @@ class IntegerGroupedMatmul:
     matrix: object
 
     def lower(self, context):
+        from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul, TiledMatmul
+        from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul
+        from mindie_sim.prediction.operators.matrix.matrix_phase import PhaseMatmul
         from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
         from mindie_sim.prediction.program import KernelProgram, Stage
 
@@ -218,7 +258,12 @@ class IntegerGroupedMatmul:
         mte3_name = context.resource_names.get("mte3")
         setup_work = {hbm_name: parent_extra} if (parent_extra > 0.0 and hbm_name) else {}
         stages = [Stage("setup", setup_work, latency=context.setup_ms)]
-        needs_read_credit_scale = not isinstance(self.matrix, SteadyMatmul) and bool(hbm_name)
+        native_credit_recipes = (
+            SteadyMatmul, MappedMatmul, HierarchicalMatmul, TiledMatmul, PhaseMatmul,
+        )
+        needs_read_credit_scale = (
+            not isinstance(self.matrix, native_credit_recipes) and bool(hbm_name)
+        )
         for rows, experts in classes:
             phase = split_context(context, rows, experts)
             child_program = self.matrix.lower(phase)

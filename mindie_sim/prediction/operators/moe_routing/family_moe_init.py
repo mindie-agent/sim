@@ -15,7 +15,7 @@ from mindie_sim.prediction.implementations import select
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from .moe_init_instructions import INDEX_BYTES
 from .moe_init_mxfp8 import (
-    MAX_COUNT_MODE_EXPERTS, MX_SCALE_GROUP_SIZE, MX_WIDTH_ALIGNMENT, RECIPE, SOURCE, build,
+    MAX_COUNT_MODE_EXPERTS, MX_SCALE_GROUP_SIZE, RECIPE, SOURCE, build, mxfp8_scale_cols,
 )
 
 TARGET_BACKEND: Literal["ascend"] = "ascend"
@@ -75,7 +75,7 @@ def tensor_contract(op):
     return ('moe_init_routing_mxfp8_active', 'MoeInitRoutingV3',
             (((tokens, width), 'bf16', 'ND'), ((tokens, topk), 'int32', 'ND')),
             (((rows, width), 'fp8_e4m3', 'ND'), ((rows,), 'int32', 'ND'),
-             ((experts,), 'int64', 'ND'), ((rows, width // MX_SCALE_GROUP_SIZE), 'fp8_e8m0', 'ND')))
+             ((experts,), 'int64', 'ND'), ((rows, mxfp8_scale_cols(width)), 'fp8_e8m0', 'ND')))
 
 
 def apply(ops, bindings, runtime):
@@ -128,14 +128,15 @@ def apply(ops, bindings, runtime):
         matrix = matrices[0]
         meta = dict(matrix.metadata)
         width, rows = matrix.local_shape[2], matrix.local_shape[0]
-        if type(width) is not int or width < MX_WIDTH_ALIGNMENT or width % MX_WIDTH_ALIGNMENT:
-            raise ModelingError("moe_init_mxfp8_requires_width_multiple_of_256")
-        scale_shape = (rows, width // MX_SCALE_GROUP_SIZE)
+        if type(width) is not int or width < 1:
+            raise ModelingError("moe_init_mxfp8_requires_positive_width")
+        scale_cols = mxfp8_scale_cols(width)
+        scale_shape = (rows, scale_cols)
         if (pack.dtype != "bf16" or meta.get("activation_format") != "fp8_e4m3"
                 or meta.get("activation_scale_format") != "fp8_e8m0"
                 or meta.get("activation_group_size") != MX_SCALE_GROUP_SIZE
                 or rows != tokens * topk or meta.get("expected_rows", rows) != rows
-                or meta.get("activation_scale_bytes") != rows * width // MX_SCALE_GROUP_SIZE):
+                or meta.get("activation_scale_bytes") != rows * scale_cols):
             raise ModelingError("moe_init_mxfp8_requires_complete_BF16_to_E4M3_MX32_assignments")
         pm = dict(pack.metadata)
         for producer in (pm.get("topk_ids_producer"), pm.get("payload_producer")):

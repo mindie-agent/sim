@@ -142,6 +142,9 @@ GATING_PIPELINE_SLOTS = 1
 GATING_SOFTMAX_WAVE_STAGES = (
     "logits_load", "softmax_reduce", "expert_topk", "renorm_store",
 )
+GATING_SOFTMAX_RENORM_WAVE_STAGES = (
+    "logits_load", "expert_topk", "softmax_topk", "renorm_store",
+)
 GATING_SIGMOID_WAVE_STAGES = (
     "logits_load", "sigmoid_score", "expert_topk", "renorm_store",
 )
@@ -177,6 +180,11 @@ _GATING_ARCH35_RESERVE_EXPERT_BUFFERS = 17
 _GATING_ARCH35_ROW_EXPERT_BUFFERS = 2
 _GATING_ARCH35_ROW_OVERHEAD_BYTES = 128
 _GATING_ARCH35_MAX_ROW_BATCH = 128
+#: Arch35 ``moe_gating_top_k_softmax_v2_tiling_k_renorm.cpp`` UB chunking constants.
+_GATING_SOFTMAX_RENORM_MAX_COL = 8160
+_GATING_SOFTMAX_RENORM_TOPK_SCRATCH_BUFFERS = 4
+_GATING_SOFTMAX_RENORM_SOFTMAX_SCRATCH_BUFFERS = 4
+_GATING_SOFTMAX_RENORM_DOUBLE_BUFFER = 2
 #: Arch35 ``moe_gating_top_k_hash_tiling_arch35.h`` / ``_regbase.h`` limits and UB sizing.
 _GATING_HASH_MAX_EXPERTS = 2048
 _GATING_HASH_MAX_TOPK = 64
@@ -293,6 +301,8 @@ def _wave_stage_names(*, is_group: bool, general_kind: str | None, meta) -> tupl
             GATING_SIGMOID_GROUPED_WAVE_STAGES
             if grouped_router else GATING_SIGMOID_WAVE_STAGES
         )
+    if general_kind == "softmax" and bool(meta.get("renorm")):
+        return GATING_SOFTMAX_RENORM_WAVE_STAGES
     return GATING_SOFTMAX_WAVE_STAGES
 
 
@@ -366,6 +376,52 @@ def _arch35_hash_gating_ub_live_bytes(
     return ub_live
 
 
+def _arch35_softmax_v2_renorm_ub_live_bytes(
+    experts: int, top_k: int, ub_cap: int, geometry,
+) -> int:
+    """Compute Arch35 ``MoeGatingTopKSoftmaxV2KRenormTiling`` per-AIV UB reservation.
+
+    Mirrors ``moe_gating_top_k_softmax_v2_tiling_k_renorm.cpp:64-125``: top-k
+    runs over partitioned expert chunks of size ``ubFormerAlign >= kAlign``
+    before applying softmax strictly over ``kAlign`` elements.
+    """
+    align = _GATING_UB_ALIGN_BYTES
+    k_align = -(-top_k // align) * align
+
+    def _chunk_ub_bytes(chunk_align: int) -> int:
+        span = chunk_align + k_align
+        gating_tmp = span * SELECTED_WEIGHT_BYTES
+        topk_out = k_align * SELECTED_WEIGHT_BYTES
+        topk_idx = span * SELECTED_WEIGHT_BYTES
+        finish_tmp = align
+        topk_scratch = _GATING_SOFTMAX_RENORM_TOPK_SCRATCH_BUFFERS * span * SELECTED_WEIGHT_BYTES
+        softmax_scratch = _GATING_SOFTMAX_RENORM_SOFTMAX_SCRATCH_BUFFERS * k_align * SELECTED_WEIGHT_BYTES
+        return _GATING_SOFTMAX_RENORM_DOUBLE_BUFFER * (
+            gating_tmp + topk_out + topk_idx + finish_tmp + max(topk_scratch, softmax_scratch)
+        )
+
+    ub_outer = max(1, experts // _GATING_SOFTMAX_RENORM_MAX_COL) if experts > _GATING_SOFTMAX_RENORM_MAX_COL else 1
+    if ub_cap <= 0:
+        former_align = -(-(experts // ub_outer) // align) * align
+        return _chunk_ub_bytes(max(align, former_align))
+    ub_live = _chunk_ub_bytes(k_align)
+    while True:
+        former = experts // ub_outer
+        former_align = -(-max(1, former) // align) * align
+        candidate = _chunk_ub_bytes(former_align)
+        if candidate <= ub_cap:
+            ub_live = candidate
+            break
+        if former_align <= k_align or former <= 1:
+            ub_live = _chunk_ub_bytes(k_align)
+            break
+        ub_outer += 1
+    LiveBufferSpec(
+        "moe_gating_ub", "ub", ub_live, 0, 1, owner_kind="aiv",
+    ).check_capacity(geometry)
+    return ub_live
+
+
 def _gating_owner_schedule(
     op, geometry, *, tokens: int, waves: int, launched: int, stage_names: tuple[str, ...],
     read: float, bias_bytes: float, write: float, logical_vector: float, aiv_units: int,
@@ -382,6 +438,8 @@ def _gating_owner_schedule(
         ub_live = _arch35_hash_gating_ub_live_bytes(
             experts, top_k, _effective_groups(meta), int(dtype_bytes(in_dtype)), geometry,
         )
+    elif meta.get("native_kind") == SOFTMAX_NATIVE_KIND and bool(meta.get("renorm")):
+        ub_live = _arch35_softmax_v2_renorm_ub_live_bytes(experts, top_k, ub_cap, geometry)
     else:
         ub_live = _arch35_gating_ub_live_bytes(experts, ub_cap, geometry)
     logits_read = max(0.0, float(read) - float(bias_bytes))
@@ -594,6 +652,14 @@ def _primitive_stage_latencies_ms(
                 )
             else:
                 per_stage.append(0.0)
+        elif name == "softmax_topk":
+            if sfu_ms > 0.0 and red_ms > 0.0:
+                per_stage.append(
+                    float(top_k * _SOFTMAX_SFU_OPS_PER_EXPERT) / sfu_ms
+                    + float(max(1, top_k - 1)) / red_ms + flag_ms
+                )
+            else:
+                per_stage.append(0.0)
         elif name in {"group_top2_scan", "group_mask"}:
             per_stage.append((float(experts) / red_ms + flag_ms) if red_ms > 0.0 else 0.0)
         elif name == "expert_topk":
@@ -635,6 +701,12 @@ def build_moe_gating_topk(op, geometry):
     logits_read = max(0.0, read - bias_bytes)
     total_mte2 = logits_read + float(launched) * bias_bytes
     logical_vector = float(op.vector_ops)
+    if general_kind == "softmax" and bool(meta.get("renorm")):
+        # CANN SoftmaxV2 with renorm=1 runs top-k across all experts first,
+        # then applies softmax strictly over the selected top_k elements.
+        logical_vector = float(tokens) * float(
+            experts + top_k * (_SOFTMAX_SFU_OPS_PER_EXPERT + _RENORM_OPS_PER_SLOT)
+        )
     stage_names = _wave_stage_names(is_group=is_group, general_kind=general_kind, meta=meta)
     kernel_binding = _gating_kernel_binding(op, group_limited=is_group, geometry=geometry)
     owner_schedule = _gating_owner_schedule(

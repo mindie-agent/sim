@@ -169,10 +169,39 @@ def test_init_gates_and_fused_activation_dependency():
     up = next(op for op in ops if op.recipe in {"grouped_gate_up", "balanced_grouped_gate_up"})
     up, binding = replace(up, deps=(pack.op_id,)), {caps["selector"]: {"implementation": RECIPE}}
     runtime = parse_case(raw).runtime
-    with pytest.raises(ModelingError, match="width_multiple_of_256"):
+    with pytest.raises(ModelingError, match="positive_width"):
+        apply((pack, replace(up, local_shape=(*up.local_shape[:2], 0))), binding, runtime)
+    with pytest.raises(ModelingError, match="complete_BF16_to_E4M3_MX32"):
         apply((pack, replace(up, local_shape=(*up.local_shape[:2], 100))), binding, runtime)
     with pytest.raises(ModelingError, match="complete_BF16_to_E4M3_MX32"):
         apply((replace(pack, dtype="fp16"), up), binding, runtime)
+    from mindie_sim.catalog.quant import quant_preset
+    from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import build as build_mxfp8_init
+    from mindie_sim.schema.hardware import Hardware
+    from tests._support.hardware import MODEL, WORKLOAD
+    hw_mxfp8 = Hardware.from_mapping(dict(backend="ascend", sku="Ascend950DT_9581", num_devices=1))
+    geom_mxfp8 = Geometry.from_devices(hw_mxfp8.dies[:1])
+    for width, expected_cols in ((256, 8), (128, 4)):
+        model_w = dict(
+            MODEL, hidden_size=width, num_heads=4, head_dim=width // 4,
+            intermediate_size=256, moe_intermediate_size=256, ffn="moe",
+            num_experts=4, top_k=2, quant=quant_preset("mxfp8").to_dict(),
+        )
+        case_w = dict(
+            machine=dict(backend="ascend", sku="Ascend950DT_9581", num_devices=1),
+            model=model_w, workload=WORKLOAD,
+            runtime=dict(kernels={"lowerings": {"moe_init_routing": RECIPE}}),
+        )
+        mx_ops = [op for op in target_operators(case_w, phase="prefill", tokens=1, apply_body_defaults=False)
+                  if op.recipe == RECIPE]
+        assert [dict(op.metadata)["activation_scale_shape"] for op in mx_ops] == [(2, expected_cols)]
+        plan_w = build_mxfp8_init(mx_ops[0], geom_mxfp8)
+        assert plan_w.metadata["output_scale_bytes"] == 2 * expected_cols
+        if width == 128:
+            # Unmasked 2-register (256-BF16) vector loops read 1024 B per quantized row.
+            assert plan_w.metadata["ub_traffic"]["quant_bf16_read_bytes"] == (
+                2 * 2 * 256 * plan_w.metadata["quantized_input_rows"]
+            )
     quantizer = next(op for op in ops if op.op_id.endswith(".expert_up.quantize"))
     meta = dict(quantizer.metadata, quantization_scope="moe_dispatch_expert_input")
     quantizer = replace(quantizer, metadata=tuple(meta.items()))

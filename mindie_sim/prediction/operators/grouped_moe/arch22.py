@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import partial
+import math
 from typing import Literal
 
 from mindie_sim.schema.datapath import ArchId, SourceRef
@@ -18,10 +19,11 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
-    ACTIVATION_OPS, FUSED_MC2_SHARED_MODE, GEMM_MODES, INT32_HANDOFF_BYTES_PER_ELEM, MX_DTYPES,
+    ACTIVATION_OPS, FRACTAL_M_DIM, FUSED_MC2_SHARED_MODE, GEMM_MODES, INT32_HANDOFF_BYTES_PER_ELEM, MX_DTYPES,
     PER_TOKEN_SCALE_BYTES, QUANT_OPS_PER_ELEMENT, ROUTED_MODES, SHIPPING_MEGAMOE_ACTIVATIONS,
     SHIPPING_SWIGLU_QUANT_ACTIVATIONS, StageDemand, activation_stages, capability_gap,
-    contract_fields, element_bytes, make_plan, matrix_schedule, matrix_stages, tensor_bytes,
+    ceil_div, contract_fields, element_bytes, gemm_declared_scale_spec, make_plan,
+    matrix_schedule, matrix_stages, tensor_bytes,
     validate_contract, vector_stages,
 )
 
@@ -298,12 +300,33 @@ def _routed_msd_flags(contract, fields) -> tuple[bool, bool]:
     return both, both
 
 
-def _scale_stage_demands(stages: list[StageDemand], scale: float) -> list[StageDemand]:
+def _scale_stage_demands(
+    stages: list[StageDemand], scale: float, *, group_rows: tuple[int, ...] = (),
+) -> list[StageDemand]:
     if scale == 1.0:
         return stages
+    cube_scale = scale
+    if scale > 1.0 and group_rows:
+        # When rounded integer rows are scaled upward (>1.0), already-padded
+        # 16-row M-fractals scale by convex-interpolated fractal-M occupancy,
+        # not linearly past the physical single-fractal ceiling.
+        base_m_fractals = sum(ceil_div(r, FRACTAL_M_DIM) for r in group_rows if r > 0)
+        if base_m_fractals > 0:
+            exp_m_fractals = 0.0
+            for r in group_rows:
+                if r <= 0:
+                    continue
+                r_exp = float(r) * scale
+                r_lo, r_hi = math.floor(r_exp), math.ceil(r_exp)
+                frac = r_exp - float(r_lo)
+                exp_m_fractals += (
+                    (1.0 - frac) * ceil_div(r_lo, FRACTAL_M_DIM)
+                    + frac * ceil_div(r_hi, FRACTAL_M_DIM)
+                )
+            cube_scale = exp_m_fractals / float(base_m_fractals)
     return [
         replace(stage, work=Work(
-            {dt: amt * scale for dt, amt in stage.work.matrix.items()},
+            {dt: amt * cube_scale for dt, amt in stage.work.matrix.items()},
             {role: amt * scale for role, amt in stage.work.resources.items()},
         ))
         if (stage.work.matrix or stage.work.resources) else stage
@@ -334,7 +357,8 @@ def _gated_stages(contract, ctx, name, after, metadata, *, msd_w4a8: bool = Fals
             *matrix_stages(
                 name + "gmm1", (pre_name,), msd_contract, schedule, contract.k, contract.handoff_dtype,
                 input_dtype="int4", input_scaled=False,
-                output_row_divisor=_MSD_ROW_MULTIPLIER, useful_flops_override=useful_flops,
+                output_row_divisor=1 if contract.mode in ROUTED_MODES else _MSD_ROW_MULTIPLIER,
+                useful_flops_override=useful_flops,
                 metadata=metadata,
             ),
         ]
@@ -414,7 +438,7 @@ def _routed_stages(
         compute_stages.extend(matrix_stages(
             name + "gmm2", (pre2,), msd_contract, schedule2, contract.intermediate,
             contract.output_dtype, input_dtype="int4", input_scaled=False,
-            output_row_divisor=_MSD_ROW_MULTIPLIER,
+            output_row_divisor=1,
             useful_flops_override=schedule2.useful_flops // _MSD_ROW_MULTIPLIER,
             metadata=cohort,
         ))
@@ -434,7 +458,7 @@ def _routed_stages(
             contract.output_dtype, input_dtype=contract.quant_dtype,
             input_scaled=contract.quant_dtype == "int8", metadata=cohort,
         ))
-    stages.extend(_scale_stage_demands(compute_stages, contract.row_scale))
+    stages.extend(_scale_stage_demands(compute_stages, contract.row_scale, group_rows=contract.group_rows))
     stages.extend(routing_stages(
         combine, (gmm2_done,), contract, metadata, transport_builder, allow_pre_weighted=False,
     ))
@@ -465,7 +489,11 @@ class _Arch22Strategy:
         metadata = {"mode": mode, "enable_dbo": contract.enable_dbo}
         if mode in GEMM_MODES:
             schedule = matrix_schedule(contract, ctx, contract.group_rows, contract.n, contract.k)
-            stages = matrix_stages("gmm", (), contract, schedule, contract.k, contract.output_dtype)
+            stages = matrix_stages(
+                "gmm", (), contract, schedule, contract.k, contract.output_dtype,
+                scale_spec=gemm_declared_scale_spec(op, contract),
+                aiv_cores=ctx.effective_aiv_cores,
+            )
             metadata.update(useful_flops=schedule.useful_flops, issued_fractals=schedule.issued_fractals,
                             max_waves=schedule.max_waves, wave_tail_imbalance=schedule.wave_tail_imbalance)
             implementation = self.abi
@@ -476,9 +504,15 @@ class _Arch22Strategy:
                             gm_handoff_bytes=_GATED_ACTIVATION_DIVISOR * contract.m * contract.n * INT32_HANDOFF_BYTES_PER_ELEM)
             implementation = contract.abi or "aclnnGroupedMatmulSwigluQuant"
         elif mode == "dequant_swiglu_quant":
+            fields = contract_fields(op)
             stages = activation_stages(
                 "dequant_swiglu_quant", (), ctx, contract, contract.group_rows,
-                has_activation_scale=contract_fields(op).get("has_activation_scale", True),
+                has_activation_scale=fields.get("has_activation_scale", True),
+                has_quant_scale=bool(fields.get("has_quant_scale", False)),
+                quant_scale_dtype=str(fields.get("quant_scale_dtype", "fp32")),
+                has_quant_offset=bool(fields.get("has_quant_offset", False)),
+                quant_offset_dtype=str(fields.get("quant_offset_dtype", "fp32")),
+                quant_mode=int(fields.get("quant_mode", 0) or 0),
             )
             implementation = "aclnnDequantSwigluQuant"
         else:

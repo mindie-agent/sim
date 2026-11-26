@@ -54,7 +54,6 @@ SOURCES: tuple[SourceRef, ...] = (
 
 RECIPE = "ascend_moe_init_routing_v3_mxfp8"
 MX_SCALE_GROUP_SIZE = 32
-MX_WIDTH_ALIGNMENT = 256
 MAX_COUNT_MODE_EXPERTS = 10240
 _ARCH35_IDS = frozenset({"npu_arch_3510", "dav_3510"})
 _BF16_BYTES = int(dtype_bytes("bf16"))
@@ -71,6 +70,7 @@ _SORT_OUTPUT_FIELDS_PER_ROW = 2
 _MX_SCALE_OPS_PER_GROUP = 21
 _QUANT_CONSTANT_REGISTERS = 11
 _CONSTANT_REGISTER_LANES = 128
+_QUANT_VF_WIDTH = 2 * _CONSTANT_REGISTER_LANES
 _QUANT_DATA_OPS_PER_ELEMENT = 5
 _QUANT_PACKED_TEMP_BUFFERS = 4
 _QUANT_BF16_UB_READ_PASSES = 2
@@ -101,6 +101,12 @@ def aligned(n, width=_UB_ALIGNMENT_BYTES):
     return ceil(n / width) * width
 
 
+def mxfp8_scale_cols(width: int) -> int:
+    """CANN ``MoeInitRoutingV3`` quant mode 3 scale width: ``CeilAlign(CeilDiv(width, 32), 2)``."""
+    valid_groups = ceil(width / MX_SCALE_GROUP_SIZE)
+    return ceil(valid_groups / 2) * 2
+
+
 def row_runs(assignments, topk, units, owner):
     """Actual source assignment intervals; a token split across owners reloads."""
     per_owner = ceil(assignments / units)
@@ -114,15 +120,19 @@ def quant_vector(width):
 
     Sort/SIMT/scalar instruction throughput and register-port issue are kept
     separate in diagnostics; this is the existing elementary lane envelope.
+    CANN executes unmasked 2-register (256-BF16) vector loops in both the amax
+    and data passes (``moe_v3_gather_mxfp8_quant.h:642``).
     """
-    scales = width // MX_SCALE_GROUP_SIZE
-    # amax: abs mask + pair max + block max = W + W/2 +(W/2-W/32).
+    vf_width = aligned(width, _QUANT_VF_WIDTH)
+    vf_scales = vf_width // MX_SCALE_GROUP_SIZE
+    scales = mxfp8_scale_cols(width)
+    # amax: abs mask + pair max + block max = W_vf + W_vf/2 + (W_vf/2 - W_vf/32).
     # RoundScale: 2 initialization + 19 expressions per scale; ten live
     # full-register constants plus amax's abs mask (three unused constants).
     # Data: multiply, BF16 interleave, BF16->FP32, FP32 interleave, FP32->FP8.
-    return ((2 * width - scales) + _MX_SCALE_OPS_PER_GROUP * scales
+    return ((2 * vf_width - vf_scales) + _MX_SCALE_OPS_PER_GROUP * scales
             + _QUANT_CONSTANT_REGISTERS * _CONSTANT_REGISTER_LANES
-            + _QUANT_DATA_OPS_PER_ELEMENT * width)
+            + _QUANT_DATA_OPS_PER_ELEMENT * vf_width)
 
 
 def _sort_program(stage, init, assignment_ids_read, sort_services, sort_input_rows, sort_vector, sort_out):
@@ -350,7 +360,8 @@ def _ub_traffic_contract(assignments, quantized_rows, width, scales, declared_ro
         "ub_write_bytes": sort_b32_write,
     })
     sort_ub_work, _ = sort_ub_counts.partition(declared_roles)
-    quant_bf16_read = _QUANT_BF16_UB_READ_PASSES * _BF16_BYTES * width * quantized_rows
+    vf_width = aligned(width, _QUANT_VF_WIDTH)
+    quant_bf16_read = _QUANT_BF16_UB_READ_PASSES * _BF16_BYTES * vf_width * quantized_rows
     quant_output_write = (width + scales) * quantized_rows
     quant_scale_intermediate = (
         _QUANT_SCALE_INTERMEDIATE_BUFFERS * _QUANT_SCALE_INTERMEDIATE_BYTES * scales * quantized_rows
@@ -384,17 +395,17 @@ def build(op, geometry):
     available = ub - _SIMT_CACHE_BYTES
     sort_capacity_blocks = min(available // _SORT_UB_BYTES_PER_ROW // SORT_BLOCK_ROWS,
                                _SORT_MAX_BLOCKS)
-    if (min(tokens, topk, width, experts, units) < 1 or width % MX_WIDTH_ALIGNMENT
+    if (min(tokens, topk, width, experts, units) < 1
             or assignments > sort_capacity_blocks * SORT_BLOCK_ROWS):
-        raise ModelingError("moe_init_mxfp8_requires_full_range_K_gt3_onecore_sort_full_256_columns")
+        raise ModelingError("moe_init_mxfp8_requires_full_range_K_gt3_onecore_sort")
     if any(role not in geometry.resource_units for role in ("mte2_aiv", "mte3")):
         raise ModelingError("moe_init_mxfp8_requires_AIV_read_write_pipes")
     per_owner = ceil(assignments / units)
     active = ceil(assignments / per_owner)
-    scales = width // MX_SCALE_GROUP_SIZE
+    scales = mxfp8_scale_cols(width)
     sort_rows = aligned(assignments, SORT_BLOCK_ROWS)
     sort_input_rows = aligned(assignments, _SORT_INPUT_ALIGNMENT_ROWS)
-    packed_temp_bytes = _QUANT_PACKED_TEMP_BUFFERS * aligned(width // _QUANT_PACKED_TEMP_BUFFERS)
+    packed_temp_bytes = _QUANT_PACKED_TEMP_BUFFERS * aligned(ceil(width / _QUANT_PACKED_TEMP_BUFFERS))
     gather_row_bytes = aligned(_BF16_BYTES * width) + aligned(scales) + packed_temp_bytes
     max_indices = (available // 2 - (gather_row_bytes + 2 * aligned(2 * scales))) // INDEX_BYTES
     if max_indices < per_owner:

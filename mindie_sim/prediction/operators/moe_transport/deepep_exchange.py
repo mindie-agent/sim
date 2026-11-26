@@ -70,6 +70,16 @@ def _hypergeometric_node_hit_prob(total_items: int, node_items: int, top_k: int)
     return 1.0 - (math.comb(other, k) / math.comb(total_items, k))
 
 
+def _rank_expert_counts(ep: int, num_experts: int | None = None) -> tuple[list[int], int]:
+    """Return ``(rank_experts, total_experts)`` matching contiguous ``expert_slot_plan``."""
+    size = int(ep)
+    total_e = int(num_experts) if (num_experts is not None and int(num_experts) > 0) else size
+    if total_e == size:
+        return [1] * size, total_e
+    base, rem = divmod(total_e, size)
+    return [base + (1 if r < rem else 0) for r in range(size)], total_e
+
+
 def _node_rank_and_expert_sizes(
     ep: int, ranks_per_node: int, num_experts: int | None = None,
 ) -> tuple[list[int], list[int], int]:
@@ -77,11 +87,9 @@ def _node_rank_and_expert_sizes(
     rpn = max(1, min(int(ep), int(ranks_per_node)))
     nodes = max(1, math.ceil(int(ep) / rpn))
     rank_sizes = [min(rpn, int(ep) - idx * rpn) for idx in range(nodes)]
-    total_e = int(num_experts) if (num_experts is not None and int(num_experts) >= int(ep)) else int(ep)
+    rank_experts, total_e = _rank_expert_counts(ep, num_experts=num_experts)
     if total_e == int(ep):
         return rank_sizes, list(rank_sizes), total_e
-    base, rem = divmod(total_e, int(ep))
-    rank_experts = [base + (1 if r < rem else 0) for r in range(int(ep))]
     node_experts: list[int] = []
     offset = 0
     for size in rank_sizes:
@@ -256,32 +264,52 @@ def _deepep_peer_traffic_matrix(total_bytes: float, *, ep: int,
     """Exact expected relay peer matrix matching the average of exact DeepEP routes."""
     size = int(ep)
     rpn = max(1, min(size, int(ranks_per_node)))
-    nodes = max(1, math.ceil(size / rpn))
+    rank_sizes, node_experts, total_e = _node_rank_and_expert_sizes(
+        size, rpn, num_experts=num_experts,
+    )
+    nodes = len(rank_sizes)
     w_intra = float(top_k) * _expected_intra_hops_per_assignment(
         size, rpn, num_experts=num_experts,
     )
+    hit_probs = [_hypergeometric_node_hit_prob(total_e, e_n, top_k) for e_n in node_experts]
     w_group = (
         _expected_remote_nodes_hit(size, rpn, top_k, num_experts=num_experts)
         if nodes > 1 else 0.0
     )
     w_total = max(w_intra + w_group, _VOLUME_EPS)
-    intra_share = w_intra / w_total
-    intra_row = float(total_bytes) * intra_share
-    inter_row = float(total_bytes) - intra_row
+    total_all_ranks = float(total_bytes) * float(size)
+    intra_total = total_all_ranks * (w_intra / w_total)
+    inter_total = total_all_ranks - intra_total
     cells = [[0.0] * size for _ in range(size)]
-    intra_peer = intra_row / float(rpn - 1) if rpn > 1 else 0.0
-    inter_peer = inter_row / float(nodes - 1) if nodes > 1 else 0.0
+    intra_weight_sum = math.fsum(
+        float(e_n) * float(s_n - 1) / float(s_n)
+        for s_n, e_n in zip(rank_sizes, node_experts) if s_n > 1
+    )
+    inter_weight_sum = math.fsum(
+        float(rank_sizes[s_node]) * hit_probs[d_node]
+        for s_node in range(nodes)
+        for d_node in range(nodes) if d_node != s_node
+    )
+    rank_experts, _ = _rank_expert_counts(size, num_experts=num_experts)
     for src in range(size):
         src_node = src // rpn
         lane = src % rpn
-        for dst in range(size):
-            if dst == src:
-                continue
-            dst_node = dst // rpn
-            if dst_node == src_node:
-                cells[src][dst] = intra_peer
-            elif dst == min(size - 1, dst_node * rpn + lane):
-                cells[src][dst] = inter_peer
+        s_n = rank_sizes[src_node]
+        e_n = node_experts[src_node]
+        if s_n > 1 and e_n > 0 and intra_weight_sum > 0.0:
+            node_intra = intra_total * ((float(e_n) * float(s_n - 1) / float(s_n)) / intra_weight_sum)
+            denom = float((s_n - 1) * e_n)
+            node_start = src_node * rpn
+            for dst in range(node_start, node_start + s_n):
+                if dst != src and rank_experts[dst] > 0:
+                    cells[src][dst] = node_intra * (float(rank_experts[dst]) / denom)
+        if nodes > 1 and inter_weight_sum > 0.0:
+            for dst_node in range(nodes):
+                if dst_node == src_node or hit_probs[dst_node] <= 0.0:
+                    continue
+                relay = min(size - 1, dst_node * rpn + lane)
+                if relay != src:
+                    cells[src][relay] = inter_total * (hit_probs[dst_node] / inter_weight_sum)
     return {
         "kind": "matrix",
         "payload_bytes": tuple(tuple(row) for row in cells),
@@ -426,6 +454,104 @@ def _scale_matrix(value, factor):
     return value
 
 
+def _continuous_hypergeom_hit_prob(total_items: float, hit_items: float, top_k: int) -> float:
+    """Continuous generalization of ``1 - C(E - m, k) / C(E, k)`` for expected node hits."""
+    k = max(0, int(top_k))
+    if k <= 0 or hit_items <= 0.0 or total_items <= 0.0:
+        return 0.0
+    if k == 1:
+        return min(1.0, hit_items / total_items)
+    other = total_items - hit_items
+    if other < float(k) or total_items <= hit_items:
+        return 1.0
+    log_ratio = (
+        math.lgamma(other + 1.0) - math.lgamma(other - float(k) + 1.0)
+        - math.lgamma(total_items + 1.0) + math.lgamma(total_items - float(k) + 1.0)
+    )
+    return max(0.0, min(1.0, -math.expm1(log_ratio)))
+
+
+def _deepep_matrix_stage_matrices(
+    matrix, *, ep: int, ranks_per_node: int, top_k: int, is_combine: bool,
+    eplb: float = 1.0, num_experts: int | None = None,
+    row_bytes: float | None = None, valid_per_rank: tuple[int, ...] = (),
+) -> tuple[tuple[tuple[float, ...], ...], tuple[tuple[float, ...], ...] | None]:
+    """Decompose a directed peer matrix into causal DeepEP inter/intra relay stages."""
+    size = min(int(ep), len(matrix))
+    rpn = max(1, min(size, int(ranks_per_node)))
+    rank_sizes, node_experts, total_e = _node_rank_and_expert_sizes(
+        size, rpn, num_experts=num_experts,
+    )
+    nodes = len(rank_sizes)
+    fwd = [
+        [float(matrix[d][s] if is_combine else matrix[s][d]) for d in range(size)]
+        for s in range(size)
+    ]
+    inter = [[0.0] * size for _ in range(size)]
+    intra = [[0.0] * size for _ in range(size)]
+    has_two_hop = False
+    for src in range(size):
+        src_node = src // rpn
+        lane = src % rpn
+        src_tokens = (
+            float(valid_per_rank[src])
+            if 0 <= src < len(valid_per_rank) and valid_per_rank[src] > 0
+            else 0.0
+        )
+        for dst_node in range(nodes):
+            node_start = dst_node * rpn
+            node_end = min(size, node_start + rank_sizes[dst_node])
+            if dst_node == src_node:
+                for dst in range(node_start, node_end):
+                    if dst != src and fwd[src][dst] > 0.0:
+                        intra[src][dst] += fwd[src][dst] * eplb
+                continue
+            node_bytes = math.fsum(fwd[src][dst] for dst in range(node_start, node_end))
+            if node_bytes <= 0.0:
+                continue
+            relay = min(size - 1, node_start + lane)
+            max_dest_bytes = max(fwd[src][dst] for dst in range(node_start, node_end))
+            min_relay_bytes = (
+                min(max_dest_bytes, src_tokens * float(row_bytes))
+                if (src_tokens > 0.0 and row_bytes and row_bytes > 0.0)
+                else max_dest_bytes
+            )
+            if top_k <= 1:
+                inter_bytes = node_bytes
+            elif src_tokens > 0.0 and row_bytes and row_bytes > 0.0:
+                expected_hits = node_bytes / (src_tokens * float(row_bytes))
+                eff_node_e = min(float(total_e), max(0.0, expected_hits * float(total_e) / float(top_k)))
+                p_hit = _continuous_hypergeom_hit_prob(float(total_e), eff_node_e, top_k)
+                inter_bytes = min(node_bytes, src_tokens * float(row_bytes) * p_hit)
+            else:
+                e_n = node_experts[dst_node]
+                uniform_hits = float(top_k) * float(e_n) / float(max(1, total_e))
+                dedup = (
+                    _hypergeometric_node_hit_prob(total_e, e_n, top_k) / uniform_hits
+                    if uniform_hits > 0.0 else 1.0
+                )
+                inter_bytes = node_bytes * min(1.0, dedup)
+            inter_bytes = max(inter_bytes, min_relay_bytes)
+            if relay != src:
+                inter[src][relay] += inter_bytes * eplb
+            for dst in range(node_start, node_end):
+                if dst != relay and fwd[src][dst] > 0.0:
+                    intra[relay][dst] += fwd[src][dst] * eplb
+                    if relay != src:
+                        has_two_hop = True
+    if not has_two_hop:
+        combined = [
+            [inter[s][d] + intra[s][d] for d in range(size)]
+            for s in range(size)
+        ]
+        if is_combine:
+            return _transpose_matrix(combined), None
+        return tuple(tuple(row) for row in combined), None
+    if is_combine:
+        return _transpose_matrix(intra), _transpose_matrix(inter)
+    return tuple(tuple(row) for row in inter), tuple(tuple(row) for row in intra)
+
+
 def scale_exchange_stages(
     op, factor, options, *, ep: int = 1, top_k: int = 1,
     is_combine: bool = False, num_experts: int | None = None,
@@ -435,25 +561,37 @@ def scale_exchange_stages(
         return (op,)
     metadata = dict(op.metadata)
     traffic = metadata.get("peer_traffic")
+    has_peer_matrix = isinstance(traffic, Mapping) and traffic.get("kind") == "matrix"
     is_exact_matrix = (
-        isinstance(traffic, Mapping)
-        and traffic.get("kind") == "matrix"
+        has_peer_matrix
         and (metadata.get("routing_basis") in _EXPLICIT_ROUTING_BASES
              or metadata.get("traffic_model") in _EXPLICIT_ROUTING_BASES)
     )
-    if is_exact_matrix:
+    rpn = int(options.get("ranks_per_node", 0) or 0)
+    if is_exact_matrix or (has_peer_matrix and options["deepep"] and 0 < rpn < ep):
         orig_bytes = float(op.link_bytes)
         stage1 = traffic["payload_bytes"]
         stage2 = None
-        rpn = int(options.get("ranks_per_node", 0) or 0)
         if options["deepep"] and 0 < rpn < ep:
-            exact_route = _extract_exact_token_route(metadata)
             row_bytes = _resolve_exact_row_bytes(op, metadata)
+            exact_route = _extract_exact_token_route(metadata) if is_exact_matrix else None
             if exact_route is not None and row_bytes is not None:
                 owners, topk, placement = exact_route
                 stage1, stage2 = _deepep_exact_stage_matrices(
                     owners, topk, placement, ep=ep, ranks_per_node=rpn,
                     row_bytes=row_bytes, is_combine=is_combine,
+                )
+            elif not is_exact_matrix:
+                raw_mask = metadata.get("source_token_mask")
+                valid_per_rank = (
+                    tuple(int(v) for v in raw_mask.get("valid_tokens_per_rank", ()))
+                    if isinstance(raw_mask, Mapping) else ()
+                )
+                stage1, stage2 = _deepep_matrix_stage_matrices(
+                    stage1, ep=ep, ranks_per_node=rpn, top_k=top_k,
+                    is_combine=is_combine, eplb=float(options["eplb"]),
+                    num_experts=num_experts, row_bytes=row_bytes,
+                    valid_per_rank=valid_per_rank,
                 )
         if stage2 is not None:
             first_suffix = ".intra" if is_combine else ".inter"
@@ -484,6 +622,7 @@ def scale_exchange_stages(
             scaled_bytes, ep=ep, ranks_per_node=options["ranks_per_node"],
             top_k=top_k, num_experts=num_experts,
         )
+        metadata.setdefault("peer_volume_basis", "group_mean")
     metadata["eplb_peak_to_avg"] = options["eplb"]
     if options["deepep"]:
         metadata["deepep_mode"] = True

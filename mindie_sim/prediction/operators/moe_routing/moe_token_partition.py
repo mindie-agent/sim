@@ -315,28 +315,18 @@ def _destination_rank_shares(*, model, plan, parallel, runtime) -> tuple[float, 
     if total_mass <= 0.0:
         return (1.0 / float(ep),) * ep
     runtime_routing = dict(getattr(runtime, "routing", {}) or {})
-    has_slots = (
-        int(getattr(parallel, "redundant_experts_per_rank", 0) or 0) > 0
-        or "expert_slot_map" in runtime_routing
-        or (experts > 0 and ep > 0 and experts % ep != 0)
+    _, slot_routing = split_routing_features(runtime_routing)
+    slot_parallel = (
+        parallel if int(getattr(parallel, "ep", 0) or 0) >= 1
+        else replace(parallel, ep=ep)
     )
+    slot_plan = expert_slot_plan(model, plan, slot_parallel, routing=slot_routing)
+    copies = slot_plan.copies_per_expert()
     rank_shares = [0.0] * ep
-    if has_slots:
-        _, slot_routing = split_routing_features(runtime_routing)
-        slot_plan = expert_slot_plan(model, plan, parallel, routing=slot_routing)
-        copies = slot_plan.copies_per_expert()
-        for rank, expert_ids in enumerate(slot_plan.expert_ids_by_rank):
-            for expert in expert_ids:
-                count = copies.get(int(expert), 1)
-                rank_shares[rank] += (float(rows_per_token[int(expert)]) / total_mass) / float(max(1, count))
-    elif ep <= experts:
-        for expert, rows in enumerate(rows_per_token):
-            rank_shares[expert % ep] += float(rows) / total_mass
-    else:
-        for rank in range(ep):
-            expert = rank % experts
-            replicas = 1 + (ep - 1 - expert) // experts
-            rank_shares[rank] += (float(rows_per_token[expert]) / total_mass) / float(replicas)
+    for rank, expert_ids in enumerate(slot_plan.expert_ids_by_rank):
+        for expert in expert_ids:
+            count = copies.get(int(expert), 1)
+            rank_shares[rank] += (float(rows_per_token[int(expert)]) / total_mass) / float(max(1, count))
     return tuple(rank_shares)
 
 

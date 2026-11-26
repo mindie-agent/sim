@@ -205,24 +205,55 @@ def _straggler_rank_moments(
     if reachable_local <= 0:
         return 0.0, 0.0
     sigma_rows = math.sqrt(max(0.0, row_var))
+    is_random_total = (pool > num_experts) and (top_k < pool)
     rank_cap = max(1, min(ep, int(active_rank_count))) if active_rank_count is not None else ep
-    active_ranks = min(rank_cap, max(1, math.ceil(total_rows - _STRAGGLER_ORDER_EPS)))
+    max_real_rows = float(tokens * min(top_k, num_experts)) if is_random_total else total_rows
+    active_ranks = min(rank_cap, max(1, math.ceil(max_real_rows - _STRAGGLER_ORDER_EPS)))
     z_order = normal_max_order_z(active_ranks)
     row_cap = float(tokens * min(top_k, reachable_local))
-    row_upper = min(total_rows, row_cap)
     is_integer_total = math.isclose(
         total_rows, round(total_rows), rel_tol=0.0, abs_tol=_STRAGGLER_ORDER_EPS,
     )
-    if total_rows < 1.0:
-        # Exact indicator lower bound when zero_experts shrinks N_eff < 1.0:
-        # E[max_r R_r] >= P(at least one real assignment) under without-replacement top-k.
+    if is_random_total or total_rows < 1.0:
+        # When zero_experts shrinks or randomizes N_real (even if E[N_real] is an
+        # integer), P(max_r R_r >= 1) = P(N_real >= 1) = p_any and
+        # E[max_r R_r] <= p_any * row_cap.
         p_any = _hypergeometric_any_real_prob(pool, num_experts, top_k, tokens)
-        row_lower = max(mean_rows, p_any)
-        r_max = min(row_upper, max(row_lower, mean_rows + z_order * sigma_rows))
+        row_upper = min(total_rows, p_any * row_cap)
+        no_replicas = (
+            slot_copies is None or all(int(c) <= 1 for c in slot_copies)
+        )
+        uniform_local = (
+            local_slot_probs is None
+            or all(
+                math.isclose(float(p), float(top_k) / float(pool), rel_tol=1e-9, abs_tol=1e-12)
+                for p in local_slot_probs
+            )
+        )
+        if (
+            no_replicas
+            and uniform_local
+            and tokens == 1
+            and top_k == 2
+            and pool >= 2
+            and num_experts >= 2
+        ):
+            # Exact combinatorial identity for one uniform top-2 draw:
+            # E[max_r R_r] = P(max_r R_r >= 1) + P(max_r R_r == 2).
+            base_l, rem_l = divmod(num_experts, ep)
+            p_two = float(sum(
+                math.comb(base_l + (1 if r < rem_l else 0), 2) for r in range(ep)
+            )) / float(math.comb(pool, 2))
+            r_max = min(row_upper, p_any + p_two)
+        else:
+            row_lower = min(row_upper, max(mean_rows, total_rows / float(ep), p_any))
+            r_max = min(row_upper, max(row_lower, mean_rows + z_order * sigma_rows))
     elif not is_integer_total:
+        row_upper = min(total_rows, row_cap)
         row_lower = max(mean_rows, total_rows / float(ep))
         r_max = min(row_upper, max(row_lower, mean_rows + z_order * sigma_rows))
     else:
+        row_upper = min(total_rows, row_cap)
         row_lower = float(math.ceil(total_rows / float(ep) - _STRAGGLER_ORDER_EPS))
         r_max = float(min(
             int(round(row_upper)),
@@ -235,16 +266,18 @@ def _straggler_rank_moments(
         * variance_scale
     )
     sigma_act = math.sqrt(max(0.0, var_act))
-    if total_active < 1.0:
+    if is_random_total or total_active < 1.0:
         p_any = _hypergeometric_any_real_prob(pool, num_experts, top_k, tokens)
-        act_lower = min(r_max, max(mu_act, p_any))
+        act_upper = min(float(reachable_local), r_max, p_any * float(reachable_local))
+        act_lower = min(act_upper, max(mu_act, p_any))
+        a_max = min(act_upper, max(act_lower, mu_act + z_order * sigma_act))
     else:
         act_lower = max(1.0, float(math.ceil(total_active / float(ep) - _STRAGGLER_ORDER_EPS)))
-    a_max = min(
-        float(reachable_local),
-        r_max,
-        max(act_lower, mu_act + z_order * sigma_act),
-    )
+        a_max = min(
+            float(reachable_local),
+            r_max,
+            max(act_lower, mu_act + z_order * sigma_act),
+        )
     return r_max, a_max
 
 
