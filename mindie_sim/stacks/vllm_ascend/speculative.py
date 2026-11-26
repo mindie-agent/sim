@@ -62,7 +62,18 @@ A3_DUAL_DIE_NODE_RANKS = 16
 A2_GDN_STRIDED_RECURRENT_MIN_VERIFY_TOKENS = 9
 
 DEFAULT_MAX_NUM_SEQS = 64
-DEFAULT_CAPTURE_BATCH_TIERS: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 48, 64)
+#: Upstream vLLM-Ascend ``_get_reduced_cg_cap`` default ACLGraph capture token ceiling.
+DEFAULT_MAX_CUDAGRAPH_CAPTURE_SIZE = 512
+_CAPTURE_STEP_SMALL = 8
+_CAPTURE_STEP_LARGE = 16
+_CAPTURE_STEP_SWITCH = 256
+DEFAULT_CAPTURE_BATCH_TIERS: tuple[int, ...] = (
+    1,
+    2,
+    4,
+    *range(_CAPTURE_STEP_SMALL, _CAPTURE_STEP_SWITCH, _CAPTURE_STEP_SMALL),
+    *range(_CAPTURE_STEP_SWITCH, DEFAULT_MAX_CUDAGRAPH_CAPTURE_SIZE + 1, _CAPTURE_STEP_LARGE),
+)
 DEFAULT_PIECEWISE_TOKEN_TIERS: tuple[int, ...] = (
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
 )
@@ -689,20 +700,33 @@ def compute_aclgraph_capture_sizes(
     max_num_seqs: int = DEFAULT_MAX_NUM_SEQS,
     cudagraph_mode: str = "FULL_DECODE_ONLY",
 ) -> tuple[int, ...]:
-    """Generate ACLGraph capture sizes respecting ``n * (K + 1)`` under full-graph modes."""
+    """Generate ACLGraph capture sizes respecting ``n * (K + 1)`` capped at 512 tokens.
+
+    Mirrors vLLM-Ascend ``_get_reduced_cg_cap``: default capture sizes cap at
+    ``min(max_num_seqs * (1 + k), 512)`` with dense step-8/step-16 tiers so
+    batches above the cap run eager unpadded instead of exploding padding.
+    """
     k = validate_fia_speculative_tokens(_require_int_spec_k(num_speculative_tokens))
     stride = k + 1
     limit = max(1, int(max_num_seqs))
+    mode_upper = str(cudagraph_mode or "FULL_DECODE_ONLY").strip().upper()
+    scale_by_stride = mode_upper in FULL_GRAPH_CUDAGRAPH_MODES and k > 0
     if batch_sizes is not None:
         raw_bs = sorted({max(1, int(b)) for b in batch_sizes if int(b) > 0})
-    else:
-        raw_bs = [b for b in DEFAULT_CAPTURE_BATCH_TIERS if b <= limit]
-        if limit not in raw_bs:
-            raw_bs.append(limit)
-    mode_upper = str(cudagraph_mode or "FULL_DECODE_ONLY").strip().upper()
-    if mode_upper in FULL_GRAPH_CUDAGRAPH_MODES and k > 0:
-        return tuple(sorted({b * stride for b in raw_bs}))
-    return tuple(sorted(set(raw_bs)))
+        if scale_by_stride:
+            return tuple(sorted({b * stride for b in raw_bs}))
+        return tuple(raw_bs)
+    token_cap = min(limit * stride, DEFAULT_MAX_CUDAGRAPH_CAPTURE_SIZE)
+    raw_tokens = [t for t in DEFAULT_CAPTURE_BATCH_TIERS if t <= token_cap]
+    if token_cap not in raw_tokens:
+        raw_tokens.append(token_cap)
+    if scale_by_stride:
+        rounded = sorted({
+            sz for t in raw_tokens
+            if (sz := _round_up_to_stride(t, stride)) <= token_cap
+        })
+        return tuple(rounded) if rounded else (stride,)
+    return tuple(sorted(set(raw_tokens)))
 
 
 def _round_up_to_stride(size: int, stride: int) -> int:
@@ -1277,6 +1301,164 @@ def _match_companion_by_draft(
     return None
 
 
+def _select_speculative_companion(
+    key: str,
+    model_id: str,
+    hw: str,
+    companions: tuple[SpeculativeCompanion, ...],
+    *,
+    method: str | None,
+    num_speculative_tokens: int | None,
+    explicit_draft: str,
+    draft_archs: Sequence[str],
+) -> tuple[SpeculativeCompanion, bool]:
+    if method:
+        req_m = str(method).strip().lower()
+        if req_m in ASCEND_V2_REJECTED_SPECULATIVE_METHODS:
+            raise ModelingError(f"unsupported_speculative_method_on_ascend_v2:{req_m}")
+        if not is_supported_speculative_method(req_m):
+            raise ModelingError(f"unsupported_speculative_method:{req_m}")
+        method_matches = [c for c in companions if c.method == req_m]
+        if req_m in ZERO_NEURAL_DRAFT_METHODS:
+            matched_zero = next((c for c in companions if c.method in ZERO_NEURAL_DRAFT_METHODS), None)
+            default_k = matched_zero.num_speculative_tokens if matched_zero is not None else NGRAM_DEFAULT_K
+            lookup_max = matched_zero.prompt_lookup_max if matched_zero is not None else DEFAULT_PROMPT_LOOKUP_MAX
+            return (
+                _c(
+                    key or str(model_id), req_m, "",
+                    num_speculative_tokens if num_speculative_tokens is not None else default_k,
+                    is_builtin=True, k_min=1, k_max=MAX_SPECULATIVE_TOKENS,
+                    prompt_lookup_max=lookup_max, doc=_DOC_SD,
+                ),
+                False,
+            )
+        draft_hit = (
+            _match_companion_by_draft(method_matches, explicit_draft, hw, draft_archs)
+            if ((explicit_draft or draft_archs) and method_matches)
+            else None
+        )
+        if draft_hit is not None:
+            return draft_hit, True
+        if explicit_draft:
+            is_lilicorr = _LILICORR_ARCH in draft_archs
+            base_match = method_matches[0] if method_matches else None
+            default_k = (
+                DFLASH_DEFAULT_K if is_lilicorr
+                else (base_match.num_speculative_tokens if base_match is not None else DEFAULT_MTP_K)
+            )
+            tp_policy = (
+                base_match.draft_tp_policy
+                if base_match is not None
+                else ("match_target" if req_m in {"eagle", "eagle3", "draft_model"} else "auto")
+            )
+            return (
+                _c(
+                    key or str(model_id), req_m, explicit_draft,
+                    num_speculative_tokens if num_speculative_tokens is not None else default_k,
+                    is_builtin=False, k_min=1,
+                    k_max=DFLASH_DEFAULT_K if is_lilicorr else MAX_SPECULATIVE_TOKENS,
+                    draft_tp_policy=tp_policy,
+                    draft_kv_on_fp8=(base_match.draft_kv_dtype_on_fp8_target if base_match is not None else ""),
+                    enforce_eager=True if is_lilicorr else None,
+                    no_prefix_cache=(req_m in NONCAUSAL_BLOCK_DRAFT_METHODS),
+                    pd_match=is_hybrid_recurrent_model(key) or req_m in NONCAUSAL_BLOCK_DRAFT_METHODS,
+                    draft_arch=_LILICORR_ARCH if is_lilicorr else (draft_archs[0] if draft_archs else ""),
+                ),
+                is_lilicorr,
+            )
+        if method_matches:
+            matched = method_matches[0]
+            if not matched.is_builtin and not matched.draft_model_for_hw(hw):
+                raise ModelingError(f"draft_structure_required_for_speculative_method:{req_m}")
+            return matched, True
+        if is_mtp_speculative_method(req_m) and _model_has_builtin_draft(key or str(model_id), "mtp"):
+            return (
+                _c(
+                    key or str(model_id), req_m, "",
+                    num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_MTP_K,
+                    is_builtin=True, pd_match=is_hybrid_recurrent_model(key),
+                ),
+                False,
+            )
+        if req_m in NONCAUSAL_BLOCK_DRAFT_METHODS and _model_has_builtin_draft(key or str(model_id), "dspark"):
+            return (
+                _c(
+                    key or str(model_id), req_m, "",
+                    num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_DSPARK_K,
+                    is_builtin=True, pd_match=True,
+                ),
+                False,
+            )
+        raise ModelingError(f"draft_structure_required_for_speculative_method:{req_m}")
+    if companions:
+        draft_hit = _match_companion_by_draft(companions, explicit_draft, hw, draft_archs) if (explicit_draft or draft_archs) else None
+        selected = draft_hit if draft_hit is not None else companions[0]
+        return selected, (not explicit_draft) or (draft_hit is not None)
+    if _model_has_builtin_draft(key or str(model_id), "dspark"):
+        return (
+            _c(
+                key or str(model_id), "dspark", "",
+                num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_DSPARK_K,
+                is_builtin=True, pd_match=True,
+            ),
+            False,
+        )
+    if _model_has_builtin_draft(key or str(model_id), "mtp"):
+        return (
+            _c(
+                key or str(model_id), "mtp", "",
+                num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_MTP_K,
+                is_builtin=True, pd_match=is_hybrid_recurrent_model(key),
+            ),
+            False,
+        )
+    raise ModelingError(f"draft_structure_required_for_speculative_companion:{key or model_id}")
+
+
+def _build_speculative_config(
+    selected: SpeculativeCompanion,
+    *,
+    hw: str,
+    tp: int,
+    eff_k: int,
+    target_kv_dtype: str,
+    draft_model: str | None,
+) -> tuple[str, int | None, str, dict[str, Any]]:
+    resolved_draft = str(draft_model) if draft_model else selected.draft_model_for_hw(hw)
+    if selected.draft_tp_policy == "one":
+        draft_tp: int | None = 1
+    elif selected.draft_tp_policy == "match_target" or selected.method in {"eagle", "eagle3"}:
+        draft_tp = tp
+    else:
+        draft_tp = None
+    kv_lower = str(target_kv_dtype or "bf16").strip().lower()
+    needs_bf16_draft_kv = bool(
+        selected.draft_kv_dtype_on_fp8_target
+        and (
+            kv_lower in {"fp8", "fp8_e4m3", "mxfp8"}
+            or (hw in A2_A3_INT_ONLY_FAMILIES and kv_lower in {"int8", "c8"} and selected.method == "dspark")
+        )
+    )
+    draft_kv = selected.draft_kv_dtype_on_fp8_target if needs_bf16_draft_kv else ""
+    spec_cfg: dict[str, Any] = {
+        "method": selected.method,
+        "num_speculative_tokens": eff_k,
+    }
+    if resolved_draft:
+        spec_cfg["model"] = resolved_draft
+    if draft_tp is not None:
+        spec_cfg["draft_tensor_parallel_size"] = draft_tp
+    if draft_kv:
+        spec_cfg["kv_cache_dtype"] = draft_kv
+    if selected.draft_sample_method:
+        spec_cfg["draft_sample_method"] = selected.draft_sample_method
+    if selected.enforce_eager_draft is not None:
+        spec_cfg["enforce_eager"] = selected.enforce_eager_draft
+    if selected.prompt_lookup_max > 0:
+        spec_cfg["prompt_lookup_max"] = selected.prompt_lookup_max
+    return resolved_draft, draft_tp, draft_kv, spec_cfg
+
+
 def resolve_speculative_companion(
     model_id: str,
     *,
@@ -1298,103 +1480,11 @@ def resolve_speculative_companion(
     draft_archs: list[str] = list(_read_local_draft_architectures(explicit_draft))
     if draft_architecture and str(draft_architecture).strip():
         draft_archs.insert(0, str(draft_architecture).strip())
-    matched_companion_exact = False
-
-    if method:
-        req_m = str(method).strip().lower()
-        if req_m in ASCEND_V2_REJECTED_SPECULATIVE_METHODS:
-            raise ModelingError(f"unsupported_speculative_method_on_ascend_v2:{req_m}")
-        if not is_supported_speculative_method(req_m):
-            raise ModelingError(f"unsupported_speculative_method:{req_m}")
-        method_matches = [c for c in companions if c.method == req_m]
-        if req_m in ZERO_NEURAL_DRAFT_METHODS:
-            matched_zero = next((c for c in companions if c.method in ZERO_NEURAL_DRAFT_METHODS), None)
-            selected = _c(
-                key or str(model_id), req_m, "",
-                num_speculative_tokens if num_speculative_tokens is not None else (
-                    matched_zero.num_speculative_tokens if matched_zero is not None else NGRAM_DEFAULT_K
-                ),
-                is_builtin=True, k_min=1, k_max=MAX_SPECULATIVE_TOKENS,
-                prompt_lookup_max=(
-                    matched_zero.prompt_lookup_max if matched_zero is not None else DEFAULT_PROMPT_LOOKUP_MAX
-                ),
-                doc=_DOC_SD,
-            )
-        else:
-            draft_hit = (
-                _match_companion_by_draft(method_matches, explicit_draft, hw, draft_archs)
-                if ((explicit_draft or draft_archs) and method_matches)
-                else None
-            )
-            if draft_hit is not None:
-                selected = draft_hit
-                matched_companion_exact = True
-            elif explicit_draft:
-                is_lilicorr = _LILICORR_ARCH in draft_archs
-                base_match = method_matches[0] if method_matches else None
-                default_k = (
-                    DFLASH_DEFAULT_K if is_lilicorr
-                    else (base_match.num_speculative_tokens if base_match is not None else DEFAULT_MTP_K)
-                )
-                selected = _c(
-                    key or str(model_id), req_m, explicit_draft,
-                    num_speculative_tokens if num_speculative_tokens is not None else default_k,
-                    is_builtin=False,
-                    k_min=1,
-                    k_max=DFLASH_DEFAULT_K if is_lilicorr else MAX_SPECULATIVE_TOKENS,
-                    draft_tp_policy=(
-                        base_match.draft_tp_policy
-                        if base_match is not None
-                        else ("match_target" if req_m in {"eagle", "eagle3", "draft_model"} else "auto")
-                    ),
-                    draft_kv_on_fp8=(base_match.draft_kv_dtype_on_fp8_target if base_match is not None else ""),
-                    enforce_eager=True if is_lilicorr else None,
-                    no_prefix_cache=(req_m in NONCAUSAL_BLOCK_DRAFT_METHODS),
-                    pd_match=is_hybrid_recurrent_model(key) or req_m in NONCAUSAL_BLOCK_DRAFT_METHODS,
-                    draft_arch=_LILICORR_ARCH if is_lilicorr else (draft_archs[0] if draft_archs else ""),
-                )
-                matched_companion_exact = is_lilicorr
-            elif method_matches:
-                matched = method_matches[0]
-                if not matched.is_builtin and not matched.draft_model_for_hw(hw):
-                    raise ModelingError(f"draft_structure_required_for_speculative_method:{req_m}")
-                selected = matched
-                matched_companion_exact = True
-            elif is_mtp_speculative_method(req_m) and _model_has_builtin_draft(key or str(model_id), "mtp"):
-                selected = _c(
-                    key or str(model_id), req_m, "",
-                    num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_MTP_K,
-                    is_builtin=True,
-                    pd_match=is_hybrid_recurrent_model(key),
-                )
-            elif req_m in NONCAUSAL_BLOCK_DRAFT_METHODS and _model_has_builtin_draft(key or str(model_id), "dspark"):
-                selected = _c(
-                    key or str(model_id), req_m, "",
-                    num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_DSPARK_K,
-                    is_builtin=True,
-                    pd_match=True,
-                )
-            else:
-                raise ModelingError(f"draft_structure_required_for_speculative_method:{req_m}")
-    elif companions:
-        draft_hit = _match_companion_by_draft(companions, explicit_draft, hw, draft_archs) if (explicit_draft or draft_archs) else None
-        selected = draft_hit if draft_hit is not None else companions[0]
-        matched_companion_exact = (not explicit_draft) or (draft_hit is not None)
-    elif _model_has_builtin_draft(key or str(model_id), "dspark"):
-        selected = _c(
-            key or str(model_id), "dspark", "",
-            num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_DSPARK_K,
-            is_builtin=True, pd_match=True,
-        )
-    elif _model_has_builtin_draft(key or str(model_id), "mtp"):
-        selected = _c(
-            key or str(model_id), "mtp", "",
-            num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_MTP_K,
-            is_builtin=True, pd_match=is_hybrid_recurrent_model(key),
-        )
-    else:
-        raise ModelingError(f"draft_structure_required_for_speculative_companion:{key or model_id}")
-
+    selected, matched_companion_exact = _select_speculative_companion(
+        key, model_id, hw, companions,
+        method=method, num_speculative_tokens=num_speculative_tokens,
+        explicit_draft=explicit_draft, draft_archs=draft_archs,
+    )
     if num_speculative_tokens is not None:
         eff_k = validate_fia_speculative_tokens(_require_int_spec_k(num_speculative_tokens))
         if (
@@ -1410,48 +1500,15 @@ def resolve_speculative_companion(
         eff_k, clamp_warn = clamp_fia_speculative_tokens(_require_int_spec_k(selected.num_speculative_tokens))
         if clamp_warn:
             warnings.append(clamp_warn)
-
-    resolved_draft = str(draft_model) if draft_model else selected.draft_model_for_hw(hw)
-    if selected.draft_tp_policy == "one":
-        draft_tp: int | None = 1
-    elif selected.draft_tp_policy == "match_target" or selected.method in {"eagle", "eagle3"}:
-        draft_tp = tp
-    else:
-        draft_tp = None
-
-    kv_lower = str(target_kv_dtype or "bf16").strip().lower()
-    needs_bf16_draft_kv = bool(
-        selected.draft_kv_dtype_on_fp8_target
-        and (
-            kv_lower in {"fp8", "fp8_e4m3", "mxfp8"}
-            or (hw in A2_A3_INT_ONLY_FAMILIES and kv_lower in {"int8", "c8"} and selected.method == "dspark")
-        )
+    resolved_draft, draft_tp, draft_kv, spec_cfg = _build_speculative_config(
+        selected, hw=hw, tp=tp, eff_k=eff_k,
+        target_kv_dtype=target_kv_dtype, draft_model=draft_model,
     )
-    draft_kv = selected.draft_kv_dtype_on_fp8_target if needs_bf16_draft_kv else ""
-
-    spec_cfg: dict[str, Any] = {
-        "method": selected.method,
-        "num_speculative_tokens": eff_k,
-    }
-    if resolved_draft:
-        spec_cfg["model"] = resolved_draft
-    if draft_tp is not None:
-        spec_cfg["draft_tensor_parallel_size"] = draft_tp
-    if draft_kv:
-        spec_cfg["kv_cache_dtype"] = draft_kv
-    if selected.draft_sample_method:
-        spec_cfg["draft_sample_method"] = selected.draft_sample_method
-    if selected.enforce_eager_draft is not None:
-        spec_cfg["enforce_eager"] = selected.enforce_eager_draft
-    if selected.prompt_lookup_max > 0:
-        spec_cfg["prompt_lookup_max"] = selected.prompt_lookup_max
-
     if hw == "a2" and is_hybrid_recurrent_model(key) and (eff_k + 1) >= A2_GDN_STRIDED_RECURRENT_MIN_VERIFY_TOKENS:
         warnings.append(
             f"a2_gdn_strided_recurrent_workaround:verify_tokens={eff_k + 1}:"
             "A2 BF16 GDN >= 9 verify tokens uses strided Triton recurrent update"
         )
-
     alts = tuple(c for c in companions if c != selected)
     return ResolvedSpeculativeCompanion(
         canonical_model=key, hw_family=hw, companion=selected,
@@ -1544,6 +1601,89 @@ def _resolve_va_weight_nz_mode(
     return WEIGHT_NZ_MODE_QUANT if hw in A2_A3_INT_ONLY_FAMILIES else None
 
 
+def _validate_va_replayssm(
+    loaded_model: ModelSpec | None,
+    resolved: ResolvedSpeculativeCompanion | None,
+    *,
+    enable_speculative: bool,
+    eff_k: int,
+    spec_method: str | None,
+    dp: int,
+    tp: int,
+    pp: int,
+    ep: int,
+    dcp: int,
+    pcp: int,
+    pd_disaggregated: bool,
+    pd_role: str,
+) -> None:
+    if not enable_speculative or eff_k <= 0:
+        raise ModelingError("replayssm_requires_speculative_decoding")
+    if loaded_model is None:
+        if pp != 1:
+            raise ModelingError(f"replayssm_requires_pp_1:got_pp={pp}")
+        return
+    eff_spec_method = resolved.method if resolved is not None else str(spec_method or "")
+    no_prefix = bool(resolved is not None and resolved.companion.requires_no_prefix_caching)
+    kv_xfer_for_check: dict[str, str] | None = None
+    if pd_disaggregated:
+        role_low = str(pd_role or "decode").strip().lower().removeprefix("pd_")
+        kv_xfer_for_check = {
+            "kv_connector": "MooncakeConnectorV2",
+            "kv_role": "kv_producer" if role_low == "prefill" else "kv_consumer",
+        }
+    validate_recover_ssm_eligibility(
+        loaded_model,
+        recover_ssm_arg=True,
+        track="shipping",
+        parallel=ParallelSpec(
+            dp=max(1, int(dp)), tp=max(1, int(tp)), pp=max(1, int(pp)),
+            ep=max(1, int(ep)), cp=max(1, int(dcp)), pcp=max(1, int(pcp)),
+        ),
+        spec_method=eff_spec_method,
+        proposal_count=eff_k,
+        enable_prefix_caching=not no_prefix,
+        kv_transfer_config=kv_xfer_for_check,
+    )
+
+
+def _build_va_cli_flags(
+    *,
+    load_strat: str,
+    ep: int,
+    ep_filter: bool,
+    mm_cache: int | None,
+    eff_kv: str,
+    resolved: ResolvedSpeculativeCompanion | None,
+    enable_replayssm: bool,
+    comp_cfg: Mapping[str, Any],
+    spec_cfg: Mapping[str, Any],
+    add_cfg: Mapping[str, Any],
+    rules: list[str],
+) -> tuple[str, ...]:
+    flags: list[str] = [f"--safetensors-load-strategy {load_strat}"]
+    if ep_filter:
+        flags.append("--enable-ep-weight-filter")
+        rules.append(f"enable_ep_weight_filter:ep={ep}")
+    if mm_cache is not None:
+        flags.append(f"--mm-processor-cache-gb {mm_cache}")
+        rules.append("mm_processor_cache_gb_0_text_only")
+    if eff_kv in {"int8", "fp8", "fp8_e4m3", "mxfp8"}:
+        cli_kv = "fp8" if eff_kv == "fp8_e4m3" else eff_kv
+        flags.append(f"--kv-cache-dtype {cli_kv}")
+    if resolved is not None and resolved.companion.requires_no_prefix_caching:
+        flags.append("--no-enable-prefix-caching")
+        rules.append("no_enable_prefix_caching_for_block_drafter")
+    if enable_replayssm:
+        flags.append("--use-replayssm")
+    flags.append(f"--compilation-config '{json.dumps(comp_cfg, separators=(',', ':'))}'")
+    if spec_cfg:
+        flags.append(f"--speculative-config '{json.dumps(spec_cfg, separators=(',', ':'))}'")
+    if add_cfg:
+        flags.append(f"--additional-config '{json.dumps(add_cfg, separators=(',', ':'))}'")
+    return tuple(flags)
+
+
 def build_va_serving_rules(
     model_id: str,
     *,
@@ -1581,12 +1721,10 @@ def build_va_serving_rules(
     multimodal = is_multimodal_model(loaded_model or key) if is_multimodal is None else bool(is_multimodal)
     warnings: list[str] = []
     rules: list[str] = []
-
     kv_lower = str(target_kv_dtype or "bf16").strip().lower()
     if hw in A2_A3_INT_ONLY_FAMILIES and kv_lower in {"fp8", "fp8_e4m3", "mxfp8"}:
         raise ModelingError(f"kv_cache_dtype_unsupported_on_hardware:{hw}:{target_kv_dtype}")
     eff_kv = "int8" if kv_lower == "c8" else (kv_lower or "bf16")
-
     resolved: ResolvedSpeculativeCompanion | None = None
     spec_cfg: dict[str, Any] = {}
     p_spec_cfg: dict[str, Any] = {}
@@ -1613,37 +1751,13 @@ def build_va_serving_rules(
             eff_k = int(spec_cfg.get("num_speculative_tokens", eff_k))
         else:
             spec_cfg = dict(resolved.speculative_config)
-
     if enable_replayssm:
-        if not enable_speculative or eff_k <= 0:
-            raise ModelingError("replayssm_requires_speculative_decoding")
-        if loaded_model is not None:
-            eff_spec_method = resolved.method if resolved is not None else str(spec_method or "")
-            no_prefix = bool(resolved is not None and resolved.companion.requires_no_prefix_caching)
-            kv_xfer_for_check: dict[str, str] | None = None
-            if pd_disaggregated:
-                role_low = str(pd_role or "decode").strip().lower().removeprefix("pd_")
-                kv_xfer_for_check = {
-                    "kv_connector": "MooncakeConnectorV2",
-                    "kv_role": "kv_producer" if role_low == "prefill" else "kv_consumer",
-                }
-            validate_recover_ssm_eligibility(
-                loaded_model,
-                recover_ssm_arg=True,
-                track="shipping",
-                parallel=ParallelSpec(
-                    dp=max(1, int(dp)), tp=max(1, int(tp)), pp=max(1, int(pp)),
-                    ep=max(1, int(ep)), cp=max(1, int(dcp)), pcp=max(1, int(pcp)),
-                ),
-                spec_method=eff_spec_method,
-                proposal_count=eff_k,
-                enable_prefix_caching=not no_prefix,
-                kv_transfer_config=kv_xfer_for_check,
-            )
-        elif pp != 1:
-            raise ModelingError(f"replayssm_requires_pp_1:got_pp={pp}")
+        _validate_va_replayssm(
+            loaded_model, resolved, enable_speculative=enable_speculative, eff_k=eff_k,
+            spec_method=spec_method, dp=dp, tp=tp, pp=pp, ep=ep, dcp=dcp, pcp=pcp,
+            pd_disaggregated=pd_disaggregated, pd_role=pd_role,
+        )
         rules.append("kda_recoverssm_enabled")
-
     capture_sizes = compute_aclgraph_capture_sizes(
         batch_sizes, num_speculative_tokens=eff_k,
         max_num_seqs=max_num_seqs, cudagraph_mode=cudagraph_mode,
@@ -1654,7 +1768,6 @@ def build_va_serving_rules(
     }
     if eff_k > 0 and comp_cfg["cudagraph_mode"] in FULL_GRAPH_CUDAGRAPH_MODES:
         rules.append(f"aclgraph_capture_multiples_of_{eff_k + 1}")
-
     resolved_nz_mode = _resolve_va_weight_nz_mode(
         hw, weight_nz_mode=weight_nz_mode,
         enable_weight_nz_layout=enable_weight_nz_layout, warnings=warnings,
@@ -1667,7 +1780,6 @@ def build_va_serving_rules(
         add_cfg["weight_nz_mode"] = resolved_nz_mode
         if resolved_nz_mode != WEIGHT_NZ_MODE_DISABLED:
             rules.append(f"weight_nz_mode={resolved_nz_mode}")
-
     if safetensors_load_strategy:
         load_strat = str(safetensors_load_strategy).strip().lower()
     else:
@@ -1675,28 +1787,11 @@ def build_va_serving_rules(
         load_strat = str(facts.get("safetensors_load_strategy") or "prefetch").strip().lower()
     ep_filter = int(ep) >= EP_WEIGHT_FILTER_MIN_EP
     mm_cache = 0 if (multimodal and text_only_serving) else None
-
-    flags: list[str] = [f"--safetensors-load-strategy {load_strat}"]
-    if ep_filter:
-        flags.append("--enable-ep-weight-filter")
-        rules.append(f"enable_ep_weight_filter:ep={ep}")
-    if mm_cache is not None:
-        flags.append(f"--mm-processor-cache-gb {mm_cache}")
-        rules.append("mm_processor_cache_gb_0_text_only")
-    if eff_kv in {"int8", "fp8", "fp8_e4m3", "mxfp8"}:
-        cli_kv = "fp8" if eff_kv == "fp8_e4m3" else eff_kv
-        flags.append(f"--kv-cache-dtype {cli_kv}")
-    if resolved is not None and resolved.companion.requires_no_prefix_caching:
-        flags.append("--no-enable-prefix-caching")
-        rules.append("no_enable_prefix_caching_for_block_drafter")
-    if enable_replayssm:
-        flags.append("--use-replayssm")
-    flags.append(f"--compilation-config '{json.dumps(comp_cfg, separators=(',', ':'))}'")
-    if spec_cfg:
-        flags.append(f"--speculative-config '{json.dumps(spec_cfg, separators=(',', ':'))}'")
-    if add_cfg:
-        flags.append(f"--additional-config '{json.dumps(add_cfg, separators=(',', ':'))}'")
-
+    flags = _build_va_cli_flags(
+        load_strat=load_strat, ep=ep, ep_filter=ep_filter, mm_cache=mm_cache,
+        eff_kv=eff_kv, resolved=resolved, enable_replayssm=enable_replayssm,
+        comp_cfg=comp_cfg, spec_cfg=spec_cfg, add_cfg=add_cfg, rules=rules,
+    )
     coll_guidance, isa_guidance = _collective_and_isa_guidance(hw, tp=tp, ep=ep, pp=pp)
     return VaServingRules(
         canonical_model=key, hw_family=hw, effective_kv_cache_dtype=eff_kv,
@@ -1706,7 +1801,7 @@ def build_va_serving_rules(
         decode_speculative_config=d_spec_cfg, compilation_config=comp_cfg,
         additional_config=add_cfg, safetensors_load_strategy=load_strat,
         enable_ep_weight_filter=ep_filter, mm_processor_cache_gb=mm_cache,
-        cli_flags=tuple(flags), cli_command_snippet=" \\\n  ".join(flags),
+        cli_flags=flags, cli_command_snippet=" \\\n  ".join(flags),
         collective_guidance=coll_guidance, hw_isa_guidance=isa_guidance,
         rules_applied=tuple(rules), warnings=tuple(dict.fromkeys(warnings)),
     )

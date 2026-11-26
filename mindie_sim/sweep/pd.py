@@ -3216,9 +3216,24 @@ def _compute_step_work_floor_rays(
     b_pad = int(b)
     if phase == "decode":
         full_bs, pw_bs = _decode_batch_capture_boundaries(eff_case, q_tokens)
-        cap_bs = full_bs or pw_bs
-        if cap_bs:
-            b_pad = next((int(c) for c in cap_bs if int(c) >= b), int(b))
+        g_mode = str(getattr(eff_case.runtime, "graph_mode", "") or "").strip().lower()
+        if (
+            g_mode not in {"none", "off", "eager", "disabled"}
+            and not getattr(eff_case.runtime, "deepep_high_throughput", False)
+        ):
+            full_ok = (
+                getattr(eff_case.runtime, "graph_capture_mode", "") == "full"
+                or getattr(eff_case.runtime, "supports_full_decode_capture", False)
+            ) and not getattr(eff_case.runtime, "invalid_full_modes", ())
+            cap_b = (
+                next((int(c) for c in full_bs if int(c) >= b), None)
+                if (full_ok and full_bs)
+                else None
+            )
+            if cap_b is None and pw_bs:
+                cap_b = next((int(c) for c in pw_bs if int(c) >= b), None)
+            if cap_b is not None:
+                b_pad = cap_b
     pad_scale = (float(b) / float(b_pad)) if b_pad > b else 1.0
     for op in ops_0:
         sem = getattr(op, "semantic_shape", ()) or ()
@@ -3804,7 +3819,10 @@ def _interval_throughput_ub(
 ) -> float:
     """Certified upper bound on ``b' / T(b')`` over ``b' in (lo_i, hi_i)``."""
     b_top = hi_i - 1
-    fl_top = float(floors.get(lo_i, 0.0))
+    fl_top = max(
+        (float(fl_e) for b_e, fl_e in floors.items() if b_e <= lo_i),
+        default=0.0,
+    )
     for b_e, rays_e in rays_map.items():
         if b_e <= lo_i and rays_e:
             val_e = _eval_floor_rays(rays_e, b_top)

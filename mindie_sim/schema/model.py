@@ -265,16 +265,21 @@ class LayerPlan:
             raise ModelingError(f"layer_plan_indexer_type_unknown:{raw}")
         if role != self.indexer_type:
             object.__setattr__(self, "indexer_type", role)
-        kind = self.q_output_gate_kind
-        if kind is None or (kind == "none" and self.q_output_gate):
-            # The legacy boolean is a compatibility alias for a headwise gate.
-            kind = "headwise" if self.q_output_gate else "none"
-        if kind not in Q_OUTPUT_GATE_KINDS:
-            raise ModelingError(f"layer_plan_q_output_gate_kind_unknown:{kind}")
         projection = str(self.q_gate_projection or "packed_q")
         if projection not in Q_GATE_PROJECTIONS:
             raise ModelingError(
                 f"layer_plan_q_gate_projection_unknown:{projection}")
+        kind = self.q_output_gate_kind
+        if kind is None or (kind == "none" and self.q_output_gate):
+            # Legacy boolean q_output_gate=True defaults to elementwise gating when
+            # packed into q_proj (Qwen3-Next/3.5/3.6/3.8), and headwise when routed
+            # to a separate g_proj (matching weight_layer_terms g_proj rows=heads).
+            if self.q_output_gate:
+                kind = "headwise" if projection == "separate" else "elementwise"
+            else:
+                kind = "none"
+        if kind not in Q_OUTPUT_GATE_KINDS:
+            raise ModelingError(f"layer_plan_q_output_gate_kind_unknown:{kind}")
         if kind == "none" and projection != "packed_q":
             raise ModelingError(
                 "layer_plan_q_gate_projection_requires_gate")
@@ -706,6 +711,14 @@ class RequestSpec:
                        "prefix_cache_key"}, "workload.request")
         request_id = raw.get("request_id", raw.get("id", f"r{index}"))
         media_tokens = _request_int("media_tokens", raw.get("media_tokens", 0), reason="workload")
+        for key, label, minimum in (
+            ("prompt_tokens", "prompt_tokens", 1),
+            ("prompt_len", "prompt_tokens", 1),
+            ("text_prompt_tokens", "text_prompt_tokens", 0),
+            ("text_tokens", "text_prompt_tokens", 0),
+        ):
+            if key in raw and raw[key] is None:
+                _request_int(label, None, minimum=minimum, reason="workload")
         text = raw.get("text_prompt_tokens", raw.get("text_tokens"))
         total = raw.get("prompt_tokens", raw.get("prompt_len"))
         if text is None:

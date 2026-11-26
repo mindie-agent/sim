@@ -53,7 +53,9 @@ MAX_RES_DYNAMIC = 65536
 _PREP_CACHE_MAX = 2048
 _AUTO_CHURN_MIN_CALLS = 512
 _AUTO_CHURN_MIN_RESOURCES = 64
-_AUTO_CHURN_MIN_STEPS_PER_CALL = 4
+#: Guard only true degenerate callback thrashing (<= 1 step/epoch); healthy hybrid
+#: recurrent graphs average ~2-3 steps per advance_epoch and stay faster in C11.
+_AUTO_CHURN_MIN_STEPS_PER_CALL = 1.5
 #: Stop re-arming ``auto`` when repeated handbacks average too few C steps/call.
 _THRASH_HANDBACK_LIMIT = 4
 _THRASH_MIN_STEPS_PER_CALL = 8
@@ -145,7 +147,7 @@ class NativeBackend:
     """One Engine's immutable library handle, kernel context and telemetry."""
     __slots__ = (
         "library", "arena", "status_dict", "backend",
-        "reason", "abi", "native_calls", "native_steps",
+        "reason", "abi", "native_calls", "native_steps", "epoch_calls",
         "native_epochs_executed", "native_boundaries", "fallbacks", "mode", "enabled",
         "res_names", "pending", "deliver", "drops",
         "external", "callback_marks", "max_tasks", "live", "seeded",
@@ -173,6 +175,7 @@ class NativeBackend:
         self.abi = ABI_VERSION
         self.native_calls = 0
         self.native_steps = 0
+        self.epoch_calls = 0
         self.native_epochs_executed = 0
         self.native_boundaries = 0
         self.fallbacks = 0
@@ -1052,6 +1055,22 @@ class NativeBackend:
         self.disable(engine, "mixed_frontier")
         self.made_progress = True
         self.needs_settle = False
+    def _can_refresh_after_drain(self, engine) -> bool:
+        """True when resource table growth only requires draining live slots first."""
+        if not engine._native_slots:
+            return False
+        names = tuple(engine.resources)
+        if not 1 <= len(names) <= MAX_RES_DYNAMIC:
+            return False
+        rates, units, policy = resource_table(engine)
+        if not all(math.isfinite(rate) and rate > 0 and 1 <= unit <= MAX_U
+                   for rate, unit in zip(rates, units)):
+            return False
+        if policy:
+            priorities = {task.priority for _, task, _ in self.pending}
+            if len(priorities) > 1:
+                return False
+        return True
     def _refresh_resources(self, engine) -> bool:
         if (self.res_version == engine._resource_version
                 and len(engine.resources) == len(self.res_names)):
@@ -1098,7 +1117,10 @@ class NativeBackend:
                 self.needs_settle = False
                 return
             if not self._refresh_resources(engine):
-                if self.partial_window:
+                if self._can_refresh_after_drain(engine):
+                    self._release_window(engine, "alloc_boundary")
+                    self.made_progress = True
+                elif self.partial_window:
                     self._release_window(engine, "mixed_frontier")
                     self.made_progress = True
                 else:
@@ -1182,7 +1204,10 @@ class NativeBackend:
             return False
         if not self._promote_hybrid_tasks(engine):
             if self.enabled:
-                self.disable(engine, "mixed_frontier")
+                if self._hybrid_allowed(engine):
+                    self._release_window(engine, "mixed_frontier")
+                else:
+                    self.disable(engine, "mixed_frontier")
             self.made_progress = True
             return False
         self.partial_window = len(engine._native_seqs) < len(engine._tasks)
@@ -1207,7 +1232,9 @@ class NativeBackend:
             self.made_progress = True
             return 0
         if not self._refresh_resources(engine):
-            if self.partial_window:
+            if self._can_refresh_after_drain(engine):
+                self._release_window(engine, "alloc_boundary")
+            elif self.partial_window:
                 self._release_window(engine, "mixed_frontier")
             else:
                 self.disable(engine, "mixed_frontier")
@@ -1257,6 +1284,7 @@ class NativeBackend:
             self._apply_prefix(engine, error)
             self._translate_fault(error)
         self.native_calls += 1
+        self.epoch_calls += 1
         self.native_steps += steps
         if steps > 0:
             self.native_epochs_executed += 1
@@ -1273,8 +1301,8 @@ class NativeBackend:
         self.made_progress = bool(steps or ncomp or nstart or obs_prog)
         if (self.mode == "auto" and self.enabled
                 and len(self.res_names) >= _AUTO_CHURN_MIN_RESOURCES
-                and self.native_calls >= _AUTO_CHURN_MIN_CALLS
-                and self.native_steps < self.native_calls * _AUTO_CHURN_MIN_STEPS_PER_CALL):
+                and self.epoch_calls >= _AUTO_CHURN_MIN_CALLS
+                and self.native_steps < self.epoch_calls * _AUTO_CHURN_MIN_STEPS_PER_CALL):
             self.disable(engine, "auto_callback_churn", count_handback=False)
             self.recoverable = False
             return steps

@@ -177,6 +177,7 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 state_bytes=float(value_heads * key_dim * value_dim * dtype_bytes(ssm_dtype)
                                   + conv_width * (conv_k - 1) * dtype_bytes("bf16")),
                 q_output_gate=gate,
+                q_output_gate_kind="elementwise" if gate else "none",
                 hyper_connections=hc_count > 0, hc_mult=hc_count, hc_lowrank=hc_lowrank,
                 has_sandwich_norm=has_sandwich_norm,
                 norm_unit_offset=norm_unit_offset,
@@ -201,6 +202,7 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 qk_norm=True,
                 qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
                 q_output_gate=gate,
+                q_output_gate_kind="elementwise" if gate else "none",
                 hyper_connections=hc_count > 0, hc_mult=hc_count, hc_lowrank=hc_lowrank,
                 has_sandwich_norm=has_sandwich_norm,
                 norm_unit_offset=norm_unit_offset,
