@@ -506,23 +506,27 @@ def test_gdn_dispatches_each_varlen_sequence_and_issues_padded_bf16(lengths, dim
     assert plan.metadata["launch_count"] == 1 and plan.work.resources["vector"] > 0
 
 def test_wy_chunk_width_requires_pinned_source_abi():
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
     _, ctx = sku_planning_context(NEWEST_SKU, "wy")
     with pytest.raises(ModelingError, match="requires_pinned_abi"):
         resolve_operator_plan(_wy_op(bt=32), ctx)
-    plan = resolve_operator_plan(_wy_op(bt=32, abi="gdn_chunk32"), ctx).recipe
-    assert plan.metadata["offdiag_inv_flops"] == compute_wy_chunk_work(32, 64, 128, 32).offdiag_inv_flops == 0
+    with pytest.raises(UnmodeledCapabilityError, match="gdn_chunk32_domain_unsupported"):
+        resolve_operator_plan(_wy_op(bt=32, abi="gdn_chunk32", dk=64), ctx)
+    plan = resolve_operator_plan(_wy_op(bt=32, abi="gdn_chunk32", dk=128), ctx).recipe
+    assert plan.metadata["offdiag_inv_flops"] == compute_wy_chunk_work(32, 128, 128, 32).offdiag_inv_flops == 0
     assert plan.metadata["launch_count"] == len(plan.metadata["launch_boundaries"]) == 3
     assert compute_wy_chunk_work(64, 64, 128).offdiag_inv_flops == 2 * 2 * 32**3
     for leaf in ("prepare", "state", "output"):
         abi = f"gdn_{leaf}_arch35_chunk32"
         for hv in (1, 2, 3, 4):
-            result = resolve_operator_plan(_wy_op(bt=32, abi=abi, hv=hv, hk=1), ctx)
+            result = resolve_operator_plan(_wy_op(bt=32, abi=abi, dk=128, hv=hv, hk=1), ctx)
             assert result.recipe.metadata["launch_count"] == 1
             assert result.recipe.metadata["launch_boundaries"] == (abi,)
             assert [ref.to_dict() for ref in result.sources] == [PR22147_SOURCE]
         for field in ("key_heads", "hk", "num_k_heads", "q_heads"):
             with pytest.raises(ModelingError, match="unsupported_value_to_key_head_ratio"):
-                resolve_operator_plan(_wy_op(bt=32, abi=abi, heads=8, **{field: 1}), ctx)
+                resolve_operator_plan(_wy_op(bt=32, abi=abi, dk=128, heads=8, **{field: 1}), ctx)
     output = _wy_op(abi="gdn_output_arch35_chunk32", lengths=(32,), heads=1, key_heads=1, dk=128)
     assert resolve_operator_plan(output, ctx).recipe.work.matrix == {"bf16": 1_572_864}
 @pytest.mark.parametrize("metadata", (

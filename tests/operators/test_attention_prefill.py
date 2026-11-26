@@ -158,9 +158,11 @@ def test_partial_update_follows_collective_and_owns_only_local_merge():
         ops, prefix="attention", stage=0, layer=0, requests=("r",), mode="decode",
         deps=("partial_attention",), rows=3, local_heads=4, v_dim=8,
         act_dtype="bf16", pcp_factor=1, tp_gather=2, dp_width=1)
-    pack, exchange, update = ops
+    pack, exchange, update, cast = ops
     meta = dict(update.metadata)
-    assert last == update.op_id and update.deps == (exchange.op_id,)
+    assert last == cast.op_id and cast.family == "cast" and cast.deps == (update.op_id,)
+    assert cast.dtype == "bf16" and cast.link_bytes == 0 and update.dtype == "fp32"
+    assert update.deps == (exchange.op_id,)
     assert pack.deps == ("partial_attention",) and exchange.deps == (pack.op_id,)
     assert exchange.link_bytes > 0 and update.link_bytes == 0 and update.vector_ops > 0
     assert meta["partial_count"] == 2 and meta["lse_wire_bytes"] == 4
@@ -302,12 +304,20 @@ def test_collectives_run_before_attention_with_already_sliced_mla_publication():
     )
     op = governed.make_attention_op(contract, op_id="prefill", deps=("input",))
     book = RecipeBook(governed.recipes())
-    cache, token, head, consumer, join = book.expand((op,))
+    cache, token, head, consumer, pack, exchange, pcp_gather, merge, join = book.expand((op,))
     assert token.deps == ("input", cache.op_id) and head.deps == ("input", token.op_id)
-    assert consumer.deps == ("input", head.op_id) and join.deps == (consumer.op_id,)
-    assert [dict(stage.metadata)["group_axis"] for stage in (cache, token, head)] == ["pcp", "pcp", "tp"]
-    assert [stage.link_bytes for stage in (cache, token, head)] == [gather.link_bytes, 512, 1024]
-    assert book.expand((cache, token, head, consumer, join)) == (cache, token, head, consumer, join)
+    assert consumer.deps == ("input", head.op_id)
+    assert pack.deps == ("input", consumer.op_id) and exchange.deps == ("input", pack.op_id)
+    assert pcp_gather.deps == ("input", exchange.op_id) and merge.deps == ("input", pcp_gather.op_id)
+    assert join.deps == (merge.op_id,)
+    assert [dict(stage.metadata)["group_axis"] for stage in (cache, token, head, exchange, pcp_gather)] == [
+        "pcp", "pcp", "tp", "tp", "pcp",
+    ]
+    assert [stage.link_bytes for stage in (cache, token, head, exchange, pcp_gather)] == [
+        gather.link_bytes, 512, 1024, 1056, 2112,
+    ]
+    expanded = (cache, token, head, consumer, pack, exchange, pcp_gather, merge, join)
+    assert book.expand(expanded) == expanded
 
     plan = governed.build(op, geom)
     assert any(ref.revision == VLLM_MLA_REVISION for ref in plan.pipeline_spec.sources)
@@ -321,16 +331,17 @@ def test_collectives_run_before_attention_with_already_sliced_mla_publication():
     engine.advance(until=(end,))
     comms = [row for row in engine.trace if row["demand"].get("link")]
     query = next(row for row in engine.trace if row["task"].endswith(":query_load"))
-    assert [row["demand"]["link"] for row in comms] == [gather.link_bytes, 512, 1024]
+    assert [row["demand"]["link"] for row in comms] == [gather.link_bytes, 512, 1024, 1056, 2112]
     assert comms[0]["start_ms"] >= 5
-    assert all(left["end_ms"] <= right["start_ms"] for left, right in zip(comms, (*comms[1:], query)))
+    assert all(left["end_ms"] <= right["start_ms"] for left, right in zip(comms[:3], (*comms[1:3], query)))
+    assert query["end_ms"] <= comms[3]["start_ms"] and comms[3]["end_ms"] <= comms[4]["start_ms"]
     assert {role: amount for role, amount in engine.serviced.items() if amount} == pytest.approx(context.bind(plan.work))
 
     case = compose_case("deepseek-v2-lite", hardware=REPRESENTATIVE_SKUS["a5"], tp=2, pcp=2, dcp=4,
                         layers=1, block_size=16, prompt_tokens=16, output_tokens=2, concurrency=1)
     result = graph_costs(case, (op,), recipes=book, external_inputs={"input": 5}, isolated=False)
     by_id = {row["op_id"]: row for row in result["timeline"]}
-    steps = [by_id[node.op_id] for node in (cache, token, head, consumer)]
+    steps = [by_id[node.op_id] for node in (cache, token, head, consumer, pack, exchange, pcp_gather, merge)]
     assert steps[0]["ready_ms"] == 5
     assert all(step["complete_ms"] > step["ready_ms"] for step in steps)
     assert all(left["complete_ms"] <= right["ready_ms"] for left, right in zip(steps, steps[1:]))
@@ -366,10 +377,22 @@ def test_hca_local_head_groups_conserve_source_work(mixed_quant_source, tp):
     parallel = ParallelSpec(tp=tp)
     family_mqsmla.validate(views=(view,), plan=hca, parallel=parallel, model=model,
                            padded_tokens=1, topk_present=False, cores=32)
+    ops_shipping = [original]
+    family_mqsmla.lower_attention(
+        ops_shipping, [original.op_id], selection=SimpleNamespace(name=family_mqsmla.RECIPE),
+        views=(view,), plan=hca, topk_present=False, prefix="s0.l0", parallel=parallel)
+    geom = Geometry.from_devices(case.machine.dies)
+    with pytest.raises(ModelingError, match="mqsmla_abi_not_admitted:rejected_abi:rejected_unmerged_pr:mqsmla_dsl_544_320"):
+        mqsmla.build(ops_shipping[0], geom)
+    proposed_rt = SimpleNamespace(metadata=(
+        ("abi_pr_track", "proposed"),
+        ("abi_manifest_bindings", (SimpleNamespace(mechanism_id="mqsmla_dsl_544_320", ref="tilelang-ascend#mqsmla_dsl_544_320"),)),
+    ))
     ops = [original]
     family_mqsmla.lower_attention(
         ops, [original.op_id], selection=SimpleNamespace(name=family_mqsmla.RECIPE),
-        views=(view,), plan=hca, topk_present=False, prefix="s0.l0", parallel=parallel)
+        views=(view,), plan=hca, topk_present=False, prefix="s0.l0", parallel=parallel,
+        runtime=proposed_rt)
     shape = dict(ops[0].metadata)["mqsmla_geometry"]
     local_heads = 128 // tp
     assert shape["heads"] == local_heads and shape["ratio"] == 128
@@ -381,7 +404,7 @@ def test_hca_local_head_groups_conserve_source_work(mixed_quant_source, tp):
         for index in range(tiles.count):
             for _, work in mqsmla.tile_phases(*tiles.key(index), heads=heads):
                 expected += work
-    assert mqsmla.build(ops[0], Geometry.from_devices(case.machine.dies)).work == expected
+    assert mqsmla.build(ops[0], geom).work == expected
 
 
 def test_sliding_window_layer_has_no_compressed_rows(mixed_quant_source):

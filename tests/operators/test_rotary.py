@@ -285,11 +285,16 @@ def test_nope_width_does_not_create_inplace_slice_traffic_or_vector_work():
 
 
 def test_batch_scaling_and_coefficient_reuse_are_explicit():
-    first, last = [_source_rotations(batch)[1]["q_rotary"] for batch in (1, 16)]
+    first_case, first_rots = _source_rotations(1)
+    last_case, last_rots = _source_rotations(16)
+    first, last = first_rots["q_rotary"], last_rots["q_rotary"]
     assert last.hbm_bytes == 16 * first.hbm_bytes
     assert last.vector_ops == 16 * first.vector_ops
     work = dict(last.metadata)["partial_rotary_work"]
-    assert work["coefficient_bytes"] == 16 * 4 * 2 * 64 * 4
+    # Hardware-independent declaration states the compulsory minimum (1 load per token);
+    # physical 64-AIV owner partitioning reloads coefficients across 4 head-owner groups.
+    assert work["coefficient_bytes"] == 16 * 2 * 64 * 4
+    assert _rotary_plan(last_case, last).work.resources["mte2"] == 16 * 64 * 64 * 2 + 16 * 4 * 2 * 64 * 4
     assert work["vector_lane_operations"]["coefficient_broadcast"] == 16 * 2 * 63 * 64
     assert not work["native_owner_split_and_reload_not_selected"]
     assert work["ub_bytes_per_owner"] == 1024
@@ -302,6 +307,16 @@ def test_public_caller_replaces_combined_rotation_and_orders_inverse_before_outp
         )
     )
     raw["model"]["layers"] = 3
+    # Bind Arch35 HC profiles and shipping CANN FP8 packed cache on Ascend950DT_9582.
+    raw["runtime"]["kernels"]["lowerings"]["native_fusion"]["options"]["traffic_profile"] = {
+        "hc_pre": "hc_pre_arch35_mk_175ef4d4",
+        "hc_post": "hc_post_arch35_bf16_175ef4d4",
+    }
+    packed_fp8 = {"dtype": "fp8_e4m3", "group_size": 64, "scale_dtype": "bf16"}
+    raw["model"]["metadata"]["cache_representations"] = {
+        "window": dict(packed_fp8),
+        "compressed_kv": dict(packed_fp8),
+    }
     probe = dict(scope="body", phase="decode", tokens=1, sequences=2, context=129)
     original = target_graphs(raw, **probe)
     raw["runtime"]["kernels"]["lowerings"]["v41_rotary"] = "v41_partial_rotary"
