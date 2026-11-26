@@ -19,6 +19,7 @@ from .mc2_instructions import phase_events, SOURCE_RANGES
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
 from .mc2_fullmesh import (
     combine_layout, combine_plan, directed_transport_cells, dispatch_layout, dispatch_plan,
+    resolve_ep_local_rank, resolve_group_send_enabled,
 )
 
 TARGET_BACKEND = "ascend"
@@ -78,29 +79,34 @@ def contract(raw, aiv_count):
             ("source_assignments", "received_assignments", "experts", "ep")}
     args["aiv_count"] = aiv_count
     args.update(source_tokens=raw["source_tokens"], top_k=raw["top_k"])
+    if "global_bs" in raw:
+        args["global_bs"] = raw["global_bs"]
+    if "enable_group_send" in raw:
+        args["enable_group_send"] = bool(raw["enable_group_send"])
     if kind == "dispatch":
-        if "global_bs" in raw:
-            args["global_bs"] = raw["global_bs"]
         if "is_scaling_down" in raw:
             args["is_scaling_down"] = bool(raw["is_scaling_down"])
         if "shared_expert_ranks" in raw:
             args["shared_expert_ranks"] = int(raw["shared_expert_ranks"])
+        if "has_smooth_scale" in raw:
+            args["has_smooth_scale"] = bool(raw["has_smooth_scale"])
     return (dispatch_plan if kind == "dispatch" else combine_plan)(layout, **args)
 
 
 def build(op, geometry):
     # Source geometry and declared owner roles determine this IR. Layer/rank
     # identities, rates and Engine callbacks are bound only by program(context).
-    raw = dict(op.metadata)["mc2_phase"]
+    meta = dict(op.metadata)
+    raw = meta["mc2_phase"]
     if "phase" not in raw:
         # The ordinary public graph binds one whole native dispatch/combine
         # call, not a dozen separately scheduled semantic phase operators.
-        return _native_plan(raw, geometry)
+        return _native_plan(raw, geometry, op_metadata=meta)
     return _template(tuple(sorted(raw.items())), geometry.compute_units,
                      tuple(sorted(geometry.resource_units.items())))
 
 
-def declared_floor_work(raw):
+def declared_floor_work(raw, *, ep_rank: int | None = None):
     """Owner-count floor of one native dispatch/combine call for its ``OpSpec``.
 
     Per-owner flag, frame and count descriptors only grow with the AIV owner
@@ -108,7 +114,8 @@ def declared_floor_work(raw):
     vector and link work the executed program can never undercut.
     """
     floor = SimpleNamespace(resource_units={"vector": MIN_PROTOCOL_AIV_OWNERS},
-                            compute_units=MIN_PROTOCOL_AIV_OWNERS)
+                            compute_units=MIN_PROTOCOL_AIV_OWNERS,
+                            rank=ep_rank)
     resources = dict(_native_plan(raw, floor).work.resources)
     reads = sum(float(resources.get(role, 0.0)) for role in ("mte2", "mte2_aiv", "mte2_aic"))
     declared = {"hbm": resources.get("hbm", 0.0), "mte2": reads, "mte3": resources.get("mte3", 0.0),
@@ -116,7 +123,7 @@ def declared_floor_work(raw):
     return Work(resources={role: float(amount) for role, amount in declared.items() if amount})
 
 
-def _native_plan(raw, geometry):
+def _native_plan(raw, geometry, *, op_metadata=None):
     """One real native call over the existing phase contract.
 
     The phase ledger remains attributable metadata; it is not scheduled a
@@ -125,27 +132,43 @@ def _native_plan(raw, geometry):
     """
     units = max(MIN_PROTOCOL_AIV_OWNERS, int(geometry.resource_units.get(
         "vector", geometry.compute_units)))
-    plan = contract(raw, units)
+    ep = max(1, int(raw["ep"]))
+    effective_raw = dict(raw)
+    if "enable_group_send" not in effective_raw:
+        if resolve_group_send_enabled(effective_raw, ep=ep, geometry=geometry):
+            effective_raw["enable_group_send"] = True
+    plan = contract(effective_raw, units)
     resources = {}
     for phase in plan.phases:
         for role, amount in phase.work:
             resources[role] = resources.get(role, 0.0) + float(amount)
-    ep = max(1, int(raw["ep"]))
-    rank = int(raw["route_rank"]) if "route_rank" in raw else int(getattr(geometry, "rank", 0) or 0)
+    rank = resolve_ep_local_rank(effective_raw, ep=ep, op_metadata=op_metadata, geometry=geometry)
+    explicit_ep_rank = (
+        op_metadata.get("ep_rank")
+        if (op_metadata is not None and isinstance(op_metadata.get("ep_rank"), int)
+            and not isinstance(op_metadata.get("ep_rank"), bool))
+        else None
+    )
+    geo_physical_rank = (
+        getattr(geometry, "rank", None)
+        if (isinstance(getattr(geometry, "rank", None), int)
+            and not isinstance(getattr(geometry, "rank", None), bool))
+        else None
+    )
     group = tuple(range(ep))
     sources = (rank,) if 0 <= rank < ep else ()
     uniform_bytes = (
-        float(raw["uniform_payload_bytes"])
-        if "uniform_payload_bytes" in raw
-        else float(raw["source_assignments"]) * float(plan.layout.packet_bytes)
+        float(effective_raw["uniform_payload_bytes"])
+        if "uniform_payload_bytes" in effective_raw
+        else float(effective_raw["source_assignments"]) * float(plan.layout.packet_bytes)
     )
     payload_cells = directed_transport_cells(
         group=group,
         sources=sources,
         packet_bytes=plan.layout.packet_bytes,
-        route_matrix=raw.get("route_matrix"),
-        route_reverse=bool(raw.get("route_reverse", False)),
-        route_matrix_bytes=raw.get("route_matrix_bytes"),
+        route_matrix=effective_raw.get("route_matrix"),
+        route_reverse=bool(effective_raw.get("route_reverse", False)),
+        route_matrix_bytes=effective_raw.get("route_matrix_bytes"),
         uniform_payload_bytes=uniform_bytes,
         count=False,
     )
@@ -153,10 +176,10 @@ def _native_plan(raw, geometry):
         directed_transport_cells(
             group=group,
             sources=sources,
-            experts=int(raw.get("experts", 0)),
+            experts=int(effective_raw.get("experts", 0)),
             count=True,
         )
-        if raw["kind"] == "dispatch"
+        if effective_raw["kind"] == "dispatch"
         else ()
     )
     link = float(
@@ -165,11 +188,13 @@ def _native_plan(raw, geometry):
     )
     if link:
         resources["link"] = resources.get("link", 0.0) + link
-    kind = str(raw["kind"])
+    kind = str(effective_raw["kind"])
 
     def program(context):
         from .mc2_program import native_program_from_contract
-        return native_program_from_contract(raw, context)
+        return native_program_from_contract(
+            effective_raw, context, rank=explicit_ep_rank, physical_rank=geo_physical_rank,
+        )
 
     return OperatorPlan(
         Work(resources=resources), program, {

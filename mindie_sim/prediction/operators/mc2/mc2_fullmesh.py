@@ -11,11 +11,13 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 import math
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.parallel import RankCoord
 from .common import (
     FRAME_PAYLOAD_BYTES, FRAME_WIRE_BYTES, GROUP_QUANT_SIZE, MX_ALIGN_BYTES, MX_GROUP_SIZE,
 )
@@ -63,6 +65,12 @@ _COUNT_SYNC_RECORD_BYTES = UB_ALIGN_BYTES
 _COUNT_SYNC_RECORD_ELEMS = _COUNT_SYNC_RECORD_BYTES // INT32_BYTES
 _EXPERTS_PER_COUNT_CORE_TARGET = 16
 _MAX_COUNT_CORES = 8
+_ALL_TO_ALL_MAX_CORE_NUM = 40
+_PERGROUP_SMOOTH_MAX_CORE_NUM = 48
+_GROUP_SEND_RANK_NUM = 4
+_GROUP_SEND_MIN_GROUPS = 2
+_COMBINE_MAX_RECV_AIV = 32
+_EXPERT_PER_HISTO_GROUP = 254
 _SERIAL_MODE_MAX_BS_PER_RANK = 32
 _SERIAL_MODE_MAX_EP_WORLD_SIZE = 16
 _COUNT_STATUS_INIT_OPS_PER_EXPERT = 9
@@ -73,6 +81,10 @@ _ROUTER_WEIGHT_BYTES = 4
 EXPAND_IDX_VALUES_PER_ROW = TRIPLE_META_BYTES // INT32_BYTES
 COMBINE_FLAG_ELEMS_PER_BLOCK = _FRAME_FLAG_BYTES // INT32_BYTES
 COMBINE_FLAG_MASK_LANES = 64
+_MESH_UB_LINK_TOKENS = ("mesh", "ub_mem", "ubmem", "d2d_intra", "urma")
+_CLOS_UB_LINK_TOKENS = ("clos", "ub_mem", "ubmem", "d2d_inter", "superpod", "urma")
+_MESH_UB_SEMANTICS = frozenset({"per_pair", "mesh", "fully_connected"})
+_INTRA_UB_FABRIC_TOKENS = ("hccs", "d2d", "ub")
 
 
 @dataclass(frozen=True)
@@ -196,15 +208,195 @@ class ProtocolPlan:
                 "boundary": "physical_phase_ledger; not_a_second_execution_engine"}
 
 
-def _geometry(source_assignments, received_assignments, experts, ep, aiv_count):
+def _geometry(
+    source_assignments, received_assignments, experts, ep, aiv_count, *,
+    quant_mode: str = "none", has_smooth_scale: bool = False, enable_group_send: bool = False,
+):
     if (ep < 1 or experts < 1 or experts % ep or aiv_count < 2
             or not math.isfinite(source_assignments) or source_assignments < 0
             or not math.isfinite(received_assignments) or received_assignments < 0):
         raise ModelingError("mc2_fullmesh_geometry_outside_supported_domain")
-    count_cores = min(max(experts // _EXPERTS_PER_COUNT_CORE_TARGET, 1),
-                      aiv_count // 2, _MAX_COUNT_CORES, experts)
-    payload_cores = aiv_count - count_cores
-    return tuple(range(payload_cores)), tuple(range(payload_cores, aiv_count))
+    cumsum_cores = min(max(experts // _EXPERTS_PER_COUNT_CORE_TARGET, 1),
+                       aiv_count // 2, _MAX_COUNT_CORES, experts)
+    per_group_send = bool(has_smooth_scale) and quant_mode == "per_group"
+    vector_heavy_send = bool(has_smooth_scale) and quant_mode == "per_token"
+    max_send_cores = (
+        _PERGROUP_SMOOTH_MAX_CORE_NUM if per_group_send
+        else (aiv_count if vector_heavy_send else _ALL_TO_ALL_MAX_CORE_NUM)
+    )
+    group_send_active = (
+        bool(enable_group_send)
+        and ep > _GROUP_SEND_MIN_GROUPS * _GROUP_SEND_RANK_NUM
+        and ep % _GROUP_SEND_RANK_NUM == 0
+    )
+    if group_send_active or aiv_count - cumsum_cores < max_send_cores:
+        payload_cores = aiv_count - cumsum_cores
+    else:
+        payload_cores = max_send_cores
+    return (
+        tuple(range(payload_cores)),
+        tuple(range(payload_cores, aiv_count)),
+        tuple(range(payload_cores, payload_cores + cumsum_cores)),
+    )
+
+
+def _transport_from_context(context: object) -> Mapping[str, object]:
+    identity = getattr(context, "service_identity", None) if context is not None else None
+    transport = identity.get("transport") if isinstance(identity, Mapping) else None
+    return transport if isinstance(transport, Mapping) else {}
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def resolve_ep_group(
+    context: object = None,
+    ep: int = 1,
+    *,
+    physical_rank: int | None = None,
+) -> tuple[int, ...]:
+    """Return the ordered physical-rank EP group for ``context`` when declared."""
+    ep_size = max(1, int(ep))
+    transport = _transport_from_context(context)
+    raw_groups = transport.get("groups") or ()
+    parsed: list[tuple[int, ...]] = []
+    for grp in raw_groups:
+        if not isinstance(grp, (list, tuple)) or not grp:
+            continue
+        members = tuple(int(member) for member in grp if _is_int(member))
+        if len(members) == len(grp):
+            parsed.append(members)
+    if not parsed:
+        return ()
+    matching = [grp for grp in parsed if len(grp) == ep_size] or parsed
+    if _is_int(physical_rank):
+        for grp in matching:
+            if physical_rank in grp:
+                return grp
+    return matching[0]
+
+
+def _link_fields(link: object) -> tuple[str, str, set[int]]:
+    if isinstance(link, Mapping):
+        tag = f"{link.get('name', '')} {link.get('channel', '')}".lower()
+        semantics = str(link.get("semantics", "") or "").lower()
+        members = {int(m) for m in (link.get("members") or ()) if _is_int(m)}
+        return tag, semantics, members
+    tag = f"{getattr(link, 'name', '')} {getattr(link, 'channel', '')}".lower()
+    semantics = str(getattr(link, "semantics", "") or "").lower()
+    members = {int(m) for m in (getattr(link, "members", ()) or ()) if _is_int(m)}
+    return tag, semantics, members
+
+
+def resolve_group_send_enabled(
+    raw: Mapping[str, object],
+    *,
+    ep: int,
+    context: object = None,
+    geometry: object = None,
+    ep_group: tuple[int, ...] = (),
+) -> bool:
+    """Resolve CANN ``Mc2Context::CheckGroupSendEnabled`` from contract or UB_MEM topology."""
+    if "enable_group_send" in raw and raw["enable_group_send"] is not None:
+        return bool(raw["enable_group_send"])
+    ep_size = int(ep)
+    if ep_size <= _GROUP_SEND_MIN_GROUPS * _GROUP_SEND_RANK_NUM or ep_size % _GROUP_SEND_RANK_NUM != 0:
+        return False
+    transport = _transport_from_context(context)
+    raw_links = tuple(transport.get("links") or ()) or tuple(getattr(geometry, "links", ()) or ())
+    if not raw_links:
+        return False
+    group = ep_group or resolve_ep_group(context, ep_size) or tuple(range(ep_size))
+    if len(group) != ep_size:
+        return False
+    mesh_sets: list[set[int]] = []
+    clos_sets: list[set[int]] = []
+    for link in raw_links:
+        tag, semantics, members = _link_fields(link)
+        if not members or "roce" in tag:
+            continue
+        is_mesh = (
+            any(tok in tag for tok in _MESH_UB_LINK_TOKENS)
+            or (semantics in _MESH_UB_SEMANTICS and any(tok in tag for tok in _INTRA_UB_FABRIC_TOKENS))
+        )
+        is_clos = any(tok in tag for tok in _CLOS_UB_LINK_TOKENS)
+        if is_mesh:
+            mesh_sets.append(members)
+        if is_clos:
+            clos_sets.append(members)
+    if not mesh_sets or not clos_sets:
+        return False
+    for idx, src in enumerate(group):
+        src_grp = idx // _GROUP_SEND_RANK_NUM
+        mesh_peers = {p for members in mesh_sets if src in members for p in members}
+        clos_peers = {p for members in clos_sets if src in members for p in members}
+        for peer_idx, dst in enumerate(group):
+            if peer_idx == idx:
+                continue
+            required = mesh_peers if (peer_idx // _GROUP_SEND_RANK_NUM == src_grp) else clos_peers
+            if dst not in required:
+                return False
+    return True
+
+
+def _map_physical_rank(phys: int, ep_group: tuple[int, ...], ep_size: int) -> int:
+    if ep_group and phys in ep_group:
+        return ep_group.index(phys)
+    return phys % ep_size if phys >= ep_size else phys
+
+
+def resolve_ep_local_rank(
+    raw: Mapping[str, object],
+    *,
+    ep: int,
+    op_metadata: Mapping[str, object] | None = None,
+    geometry: object = None,
+    context: object = None,
+    rank_coord: RankCoord | None = None,
+    explicit_rank: int | None = None,
+    physical_rank: int | None = None,
+) -> int:
+    """Resolve an EP-local rank in ``[0, ep)`` from ``RankCoord``, contract, or EP-group physical rank."""
+    ep_size = max(1, int(ep))
+    if isinstance(rank_coord, RankCoord):
+        return int(rank_coord.ep_rank) % ep_size
+    for holder in (geometry, context):
+        coord = getattr(holder, "rank_coord", None)
+        if isinstance(coord, RankCoord):
+            return int(coord.ep_rank) % ep_size
+    if op_metadata is not None:
+        meta_coord = op_metadata.get("rank_coord")
+        if isinstance(meta_coord, RankCoord):
+            return int(meta_coord.ep_rank) % ep_size
+    if "route_rank" in raw and raw["route_rank"] is not None:
+        rank = int(raw["route_rank"])
+        return rank % ep_size if rank >= ep_size else rank
+    transport = _transport_from_context(context)
+    ep_group = resolve_ep_group(context, ep_size, physical_rank=physical_rank)
+    if _is_int(explicit_rank):
+        if explicit_rank >= ep_size:
+            return _map_physical_rank(explicit_rank, ep_group, ep_size)
+        return explicit_rank
+    if op_metadata is not None:
+        meta_ep = op_metadata.get("ep_rank")
+        if _is_int(meta_ep):
+            if meta_ep >= ep_size:
+                return _map_physical_rank(meta_ep, ep_group, ep_size)
+            return meta_ep
+    if _is_int(transport.get("ep_rank")):
+        t_ep = int(transport["ep_rank"])
+        return _map_physical_rank(t_ep, ep_group, ep_size) if t_ep >= ep_size else t_ep
+    for cand in (
+        physical_rank,
+        getattr(geometry, "rank", None),
+        getattr(context, "rank", None),
+        transport.get("rank"),
+    ):
+        if _is_int(cand):
+            cand_group = resolve_ep_group(context, ep_size, physical_rank=cand)
+            return _map_physical_rank(cand, cand_group, ep_size)
+    return 0
 
 
 def assignment_prefix_work(source_tokens, top_k, source_assignments, owners):
@@ -372,25 +564,42 @@ def directed_transport_cells(
     return tuple(cells)
 
 
+def _validate_global_bs(global_bs, *, source_tokens, ep: int) -> int:
+    if type(global_bs) is not int or global_bs < 0:
+        raise ModelingError("arch35_fullmesh_global_bs_requires_nonnegative_integer")
+    if global_bs > 0:
+        min_global = (math.ceil(source_tokens) * int(ep)) if source_tokens is not None else 0
+        if global_bs % int(ep) != 0 or global_bs < min_global:
+            raise ModelingError("arch35_fullmesh_global_bs_invalid_for_batch_and_ep")
+    return global_bs
+
+
 def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
                   received_assignments, experts, ep, aiv_count,
-                  global_bs=0, is_scaling_down=False, shared_expert_ranks=0):
+                  global_bs=0, is_scaling_down=False, shared_expert_ranks=0,
+                  enable_group_send=False, has_smooth_scale=False):
     """Source rows include local destinations; peer routing removes diagonals.
 
     Fractional counts are expected work. Their eligible owner domain must not
     be interpreted as all cores being active; integer routes identify owners.
     """
-    send, count = _geometry(source_assignments, received_assignments, experts, ep, aiv_count)
+    send, count, cumsum = _geometry(
+        source_assignments, received_assignments, experts, ep, aiv_count,
+        quant_mode=layout.quant_mode, has_smooth_scale=has_smooth_scale,
+        enable_group_send=enable_group_send,
+    )
     all_cores = tuple(range(aiv_count))
     if source_tokens < 0 or top_k < 1 or source_assignments > source_tokens * top_k:
         raise ModelingError("mc2_assignment_count_exceeds_source_ids")
+    validated_global_bs = _validate_global_bs(global_bs, source_tokens=source_tokens, ep=ep)
     serial = _is_serial_mode(
-        source_tokens, ep, global_bs=global_bs,
+        source_tokens, ep, global_bs=validated_global_bs,
         is_scaling_down=is_scaling_down, shared_expert_ranks=shared_expert_ranks,
     )
     if serial:
         send = all_cores
         count = tuple(range(min(aiv_count, experts)))
+        cumsum = count
     send_after = ("count_status_exchange",) if serial else ("routing_metadata",)
     rows, recv = source_assignments, received_assignments
     ids = source_tokens * top_k
@@ -400,8 +609,12 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
                "native UB-derived token window and actual nonuniform destination ownership"]
     mask_count = (max(1, int(source_assignments))
                   if source_assignments > 0 else 0)
-    count_vector = len(count) * _COUNT_STATUS_INIT_OPS_PER_EXPERT * _align(experts, _COUNT_SYNC_RECORD_ELEMS)
-    c, a = len(count), aiv_count
+    count_core_num = aiv_count if serial else len(count)
+    nonempty_count_owners = min(len(count), experts)
+    expert_num_per_core = math.ceil(experts / count_core_num)
+    status_cnt_align = _align(expert_num_per_core, _COUNT_SYNC_RECORD_ELEMS)
+    count_vector = nonempty_count_owners * _COUNT_STATUS_INIT_OPS_PER_EXPERT * status_cnt_align
+    c, a = len(cumsum), aiv_count
     prefix_owners = tuple(range(min(a, experts)))
     prefix_total, quant_steps, quant_details = _dispatch_quant_details(
         layout, source_tokens, top_k, rows, ids, send, unknown)
@@ -418,20 +631,17 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
                 ("scalar_count_stores", experts),
                 ("serial_mode", serial),
                 ("cal_expert_cnt", {
-                    "source": "CalExpertCnt:808-820",
-                    "tensor_dtype": "int32 indices; Abs/ReduceSum reinterpret float",
+                    "source": "CalExpertCntByHistogram:1810-1883",
+                    "tensor_dtype": "int32 indices; uint8 histogram bins -> uint16 frequencies",
                     "mask_count": mask_count,
                     "mask_basis": ("source_assignments; activeMaskBsCnt unknown"
                                    if mask_count else "unresolved"),
                     "short_vector": mask_count,
-                    "ops_per_expert": ("Duplicate", "Sub", "Abs(float)",
-                                       "Mins", "software ReduceSum(float)"),
+                    "ops_per_group": ("Subs", "Mins", "Maxs", "Cast", "GetExpertFreq"),
+                    "experts_per_histo_group": _EXPERT_PER_HISTO_GROUP,
                     "owner_domain": "contiguous_expert_intervals",
-                    "pipe_v_per_expert": _COUNT_PIPE_V_OPS_PER_EXPERT,
                     "v_s_dependency": True,
-                    "vector_ops_per_owner": _COUNT_VECTOR_OPS_PER_ID * mask_count,
-                    "int32_ub_read_bytes_per_expert": INT32_BYTES * mask_count,
-                    "int32_ub_write_bytes_per_expert": INT32_BYTES,
+                    "int32_ub_read_bytes_per_group": INT32_BYTES * mask_count,
                 })), "domain"),
         ProtocolPhase("count_status_exchange", ("count_compute",), count,
                       "contiguous_expert_intervals_to_destination_ranks", (
@@ -457,7 +667,7 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
             ("source_assignments_including_local", rows),
             ("received_assignments_including_local", recv),
             ("remote_count_basis", "caller peer matrix; no implicit uniform split"))),
-        _staged("receive_counts", ("count_status_exchange",), count,
+        _staged("receive_counts", ("count_status_exchange",), cumsum,
                 "contiguous_source_expert_status_intervals", (
                     ("read_status", _read(experts * EXPERT_STATUS_RECORD_BYTES)),
                     ("check_status", (("vector", experts - c),)),
@@ -466,7 +676,7 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
                     ("sum_counts", (("vector", 2 * experts - c + (0 if serial else 2 * c * c)),)),
                     ("publish_sums", _write((c if serial else c * c) * _COUNT_SYNC_RECORD_BYTES)),
                 ), details=(("polls_counted", 1), ("additional_spin_polls", "unmodeled"))),
-        _staged("prefix_counts", ("receive_counts",), count,
+        _staged("prefix_counts", ("receive_counts",), cumsum,
                 "count_core_prefix_exchange_and_replicated_offsets", (
                     ("read_sums", _read((c if serial else c * c) * _COUNT_SYNC_RECORD_BYTES)),
                     ("check_and_prefix", (("vector", c * (c - 1) if serial else c * (2 * c - 1) + (c - 1) ** 2),)),
@@ -519,24 +729,35 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
 
 
 def combine_plan(layout, *, source_assignments, received_assignments, experts, ep, aiv_count,
-                 source_tokens=None, top_k=None):
+                 source_tokens=None, top_k=None, global_bs=0, enable_group_send=False):
     """Return framing/slots and optional token-owned weighted output publication."""
+    del enable_group_send
     _geometry(source_assignments, received_assignments, experts, ep, aiv_count)
-    cores = tuple(range(aiv_count))
+    validated_global_bs = _validate_global_bs(global_bs, source_tokens=source_tokens, ep=ep)
+    if validated_global_bs > 0:
+        max_bs = validated_global_bs // int(ep)
+    elif source_tokens is not None:
+        max_bs = math.ceil(source_tokens)
+    else:
+        max_bs = 0
+    recv_aiv = max(1, min(max_bs, min(_COMBINE_MAX_RECV_AIV, aiv_count // 2)))
+    send_aiv = aiv_count - recv_aiv
+    send_cores = tuple(range(send_aiv))
+    recv_cores = tuple(range(send_aiv, aiv_count))
     rows, recv = source_assignments, received_assignments
     phases = (
-        _staged("return_read_frame", (), cores, "contiguous_actual_return_rows", (
+        _staged("return_read_frame", (), send_cores, "contiguous_actual_return_rows", (
             ("read", _read(rows * (layout.input_bytes + TRIPLE_META_BYTES))),
             ("frame", (("vector", rows * (layout.packet_bytes + layout.data_region_bytes) / INT32_BYTES),)),
         ), owner_basis="assignment_rows", details=(("expand_idx_bytes_per_row", TRIPLE_META_BYTES),)),
-        ProtocolPhase("payload_exchange", ("return_read_frame",), cores,
+        ProtocolPhase("payload_exchange", ("return_read_frame",), send_cores,
                       "transpose_of_dispatch_assignment_cells", (
             ("mte3", rows * layout.packet_bytes),
             ("hbm", recv * layout.packet_bytes)), (
             ("packet_bytes_per_assignment", layout.packet_bytes),
             ("source_assignments_including_local", rows),
             ("received_assignments_including_local", recv))),
-        ProtocolPhase("receive_flags", ("payload_exchange",), cores,
+        ProtocolPhase("receive_flags", ("payload_exchange",), recv_cores,
                       "contiguous_output_tokens", (("hbm", recv * layout.flag_bytes),
                                                     ("mte2_aiv", recv * layout.flag_bytes)),
                       (("polls_counted", "unknown_causal"),
@@ -544,12 +765,12 @@ def combine_plan(layout, *, source_assignments, received_assignments, experts, e
                        ("poll_termination", "matching_peer_send_event"),
                        ("per_iteration_work", "MTE2 flag read + Compare/Sum + SFF issue"),
                        ("additional_spin_polls", "unknown; no universal count")), "output_tokens"),
-        ProtocolPhase("receive_slots", ("receive_flags",), cores,
+        ProtocolPhase("receive_slots", ("receive_flags",), recv_cores,
                       "contiguous_output_tokens; wait only required topk slots", (
             ("hbm", recv * layout.data_region_bytes),
             ("mte2_aiv", recv * layout.data_region_bytes)),
                       (("downstream", "weighted combine arithmetic and final output store"),), "output_tokens"),
-        ProtocolPhase("clear_data_flags", ("receive_slots",), cores, "same_receive_owner", (
+        ProtocolPhase("clear_data_flags", ("receive_slots",), recv_cores, "same_receive_owner", (
             ("hbm", recv * layout.flag_bytes), ("mte3", recv * layout.flag_bytes)), (), "output_tokens"),
     )
     retained = ("route weights", "weighted sum arithmetic", "final output write")
@@ -568,7 +789,7 @@ def combine_plan(layout, *, source_assignments, received_assignments, experts, e
         flags = top_k * layout.blocks * COMBINE_FLAG_ELEMS_PER_BLOCK
         compared = _align(flags, COMBINE_FLAG_MASK_LANES)
         mask_words = compared // COMBINE_FLAG_MASK_LANES
-        successful_flags = _staged("receive_flags", ("payload_exchange",), cores,
+        successful_flags = _staged("receive_flags", ("payload_exchange",), recv_cores,
             "contiguous_output_tokens; one_successful_batch_flag_check", (
                 ("initialize_flags", (("vector", source_tokens * compared),)),
                 ("read_flags", _read(recv * layout.flag_bytes)),
@@ -591,7 +812,7 @@ def combine_plan(layout, *, source_assignments, received_assignments, experts, e
         # Keep the named boundary for caller graph compatibility, not a second
         # payload read. Native queue depth is unknown; this is an explicit
         # conservative serial-slot schedule, not recovered issue timing.
-        ready_slots = ProtocolPhase("receive_slots", ("receive_flags",), cores,
+        ready_slots = ProtocolPhase("receive_slots", ("receive_flags",), recv_cores,
             "payload_read_owned_by_weighted_reduce", owner_basis="output_tokens")
         steps = [("weights", _read(recv * _ROUTER_WEIGHT_BYTES)),
                  ("initialize_accumulator", (("vector", source_tokens * layout.width),))]
@@ -603,7 +824,7 @@ def combine_plan(layout, *, source_assignments, received_assignments, experts, e
                 (f"slot{slot}_accumulate", (("vector", source_tokens * layout.width),)),
             ))
         phases = phases[:2] + (successful_flags, ready_slots,
-            _staged("weighted_reduce", ("receive_slots",), cores,
+            _staged("weighted_reduce", ("receive_slots",), recv_cores,
             "contiguous_output_tokens_with_serial_topk_reduction", tuple(steps),
             owner_basis="output_tokens", details=(
                 ("token_repeat_schedule", "serial_per_token; fractional_expected_tail_retained"),
@@ -614,7 +835,7 @@ def combine_plan(layout, *, source_assignments, received_assignments, experts, e
             )),
             ProtocolPhase(clear.name, ("weighted_reduce",), clear.owner_domain,
                           clear.ownership, clear.work, clear.details, clear.owner_basis),
-            _staged("publish_output", ("clear_data_flags",), cores,
+            _staged("publish_output", ("clear_data_flags",), recv_cores,
                     "contiguous_output_tokens_after_FP32_accumulation_and_flag_release", (
                 ("cast", (("vector", source_tokens * layout.width),)),
                 ("write_output", _write(source_tokens * layout.payload_bytes)),

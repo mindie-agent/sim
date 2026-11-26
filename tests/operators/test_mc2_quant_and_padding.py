@@ -606,3 +606,110 @@ def test_collective_hierarchy_and_directional_dma_lowering():
     assert dict(r_h2d.metadata)["startup_metric"] == "pinned_h2d_startup_ns" and dict(r_d2h.metadata)["startup_metric"] == "pinned_d2h_startup_ns"
     with pytest.raises(ModelingError, match="primitive_dma_direction_invalid"):
         lower_primitive("P20_host_dma_sync", {"direction": "sideways", "payload_bytes": 4096}, pt, allow_uncalibrated_declaration=True)
+
+
+def test_active_mask_dependency_owner_split_histogram_count_and_mx_mmrs_scales():
+    from mindie_sim.prediction.graph_analysis import _validate_graph
+    from mindie_sim.prediction.operators.mc2.mc2_fullmesh import dispatch_layout, dispatch_plan
+    from mindie_sim.prediction.operators.mc2.mc2_instructions import phase_events
+    from mindie_sim.prediction.sharding.sequence_parallel import DECLARATION
+    from mindie_sim.schema.operators import TensorPrecisionABI
+
+    # Native dispatch retains its active-mask dependency in valid topological order and checks active-mask global_bs.
+    mask_case = dict(
+        machine=dict(backend="ascend", sku=MESH_SKU, num_devices=2),
+        model=dict(layers=1, hidden_size=2048, head_dim=128, num_heads=16, num_kv_heads=16,
+                   ffn="moe", num_experts=4, top_k=2, intermediate_size=256,
+                   moe_intermediate_size=256, vocab_size=256),
+        workload=dict(requests=[dict(id="r", prompt_tokens=2, output_tokens=1)]),
+        runtime=dict(
+            tp=2, ep=2, routing=dict(policy="balanced"),
+            kernels={
+                "native_moe_protocol": dict(kind="arch35_fullmesh"),
+                "sequence_parallel": dict(DECLARATION, padding="right_to_tp", mc2_active_mask_active=True),
+            },
+        ),
+    )
+    mask_ops = target_graphs(mask_case, phase="decode", tokens=1, sequences=3, context=8, scope="body", resource_fusion=False)[0]
+    mask_idx, mask_op = next((i, o) for i, o in enumerate(mask_ops) if o.op_id.endswith(".mc2_mask_pad"))
+    disp_idx, disp_op = next((i, o) for i, o in enumerate(mask_ops) if o.op_id.endswith(".dispatch"))
+    assert mask_idx < disp_idx and sum(mask_op.op_id in o.deps for o in mask_ops) == 1 and mask_op.op_id in disp_op.deps
+    _validate_graph(mask_ops, {"analysis_input"})
+    bad_mask = dict(mask_case, runtime=dict(mask_case["runtime"], kernels={
+        "native_moe_protocol": dict(kind="arch35_fullmesh", global_bs=8),
+        "sequence_parallel": dict(DECLARATION, padding="right_to_tp", mc2_active_mask_active=True),
+    }))
+    with pytest.raises(ModelingError, match="global_bs_incompatible_with_active_mask"):
+        target_graphs(bad_mask, phase="decode", tokens=1, sequences=3, context=8, scope="body", resource_fusion=False)
+
+    # Expert histogram counting emits zero ReduceSum reductions, saves/merges bins per chunk, and issues BIN0+BIN1.
+    dims = dict(source_tokens=16, top_k=4, source_assignments=64, received_assignments=64, experts=64, ep=2)
+    h_plan = dispatch_plan(dispatch_layout(2048), aiv_count=64, **dims)
+    cnt_phase = next(p for p in h_plan.phases if p.name == "count_compute")
+    events = [
+        phase_events(dict(kind="dispatch", **dims), cnt_phase, owner, 1 / len(cnt_phase.owner_domain), h_plan.layout)
+        for owner in cnt_phase.owner_domain
+    ]
+    assert sum(e["after:service"].counts.get("reduce_sum_issue", 0) for e in events) == 0
+    single_phase = cnt_phase.__class__(
+        cnt_phase.name, cnt_phase.after, (0,), cnt_phase.ownership,
+        cnt_phase.work, cnt_phase.details, cnt_phase.owner_basis, cnt_phase.steps,
+    )
+    single_inv = phase_events(
+        dict(kind="dispatch", source_tokens=16, top_k=16, source_assignments=256, received_assignments=256, experts=3, ep=2),
+        single_phase, 0, 1.0, h_plan.layout,
+    )["after:service"].counts
+    assert single_inv["scalar_ub_access"] == 26 and single_inv["scalar_alu_issue"] == 4 and single_inv["pipe_v_issue"] == 18
+
+    # Nonserial ungrouped dispatch caps payload senders at 40, assigns 24 count cores (4 cumsum), and aligns per-core count status.
+    ns_plan = dispatch_plan(
+        dispatch_layout(2048), source_tokens=33, top_k=2, source_assignments=66,
+        received_assignments=66, experts=64, ep=16, aiv_count=64,
+    )
+    ns_phases = {p.name: p for p in ns_plan.phases}
+    assert len(ns_phases["send_read_quantize"].owner_domain) == 40
+    assert len(ns_phases["count_compute"].owner_domain) == 24
+    assert len(ns_phases["receive_counts"].owner_domain) == 4
+    assert dict(ns_phases["count_compute"].work)["vector"] == 24 * 9 * 8
+    grp_plan = dispatch_plan(
+        dispatch_layout(2048), source_tokens=33, top_k=2, source_assignments=66,
+        received_assignments=66, experts=64, ep=16, aiv_count=64, enable_group_send=True,
+    )
+    grp_phases = {p.name: p for p in grp_plan.phases}
+    assert len(grp_phases["send_read_quantize"].owner_domain) == 60
+    assert len(grp_phases["count_compute"].owner_domain) == 4
+
+    # MXFP8 and typed TensorPrecisionABI MXFP4 MatmulReduceScatter bill both E8M0 scales in AIC reads while RS link stays output-sized.
+    rs_case = parse_case(dict(
+        machine=dict(backend="ascend", sku=MESH_SKU, num_devices=4),
+        model=dict(layers=1, hidden_size=128, num_heads=4, head_dim=32, intermediate_size=256, vocab_size=256),
+        workload=dict(requests=[dict(id="r", prompt_tokens=1, output_tokens=1)]),
+        runtime=dict(tp=4),
+    ))
+    rs_geo = Geometry.from_devices(rs_case.machine.dies[:1], links=rs_case.machine.links)
+    m, k, n = 16, 256, 256
+    rs_meta = dict(
+        world_size=2, m=m, k=k, n=n, caller_abi="ai_cpu", quant_mode="mx",
+        compute_dtype="fp8_e4m3", output_dtype="bf16",
+        activation_group_size=32, activation_scale_format="fp8_e8m0",
+    )
+    rs_op = OpSpec(
+        "rs", "matmul_reduce_scatter", "prefill", 0, 0, (), *((m, k, n),) * 4,
+        dtype="fp8_e4m3", recipe="matmul_reduce_scatter_v2_arch35", metadata=tuple(rs_meta.items()),
+    )
+    rs_plan = mc2.build(rs_op, rs_geo)
+    assert int(rs_plan.work.resources["mte2_aic"]) == (m + n) * k + (m + n) * (k // 32)
+    assert int(rs_plan.work.resources["link"]) == (m // 2) * n * 2
+    mx4_abi = TensorPrecisionABI(
+        linear_method="mx_fp4", input_dtype="fp4_e2m1", weight_dtype="fp4_e2m1", output_dtype="bf16",
+        act_group_size=32, act_scale_dtype="fp8_e8m0", weight_scale_dtype="fp8_e8m0",
+        activation_quant_mode="dynamic_mx32",
+    )
+    rs4_op = OpSpec(
+        "rs_mx4", "matmul_reduce_scatter", "prefill", 0, 0, (), *((256, 256, 256),) * 4,
+        dtype="fp4_e2m1", recipe="matmul_reduce_scatter_v2_arch35", precision_abi=mx4_abi,
+        metadata=(("mc2", {"abi": "matmul_reduce_scatter", "world_size": 4, "m": 256, "k": 256, "n": 256}),),
+    )
+    rs4_plan = mc2.build(rs4_op, rs_geo)
+    assert int(rs4_plan.work.resources["mte2_aic"]) == 69632
+    assert int(rs4_plan.work.resources["link"]) == 3 * (64 * 256 * 2)

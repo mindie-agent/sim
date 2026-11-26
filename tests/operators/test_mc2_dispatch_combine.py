@@ -790,3 +790,221 @@ def test_w4a4_mxfp4_preserves_fp4_payload_and_megamoe_charges_gmm2_activation_wo
     plan_fp4 = megamoe.build(mm_fp4, geo_l2)
     assert plan_fp4.metadata["gmm2_activation_workspace_bytes"] == pytest.approx(128.0 * (1024 + 64))
     assert "fp4_e2m1" in plan_fp4.work.matrix
+
+
+def test_pipeline_stage_dispatch_combine_shape_and_protocol_validation():
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.operators.mc2.mc2_phase import build as build_phase
+    from mindie_sim.prediction.operators.mc2.mc2_program import native_program_from_contract
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.prediction.values.typed import typed_outputs
+    from mindie_sim.schema.parallel import DieIndex, GlobalRank, RankCoord, ReplicaLocalRank
+
+    # Pipeline stage-1 die physical rank projects to EP-local rank without dropping link work.
+    pp_model = dict(layers=2, hidden_size=2048, head_dim=128, num_heads=16, num_kv_heads=16,
+                    ffn="moe", num_experts=4, top_k=2, intermediate_size=256,
+                    moe_intermediate_size=256, vocab_size=256)
+    pp_case = parse_case(dict(
+        machine=dict(backend="ascend", sku=MESH_SKU, num_devices=4),
+        model=pp_model,
+        workload=dict(requests=[dict(id="r", prompt_tokens=2, output_tokens=1)]),
+        runtime=dict(pp=2, dp=2, ep=2, kernels=dict(native_moe_protocol=dict(kind="arch35_fullmesh")),
+                     routing=dict(policy="balanced")),
+    ))
+    pp_ops = target_graphs(pp_case, phase="decode", tokens=1, sequences=(2, 2), context=8, scope="body")[1]
+    pp_disp = next(o for o in pp_ops if o.stage == 1 and o.op_id.endswith(".dispatch"))
+    pp_phase = dict(pp_disp.metadata)["mc2_phase"]
+    pp_plan = build_phase(pp_disp, Geometry.from_devices((pp_case.machine.dies[3],)))
+    assert pp_plan.work.resources["link"] == pytest.approx(float(pp_phase["route_matrix_bytes"][1][0]) + 64.0)
+
+    # Combine output publishes (BS, H) rows rather than pre-reduction (BS * top_k, H) rows.
+    comb_case = dict(
+        machine=dict(backend="ascend", sku=MESH_SKU, num_devices=2),
+        model=dict(pp_model, layers=1),
+        workload=dict(requests=[dict(id="r", prompt_tokens=2, output_tokens=1)]),
+        runtime=dict(dp=2, ep=2, kernels=dict(native_moe_protocol=dict(kind="arch35_fullmesh")),
+                     routing=dict(policy="balanced")),
+    )
+    comb_op = next(
+        o for o in target_graphs(comb_case, phase="decode", tokens=1, sequences=(3, 3), context=8, scope="body")[1]
+        if o.op_id.endswith(".unpack")
+    )
+    comb_val = typed_outputs(comb_op)[0]
+    assert tuple(comb_val["logical_shape"]) == (3, 2048) and int(comb_val["bytes"]) == 3 * 2048 * 2
+
+    # Unequal EP batches propagate rank-1 EP ownership identically across op, plan, and native program.
+    asym_case = parse_case(compose_case(
+        "qwen3-30b-a3b", MESH_SKU, dp=2, tp=1, ep=2, layers=1,
+        prompt_tokens=16, output_tokens=2, quant="mxfp8", enable_fused_mc2=0, feature_track="shipping",
+    ))
+    asym_op = next(
+        o for o in target_graphs(asym_case, phase="decode", tokens=1, context=16, sequences=(1, 3), scope="body")[1]
+        if o.op_id.endswith(".dispatch")
+    )
+    asym_geo = replace(Geometry.from_devices(asym_case.machine.dies[1:2]), rank=1)
+    asym_plan = build_phase(asym_op, asym_geo)
+    asym_ctx = RecipeContext(
+        asym_op, {}, {k: k for k in asym_geo.rates}, asym_geo.rates,
+        asym_geo.compute_units, resource_units=asym_geo.resource_units,
+    )
+    native = asym_plan.program(asym_ctx)
+    wire = sum(v for k, v in native.work if k.startswith("link"))
+    assert int(asym_op.link_bytes) == int(asym_plan.work.resources["link"]) == int(wire)
+    assert native.rank == 1
+    coord = RankCoord(GlobalRank(3), DieIndex(3), 1, 1, ReplicaLocalRank(0), 0, 0, 0, 1)
+    via_coord = native_program_from_contract(
+        dict(asym_op.metadata)["mc2_phase"], replace(asym_ctx, op=None), rank_coord=coord,
+    )
+    assert via_coord.rank == 1 and sum(v for k, v in via_coord.work if k.startswith("link")) == wire
+
+    # Protocol validation: omitted peer window constructs cleanly and nonnegative global_bs is accepted.
+    for window in ({}, {"max_inflight_per_rank": 1}):
+        decl = dict(kind="arch22_v2_caller", dispatch_quant="per_token_int8", **window)
+        assert mc2.select_native_protocol({"native_moe_protocol": decl})["kind"] == "arch22_v2_caller"
+        assert "arch22_v2_declared_peer_channel" in RecipeBook.from_mapping({"native_moe_protocol": decl}).recipes
+    assert mc2.select_native_protocol({"native_moe_protocol": dict(kind="arch35_fullmesh", global_bs=6)})["global_bs"] == 6
+    assert mc2.select_native_protocol({"native_moe_protocol": dict(kind="arch35_fullmesh", enable_group_send=True)})["enable_group_send"] is True
+    for bad in (-1, True):
+        with pytest.raises(ModelingError, match="global_bs_requires_nonnegative_integer"):
+            mc2.select_native_protocol({"native_moe_protocol": dict(kind="arch35_fullmesh", global_bs=bad)})
+    with pytest.raises(ModelingError, match="enable_group_send_requires_bool"):
+        mc2.select_native_protocol({"native_moe_protocol": dict(kind="arch35_fullmesh", enable_group_send=1)})
+
+    # Empty expert bank on a cross-node EP group retains EP-local rank, projects placements, and bills RoCE.
+    from fractions import Fraction
+    from mindie_sim.prediction.operators.mc2 import mc2_phase
+    from mindie_sim.prediction.operators.mc2.mc2_fullmesh import combine_layout, combine_plan
+    from mindie_sim.prediction.service_regime_domains.services import service_identity
+    from mindie_sim.prediction.values.typed import produced_values
+
+    xnode_links = [
+        dict(name="hccs_0", channel="hccs", scope="node", capacity_bytes_per_ms=1e6, members=[0, 1], semantics="per_pair", latency_us=5),
+        dict(name="hccs_1", channel="hccs", scope="node", capacity_bytes_per_ms=1e6, members=[2, 3], semantics="per_pair", latency_us=5),
+        dict(name="roce", channel="roce", scope="cross_node", capacity_bytes_per_ms=1e5, members=[0, 1, 2, 3], semantics="fully_connected", latency_us=15),
+    ]
+    empty_raw = caller_case(tp=1, dp=2)
+    empty_raw["machine"].update(num_devices=4, ranks_per_node=2, links=xnode_links)
+    empty_raw["model"].update(layers=2, num_experts=2, top_k=1)
+    empty_raw["runtime"].update(tp=1, dp=2, pp=2, ep=2)
+    empty_gs = target_graphs(empty_raw, phase="decode", tokens=1, sequences=(0, 1), context=128, scope="body")
+    d0 = next(o for o in empty_gs[0] if o.op_id.endswith(".dispatch") and o.stage == 0)
+    c0 = next(o for o in empty_gs[0] if o.op_id.endswith(".unpack") and o.stage == 0)
+    d1 = next(o for o in empty_gs[1] if o.op_id.endswith(".dispatch") and o.stage == 0)
+    c1 = next(o for o in empty_gs[1] if o.op_id.endswith(".unpack") and o.stage == 0)
+    assert dict(d1.metadata)["ep_rank"] == 1 and dict(c1.metadata)["ep_rank"] == 1
+    assert (d0.link_bytes, d1.link_bytes, c0.link_bytes, c1.link_bytes) == (32.0, 544.0, 512.0, 0.0)
+    empty_case = parse_case(empty_raw)
+    sid1 = service_identity(empty_case, d1, "body", device=empty_case.machine.dies[2])
+    xrates = {"hbm": FAST, "vector": FAST, "mte2_aiv": FAST, "mte3": FAST, "link_hccs": 1e6, "link_roce": 1e5}
+    xunits = {"vector": 4, "mte2_aiv": 4, "mte3": 4}
+    xctx = RecipeContext(d1, {}, {k: k for k in xrates}, xrates, 4, resource_units=xunits, compute_peaks={"bf16": FAST}, service_identity=sid1)
+    xprog = native_program_from_contract(dict(d1.metadata)["mc2_phase"], xctx, physical_rank=2)
+    assert xprog.view.rank == 1 and xprog.rank_nodes == {0: 0, 1: 1}
+    assert xprog.link_by_phase["count_status_exchange"] == {"link_roce": Fraction(32, 1)}
+    assert xprog.link_by_phase["payload_exchange"] == {"link_roce": Fraction(512, 1)}
+    assert xprog.link_by_phase_for(1)["payload_exchange"] == {"link_roce": Fraction(512, 1)}
+
+    # Padded combine retains distinct logical and physical storage extents in typed_outputs.
+    pad_base = target_graphs(caller_case(tp=1, dp=2, protocol=None), phase="decode", tokens=1, sequences=2, context=128, scope="body")[0]
+    pad_lowered = mc2.lower_native_protocol(
+        pad_base, selected=dict(kind="arch35_fullmesh", dispatch_quant="none"),
+        runtime=SimpleNamespace(moe_recipe="alltoall", kernels={}, parallel=None, metadata=()),
+        prefix="s0.l0", tokens=2, top_k=2, width=2048, experts=4, ep=2,
+        source_partitions=1, received_assignments=2, dtype="bf16", valid_tokens=1,
+    )
+    pad_out = produced_values(next(o for o in pad_lowered if o.op_id == "s0.l0.unpack"))[0]
+    assert pad_out["logical_shape"] == [1, 2048] and pad_out["storage_shape"] == [2, 2048]
+    assert pad_out["bytes"] == 4096.0 and pad_out["storage_bytes"] == 8192.0
+
+    # global_bs forwards consistently to dispatch and combine, splits combine cores, and enforces tiling checks.
+    cp = combine_plan(combine_layout(2048), source_assignments=4, received_assignments=4, experts=16, ep=2, aiv_count=64, source_tokens=2, top_k=2, global_bs=6)
+    c_phases = {p.name: p for p in cp.phases}
+    assert len(c_phases["return_read_frame"].owner_domain) == 61 and len(c_phases["receive_flags"].owner_domain) == 3
+    gbs_raw = caller_case(tp=1, dp=2, protocol=dict(kind="arch35_fullmesh", dispatch_quant="none", global_bs=6))
+    gbs_gs = target_graphs(gbs_raw, phase="decode", tokens=1, sequences=(2, 3), context=128, scope="body")
+    for rep in (0, 1):
+        assert dict(next(o for o in gbs_gs[rep] if o.op_id.endswith(".dispatch")).metadata)["mc2_phase"]["global_bs"] == 6
+        assert dict(next(o for o in gbs_gs[rep] if o.op_id.endswith(".unpack")).metadata)["mc2_phase"]["global_bs"] == 6
+    for bad_gbs in (3, 5):
+        with pytest.raises(ModelingError, match="global_bs_invalid_for_batch_and_ep"):
+            target_graphs(caller_case(tp=1, dp=2, protocol=dict(kind="arch35_fullmesh", global_bs=bad_gbs)), phase="decode", tokens=1, sequences=(2, 3), context=128, scope="body")
+
+    # Mesh topology at EP16 derives group-send tiling (60 send / 4 count cores) automatically.
+    geo16 = geometry(MESH_SKU, 16)
+    hw16 = machine(MESH_SKU, num_devices=16)
+    d16_raw = dict(kind="dispatch", width=2048, dtype="bf16", source_tokens=33, top_k=2, source_assignments=66, received_assignments=66, experts=64, ep=16)
+    d16_op = OpSpec("d16", "mc2_protocol", "decode", 0, 0, (), *((66, 2048),) * 4, dtype="bf16", recipe=mc2_phase.RECIPE, metadata=(("mc2_phase", d16_raw),))
+    sid16 = {"transport": {"links": [lk.to_dict() for lk in hw16.links], "placements": [{"rank": d.rank, "node": d.node} for d in hw16.dies], "groups": [list(range(16))]}}
+    ctx16 = RecipeContext(d16_op, {}, {k: k for k in xrates}, xrates, 32, resource_units={"vector": 64, "mte2_aiv": 64, "mte3": 64}, compute_peaks={"bf16": FAST}, service_identity=sid16)
+    p16 = {p.name: p for p in mc2_phase.build(d16_op, geo16).program(ctx16).phases}
+    assert len(p16["send_read_quantize"].owner_domain) == 60 and len(p16["count_compute"].owner_domain) == 4
+
+
+def test_megamoe_width_shared_tp_reserved_l2_and_comm_selection_conservation():
+    from mindie_sim.compose import compose_case
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.prediction.operators.mc2 import mc2_graph, megamoe
+    from mindie_sim.prediction.operators.mc2.moe_comm_selection import MC2, MoeCommConfig
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+
+    # Gated-GELU preserves full matrix FLOPs rather than misclassifying as elementwise GELU.
+    gelu_model = load_model("qwen3-30b-a3b").to_dict()
+    for layer in gelu_model["layer_plans"]:
+        layer["ffn_activation"] = "gelu"
+    gelu_flops = {}
+    for level in (0, 2):
+        raw = compose_case(
+            gelu_model, MESH_SKU, tp=2, ep=2, layers=1,
+            prompt_tokens=16, output_tokens=2, quant="mxfp8", enable_fused_mc2=level, feature_track="shipping",
+        )
+        ops = target_graphs(raw, phase="decode", tokens=1, context=16, scope="body")[0]
+        gelu_flops[level] = sum(
+            o.flops for o in ops if o.recipe in {"grouped_gate_up", "grouped_down", "megamoe_arch35"}
+        )
+    assert gelu_flops[2] == pytest.approx(gelu_flops[0])
+
+    # SP/TP shared expert keeps its collectives and full shared matrix FLOPs at level 3 vs level 2.
+    shared_model = load_model("qwen3-30b-a3b").to_dict()
+    shared_model["num_shared_experts"] = 1
+    for layer in shared_model["layer_plans"]:
+        layer["num_shared_experts"] = 1
+    shared_stats = {}
+    for level in (2, 3):
+        raw = compose_case(
+            shared_model, MESH_SKU, tp=2, ep=2, sp=True, layers=1,
+            prompt_tokens=16, output_tokens=2, quant="mxfp8", enable_fused_mc2=level, feature_track="shipping",
+        )
+        ops = target_graphs(parse_case(raw), phase="decode", tokens=1, context=16, sequences=4, scope="body")[0]
+        shared_stats[level] = (sum(o.flops for o in ops), sum(o.link_bytes for o in ops))
+    assert shared_stats[3] == pytest.approx(shared_stats[2])
+
+    # MegaMoE honors live L2 reservations identically to zero capacity.
+    l2_case = parse_case(compose_case(
+        "qwen3-30b-a3b", MESH_SKU, tp=2, ep=2, layers=1,
+        prompt_tokens=16, output_tokens=2, quant="mxfp8", enable_fused_mc2=2, feature_track="shipping",
+    ))
+    mega_op = next(
+        o for o in target_graphs(l2_case, phase="decode", tokens=1, context=16, scope="body")[0]
+        if o.recipe == "megamoe_arch35"
+    )
+    geo = Geometry.from_devices(l2_case.machine.dies[:1])
+    cap = int(geo.buffers["l2"])
+    v_zero = AdmissionMemoryView({0: 0})
+    v_reserved = AdmissionMemoryView({0: cap})
+    v_reserved.grant_reservation(0, "live-workspace", cap)
+    w_zero = megamoe.build(mega_op, replace(geo, admission_memory_view=v_zero)).work.resources
+    w_res = megamoe.build(mega_op, replace(geo, admission_memory_view=v_reserved)).work.resources
+    assert w_res.get("l2", 0.0) == 0.0 and w_res["hbm"] == pytest.approx(w_zero["hbm"])
+
+    # Fused-or-capacity selector and mc2_graph.select_common honor capacity across decode and prefill.
+    selector = MoeCommConfig(
+        mode="dynamic", policy="fused_or_capacity", arch_family="A3",
+        capacity=32, world_size=2, tp=1, top_k=1, experts_per_device=8,
+    )
+    assert selector.select(16, phase="decode") == MC2
+    assert selector.select(16, phase="prefill") == MC2
+    rt_meta = {"arch_family": selector.arch_family, "moe_comm_mode": "dynamic", "additional_config": {"enable_prefill_mc2": False}}
+    rt_obj = SimpleNamespace(kernels={}, moe_recipe="alltoall", metadata=rt_meta)
+    feat_obj = SimpleNamespace(tp=1, graph_buckets=(32,), metadata=rt_meta)
+    prefill_sel = mc2_graph.select_common(rt_obj, feat_obj, tokens=16, top_k=1, experts=16, ep=2, phase="prefill")
+    assert prefill_sel is not None and prefill_sel["selected_method"] == MC2

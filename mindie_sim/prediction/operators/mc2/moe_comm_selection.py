@@ -197,10 +197,9 @@ class MoeCommConfig:
             return ALLGATHER
         if self.lora:
             return ALLTOALL
-        allow_plain_mc2 = phase != "prefill" or self.enable_prefill_mc2
+        del phase  # Upstream enable_prefill_mc2 sizes capacity; selectors do not gate on phase.
         if self.policy == CAPACITY_AND_EXPERT_DENSITY:
-            if (allow_plain_mc2
-                    and self.experts_per_device <= _DENSITY_MC2_MAX_EXPERTS_PER_DEVICE
+            if (self.experts_per_device <= _DENSITY_MC2_MAX_EXPERTS_PER_DEVICE
                     and self.world_size >= _DENSITY_MC2_MIN_WORLD_SIZE
                     and num_tokens <= self.capacity):
                 return MC2
@@ -210,18 +209,17 @@ class MoeCommConfig:
                     and self.mega_moe_supported
                     and self.world_size <= _FUSED_OR_CAPACITY_MAX_MEGAMOE_WORLD_SIZE):
                 return FUSED_MC2
-            if (allow_plain_mc2
-                    and self.enable_fused_mc2
+            if (self.enable_fused_mc2
                     and self.world_size <= _FUSED_OR_CAPACITY_MAX_FUSED_WORLD_SIZE):
                 return FUSED_MC2
-            if allow_plain_mc2 and num_tokens <= self.capacity:
+            if num_tokens <= self.capacity:
                 return MC2
             return ALLTOALL
         if self.policy == CAPACITY_AND_WORLD_SIZE:
             if (self.enable_fused_mc2 and self.mega_moe_supported
                     and not (self.is_draft_model and not self.draft_quant_supported)):
                 return FUSED_MC2
-            if allow_plain_mc2 and num_tokens <= self.capacity and self.world_size > 1:
+            if num_tokens <= self.capacity and self.world_size > 1:
                 return MC2
             if self.world_size <= self.top_k:
                 return ALLGATHER

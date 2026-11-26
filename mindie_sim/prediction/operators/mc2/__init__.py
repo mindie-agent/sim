@@ -34,8 +34,8 @@ _NATIVE_PROTOCOLS = {leaf.NATIVE_PROTOCOL_KIND: leaf for leaf in (arch22, arch35
 _DEFAULT_NATIVE_PROTOCOL = arch35
 NATIVE_PROTOCOL_NETWORK = _DEFAULT_NATIVE_PROTOCOL.NETWORK
 _NATIVE_PROTOCOL_FIELDS = frozenset({
-    "kind", "max_inflight_per_rank", "dispatch_quant", "global_bs", "chunk_bytes",
-    "hop_startup_us", "receive_capacity_bytes_per_peer",
+    "kind", "max_inflight_per_rank", "dispatch_quant", "global_bs", "enable_group_send",
+    "chunk_bytes", "hop_startup_us", "receive_capacity_bytes_per_peer",
 })
 
 
