@@ -63,21 +63,21 @@ SITU_CLIPPED_NATIVE_KINDS = (
 
 def _assert_waterfall_monotonic(result: dict) -> None:
     wf = result["waterfall"]
-    t_eager = float(wf["raw_eager"]["step_ms"])
-    t_merged = float(wf["current_merged"]["step_ms"])
-    t_pr = float(wf["current_unmerged_pr"]["step_ms"])
-    t_ideal = float(wf["expected_ideal"]["step_ms"])
+    t_eager = float(wf["eager"]["step_ms"])
+    t_shipping = float(wf["shipping"]["step_ms"])
+    t_proposed = float(wf["proposed"]["step_ms"])
+    t_target = float(wf["target"]["step_ms"])
     t_roof = float(wf["hardware_roofline"]["physical_ideal_1p0x_ms"])
-    assert t_eager + MONOTONIC_TOL_MS >= t_merged
-    assert t_merged + MONOTONIC_TOL_MS >= t_pr
-    assert t_pr + MONOTONIC_TOL_MS >= t_ideal
-    assert t_ideal + MONOTONIC_TOL_MS >= t_roof
+    assert t_eager + MONOTONIC_TOL_MS >= t_shipping
+    assert t_shipping + MONOTONIC_TOL_MS >= t_proposed
+    assert t_proposed + MONOTONIC_TOL_MS >= t_target
+    assert t_target + MONOTONIC_TOL_MS >= t_roof
 
 
 def test_indexer_layer_norm_raw_eager_retains_fp32_wrapper_casts() -> None:
-    """BF16 indexer LayerNorm retains upstream FP32 wrapper casts in both raw_eager and merged."""
+    """BF16 indexer LayerNorm retains upstream FP32 wrapper casts in both eager and shipping."""
     sku = REPRESENTATIVE_SKUS["a3"]
-    for track in ("raw_eager", "merged"):
+    for track in ("eager", "shipping"):
         case = compose_case(
             "glm-5.2", hardware=sku, feature_track=track,
             tp=TP_WIDTH, num_devices=TP_WIDTH, layers=SAMPLE_LAYERS,
@@ -96,11 +96,11 @@ def test_gated_rmsnorm_eager_differentiates_gdn_swish_from_kda_sigmoid() -> None
     """Unfused 11-op FusedRMSNormGated uses Swish (5 ops) on GDN and Sigmoid (4 ops) on KDA."""
     sku = REPRESENTATIVE_SKUS["a5"]
     gdn_case = compose_case(
-        "qwen3.5-35b-a3b", hardware=sku, feature_track="raw_eager",
+        "qwen3.5-35b-a3b", hardware=sku, feature_track="eager",
         tp=TP_WIDTH, num_devices=TP_WIDTH, layers=SAMPLE_LAYERS,
     )
     kda_case = compose_case(
-        "glm-5.3-flash", hardware=sku, feature_track="raw_eager",
+        "glm-5.3-flash", hardware=sku, feature_track="eager",
         tp=TP_WIDTH, num_devices=TP_WIDTH, layers=SAMPLE_LAYERS,
     )
     gdn_rep = export_structure(
@@ -134,10 +134,10 @@ def test_gated_rmsnorm_eager_differentiates_gdn_swish_from_kda_sigmoid() -> None
 
 @pytest.mark.parametrize("gen", ("a3", "a5"))
 def test_gdn_decode_raw_eager_decomposes_conv_and_gating_monotonically(gen: str) -> None:
-    """GDN decode raw_eager lowers real torch conv1d + gating chains and satisfies monotonicity."""
+    """GDN decode eager lowers real torch conv1d + gating chains and satisfies monotonicity."""
     sku = REPRESENTATIVE_SKUS[gen]
     eager_case = compose_case(
-        "qwen3.5-27b", hardware=sku, feature_track="raw_eager",
+        "qwen3.5-27b", hardware=sku, feature_track="eager",
         tp=TP_WIDTH, num_devices=TP_WIDTH, layers=SAMPLE_LAYERS,
     )
     rep = export_structure(
@@ -363,8 +363,14 @@ def test_probed_abi_registry_covers_cann_and_non_cann_with_joint_tuples() -> Non
 
     assert resolve_mla_preprocess_mode(
         arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512,
-        qk_rope_head_dim=64, is_draft_model=True, input_size=14336, num_kv_heads=1,
+        qk_rope_head_dim=64, is_draft_model=True, is_strided_kv_cache=True,
+        input_size=14336, num_kv_heads=1,
     ) == "strided_kv_adapter"
+    assert resolve_mla_preprocess_mode(
+        arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512,
+        qk_rope_head_dim=64, is_draft_model=True, is_strided_kv_cache=False,
+        input_size=14336, num_kv_heads=1,
+    ) == "native_decomposed"
     c_ds = parse_case(compose_case("deepseek-v3.2", hardware="a5-pod", layers=4, dp=1, tp=4, ep=4, num_devices=4))
     p0 = c_ds.model.layer_plans[0]
     rt_strided = replace(c_ds.runtime, metadata=tuple(c_ds.runtime.metadata) + (("automatic_lowerings", ("mla_prolog",)), ("is_strided_kv_cache", True)))
@@ -379,11 +385,18 @@ def test_probed_abi_registry_covers_cann_and_non_cann_with_joint_tuples() -> Non
         (SimpleNamespace(phase="decode", q_len=4),), 4, c_ds.machine,
     )
     assert prolog_m is None
-    c_glm = compose_case("glm-5.3-flash", hardware="a5-pod", layers=4, dp=2, tp=1, ep=2, dcp=2, num_devices=2)
+    with pytest.raises(ModelingError, match="kpool_indexer_requires_dcp_1"):
+        compose_case("glm-5.3-flash", hardware="a5-pod", layers=4, dp=2, tp=1, ep=2, dcp=2, num_devices=2)
+    c_glm = compose_case("glm-5.3-flash", hardware="a5-pod", layers=4, dp=2, tp=1, ep=2, dcp=1, num_devices=2)
     c_glm["runtime"]["metadata"].pop("va_profile", None)
     c_glm["runtime"]["kernels"]["lowerings"].pop("pool_key_indexer", None)
+    parsed_glm = parse_case(c_glm)
+    forced_dcp = replace(
+        parsed_glm,
+        runtime=replace(parsed_glm.runtime, parallel=replace(parsed_glm.runtime.parallel, cp=2, cp_plan="dcp")),
+    )
     with pytest.raises(ModelingError, match="m10_kpool_requires_dcp_eq_1"):
-        target_graphs(parse_case(c_glm), phase="decode", tokens=1, context=128, sequences=1, scope="body")
+        target_graphs(forced_dcp, phase="decode", tokens=1, context=128, sequences=1, scope="body")
     c_v41_a3 = parse_case(compose_case("deepseek-v4.1-flash", hardware="a3-pod", layers=1, dp=1, tp=4, ep=4, num_devices=4))
     g_v41_a3 = target_graphs(c_v41_a3, phase="decode", tokens=2, context=128, sequences=1, scope="body")[0]
     smla_meta = [op for op in g_v41_a3 if op.recipe == "SparseFlashMlaMetadata"]
@@ -468,10 +481,10 @@ def test_phase3_physics_and_rot_audit_closures() -> None:
     from mindie_sim.schema.parallel import ParallelSpec
     from mindie_sim.schema.workload import RequestView
 
-    # P1-6: strided_kv_adapter strictly requires input_size not in PROLOG_V3_SUPPORTED_INPUT_SIZES.
+    # P1-6: supported-width strided draft uses prolog_v3; unsupported input_size selects strided_kv_adapter.
     kw_draft = dict(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512,
                     qk_rope_head_dim=64, is_draft_model=True, is_strided_kv_cache=True)
-    assert resolve_mla_preprocess_mode(**kw_draft, input_size=7168) == "native_decomposed"
+    assert resolve_mla_preprocess_mode(**kw_draft, input_size=7168) == "prolog_v3"
     assert resolve_mla_preprocess_mode(**kw_draft, input_size=14336) == "strided_kv_adapter"
 
     # P1-8: window_compressed sparse DCP reports exact 32/32 compressed rows per rank.
@@ -529,14 +542,15 @@ def test_phase3_physics_and_rot_audit_closures() -> None:
     with pytest.raises(ModelingError, match="arch35_fused_mc2_level_unsupported"):
         mc2.fused_mc2_native_binding("bf16", fused_level=1, arch_family="A5")
 
-    # S3-031 & S3-035: cooperative AttnRes write conservation + j=0 bypass exact 128 vector ops.
+    # S3-031 & S3-035: cooperative AttnRes write conservation (8192B output + 160B GM score-slot exchange)
+    # + j=0 bypass exact 128 vector ops.
     coop_m = family_attnres.point_metrics(
         {"tokens_local": 1, "hidden": 4096, "valid_blocks": 4, "mix": True, "fuse_add": False,
          "block_write_idx": -1, "save_materialized": False, "output_norm": False, "optimize_prefill": False,
          "tiling_mode": "cooperative"},
         253952, 64, arch_family="A5",
     )
-    assert sum(c["write_bytes"] for c in coop_m["cores"]) == coop_m["write_bytes"] == 8192
+    assert sum(c["write_bytes"] for c in coop_m["cores"]) == coop_m["write_bytes"] == 8192 + 5 * 32
     op_j0 = OpSpec("ar_j0", "attention_residual", "decode", 0, 0, (), (1, 64), (1, 64), (1, 64), (1, 64),
                    dtype="bf16", recipe="attn_res_fwd",
                    metadata=(("attn_res_view", {"tokens_local": 1, "hidden": 64, "valid_blocks": 0, "bank_capacity": 8,

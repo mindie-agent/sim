@@ -156,7 +156,7 @@ def _assert_kv_bounds(kv_base: tuple[float, ...], kv_dcp: tuple[float, ...], dcp
     [
         ("deepseek-v3", dict(dp=1, tp=4, ep=4, dcp=1), dict(dp=1, tp=4, ep=4, dcp=4), 0.25),
         ("deepseek-v3.2", dict(dp=1, tp=4, ep=4, dcp=1), dict(dp=1, tp=4, ep=4, dcp=4), None),
-        ("glm-5.3-flash", dict(dp=2, tp=1, ep=2, dcp=1), dict(dp=2, tp=1, ep=2, dcp=2), None),
+        ("kimi-k3", dict(dp=2, tp=1, ep=2, dcp=1), dict(dp=2, tp=1, ep=2, dcp=2), None),
         ("qwen3-32b", dict(dp=2, tp=1, ep=1, dcp=1), dict(dp=2, tp=1, ep=1, dcp=2), 0.5),
         ("qwen3.5-35b-a3b", dict(dp=2, tp=1, ep=2, dcp=1), dict(dp=2, tp=1, ep=2, dcp=2), None),
     ],
@@ -402,8 +402,11 @@ def test_sfa_prefill_kv_gather_sharded_indexer_and_keypool_pre_store_dag():
     assert not any(op.recipe == "sfa_dcp_prefill_kv_gather" for op in g_shd_pf[0])
     assert any(op.recipe == "dcp_output_alltoall" for op in g_shd_pf[0])
 
-    # 3) KeyPool PCP prefill gathers full hidden states BEFORE cann_key_pool (zero post-store index gather).
-    c_kp = compose_case("glm-5.3-flash", hardware=HW_DEFAULT, dp=1, tp=1, pcp=TWO_RANKS, dcp=TWO_RANKS, ep=TWO_RANKS, num_devices=TWO_RANKS, layers=AUDIT_LAYERS)
+    # 3) KeyPool PCP prefill gathers full hidden states BEFORE cann_key_pool (zero post-store index gather);
+    #    KeyPool models strictly reject DCP > 1.
+    with pytest.raises(ModelingError, match="kpool_indexer_requires_dcp_1"):
+        compose_case("glm-5.3-flash", hardware=HW_DEFAULT, dp=1, tp=1, pcp=TWO_RANKS, dcp=TWO_RANKS, ep=TWO_RANKS, num_devices=TWO_RANKS, layers=AUDIT_LAYERS)
+    c_kp = compose_case("glm-5.3-flash", hardware=HW_DEFAULT, dp=1, tp=1, pcp=TWO_RANKS, dcp=1, ep=TWO_RANKS, num_devices=TWO_RANKS, layers=AUDIT_LAYERS)
     _, g_kp, _, _ = _body_graphs(c_kp, phase="prefill", tokens=1024, context=0, sequences=1)
     ops_kp = g_kp[0]
     _assert_strict_dag(ops_kp)

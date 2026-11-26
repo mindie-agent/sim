@@ -30,8 +30,8 @@ MTP_PROPOSALS = 5
 MTP_ACCEPT_LEN = 3.5
 DECODE_VERIFY_TOKENS = 1 + MTP_PROPOSALS
 
-V41_LAYERS = 40
-V41_HIDDEN_SIZE = 5120
+V4_FLASH_LAYERS = 43
+V4_FLASH_HIDDEN_SIZE = 4096
 V41_NUM_HEADS = 64
 V41_HEAD_DIM = 512
 V41_O_GROUPS = 8
@@ -57,15 +57,26 @@ UNIT_K_WIDTH = 64
 
 def test_mla_replicated_grouped_output_sp_closure_prefill_and_decode():
     """Grouped MLA output with o_groups < tp closes SP via local row shard without allreduce."""
-    raw = compose_case(
+    # V4.1 Engram has 24 lookup heads/table, which fails fast at TP=16 (24 % 16 != 0).
+    raw_v41 = compose_case(
         "deepseek-v4.1-flash", "a3",
+        tp=V41_TP_REPLICATED, ep=V41_EP_REPLICATED, dp=1, sp=True, layers=V41_REPLAY_LAYERS,
+        prompt_tokens=CONTEXT_128K, output_tokens=OUTPUT_1K,
+        mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
+    )
+    with pytest.raises(ModelingError, match="catalog_engram_heads_not_divisible:24%16"):
+        target_graphs(parse_case(raw_v41), phase="decode", tokens=DECODE_VERIFY_TOKENS, context=CONTEXT_128K, sequences=1, scope="model")
+
+    # V4-Flash has the same o_groups=8 < tp=16 grouped MLA output geometry without Engram.
+    raw = compose_case(
+        "deepseek-v4-flash-0731", "a3",
         tp=V41_TP_REPLICATED, ep=V41_EP_REPLICATED, dp=1, sp=True,
         prompt_tokens=CONTEXT_128K, output_tokens=OUTPUT_1K,
         mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
     )
     case = parse_case(raw)
     assert case.machine.sku == resolve_hardware_sku("a3")
-    assert case.model.layers == V41_LAYERS
+    assert case.model.layers == V4_FLASH_LAYERS
     assert case.model.layer_plans[0].o_groups == V41_O_GROUPS
     group_parallel, groups = _group_plan(case.model.layer_plans[0], case.runtime.parallel)
     assert (group_parallel, groups) == (False, V41_O_GROUPS)
@@ -96,8 +107,8 @@ def test_mla_replicated_grouped_output_sp_closure_prefill_and_decode():
             if op.family == "reduce_scatter"
             and dict(op.metadata).get("structure_block") == "attention"
         ]
-        assert len(shards) == V41_LAYERS
-        assert len(gathers) == V41_LAYERS
+        assert len(shards) == V4_FLASH_LAYERS
+        assert len(gathers) == V4_FLASH_LAYERS
         assert not attn_tp_ars
         assert not attn_rs
 
@@ -120,23 +131,23 @@ def test_mla_replicated_grouped_output_sp_closure_prefill_and_decode():
             local_rows = q_tokens // V41_TP_REPLICATED
             assert shard0.family == "barrier"
             assert shard0.recipe == "sequence_parallel_view"
-            assert shard0.local_shape == (local_rows, V41_HIDDEN_SIZE)
+            assert shard0.local_shape == (local_rows, V4_FLASH_HIDDEN_SIZE)
             assert (shard0.mte2_bytes, shard0.mte3_bytes, shard0.hbm_bytes) == (0.0, 0.0, 0.0)
         else:
             physical_rows = q_tokens + (-q_tokens) % V41_TP_REPLICATED
             local_rows = physical_rows // V41_TP_REPLICATED
-            expected_read = float(q_tokens * V41_HIDDEN_SIZE * act_bytes)
-            expected_write = float(physical_rows * V41_HIDDEN_SIZE * act_bytes)
+            expected_read = float(q_tokens * V4_FLASH_HIDDEN_SIZE * act_bytes)
+            expected_write = float(physical_rows * V4_FLASH_HIDDEN_SIZE * act_bytes)
             assert shard0.family == "pad"
             assert shard0.recipe == "sequence_parallel_right_pad"
-            assert shard0.local_shape == (local_rows, V41_HIDDEN_SIZE)
+            assert shard0.local_shape == (local_rows, V4_FLASH_HIDDEN_SIZE)
             assert shard0.mte2_bytes == pytest.approx(expected_read)
             assert shard0.mte3_bytes == pytest.approx(expected_write)
             assert shard0.hbm_bytes == pytest.approx(expected_read + expected_write)
-            assert shard0.vector_ops == (physical_rows - q_tokens) * V41_HIDDEN_SIZE
+            assert shard0.vector_ops == (physical_rows - q_tokens) * V4_FLASH_HIDDEN_SIZE
 
     raw_replay = compose_case(
-        "deepseek-v4.1-flash", "a3",
+        "deepseek-v4-flash-0731", "a3",
         tp=V41_TP_REPLICATED, ep=V41_EP_REPLICATED, dp=1, sp=True, layers=V41_REPLAY_LAYERS,
         prompt_tokens=CONTEXT_128K, output_tokens=OUTPUT_1K,
         mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
@@ -256,7 +267,7 @@ def test_gqa_explicit_mtp_synthesizes_eagle_draft_and_replays_at_long_context():
         prompt_tokens=CONTEXT_128K, output_tokens=OUTPUT_1K,
         max_model_len=EXTENDED_MAX_MODEL_LEN,
         mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
-        feature_track="expected_ideal", allow_synthetic_gqa_draft=True,
+        feature_track="target", allow_synthetic_gqa_draft=True,
     )
     case = parse_case(raw_128k)
     assert case.machine.sku == resolve_hardware_sku("a3")
@@ -315,7 +326,7 @@ def test_gqa_explicit_mtp_synthesizes_eagle_draft_and_replays_at_long_context():
         tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
         prompt_tokens=NATIVE_PROMPT_32K, output_tokens=OUTPUT_1K,
         mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
-        feature_track="expected_ideal", allow_synthetic_gqa_draft=True,
+        feature_track="target", allow_synthetic_gqa_draft=True,
     )
     assert raw_32k["runtime"]["metadata"]["draft_proposal_tokens"] == MTP_PROPOSALS
 
@@ -346,7 +357,7 @@ def test_gqa_synthetic_draft_preserves_fail_fast_and_profile_opt_out_contracts()
             "qwen3-32b", "a3", tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
             prompt_tokens=NATIVE_PROMPT_32K, output_tokens=OUTPUT_1K,
             mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
-            feature_track="expected_ideal",
+            feature_track="target",
         )
 
     non_gqa = replace(qwen_model, attention="linear")
@@ -370,7 +381,7 @@ def test_gqa_synthetic_draft_preserves_fail_fast_and_profile_opt_out_contracts()
             "qwen3-32b", "a3", tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
             prompt_tokens=CONTEXT_128K, output_tokens=OUTPUT_1K,
             mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
-            feature_track="expected_ideal", allow_synthetic_gqa_draft=True,
+            feature_track="target", allow_synthetic_gqa_draft=True,
         )
 
 
@@ -497,7 +508,39 @@ def test_dspark_128k_zero_ffn_prepare_slot_mapping_none_and_rd2h_proration():
         d_ops = [op for op in ops if op.op_id.startswith("draft")]
         assert not any(op.family in ("grouped_gemm", "attention") for op in d_ops)
         gemm_flops = int(sum(op.flops for op in d_ops if op.family in ("gemm", "qkv_projection", "projection")))
-        assert gemm_flops == exp
+        prolog_ops = [op for op in d_ops if op.recipe == "draft_context_mla_prolog_v3"]
+        if prolog_ops:
+            # L-B06: paired_sfa MLA DSpark prefill lowers context KV through fused PrologV3
+            # (qa_kva matches exact qkv_a budget; total op.flops includes qb + w_uk).
+            qa_kva_flops = int(sum(
+                fl for op in prolog_ops for _, fl in dict(op.metadata).get("qa_kva_matrix_flops", ())
+            ))
+            qb_wuk_flops = int(sum(
+                fl for op in prolog_ops for _, fl in dict(op.metadata).get("qb_wuk_matrix_flops", ())
+            ))
+            assert gemm_flops + qa_kva_flops == exp
+            assert int(sum(op.flops for op in prolog_ops)) == qa_kva_flops + qb_wuk_flops
+            assert qb_wuk_flops > 0
+            # Contiguous draft cache opts out of PrologV3 and emits standalone qkv_a GEMMs == exp.
+            raw_contig = compose_case(
+                model_name, "a5", tp=1, ep=1, dp=1,
+                prompt_tokens=CONTEXT_128K, output_tokens=OUTPUT_1K,
+                mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
+            )
+            raw_contig["runtime"]["metadata"] = {
+                **raw_contig["runtime"].get("metadata", {}),
+                "draft_cache_contiguous": True,
+            }
+            d_contig = [
+                op for op in target_graphs(
+                    parse_case(raw_contig), phase="prefill", tokens=CONTEXT_128K,
+                    context=0, sequences=1, scope="model", draft_prepare=True,
+                )[0]
+                if op.op_id.startswith("draft")
+            ]
+            assert int(sum(op.flops for op in d_contig if op.family in ("gemm", "qkv_projection", "projection"))) == exp
+        else:
+            assert gemm_flops == exp
 
     # slot_mapping=None: V4.1 still runs context_wkv_proj (no cache scatter), K3.1 returns before KV proj.
     for model_name, expect_wkv in (("deepseek-v4.1-flash", True), ("kimi-k3.1", False)):
@@ -514,7 +557,7 @@ def test_dspark_128k_zero_ffn_prepare_slot_mapping_none_and_rd2h_proration():
 
 
 def test_dspark_decode_sp_collapse_padded_vocab_serial_markov_and_gqa_swa():
-    """Q_phys=8, V4.1 71,680 B vs V4 401,408 B, padded vocab 128 cols/rank, 5 serial Markov, GQA SWA 665/804."""
+    """Q_phys=8, V4.1 71,680 B vs V4 401,408 B, padded vocab 128 cols/rank, 5 serial Markov, GQA SWA 650/783."""
     from mindie_sim.prediction.operators.attention.attention import AttentionPolicy, gqa
 
     # V4.1 pre-gather collapse (71,680 B) vs V4-Pro post-gather (401,408 B), 5 serial Markov with 0 AllGather.
@@ -546,10 +589,10 @@ def test_dspark_decode_sp_collapse_padded_vocab_serial_markov_and_gqa_swa():
     d_logits = next(op for op in ops_v if op.op_id == "draft0.logits")
     assert d_logits.local_shape[1] == 128 and d_logits.local_shape[0] == 4 * 5
 
-    # GQA noncausal SWA (window=128, noncausal_attention=True): exact 665 (q_d=5) and 804 (q_d=6) pairs/head.
+    # GQA noncausal SWA symmetric band (W-1, W-1) for window=128: exact 650 (q_d=5) and 783 (q_d=6) pairs/head.
     qwen_case = parse_case(compose_case("qwen3-32b", "a3", tp=1, dp=1, layers=1, prompt_tokens=256, output_tokens=16))
     swa_plan = replace(qwen_case.model.layer_plans[0], window=128, noncausal_attention=True)
-    for q_d, exp_pairs in ((5, 665.0), (6, 804.0)):
+    for q_d, exp_pairs in ((5, 650.0), (6, 783.0)):
         view = RequestView("r0", q_d, CONTEXT_128K, True, "decode")
         res = gqa(
             prefix="d0.l0", plan=swa_plan, views=(view,), stage=0, deps="in",
@@ -619,7 +662,7 @@ def test_ascend_v2_mtp_disjoint_modes_pcp_downgrade_and_alltoall_filter():
     rt_pcp = replace(
         case.runtime,
         graph_capture_mode="full_and_piecewise",
-        parallel=replace(case.runtime.parallel, pcp=2, cp=2, cp_plan="pcp"),
+        parallel=replace(case.runtime.parallel, pcp=2, cp=1, cp_plan="pcp"),
     )
     m0, _ = resolve_ar_draft_capture_mode(rt_pcp, cyc_draft, step=0, decode_query_len=6)
     assert m0 == "piecewise"
@@ -742,7 +785,9 @@ def test_speculative_prefill_pp_ragged_ngram_validation_and_dspark_slots() -> No
     from mindie_sim.schema.workload import IterationPlan
 
     fe = Frontend()
-    a3 = parse_case(compose_case("glm-5.3-flash", "a3-16p", tp=8, ep=8, prompt_tokens=128, output_tokens=16)).machine
+    a3 = parse_case(compose_case(
+        "glm-5.3-flash", "a3-16p", tp=8, ep=8, num_devices=16, prompt_tokens=128, output_tokens=16,
+    )).machine
     glm = load_model("glm-5.3-flash")
     kimi = load_model("kimi-k3")
 
@@ -891,9 +936,18 @@ def test_speculative_prefill_pp_ragged_ngram_validation_and_dspark_slots() -> No
     kimi_mla = load_model("kimi-k3.1")
     rt_none_slots = replace(rt_kimi, metadata=rt_kimi.metadata + (("dspark_layer_slot_mappings", (None,) * 5),))
     regs_ns, _ = draft_program(fe, kimi_mla, rt_none_slots, v_rag_pf[:1], "ready", prefill=True, machine=a3, assembly="service")
-    assert not any(op.recipe in {"kv_store", "draft_context_kv_scatter"} for r in regs_ns for op in r.ops)
+    assert not any(op.recipe in {"kv_store", "draft_context_kv_scatter", "draft_context_mla_prolog_v3"} for r in regs_ns for op in r.ops)
     rt_part_kimi = replace(rt_kimi, metadata=rt_kimi.metadata + (("dspark_layer_slot_mappings", (None, tuple(range(32)), None, None, None)),))
+    # L-B06: A3 component-major cache writes directly inside PrologV3 (layer=1, rank_owned_rows=32, zero kv_scatter).
     regs_pk, _ = draft_program(fe, kimi_mla, rt_part_kimi, v_rag_pf[:1], "ready", prefill=True, machine=a3, assembly="service")
-    pk_scatters = [op for r in regs_pk for op in r.ops if op.recipe in {"kv_store", "draft_context_kv_scatter"}]
+    pk_prologs = [op for r in regs_pk for op in r.ops if op.recipe == "draft_context_mla_prolog_v3"]
+    assert len(pk_prologs) == 1 and pk_prologs[0].layer == 1 and pk_prologs[0].op_id == "draft_prefill.context_kv1.mla_prolog_v3"
+    assert dict(pk_prologs[0].metadata)["rank_owned_rows"] == 32
+    assert dict(pk_prologs[0].metadata)["direct_cache_write"] is True
+    assert not any(op.recipe in {"kv_store", "draft_context_kv_scatter"} for r in regs_pk for op in r.ops)
+    # Token-interleaved cache stages through PrologV3 + standalone kv_scatter with layer=1 and 32 rows.
+    rt_part_staged = replace(rt_part_kimi, metadata=rt_part_kimi.metadata + (("draft_cache_layout", "token_interleaved"),))
+    regs_st, _ = draft_program(fe, kimi_mla, rt_part_staged, v_rag_pf[:1], "ready", prefill=True, machine=a3, assembly="service")
+    pk_scatters = [op for r in regs_st for op in r.ops if op.recipe in {"kv_store", "draft_context_kv_scatter"}]
     assert len(pk_scatters) == 1 and pk_scatters[0].layer == 1 and pk_scatters[0].op_id == "draft_prefill.context_kv1.kv_scatter"
     assert pk_scatters[0].local_shape[0] == 32

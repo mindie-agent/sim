@@ -647,7 +647,7 @@ def test_shard2_verify_lengths_fp32_ub_and_nonzero_compulsory_spec_work():
     raw, req = compose_export_case(
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"],
         tp=1, dp=8, ep=8, prompt_tokens=2048, output_tokens=64,
-        concurrency=16, mtp_proposal_tokens=3, feature_track="unmerged_pr",
+        concurrency=16, mtp_proposal_tokens=3, feature_track="proposed",
     )
     bundle = build_export_bundle(raw, request=req, apply_target_envelope=False)
     scans = [r for r in bundle.operators if r.op_id.endswith(".decode_recurrent_scan")]
@@ -723,7 +723,7 @@ def test_gdn_decode_fp32_decay_record_size_and_mixed_prefill_recover_ssm_runtime
 
     raw = compose_case(
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"],
-        layers=4, tp=1, dp=1, ep=1, mtp_proposal_tokens=3, feature_track="unmerged_pr",
+        layers=4, tp=1, dp=1, ep=1, mtp_proposal_tokens=3, feature_track="proposed",
     )
     case = parse_case(raw)
     rt_meta = dict(case.runtime.metadata)
@@ -825,9 +825,12 @@ def test_recover_ssm_exact_gdn_kda_align_version_triton_and_kda_decode_parity() 
     with pytest.raises(ModelingError, match="ascend_fia_speculative_tokens_exceeds_limit"):
         validate_fia_speculative_tokens(16)
 
-    # (f) KDA decode on A3 BF16 and DCP=2 installs RecurrentKda via body_defaults.
-    for hw, dcp in (("a3", 1), ("a5", 2)):
-        kda_case = parse_case(compose_case("glm-5.3-flash", REPRESENTATIVE_SKUS[hw], tp=2, dp=1, ep=2, dcp=dcp, layers=4, quant="none"))
+    # (f) KDA decode on A3 BF16 (dcp=1) and A5 non-KPool KDA (dcp=2) installs RecurrentKda via body_defaults;
+    #     KPool indexer models (glm-5.3-flash) strictly reject dcp > 1.
+    with pytest.raises(ModelingError, match="kpool_indexer_requires_dcp_1"):
+        compose_case("glm-5.3-flash", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, ep=2, dcp=2, layers=4, quant="none")
+    for model_id, hw, dcp in (("glm-5.3-flash", "a3", 1), ("kimi-k3.1", "a5", 2)):
+        kda_case = parse_case(compose_case(model_id, REPRESENTATIVE_SKUS[hw], tp=2, dp=1, ep=2, dcp=dcp, layers=4, quant="none"))
         ops = target_graphs(kda_case, phase="decode", tokens=1, context=128, sequences=1, scope="body", apply_body_defaults=True)[0]
         rec_ops = [op for op in ops if op.family == "recurrent_scan"]
         assert rec_ops and all(dict(op.metadata).get("native_kind") == "RecurrentKda" for op in rec_ops)

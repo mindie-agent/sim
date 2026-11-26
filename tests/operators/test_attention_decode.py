@@ -318,7 +318,12 @@ def test_disjoint_stream_uses_physical_core_ids_for_work_and_allocations():
     (row,) = rows.tile(0)
     (partial,) = row.program.stages[0].program.programs
     load = partial.stages[0]
-    assert load.acquire and all(allocation.units == (7,) for allocation in load.acquire)
+    assert load.acquire
+    by_pool = {allocation.pool: allocation.units for allocation in load.acquire}
+    assert by_pool.get("ub") == (14, 15)
+    assert {pool: units for pool, units in by_pool.items() if pool != "ub"} and all(
+        units == (7,) for pool, units in by_pool.items() if pool != "ub"
+    )
     done = plan.lower(context).start(engine, "decode", ready)
     engine.advance(until=(done,))
     qk = next(row for row in engine.trace if "qk_panel_" in row["task"])
@@ -354,10 +359,25 @@ def test_draft_context_attributes_every_layer_op():
             query_rows=3, prefix="d:", stage=0, requests=())
     attributed = {op.op_id: op.layer for op in ops}
     for layer in range(draft.layers):
-        for suffix in ("mla_prolog_v3", "kv_scatter"):
-            assert attributed[f"d:context_kv{layer}.{suffix}"] == layer
+        assert attributed[f"d:context_kv{layer}.mla_prolog_v3"] == layer
+        assert f"d:context_kv{layer}.kv_scatter" not in attributed
+    assert all(
+        dict(op.metadata).get("direct_cache_write") is True
+        for op in ops if op.op_id.endswith(".mla_prolog_v3")
+    )
     assert not any("qkv_a" in op_id or "kv_copy" in op_id for op_id in attributed)
     assert attributed["d:context_norm"] == -1
+
+    staged_ops = []
+    prepare(staged_ops, projection=projection, model=model, draft=draft, rows=4,
+            query_rows=3, prefix="d:", stage=0, requests=(),
+            requires_staging_scatter=True)
+    staged_attributed = {op.op_id: op.layer for op in staged_ops}
+    for layer in range(draft.layers):
+        for suffix in ("mla_prolog_v3", "kv_scatter"):
+            assert staged_attributed[f"d:context_kv{layer}.{suffix}"] == layer
+    assert not any("qkv_a" in op_id or "kv_copy" in op_id for op_id in staged_attributed)
+    assert staged_attributed["d:context_norm"] == -1
 
 
 @pytest.mark.parametrize("shape,qk,pv", [((1, 128, 4, 3, 1), 75, 25), ((1, 128, 4, 16), 50, 50)])
@@ -469,18 +489,28 @@ def test_mqsmla_shares_only_completed_prefix_rows(contexts, prefixes, keys, rati
 
 @pytest.mark.parametrize("row_width", (MODE1_ROW_BYTES, MODE2_ROW_BYTES))
 def test_dsl_mqsmla_contract_rejects_native_only_row_widths(row_width):
+    from mindie_sim.observed_contracts.attention import MQSMLA_NATIVE_INPUT_COUNT
+
     query = ((4, 64, 512), "bf16", "ND")
     empty = ((), None, None)
-    inputs = (query, empty, ((16, 1, 1, row_width), "uint8", "ND"),
-              ((1, 16), "int32", "ND"), empty, empty, empty)
-    input_shapes, input_dtypes, input_formats = zip(*inputs)
+    dsl_inputs = (query, empty, ((16, 1, 1, row_width), "uint8", "ND"),
+                  ((1, 16), "int32", "ND"), empty, empty, empty)
+    input_shapes, input_dtypes, input_formats = zip(*dsl_inputs)
     output_shapes, output_dtypes, output_formats = zip(query, empty)
-    row = SimpleNamespace(input_shapes=input_shapes, input_dtypes=input_dtypes, input_formats=input_formats,
-                          output_shapes=output_shapes, output_dtypes=output_dtypes, output_formats=output_formats,
-                          kind="MqsmlaKernel___call__")
-    assert observed_attention_contract(row) is None
-    row.kind = "aclnnMixedQuantSparseFlashMla"
-    assert observed_attention_contract(row) is not None
+    dsl_row = SimpleNamespace(input_shapes=input_shapes, input_dtypes=input_dtypes, input_formats=input_formats,
+                              output_shapes=output_shapes, output_dtypes=output_dtypes, output_formats=output_formats,
+                              kind="MqsmlaKernel___call__")
+    assert observed_attention_contract(dsl_row) is None
+    # Native CANN aclnnMixedQuantSparseFlashMla uses the 18-input ABI (original at slot 1, block table at slot 5).
+    native_inputs = [empty] * MQSMLA_NATIVE_INPUT_COUNT
+    native_inputs[0] = query
+    native_inputs[1] = ((16, 1, 1, row_width), "uint8", "ND")
+    native_inputs[5] = ((1, 16), "int32", "ND")
+    n_shapes, n_dtypes, n_formats = zip(*native_inputs)
+    native_row = SimpleNamespace(input_shapes=n_shapes, input_dtypes=n_dtypes, input_formats=n_formats,
+                                 output_shapes=output_shapes, output_dtypes=output_dtypes, output_formats=output_formats,
+                                 kind="aclnnMixedQuantSparseFlashMla")
+    assert observed_attention_contract(native_row) is not None
 
 
 @pytest.mark.parametrize("scale_dtype", ("bf16", "fp8_e8m0"))
@@ -553,7 +583,7 @@ def test_cold_mte2_cap_keeps_unsaturated_knee_when_curve_plateaus():
     assert caps_unsat["memory@r0"] == pytest.approx(160e6)
     caps_sat = p01_cold_mte2_aic_cap(ctx, 32, include_hbm=True)
     assert caps_sat["mte2_aic@r0"] == pytest.approx(2480e9 / 16.0 / 1000.0)
-    assert caps_sat["memory@r0"] == pytest.approx(2480e9 / 16.0 / 1000.0)
+    assert caps_sat["memory@r0"] == pytest.approx(2720e9 / 32.0 / 1000.0)
 
 
 def test_fia_weighted_contiguous_partition_balances_ragged_kv_tails():
