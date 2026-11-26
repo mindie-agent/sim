@@ -266,9 +266,10 @@ def test_selected_prefill_uses_profile_copy_roles_and_input_readiness():
                          external_inputs={d: 11 for o in attention for d in o.deps})
     serviced = result["execution"]["serviced"]
     query, kv, output = 5 * 8 * 2, 2 * (7 + 8) * 8 * 2, 5 * 8 * 2  # 4x7 and 1x8 causal rectangles
+    prob_store = (4 * 7 + 1 * 8) * 2  # softmax probability UB->L1 staging across both causal tiles
     assert serviced["memory@r0:s0"] == pytest.approx(query + kv + output)
     assert serviced["mte2_aic@r0:s0"] == pytest.approx(query + kv)
-    assert serviced["mte3@r0:s0"] == pytest.approx(output)
+    assert serviced["mte3@r0:s0"] == pytest.approx(output + prob_store)
     assert serviced["mte1@r0:s0"] > 0 and "mte2@r0:s0" not in serviced
     assert all(event["start_ms"] >= 11 for event in result["events"] if event["demand"])
 

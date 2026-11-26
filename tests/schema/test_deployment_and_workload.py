@@ -653,7 +653,7 @@ def test_shipping_baseline_enables_quant_capture_mlapo_and_arch_disjoint_collect
 
     prefill = compose_case(
         "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"],
-        tp=1, dp=8, ep=8, layers=4, role="pd_prefill", feature_track="shipping",
+        tp=1, dp=8, ep=8, layers=4, role="pd_prefill", ttft_slo_ms=5000.0, feature_track="shipping",
     )
     assert prefill["runtime"]["metadata"]["execution_policy"]["mlapo"] is False
     assert "VLLM_ASCEND_ENABLE_MLAPO" not in prefill["runtime"]["metadata"]["va_env"]
@@ -742,11 +742,12 @@ def test_architecture_isolation_rejects_cross_generation_presets_and_knobs():
         blob = f"{rules.collective_guidance} {rules.hw_isa_guidance}"
         assert "AIV/CCU" not in blob and "CCU/AIV" not in blob
         if family == "a5":
+            assert "weight_nz_mode" not in rules.additional_config
             assert "enable_weight_nz_layout" not in rules.additional_config
-            assert any("weight_nz_layout_not_applicable" in w for w in rules.warnings)
+            assert any("weight_nz_mode_not_applicable" in w for w in rules.warnings)
             assert "CCU" in blob and "UB-Direct" in blob
         else:
-            assert rules.additional_config.get("enable_weight_nz_layout") is True
+            assert rules.additional_config.get("weight_nz_mode") == 1
             assert "CCU" not in blob
             if family == "a2":
                 assert "SuperPoD" not in blob and "UB-Direct" not in blob

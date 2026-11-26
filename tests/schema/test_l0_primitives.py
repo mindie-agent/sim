@@ -461,7 +461,8 @@ def test_sortall_merge_fan_in_and_masked_histogram_trunks(memory_device, registe
     for offset, width in ((0, trunk), (trunk, trunk), (2 * trunk, 1)):
         assert _trace(engine, f"masked_low_histogram:{offset}")["serviced"]["vhist256"] == pytest.approx(width)
     assert engine.serviced["vhist256"] == pytest.approx(3 * n + 3 * 256 + splits * k)
-    assert engine.serviced["hbm"] == pytest.approx(splits * k * 2 * 4)
+    assert engine.serviced["hbm"] == pytest.approx(2 * splits * k * 2 * 4)
+    assert _trace(engine, "split_merge:workspace_read")["start_ms"] == _trace(engine, "split_merge:workspace_write")["end_ms"]
     assert _trace(engine, "split_merge")["start_ms"] == _trace(engine, "split_merge:workspace_read")["end_ms"]
 @pytest.mark.parametrize("frontend,limit", [("tla_dsl", 2048), ("catlass", 1024)])
 def test_simt_requires_ub_carveout_and_enforces_frontend_thread_limit(memory_device, register_device, frontend, limit):

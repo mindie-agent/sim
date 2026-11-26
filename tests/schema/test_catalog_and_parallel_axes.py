@@ -516,7 +516,10 @@ def test_physical_key_count_is_bounded_by_layer_archetypes_not_layer_count(key):
     from mindie_sim import target_graphs
     from mindie_sim.prediction.program.physical_key import physical_key
 
-    cases = {n: compose_case(key, hardware="a5", layers=n) for n in (2, 6, 12)}
+    model = load_model(key)
+    min_tp = max((p.num_kv_heads for p in model.layer_plans if p.indexer_kind == "region_csa"), default=1)
+    tp_kw = {"tp": min_tp} if min_tp > 1 else {}
+    cases = {n: compose_case(key, hardware="a5", layers=n, **tp_kw) for n in (2, 6, 12)}
     counts = {
         n: len({
             physical_key(op)
