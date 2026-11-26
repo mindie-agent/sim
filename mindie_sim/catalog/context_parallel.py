@@ -1590,13 +1590,13 @@ def legal_vllm_ascend_dcp_values(
 ) -> tuple[int, ...]:
     """Structural ``vllm-ascend`` legal DCP degrees reusing TP (and optional PCP) ranks.
 
-    Enforces M10 structural legality:
+    Canonical single truth table shared with ``validate_vllm_ascend_dcp_codomain``:
     - ``dcp == 1`` is always legal (including PCP-only ``pcp > 1, dcp == 1``).
     - Replicated cache (DS-V4.1 latent-MQA C2), KPool/QSA (``index_kpool > 1``),
       and non-KV models: ``dcp == 1`` only.
     - SFA / DSA sparse MLA: ``dcp in {1, pcp, pcp * tp}`` (``{1, tp}`` at ``pcp == 1``).
     - Standard MLA: all positive divisors of ``tp * pcp``.
-    - GQA: ``(1, pcp)`` when ``pcp > 1`` else ``(1,)``.
+    - GQA: ``(1, pcp)`` when ``pcp > 1`` else all positive divisors of ``tp``.
     """
     tp_n = max(1, int(tp))
     pcp_n = max(1, int(pcp))
@@ -1604,7 +1604,9 @@ def legal_vllm_ascend_dcp_values(
     if kind in {"replicated_cache", "kpool_indexer", "non_kv"}:
         return (1,)
     if kind == "gqa":
-        return (1, pcp_n) if pcp_n > 1 else (1,)
+        if pcp_n > 1:
+            return (1, pcp_n)
+        return tuple(d for d in range(1, tp_n + 1) if tp_n % d == 0)
     if kind == "sfa_dsa":
         if pcp_n > 1:
             return tuple(dict.fromkeys((1, pcp_n, pcp_n * tp_n)))
@@ -1620,23 +1622,21 @@ def validate_vllm_ascend_dcp_codomain(
     dcp = max(1, int(getattr(parallel, "cp", 1) or 1))
     tp = max(1, int(getattr(parallel, "tp", 1) or 1))
     pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
-    kind = _model_dcp_attention_class(model)
     if dcp <= 1:
         return True, None
-    if kind == "replicated_cache":
-        return False, "vllm_ascend_replicated_cache_requires_dcp_1"
-    if kind == "kpool_indexer":
-        return False, "kpool_indexer_requires_dcp_1"
-    if kind == "non_kv":
-        return False, "vllm_ascend_non_kv_model_requires_dcp_1"
-    if kind == "gqa":
-        if pcp > 1 and dcp != pcp:
-            return False, f"vllm_ascend_gqa_pcp_dcp_must_match:pcp={pcp},dcp={dcp}"
-        if pcp == 1 and tp % dcp != 0:
-            return False, f"vllm_ascend_gqa_dcp_must_divide_tp:dcp={dcp},tp={tp}"
-        return True, "vllm_ascend_gqa_dcp_deprecated"
+    kind = _model_dcp_attention_class(model)
     legal = legal_vllm_ascend_dcp_values(model, tp=tp, pcp=pcp)
     if dcp not in legal:
+        if kind == "replicated_cache":
+            return False, "vllm_ascend_replicated_cache_requires_dcp_1"
+        if kind == "kpool_indexer":
+            return False, "kpool_indexer_requires_dcp_1"
+        if kind == "non_kv":
+            return False, "vllm_ascend_non_kv_model_requires_dcp_1"
+        if kind == "gqa":
+            if pcp > 1:
+                return False, f"vllm_ascend_gqa_pcp_dcp_must_match:pcp={pcp},dcp={dcp}"
+            return False, f"vllm_ascend_gqa_dcp_must_divide_tp:dcp={dcp},tp={tp}"
         if kind == "sfa_dsa":
             if pcp > 1:
                 return (
@@ -1652,6 +1652,8 @@ def validate_vllm_ascend_dcp_codomain(
                 f"dcp={dcp},pcp={pcp},tp={tp}",
             )
         return False, f"vllm_ascend_mla_dcp_must_divide_tp:dcp={dcp},tp={tp}"
+    if kind == "gqa":
+        return True, "vllm_ascend_gqa_dcp_deprecated"
     if kind == "sfa_dsa" and runtime is not None and not dcp_indexer_sharded(model, runtime):
         interleave = cp_interleave(runtime)
         if interleave % DEFAULT_CP_INTERLEAVE != 0:

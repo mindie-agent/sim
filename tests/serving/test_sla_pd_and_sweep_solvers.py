@@ -669,3 +669,103 @@ def test_sla_certified_search_finds_nonmonotone_b5_and_maximizes_throughput_b4_o
     res_tps = solve_sla_sizing(parsed, sla_ms=30.0, context=128, max_sequences_per_dp=8, scope="body", scenarios=[{"id": "baseline"}])
     sc_tps = res_tps["scenarios"][0]
     assert sc_tps["b_sla"] == 4 and sc_tps["b_feasible"] == 4 and sc_tps["step_ms_at_sla"] == pytest.approx(10.0)
+
+
+def test_dcp_codomain_unification_unpinned_pp_grid_and_single_token_pd_pareto():
+    """Verify unified DCP legality truth table, full unpinned PP grid, and output_tokens=1 Pareto frontier."""
+    from mindie_sim.catalog.context_parallel import (
+        legal_vllm_ascend_dcp_values,
+        validate_vllm_ascend_dcp_codomain,
+    )
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.sweep import pd as pd_mod
+
+    # 1. Single canonical truth table between legal_vllm_ascend_dcp_values and validate_vllm_ascend_dcp_codomain.
+    gqa_model = load_model("qwen3-32b")
+    mla_model = load_model("deepseek-v3")
+    sfa_model = load_model("deepseek-v3.2")
+    for model in (gqa_model, mla_model, sfa_model):
+        for tp, pcp in ((8, 1), (16, 1), (4, 2)):
+            legal = set(legal_vllm_ascend_dcp_values(model, tp=tp, pcp=pcp))
+            for dcp in range(1, tp * pcp + 1):
+                ok, _ = validate_vllm_ascend_dcp_codomain(model, ParallelSpec(tp=tp, pcp=pcp, cp=dcp))
+                assert (dcp in legal) is ok, (model.name, tp, pcp, dcp)
+    assert legal_vllm_ascend_dcp_values(gqa_model, tp=16, pcp=1) == (1, 2, 4, 8, 16)
+    for role in ("pd_decode", "pd_prefill"):
+        unpinned_gqa = pd_mod._build_pd_stage_candidates(
+            role=role, max_dies=16, is_moe=False, layers=1, prompt_tokens=4096,
+            rec_topo=None, pinned={"tp": 16, "dp": 1, "pp": 1, "pcp": 1}, model_spec=gqa_model,
+        )
+        pinned_gqa = pd_mod._build_pd_stage_candidates(
+            role=role, max_dies=16, is_moe=False, layers=1, prompt_tokens=4096,
+            rec_topo=None, pinned={"tp": 16, "dp": 1, "pp": 1, "pcp": 1, "dcp": 2}, model_spec=gqa_model,
+        )
+        pinned_cp_alias = pd_mod._build_pd_stage_candidates(
+            role=role, max_dies=16, is_moe=False, layers=1, prompt_tokens=4096,
+            rec_topo=None, pinned={"tp": 16, "dp": 1, "pp": 1, "pcp": 1, "cp": 2}, model_spec=gqa_model,
+        )
+        assert {r["dcp"] for r in pinned_gqa} == {2}
+        assert {r["dcp"] for r in pinned_cp_alias} == {2}
+        assert {r["dcp"] for r in pinned_gqa}.issubset({r["dcp"] for r in unpinned_gqa})
+
+    # 2. Unpinned PP enumerates full power-of-two width grid up to min(max_dies, layers).
+    base_pins = {"tp": 1, "dp": 1, "pcp": 1, "ep": 1, "dcp": 1}
+    pf_4 = pd_mod._build_pd_stage_candidates(
+        role="pd_prefill", max_dies=4, is_moe=True, layers=4, prompt_tokens=8,
+        rec_topo=None, pinned=base_pins,
+    )
+    dec_4 = pd_mod._build_pd_stage_candidates(
+        role="pd_decode", max_dies=4, is_moe=True, layers=4, prompt_tokens=8,
+        rec_topo=None, pinned=base_pins,
+    )
+    col_8 = pd_mod._build_colocated_candidates(
+        num_devices=8, is_moe=True, layers=8, rec_topo=None, pinned=base_pins,
+    )
+    capped_2 = pd_mod._build_pd_stage_candidates(
+        role="pd_prefill", max_dies=8, is_moe=True, layers=2, prompt_tokens=8,
+        rec_topo=None, pinned=base_pins,
+    )
+    assert sorted({r["pp"] for r in pf_4}) == [1, 2, 4]
+    assert sorted({r["pp"] for r in dec_4}) == [1, 2, 4]
+    assert sorted({r["pp"] for r in col_8}) == [1, 2, 4, 8]
+    assert sorted({r["pp"] for r in capped_2}) == [1, 2]
+    assert "shared_expert_tp" in pd_mod._ALLOWED_PINNED_AXES
+    assert ParallelSpec(dp=1, tp=4, ep=2).etp == 2
+
+    # 3. output_tokens == 1 closed-form PD Pareto frontier matches exhaustive sweep_pd_disaggregation_ratios.
+    p_case = _dense_case(layers=1, dp=1, tp=1)
+    d_case = _dense_case(layers=1, dp=1, tp=1)
+    sw = sweep_pd_disaggregation_ratios(
+        p_case, d_case, total_dies=6, prompt_tokens=16, output_tokens=1,
+        ttft_sla_ms=5000.0, tpot_sla_ms=50.0, pd_transfer_mode="direct_blocking_d2d",
+    )
+    st_single = {
+        "infeasible": None,
+        "rps_p": sw["prefill_instance"]["rps_per_instance"],
+        "rps_d": sw["prefill_instance"]["rps_per_instance"],
+        "p_kv_rps_per_inst": sw["prefill_instance"]["rps_per_instance"],
+        "d_kv_rps_per_inst": None,
+        "decode_tps_per_die": 0.0,
+        "decode_step": 0.0,
+        "effective_tpot": 0.0,
+        "first_itl": 0.0,
+        "decode_budget": 50.0,
+        "raw_rps_d": sw["prefill_instance"]["rps_per_instance"],
+    }
+    cf_rows = pd_mod._solve_pareto_pd_ratios_closed_form(
+        st_single, total=6, p_dies=1, d_dies=1, output=1, mode="direct_blocking_d2d",
+    )
+    sw_front = sorted(
+        [(int(r["used_dies"]), round(float(r["sustainable_tps"]), 6)) for r in sw["pareto_frontier"]],
+    )
+    cf_front = [(int(r["used_dies"]), round(float(r["sustainable_tps"]), 6)) for r in cf_rows]
+    assert len(cf_front) == 5
+    assert cf_front == sw_front
+    assert [(r["n_prefill"], r["n_decode"]) for r in cf_rows] == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+    cf_p2 = pd_mod._solve_pareto_pd_ratios_closed_form(
+        st_single, total=6, p_dies=2, d_dies=1, output=1, mode="direct_blocking_d2d",
+    )
+    assert [(r["n_prefill"], r["n_decode"], r["used_dies"]) for r in cf_p2] == [(1, 1, 3), (2, 1, 5)]
+    assert pd_mod._solve_pareto_pd_ratios_closed_form(
+        {**st_single, "rps_p": 0.0}, total=6, p_dies=1, d_dies=1, output=1, mode="direct_blocking_d2d",
+    ) == []
