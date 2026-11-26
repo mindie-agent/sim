@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from _support.operator_cases import declared_case, mla_case
+from _support.operator_cases import declared_case
 from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import QuantSpec
@@ -204,34 +204,65 @@ def test_export_is_independent_of_timing_and_does_not_execute_engine(monkeypatch
     assert all("flops" not in row["operator"] for row in expanded["nodes"])
 
 def test_source_call_expansion_retains_parent_and_dependency_lineage():
-    raw, geometry = mla_case(), dict(phase="decode", tokens=1, context=16, sequences=2)
-    parent_id = "rank:0/s0.l0.latent_attention_decode"
-    parent = _nodes(export_structure(raw, **geometry, expand_calls=False))[parent_id]
-    expanded = export_structure(raw, **geometry)
+    from mindie_sim.prediction.operators import attention as governed
+    from mindie_sim.prediction.operators.attention._cp_tiling import HISTORY_DECODE_SITE, VLLM_REVISION
+
+    def _semantic(op_id, family, recipe, deps=()):
+        return OpSpec(
+            op_id=op_id, family=family, phase="decode", stage=0, layer=0, deps=deps, requests=("r0",),
+            semantic_shape=(1, 1, 128), local_shape=(1, 1, 128), padded_shape=(1, 1, 128), launch_shape=(1, 1, 128),
+            recipe=recipe, dtype="bf16", layout="ND",
+        )
+
+    history = governed.ContextParallelPlan(
+        VLLM_REVISION, HISTORY_DECODE_SITE, "decode", "history_attention",
+        (("query", (1, 1, 128), 2),), dcp_size=2,
+    )
+    prev = _semantic("s0.l0.qkv", "qkv_projection", "qkv_projection")
+    attn = governed.make_attention_op(
+        governed.AttentionContract(1, 1, 1, 128, 128, selected_tokens=33, cp_plan=history),
+        op_id="s0.l0.attention", deps=("s0.l0.qkv",), dtype="bf16",
+    )
+    after = _semantic("s0.l0.o_proj", "output_projection", "output_projection", deps=("s0.l0.attention",))
+    parent_id = "rank:0/s0.l0.attention"
+    meta = dict(model={"name": "ascend-cp-decode"}, execution={"phase": "decode"})
+    parent = _nodes(export_op_structure([prev, attn, after], **meta, expand_calls=False))[parent_id]
+    expanded = export_op_structure([prev, attn, after], **meta)
     call = next(row for row in expanded["source_calls"] if row["node_id"] == parent_id)
     nodes = _nodes(expanded)
-    first, last = (nodes[child] for child in call["children"])
+    children = [nodes[child] for child in call["children"]]
+    assert len(children) >= 2
+    first, last = children[0], children[-1]
     assert parent["boundary"] == "call" and call["operator"] == parent["operator"]
-    for child in (first, last):
-        assert itemgetter("boundary", "layer", "phase")(child) == ("kernel", parent["layer"], "decode")
+    assert {child["boundary"] for child in children} == {"kernel", "semantic"}
+    assert any(child["family"] == "attention" and child["boundary"] == "kernel" for child in children)
+    for child in children:
+        assert itemgetter("layer", "phase")(child) == (parent["layer"], "decode")
         assert child["lineage"]["source_call_id"] == parent_id
-    assert set(parent["deps"]) <= set(first["deps"]) and first["node_id"] in last["deps"]
-    assert nodes[parent_id]["deps"] == [last["node_id"]] and nodes["rank:0/s0.l0.v_expand"]["deps"] == [parent_id]
+    assert set(parent["deps"]) <= set(first["deps"])
+    assert all(a["node_id"] in b["deps"] for a, b in zip(children, children[1:], strict=False))
+    assert nodes[parent_id]["deps"] == [last["node_id"]] and nodes["rank:0/s0.l0.o_proj"]["deps"] == [parent_id]
 
 @pytest.mark.parametrize("native", (False, True))
 def test_fusion_retains_declared_members_and_contracts(native):
     raw = declared_case()
     raw["runtime"]["lowering_passes"] = ["activation_quantization", "residual_norm"]
     if native:
-        raw["runtime"]["kernels"] = {"lowerings": {"add_rmsnorm": "vllm_cuda_rms_norm"}}
+        raw["runtime"]["kernels"] = {"lowerings": {"add_rmsnorm": "vllm_ascend_native_norm"}}
     report = export_structure(raw, phase="prefill", tokens=3)
     fused = [row for row in report["nodes"] if row["family"] == "add_rmsnorm"]
     assert fused
+    expected_contract = (
+        ["native_tensor_abi", "AddRmsNormBias",
+         [[[3, 32], "bf16", "ND"], [[3, 32], "bf16", "ND"], [[32], "bf16", "ND"], [[], None, None]],
+         [[[3, 32], "bf16", "ND"], [[3, 1], "fp32", "ND"], [[3, 32], "bf16", "ND"]]]
+        if native else ["add_rmsnorm", [3, 32], "bf16", True]
+    )
     for row in fused:
         assert row["lineage"]["fused_from"] == ["residual_add", "rmsnorm"]
-        assert row["contract"] == ["add_rmsnorm", [3, 32], "bf16", True]
+        assert row["contract"] == expected_contract
     if native:
-        assert all(row["boundary"] == "kernel" for row in fused)
+        assert all(row["implementation"]["native_kinds"] == ["AddRmsNormBias"] for row in fused)
     nodes = _nodes(report)
     assert itemgetter("block", "contract")(nodes["rank:0/s0.l0.swiglu"]) == ("ffn", ["swiglu", [3, 64], "bf16"])
     assert len(report["nodes"]) == len(nodes)
@@ -460,7 +491,9 @@ def test_hc_pre_internal_roundtrip_matches_tensor_work():
     def mte3(suffix):
         node_id = next(key for key in group["node_ids"] if key.endswith(suffix))
         return by_id[node_id]["physical_work"]["mte3_bytes"]
-    expected = 3 * mte3(".hc_values_fp32") + 2 * sum(mte3(suffix) for suffix in (".hc_project", ".hc_inv_rms", ".hc_affine"))
+    expected = (3 * mte3(".hc_values_fp32")
+                + 2 * sum(mte3(suffix) for suffix in (".hc_project", ".hc_inv_rms", ".hc_affine"))
+                + mte3(".hc_sinkhorn"))
     summary = group["math_summary"]
     _assert_boundary_roundtrip(summary, expected)
     assert summary["unavailable_reasons"] == []
@@ -576,17 +609,18 @@ def test_mixed_quant_cache_rows_agree_across_capacity_and_contracts(scale_dtype,
     assert layer0["window"] == pytest.approx(128 * expected_row_bytes)
     Memory(case).allocation_report(512)
     contracts = _mixed_quant_contracts(case, context=512)
-    assert len(contracts) == 4 and contracts[2][3] == [[[1, expected_row_bytes], "uint8", "ND"]] * 2
+    assert len(contracts) == 4 and contracts[2][3] == [[[1, expected_row_bytes], "fp8_e4m3", "ND"]] * 2
     query = ((1, 16, 512), "bf16", "ND")
     empty = ((), None, None)
-    obs_inputs = [query, empty, ((16, 1, 1, expected_row_bytes), "uint8", "ND"),
-        ((1, 16), "int32", "ND"), empty, empty, empty, ((16, 1, 1, expected_row_bytes), "uint8", "ND"),
-        ((1, 16), "int32", "ND"), empty,]
+    cache_slot = ((16, 1, 1, expected_row_bytes), "uint8", "ND")
+    table_slot = ((1, 16), "int32", "ND")
+    # CANN aclnnMixedQuantSparseFlashMla native 18-input ABI: inputs[1:3] caches, inputs[5:7] block tables.
+    obs_inputs = [query, cache_slot, cache_slot, empty, empty, table_slot, table_slot, *([empty] * 11)]
     def observe(inputs):
         return observed_attention_contract(_observed_row("aclnnMixedQuantSparseFlashMla", inputs, [query, empty]))
     observed = observe(obs_inputs)
     assert observed is not None and observed[3] == (((1, expected_row_bytes), "uint8", "ND"),) * 2
-    obs_inputs[7] = ((16, 1, 1, 320), "uint8", "ND")
+    obs_inputs[2] = ((16, 1, 1, 320), "uint8", "ND")
     assert observe(obs_inputs) is None
 
 def test_subgraph_boundary_respects_producer_and_consumer_caps():
@@ -595,11 +629,19 @@ def test_subgraph_boundary_respects_producer_and_consumer_caps():
     prolog = next(group for group in exported["subgraphs"] if group["subgraph_id"].endswith("l0.mla_prolog"))
     nodes, members = _nodes(exported), set(prolog["node_ids"])
     dependencies = {dep for name in members for dep in nodes[name]["deps"]}
-    internal_producers = (members & dependencies) - set(prolog["external_outputs"])
-    produced = {node: float(nodes[node]["physical_work"]["mte3_bytes"]) for node in internal_producers}
-    writes, max_reads = sum(produced.values()), 0.0
+    write_producers = (members & dependencies) - set(prolog["external_outputs"])
+    read_producers = members & dependencies
+    produced = {node: float(nodes[node]["physical_work"]["mte3_bytes"]) for node in read_producers}
+    writes = sum(produced[node] for node in write_producers)
+    max_reads = 0.0
     for consumer in (nodes[node] for node in members):
         cap = float(consumer["physical_work"]["mte2_bytes"])
         max_reads += min(cap, sum(min(cap, produced[dep]) for dep in consumer["deps"] if dep in produced))
-    assert max_reads == pytest.approx(1_983_488.0)
-    _assert_boundary_roundtrip(prolog["math_summary"], writes + max_reads)
+    # Shared external quantized input (s0.l0.q_a.quantize payload + scales) is read once across q_a and kv_a.
+    shared_ext_reuse = sum(
+        float(inp["bytes"]) for inp in nodes["rank:0/s0.l0.kv_a"]["values"]["inputs"]
+        if inp.get("producer") == "s0.l0.q_a.quantize"
+    )
+    assert max_reads == pytest.approx(2_328_064.0)
+    assert shared_ext_reuse == pytest.approx(918_016.0)
+    _assert_boundary_roundtrip(prolog["math_summary"], writes + max_reads + shared_ext_reuse)

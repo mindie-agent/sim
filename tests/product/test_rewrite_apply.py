@@ -286,8 +286,8 @@ def test_three_stream_gcd_core_lattice_and_zero_aic_lane():
 
 def test_prefetch_clamps_to_l1_and_conserves_bytes(dense):
     norm, qkv, *_ = dense.atomic_ops[0].ops
-    capacity = dense.datapath.usable_bytes("l1")
-    assert dict(qkv.metadata)["weight_bytes"] > capacity > 0
+    capacity = dense.datapath.usable_bytes("l1") * dense.datapath.aic_count
+    assert dict(qkv.metadata)["packed_weight_bytes"] > capacity > 0
     edit = Edit("prefetch", operation=WeightPrefetch(
         PortRef(_atom(qkv.op_id), "weight", 0), PortRef(_atom(norm.op_id), "output", 0),
         max_bytes=2 * capacity,
@@ -323,8 +323,9 @@ def test_quantization_projection_respects_exclusions_and_checkpoint(dense):
                         spec.w_dtype, spec.a_dtype, spec.kv_dtype, spec.group_size, spec.scale_dtype)
         else:
             assert "quant_w_dtype" not in meta
+    wrong_w_dtype = "int8" if quant.weight_format == "bf16" else "bf16"
     with pytest.raises(ModelingError, match="rewrite_quant_precision_mismatch"):
-        apply_plan(_plan(dense, Edit("quantize", operation=replace(spec, w_dtype="bf16"))), dense)
+        apply_plan(_plan(dense, Edit("quantize", operation=replace(spec, w_dtype=wrong_w_dtype))), dense)
 
 
 def test_hoist_load_time_and_deduplicate_intra_step_preserve_users(dense):
@@ -556,7 +557,7 @@ def test_two_cohort_replay_records_positive_intervals_and_routing_moments(monkey
 
 def test_host_split_elision_replays_with_device_count_rendezvous():
     case = compose_case("qwen3-30b-a3b", REPRESENTATIVE_SKUS["a3"], tp=2, ep=2, dp=1, layers=1,
-                        feature_track="merged", _stack_phase="prefill")
+                        feature_track="shipping", _stack_phase="prefill")
     request = ScenarioRequest(case, StepRequest("prefill", tokens=12, context=64),
                               replay=ReplayOptions(include_submission=True))
     dossier = prepare_scenario(request)
@@ -1069,10 +1070,10 @@ def test_megamoe_abi_role_ports_and_moe_mutex_legality():
     from mindie_sim.prediction.structure import parse_case
     from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
 
-    def _port(role, dtype, shape, layout="ND", quant_mode="dense", group_shape=(), scale_dtype="none"):
+    def _port(role, dtype, shape, layout="ND", quant_mode="dense", group_shape=(), scale_dtype="none", scale_shape=()):
         return OperandPortSig(
             role=role, dtype=dtype, shape=shape, layout=layout, quant_mode=quant_mode,
-            group_shape=group_shape, scale_dtype=scale_dtype, scale_shape=(), transposed=False,
+            group_shape=group_shape, scale_dtype=scale_dtype, scale_shape=scale_shape, transposed=False,
         )
 
     # 1. Regression lock: aclnnMegaMoe role-port query (context at operands[0], x at [1], weight1 at [4]) PASSES.
@@ -1081,17 +1082,17 @@ def test_megamoe_abi_role_ports_and_moe_mutex_legality():
         soc_arch="A5", sku_id=REPRESENTATIVE_SKUS["a5"], abi_id="aclnnMegaMoe",
         graph_motif="moe_mc2_frame", model_scope="target", draft_quant_mode="none", pr_track="shipping",
         operands=(
-            _port("context", "int8", (64,), quant_mode="none"),
+            _port("context", "int32", (64,), quant_mode="none"),
             _port("x", "bf16", (16, 4096)),
             _port("topk_ids", "int32", (16, 8), quant_mode="none"),
             _port("topk_weights", "fp32", (16, 8)),
-            _port("weight1", "fp8_e4m3fn", (4096, 2048), layout="FRACTAL_NZ", quant_mode="mx_fp8", group_shape=(32,), scale_dtype="fp8_e8m0"),
-            _port("weight2", "fp8_e4m3fn", (2048, 4096), layout="FRACTAL_NZ", quant_mode="mx_fp8", group_shape=(32,), scale_dtype="fp8_e8m0"),
+            _port("weight1", "fp8_e4m3fn", (2048, 4096), layout="FRACTAL_NZ", quant_mode="mx_fp8", group_shape=(32,), scale_dtype="fp8_e8m0", scale_shape=(2048, 64, 2)),
+            _port("weight2", "fp8_e4m3fn", (4096, 1024), layout="FRACTAL_NZ", quant_mode="mx_fp8", group_shape=(32,), scale_dtype="fp8_e8m0", scale_shape=(4096, 16, 2)),
         ),
-        outputs=(_port("y", "bf16", (16, 4096)), _port("expert_token_nums", "int64", (1,), quant_mode="none")),
+        outputs=(_port("y", "bf16", (16, 4096)), _port("expert_token_nums", "int32", (8,), quant_mode="none")),
         rank_placement="ub_ccu_intramachine", world_size=16, comm_group_id="ep", comm_domain_width=16,
         comm_dtype="bf16", reduction_kind="permute", activation_kind="swiglu", activation_params=(),
-        has_bias=False, has_active_mask=True, dispatch_quant_mode=0, shared_experts_per_rank=1,
+        has_bias=False, has_active_mask=False, dispatch_quant_mode=4, shared_experts_per_rank=1,
         top_k=8, moe_expert_num=128, qk_rope_head_dim=0, mla_variant="none", sfa_dcp_active=False,
         pcp_size=1, kv_cache_dtype="none", has_kpool_indexer=False, dcp_size=1, is_act_and_mul=True,
         enabled_stack_passes=frozenset(),
@@ -1101,15 +1102,18 @@ def test_megamoe_abi_role_ports_and_moe_mutex_legality():
     assert verdict.matched_entry_id == "a5_hccl_megamoe_routed"
     assert (verdict.act_dtype, verdict.weight_dtype, verdict.quant_mode) == ("bf16", "fp8_e4m3fn", "dense")
 
-    # 2. MoE mutex legality via ProbedAbiRegistry: fused_mc2 perpendicular to MSO; level=3 A5 non-latent only.
+    # 2. MoE mutex legality via ProbedAbiRegistry: fused_mc2 perpendicular to MSO; level=3 A5 MXFP non-latent only.
     case_a3 = parse_case(compose_case("deepseek-v3.2", REPRESENTATIVE_SKUS["a3"], tp=1, dp=4, ep=4, layers=4))
     case_a5 = parse_case(compose_case("deepseek-v3.2", REPRESENTATIVE_SKUS["a5"], tp=1, dp=4, ep=4, layers=4))
+    case_a5_mx = parse_case(compose_case("deepseek-v3.2", REPRESENTATIVE_SKUS["a5"], tp=1, dp=4, ep=4, layers=4, quant="mxfp8"))
     shared_node = SimpleNamespace(op_id="s0.l0.shared_expert_gate", family="gemm")
     assert moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=True).legal is False
     assert moe_route_legality(case_a3, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_node,)).legal is False
-    a5_lvl3 = moe_route_legality(case_a5, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_node,))
+    a5_fp8_lvl3 = moe_route_legality(case_a5, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_node,))
+    assert a5_fp8_lvl3.legal is False and a5_fp8_lvl3.reason == "fused_mc2_level3_requires_mxfp_routed:fp8"
+    a5_lvl3 = moe_route_legality(case_a5_mx, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_node,))
     assert a5_lvl3.legal is True and a5_lvl3.is_shipping_abi is True
-    case_latent = replace(case_a5, model=replace(case_a5.model, metadata=(("routed_expert_hidden_size", 512),)))
+    case_latent = replace(case_a5_mx, model=replace(case_a5_mx.model, metadata=(("routed_expert_hidden_size", 512),)))
     assert moe_route_legality(case_latent, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_node,)).legal is False
     assert moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="clipped_swiglu", allow_unbound_formula=False).legal is False
     clipped_mod = moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="clipped_swiglu", allow_unbound_formula=True)

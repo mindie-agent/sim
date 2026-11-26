@@ -509,7 +509,7 @@ def test_dual_cert_port_links_abi_bindings_and_algebra_port_honesty() -> None:
     ))
     q_ports = _law1_quant_output_ports(q_op, classify_op_traits(q_op), 4, 128, y_name="y", scale_name="scale")
     assert any(p.dtype == "fp8_e4m3fn" and p.group_shape == (32,) for p in q_ports)
-    assert any(p.role == "scale" and p.dtype == "ue8m0" and p.shape == (4, 4) for p in q_ports)
+    assert any(p.role == "scale" and p.dtype == "ue8m0" and p.shape == (4, 2, 2) for p in q_ports)
     assert _resolve_declared_weight_layout(_op("l0.mm", "gemm", (4, 128, 256), metadata=(("weight_layout", "ND"),)), None) == "ND"
     qa_op = _op("l0.q_a", "gemm", (4, 1536, 7168), dtype="bf16")
     assert _build_mla_prolog_ports([qa_op], {qa_op.op_id: "q_a"}, {qa_op.op_id: classify_op_traits(qa_op)}, soc_arch="A3", rope_dim=64) is None

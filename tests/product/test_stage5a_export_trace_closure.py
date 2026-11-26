@@ -433,17 +433,13 @@ def test_a3_deepseek_megamoe_contract_and_sheet3_isa_plus_exact_c8_parity(tmp_pa
     dv_xml = ET.tostring(roots[SHEET_MEMORY], encoding="unicode")
     assert '"BF16"' in dv_xml and '"BF16,C8"' not in dv_xml
 
-    # A3 DeepSeek-V4.1-Flash hard-rejects INT8/C8 KV (aliased_window_compressed_rejects_int8_kv).
-    raw_ds_c8, _ = compose_export_case(
-        "deepseek-v4.1-flash", REPRESENTATIVE_SKUS["a3"],
-        dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
-        prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
-        concurrency=DEEPSEEK_CONC, feature_track="target", quant="w4a8_dynamic", kv_cache_dtype="int8",
-    )
-    ds_seq = b_ds_aft.memory_ledger.seq_len
-    with pytest.raises(ModelingError, match="aliased_window_compressed_rejects_int8_kv"):
-        Memory(parse_case(raw_ds_c8)).resident_memory_receipt(
-            phase="decode", sequence_tokens=ds_seq, batch_per_dp=DEEPSEEK_CONC,
+    # A3 DeepSeek-V4.1-Flash hard-rejects INT8/C8 KV at compose time (kv_cache_int8_unsupported_on_window_compressed_mla).
+    with pytest.raises(ModelingError, match="kv_cache_int8_unsupported_on_window_compressed_mla"):
+        compose_export_case(
+            "deepseek-v4.1-flash", REPRESENTATIVE_SKUS["a3"],
+            dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
+            prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
+            concurrency=DEEPSEEK_CONC, feature_track="target", quant="w4a8_dynamic", kv_cache_dtype="int8",
         )
 
     # Kimi-K3.1 & GLM-5.3 A3 MLA C8 exact parity + Sheet 3 exact cache/total bijection.
