@@ -105,7 +105,10 @@ class ChunkSequence(Sequence):
     max_physical_chunks: int | None = DEFAULT_MAX_PHYSICAL_CHUNKS
 
     def __len__(self):
-        count = chunk_count(self.flow.payload_bytes, self.chunk_bytes)
+        if self.flow.messages <= 0:
+            return 0
+        per_message = chunk_count(self.flow.payload_bytes, self.chunk_bytes)
+        count = per_message * self.flow.messages
         if self.max_physical_chunks is not None and count > self.max_physical_chunks:
             raise ModelingError(
                 "transport_chunk_expansion_unbounded:"
@@ -113,13 +116,17 @@ class ChunkSequence(Sequence):
         return count
 
     def __getitem__(self, index):
+        total = len(self)
         if index < 0:
-            index += len(self)
+            index += total
+        if not 0 <= index < total:
+            raise IndexError(index)
+        per_message = chunk_count(self.flow.payload_bytes, self.chunk_bytes)
+        chunk_index = index % per_message
         size = chunk_size_at(
-            self.flow.payload_bytes, self.chunk_bytes, index)
+            self.flow.payload_bytes, self.chunk_bytes, chunk_index)
         return self.topology.route_message(MessageFlow(
-            self.flow.source, self.flow.destination, size,
-            self.flow.messages))
+            self.flow.source, self.flow.destination, size, 1))
 
 
 @dataclass(frozen=True)
@@ -696,6 +703,10 @@ class TransportPlan:
             dependencies = [engine.submit(
                 prefix + ":gate", after=tuple(dependencies), owner=owner)]
         has_tx, has_rx = self._flow_ports(path)
+        per_message = chunk_count(path.flow.payload_bytes, self.chunk_bytes)
+        message_chunk_index = (
+            chunk_index % per_message if per_message > 0 else chunk_index
+        )
         previous = dependencies[0]
         chunk_service = [None] * len(chunk.hops)
         for hop_index, hop in enumerate(chunk.hops):
@@ -703,7 +714,7 @@ class TransportPlan:
             if previous_services:
                 hop_dependencies.append(previous_services[hop_index])
             startup = float(self.hop_startup_us)
-            if chunk_index == 0 and startup:
+            if message_chunk_index == 0 and startup:
                 if has_tx and hop_index == 0:
                     gate = engine.submit(
                         prefix + ":inject:startup",
@@ -732,7 +743,7 @@ class TransportPlan:
         service_events[flow_index][chunk_index] = tuple(chunk_service)
         if chunk_index >= 2:
             service_events[flow_index].pop(chunk_index - 2, None)
-        if chunk_index == 0 and float(self.hop_startup_us) and has_rx:
+        if message_chunk_index == 0 and float(self.hop_startup_us) and has_rx:
             previous = engine.submit(
                 prefix + ":receive:startup", after=(previous,),
                 latency=float(self.hop_startup_us) / MS_PER_S, owner=owner,

@@ -45,15 +45,40 @@ class FiniteTransfer:
         return engine.submit(name + ":complete", after=tuple(paths) or (ready,), owner=owner)
 
     def _path(self, engine, name, ready, resource, count, owner):
-        # With no credit stalls, a continuous service has the same last-byte
-        # completion as the serialized transactions, without expanding packets.
-        if self.outstanding is None or (
-                not self.response_ms and engine.resources[resource].policy == "fair"):
+        # With fair sharing and no credit stalls (or a single transaction),
+        # one continuous service matches serialized transactions without packet expansion.
+        if count == 1 or (
+                engine.resources[resource].policy == "fair"
+                and (self.outstanding is None or not self.response_ms)):
             service = engine.submit(
                 name + ":service", {resource: count * self.transaction_bytes},
                 after=(ready,), owner=owner)
             return engine.submit(name + ":response", after=(service,),
                                  latency=self.response_ms, owner=owner)
+
+        if self.outstanding is None:
+            complete = engine.future(name + ":drained")
+            issued = 0
+
+            def next_transaction(prior):
+                nonlocal issued
+                if issued == count:
+                    engine.submit(
+                        name + ":response", after=(prior,),
+                        latency=self.response_ms,
+                        on_complete=lambda _: engine.resolve(complete),
+                        owner=owner)
+                    return
+                index = issued
+                issued += 1
+                engine.submit(
+                    f"{name}:transaction{index}:service",
+                    {resource: self.transaction_bytes},
+                    after=(prior,), on_complete=next_transaction, owner=owner)
+
+            engine.submit(name + ":begin", after=(ready,),
+                          on_complete=next_transaction, owner=owner)
+            return complete
 
         complete = engine.future(name + ":drained")
         service_tail = ready

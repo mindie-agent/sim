@@ -28,17 +28,21 @@ COPY_SLOTS = 8
 _ONESHOT_MAX_RANKS = 8
 _ONESHOT_RESOURCE_GROUPS = 128
 _ONESHOT_V2_EVENT_HANDLES_PER_GROUP = 3
-_PRESYNC_CONTROL_OPS_PER_PEER = 3  # Two variable writes and one notify wait.
+_PRESYNC_RECORD_OPS_PER_PEER = 2  # Two variable writes issued before remote flight.
 _WRITE_WAIT_RANKS_PER_EVENT = 16
 
 
-def _phase(name, after=(), *, exchange=(), counts=(), **work):
+def _phase(name, after=(), *, exchange=(), signals=(), counts=(), **work):
     return HcclPhase(name, after, tuple((k,v) for k,v in work.items() if v),
-                     exchange=exchange, control_counts=counts)
+                     exchange=exchange, control_counts=counts, signals=signals)
 
 
 def _mesh(ranks, size):
     return tuple(tuple(0 if i==j else size for j in range(ranks)) for i in range(ranks))
+
+
+def _peer_signals(ranks):
+    return tuple((src, dst) for src in range(ranks) for dst in range(ranks) if src != dst)
 
 
 def _kind(s):
@@ -76,9 +80,14 @@ def contract(selection, rank=0):
     r,n = s.ranks,s.payload_bytes
     if not n:
         return HcclPlan(s,rank,(_phase('empty'),),1,0,unmodeled=('zero_payload_outer_executor_no_kernel',))
-    pre = _phase('pre_sync', ccu_control=_PRESYNC_CONTROL_OPS_PER_PEER * (r - 1), counts=(
-        ('write_variable_notify',2*(r-1)),('notify_wait',r-1)))
-    phases=[pre]
+    peer_signals = _peer_signals(r)
+    phases = [
+        _phase('pre_sync_record', (), ccu_control=_PRESYNC_RECORD_OPS_PER_PEER * (r - 1),
+               counts=(('write_variable_notify', _PRESYNC_RECORD_OPS_PER_PEER * (r - 1)),)),
+        _phase('pre_sync_signal', ('pre_sync_record',), signals=peer_signals),
+        _phase('pre_sync', ('pre_sync_signal',), ccu_control=r - 1,
+               counts=(('notify_wait', r - 1),)),
+    ]
     if kind=='oneshot':
         phases.extend((
             _phase('local_input_to_ccu',('pre_sync',),hbm=n,ccu_copy=n,ccu_buffer_bytes=n,
@@ -111,8 +120,13 @@ def contract(selection, rank=0):
         ))
         final=('write_wait',)
         scratch=0
-    phases.append(_phase('post_sync',final,ccu_control=2*(r-1),
-                         counts=(('notify_record',r-1),('notify_wait',r-1))))
+    phases.extend((
+        _phase('post_sync_record', final, ccu_control=r - 1,
+               counts=(('notify_record', r - 1),)),
+        _phase('post_sync_signal', ('post_sync_record',), signals=peer_signals),
+        _phase('post_sync', ('post_sync_signal',), ccu_control=r - 1,
+               counts=(('notify_wait', r - 1),)),
+    ))
     counts={}
     for phase in phases:
         for key,value in phase.control_counts:counts[key]=counts.get(key,0)+value

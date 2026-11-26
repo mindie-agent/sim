@@ -863,6 +863,15 @@ class Topology(_TopologyPlansMixin):
                 result.extend(self._endpoint_resource(link, direction, rank)
                               for rank in endpoint_ranks
                               for direction in ("tx", "rx"))
+                for rank in link.members:
+                    for direction in ("tx", "rx"):
+                        shared_key = self._link_shared_ports.get(
+                            (link.name, int(rank), direction)
+                        )
+                        if shared_key is not None:
+                            included_shared_ports[shared_key] = (
+                                self._shared_port_rates[shared_key]
+                            )
             if link.switch_capacity_bytes_per_ms is not None:
                 sw_key = self._link_shared_switches.get(link.name)
                 if sw_key is not None:

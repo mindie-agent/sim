@@ -454,7 +454,10 @@ def test_native_lowering_uses_declared_chunks_and_records_unknowns():
     reports, names = {}, {}
     for label, op, messages in (("whole", baseline, 12), ("chunked", chunked, 1536)):
         selected = hccl_lower((op,), parsed.runtime, parsed.model.activation_dtype)
-        network = next(item for item in selected if item.recipe == HCCL_NETWORK)
+        network = next(
+            item for item in selected
+            if item.recipe == HCCL_NETWORK and item.op_id.endswith(".broadcast.network")
+        )
         topology = Topology(parsed.machine, parsed.runtime.parallel)
         ledger = topology.accounting(network, 0)
         # Four ranks each send an 8 MiB payload to three peers.

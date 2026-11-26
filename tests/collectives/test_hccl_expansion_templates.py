@@ -602,3 +602,95 @@ def test_sequence_parallel_service_is_inclusive_and_preserves_physical_work():
     assert before["body_forward_ms"] < calibrated["body_forward_ms"] < constrained["body_forward_ms"]
     assert before["execution"]["work"] == calibrated["execution"]["work"] == constrained["execution"]["work"]
     _assert_released(calibrated["execution"])
+
+
+def test_aiv_flags_lane_framing_consumer_order_chunk_retention_and_dtype_guard():
+    from mindie_sim.prediction.collectives.transport import chunk_count
+    from mindie_sim.prediction.operators.collectives.hccl_graph import SourceMeshPeers
+
+    # 1. FP8 reduction is rejected while BF16 emits both layer AllReduce calls.
+    raw_dtype = case(tp=2)
+    raw_dtype["machine"] = {"backend": "ascend", "sku": "Ascend950DT_9582", "num_devices": 2}
+    raw_dtype["runtime"]["kernels"] = {
+        "hccl": {"allreduce": {"expansion": "AIV", "template": "mesh_oneshot", "block_limit": 3}}
+    }
+    raw_dtype["model"].update(layers=1, activation_dtype="bf16")
+    ops_bf16 = target_graphs(raw_dtype, phase="decode", tokens=1, context=16, scope="body")[0]
+    starts_bf16 = sum(
+        bool(dict(o.metadata).get("device_kernel_group", {}).get("entry"))
+        for o in ops_bf16 if dict(o.metadata).get("hccl_source_group")
+    )
+    assert starts_bf16 == 2
+    raw_dtype["model"]["activation_dtype"] = "fp8_e4m3"
+    with pytest.raises(ModelingError, match="hccl_reduction_dtype_unsupported"):
+        target_graphs(raw_dtype, phase="decode", tokens=1, context=16, scope="body")
+
+    # 2. AIV OneShot emits empty plan for zero count and owner MTE3/MTE2 work + 3x128B flags for positive count.
+    sel_zero = select(
+        {"expansion": "AIV", "template": "mesh_oneshot", "block_limit": 3},
+        collective="allreduce", ranks=2, payload_bytes=0,
+    )
+    assert sum(sum(map(sum, p.exchange)) for p in hccl_aiv.contract(sel_zero, 3).phases if p.exchange) == 0
+    sel_one = select(
+        {"expansion": "AIV", "template": "mesh_oneshot", "block_limit": 3},
+        collective="allreduce", ranks=2, payload_bytes=32,
+    )
+    plan_one = hccl_aiv.contract(sel_one, 3)
+    assert sum(sum(map(sum, p.exchange)) for p in plan_one.phases) == 2 * (32 + 3 * FLAG_BYTES)
+    flag_only = [p for p in plan_one.phases if p.name not in {"broadcast", "reduce_output"}]
+    assert sum(dict(p.work).get("mte3", 0) for p in flag_only) == 3 * FLAG_BYTES
+    assert sum(dict(p.work).get("mte2_aiv", 0) for p in flag_only) == 3 * FLAG_BYTES
+
+    # 3. AIV TwoShot frames each lane read independently and splits reads exceeding UB_BATCH.
+    raw_two = declared(template="mesh_twoshot", ranks=2, blocks=63)
+    raw_two["machine"]["links"][0].update(transaction_bytes=64, alignment_bytes=1)
+    op_two = OpSpec("ar", "allreduce", "decode", 0, 0, (), (60,), (60,), (60,), (60,), dtype="bf16", link_bytes=120)
+    ops_two = lower((op_two,), parse_case(raw_two).runtime, "bf16")
+    rep_two = graph_costs(raw_two, ops_two, isolated=False, trace_limit=0)
+    assert rep_two["execution"]["serviced"]["link:fabric"] == pytest.approx(2 * 2 * 30 * 64)
+    raw_two_ub = declared(template="mesh_twoshot", ranks=2, blocks=6)
+    n_two_ub = 389128
+    op_two_ub = OpSpec(
+        "ar_ub", "allreduce", "decode", 0, 0, (), (n_two_ub // 2,), (n_two_ub // 2,), (n_two_ub // 2,), (n_two_ub // 2,),
+        dtype="bf16", link_bytes=n_two_ub,
+        metadata=(("transport_receive_capacity_bytes_per_peer", UB_BATCH),),
+    )
+    rep_two_ub = graph_costs(raw_two_ub, lower((op_two_ub,), parse_case(raw_two_ub).runtime, "bf16"), isolated=False, trace_limit=0)
+    assert rep_two_ub["execution"]["live_tasks"] == 0
+
+    # 4. AIV AllGather producer-consumer serializes fragments on propagation and slow local MTE3 writes.
+    raw_ag = declared(ranks=2, blocks=4)
+    raw_ag["runtime"]["kernels"] = {"hccl": {"allgather": {"expansion": "AIV", "template": "mesh", "block_limit": 4}}}
+    raw_ag["machine"]["links"][0].update(latency_us=10, capacity_bytes_per_ms=5e8)
+    raw_ag["machine"]["device"]["rates"] = dict.fromkeys(raw_ag["machine"]["device"]["rates"], 1e13)
+    n_ag, shape_ag = 512 * 1024, (2, 262144)
+    op_ag = OpSpec("g", "allgather", "decode", 0, 0, (), shape_ag, shape_ag, shape_ag, shape_ag, dtype="bf16", link_bytes=n_ag)
+    rep_ag = graph_costs(raw_ag, lower((op_ag,), parse_case(raw_ag).runtime, "bf16"), isolated=False, trace_limit=0)
+    assert rep_ag["duration_ms"] * 1000.0 >= 40.0
+    raw_ag_mte = deepcopy(raw_ag)
+    raw_ag_mte["machine"]["links"][0].update(latency_us=0, capacity_bytes_per_ms=1e12)
+    raw_ag_mte["machine"]["device"]["rates"]["mte3"] = 256 * 1024
+    rep_ag_mte = graph_costs(raw_ag_mte, lower((op_ag,), parse_case(raw_ag_mte).runtime, "bf16"), isolated=False, trace_limit=2000)
+    copy0 = next(ev for ev in rep_ag_mte["timeline"] if ev["op_id"].endswith(".gather_copy_0"))
+    ready1 = next(ev for ev in rep_ag_mte["timeline"] if ev["op_id"].endswith(".gather_ready_1"))
+    assert ready1["ready_ms"] >= copy0["complete_ms"] - 1e-9 and copy0["complete_ms"] >= 1.0 - 1e-6
+
+    # 5. AIV AllGather retains 95 KiB chunks, executes beyond 4,096 chunks, and preserves explicit None bound.
+    raw_big = declared(ranks=2, blocks=2)
+    raw_big["machine"]["device"]["memory_bytes"] = 16 * 1024**3
+    raw_big["runtime"]["kernels"] = {"hccl": {"allgather": {"expansion": "AIV", "template": "mesh", "block_limit": 2}}}
+    rt_big = parse_case(raw_big).runtime
+    for n_big in (4096 * UB_BATCH, 4096 * UB_BATCH + 2):
+        shape_big = (2, n_big // 2)
+        op_big = OpSpec("ag", "allgather", "decode", 0, 0, (), shape_big, shape_big, shape_big, shape_big, dtype="bf16", link_bytes=n_big)
+        ops_big = lower((op_big,), rt_big, "bf16")
+        net_op = next(o for o in ops_big if o.op_id.endswith(".gather.network"))
+        resolved = SourceMeshPeers().resolve_transport(net_op)
+        assert chunk_count(n_big, resolved.chunk_bytes) == (n_big + UB_BATCH - 1) // UB_BATCH
+        if n_big > 4096 * UB_BATCH:
+            assert resolved.max_physical_chunks == 4097
+            rep_big = graph_costs(raw_big, ops_big, isolated=False, trace_limit=0)
+            assert rep_big["execution"]["live_tasks"] == rep_big["execution"]["live_programs"] == 0
+            op_none = replace(op_big, metadata=(("transport_max_physical_chunks", None),))
+            net_none = next(o for o in lower((op_none,), rt_big, "bf16") if o.op_id.endswith(".gather.network"))
+            assert SourceMeshPeers().plan_options(net_none)["max_physical_chunks"] is None

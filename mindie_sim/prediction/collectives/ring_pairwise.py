@@ -596,12 +596,15 @@ class OneShotPlan:
                     for resource in hop.demand:
                         useful[resource] = useful.get(resource, 0.0) + hop.useful_bytes
                         wire[resource] = wire.get(resource, 0.0) + hop.wire_bytes
-                        transactions[resource] = (
-                            None if hop.transactions is None
-                            else transactions.get(resource, 0) + hop.transactions
-                        )
-                        if hop.transaction_frame is not None:
+                        previous_tx = transactions.get(resource, 0)
+                        if hop.transactions is None or previous_tx is None:
+                            transactions[resource] = None
+                        else:
+                            transactions[resource] = previous_tx + hop.transactions
+                        if resource not in transaction_frames:
                             transaction_frames[resource] = hop.transaction_frame
+                        elif transaction_frames[resource] != hop.transaction_frame:
+                            transaction_frames[resource] = None
                     path_latency += hop.latency_ms
                 group_path_latency = max(group_path_latency, path_latency)
                 max_path_latency = max(max_path_latency, path_latency)
@@ -609,8 +612,12 @@ class OneShotPlan:
                 setup_ms = max(
                     setup_ms, float(group.startup_ms or 0.0) + group_path_latency
                 )
+        uniform_frames = {
+            resource: frame for resource, frame in transaction_frames.items()
+            if frame is not None
+        }
         return CommunicationWork(
-            useful_by_rank, useful, wire, transactions, transaction_frames,
+            useful_by_rank, useful, wire, transactions, uniform_frames,
             count, setup_ms, routed_useful, physical_wire, max_path_latency,
         )
 

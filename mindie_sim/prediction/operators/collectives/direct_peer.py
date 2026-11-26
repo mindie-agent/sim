@@ -74,6 +74,8 @@ class DirectPeerGroup(PairwiseGroup):
     receive_capacity_bytes_per_peer: float | None = None
     receive_buffer_id: str | None = None
     max_physical_chunks: int | None = DEFAULT_MAX_PHYSICAL_CHUNKS
+    receive_capacity_bytes: tuple[tuple[int, float], ...] = ()
+    receive_buffer_ids: tuple[tuple[int, str], ...] = ()
 
     def __post_init__(self):
         if self.max_physical_chunks is not None and (
@@ -105,6 +107,41 @@ class DirectPeerGroup(PairwiseGroup):
             if not math.isfinite(value) or value <= 0:
                 raise ModelingError(
                     "direct_peer_receive_capacity_requires_positive_number")
+        for _rank, raw_cap in self.receive_capacity_bytes:
+            if isinstance(raw_cap, bool):
+                raise ModelingError(
+                    "direct_peer_receive_capacity_requires_positive_number")
+            value = float(raw_cap)
+            if not math.isfinite(value) or value <= 0:
+                raise ModelingError(
+                    "direct_peer_receive_capacity_requires_positive_number")
+        for _rank, raw_buf in self.receive_buffer_ids:
+            if not str(raw_buf):
+                raise ModelingError("direct_peer_receive_buffer_id_invalid")
+        if (self.receive_capacity_bytes_per_peer is not None
+                and self.receive_capacity_bytes):
+            raise ModelingError("direct_peer_receive_capacity_conflict")
+
+    def _receive_pool_spec(self, source: int, destination: int) -> tuple[float | None, str | None]:
+        rank_cap = next(
+            (float(val) for r, val in self.receive_capacity_bytes if int(r) == destination),
+            None,
+        )
+        rank_buf = next(
+            (str(val) for r, val in self.receive_buffer_ids if int(r) == destination),
+            None,
+        )
+        if rank_cap is not None:
+            buf_id = rank_buf or self.receive_buffer_id or f"{self.topology.namespace}rank:{destination}"
+            return rank_cap, f"transport:rx:{buf_id}"
+        if self.receive_capacity_bytes_per_peer is not None:
+            identity = (
+                rank_buf
+                or self.receive_buffer_id
+                or f"{self.topology.namespace}peer:{source}>{destination}"
+            )
+            return float(self.receive_capacity_bytes_per_peer), f"transport:rx:{identity}"
+        return None, None
 
     def start_participants(self, engine, name, ready_by_rank, *, owner="",
                            release_events=None):
@@ -113,6 +150,7 @@ class DirectPeerGroup(PairwiseGroup):
         if count <= 1:
             return initial
         if (self.chunk_bytes is not None or self.hop_startup_us
+                or self.receive_capacity_bytes
                 or self.receive_capacity_bytes_per_peer is not None
                 or release_events is not None):
             return self._start_chunked(
@@ -194,12 +232,12 @@ class DirectPeerGroup(PairwiseGroup):
 
     def _start_peer_message(
         self, engine, name, initial, owner, index, destination_index, payload,
-        release_chunk, finish_message,
+        release_chunk, finish_message, *, has_explicit_release=False,
     ):
         """[Cohesive-Pipeline] Schedule one direct-peer collective chunk transfer across link resources."""
         source, destination = self.ranks[index], self.ranks[destination_index]
         prefix = f"{name}:rank{source}:peer{destination}"
-        capacity = self.receive_capacity_bytes_per_peer
+        capacity, pool = self._receive_pool_spec(source, destination)
         total = chunk_count(float(payload), self.chunk_bytes)
         if (self.max_physical_chunks is not None
                 and total > self.max_physical_chunks):
@@ -211,7 +249,20 @@ class DirectPeerGroup(PairwiseGroup):
             raise ModelingError(
                 "direct_peer_chunk_exceeds_receive_capacity:"
                 f"{largest}>{capacity}")
-        if capacity is None:
+        shared_pool = bool(
+            self.receive_capacity_bytes
+            or self.receive_buffer_ids
+            or self.receive_buffer_id
+        )
+        atomic_message_credit = (
+            pool is not None
+            and capacity is not None
+            and shared_pool
+            and total > 1
+            and has_explicit_release
+            and float(payload) <= float(capacity) + 1e-9
+        )
+        if capacity is None or atomic_message_credit:
             chunk_window = None
         else:
             chunk_window = max(
@@ -231,30 +282,39 @@ class DirectPeerGroup(PairwiseGroup):
                       "transport_schedule": "chunked_direct_peer",
                       "chunk_bytes": self.chunk_bytes,
                       "receive_capacity_bytes_per_peer":
-                          self.receive_capacity_bytes_per_peer})
-        pool = None
-        if self.receive_capacity_bytes_per_peer is not None:
-            identity = (self.receive_buffer_id
-                        or f"{self.topology.namespace}peer:"
-                           f"{source}>{destination}")
-            pool = f"transport:rx:{identity}"
+                          self.receive_capacity_bytes_per_peer,
+                      **({"receive_capacity_bytes": capacity}
+                         if capacity is not None and self.receive_capacity_bytes
+                         else {})})
+        if pool is not None and capacity is not None:
             if pool in engine.pools:
                 if not math.isclose(
                         engine.pools[pool],
-                        float(self.receive_capacity_bytes_per_peer),
+                        float(capacity),
                         rel_tol=1e-12, abs_tol=1e-9):
                     raise ModelingError(
                         f"direct_peer_receive_capacity_conflict:{pool}")
             else:
-                engine.extend(pools={
-                    pool: float(self.receive_capacity_bytes_per_peer)})
+                engine.extend(pools={pool: float(capacity)})
+        msg_allocation = None
+        message_ready = ready
+        if atomic_message_credit:
+            msg_allocation = Allocation(
+                f"{prefix}:credit", pool, float(payload), (0,))
+            message_ready = engine.submit(
+                f"{prefix}:grant", after=(ready,),
+                acquire=(msg_allocation,), owner=owner)
 
         def arrived(_event, chunk_index, prefix, allocation, hop_count):
             remaining[0] -= 1
             arrived_chunks[0] += 1
             if hop_count == 0:
                 hop0_done[0] += 1
-            release_chunk(prefix, pair, allocation, _event)
+            if atomic_message_credit:
+                if remaining[0] == 0:
+                    release_chunk(prefix, pair, msg_allocation, _event)
+            else:
+                release_chunk(prefix, pair, allocation, _event)
             pump()
             if remaining[0]:
                 return
@@ -270,12 +330,12 @@ class DirectPeerGroup(PairwiseGroup):
                 float(payload), self.chunk_bytes, chunk_index)
             chunk = self.topology.route_message(MessageFlow(
                 source, destination, useful)).hops
-            dependencies = [ready]
+            dependencies = [message_ready]
             previous_services = services.get(chunk_index - 1)
             if previous_services is not None:
                 dependencies.append(previous_services[0])
             allocation = None
-            if pool is not None:
+            if pool is not None and not atomic_message_credit:
                 allocation = Allocation(
                     f"{prefix}:chunk{chunk_index}:credit", pool,
                     useful, (0,))
@@ -411,9 +471,15 @@ class DirectPeerGroup(PairwiseGroup):
                 if not payload:
                     continue
                 outstanding[index] += 1
+                pair = (self.ranks[index], self.ranks[destination_index])
+                has_explicit_release = (
+                    pair in explicit_events
+                    or ("dest", pair[1]) in explicit_events
+                )
                 self._start_peer_message(
                     engine, name, initial, owner, index, destination_index, payload,
                     release_chunk, finish_message,
+                    has_explicit_release=has_explicit_release,
                 )
             retire(index)
 
@@ -630,6 +696,21 @@ class DirectMeshPlan:
                 owner=owner).values(),
             ready, owner)
 
+    @staticmethod
+    def _accumulate_hop_resources(hop, useful, wire, transactions, frames):
+        for resource in hop.demand:
+            useful[resource] = useful.get(resource, 0.0) + hop.useful_bytes
+            wire[resource] = wire.get(resource, 0.0) + hop.wire_bytes
+            previous_tx = transactions.get(resource, 0)
+            if hop.transactions is None or previous_tx is None:
+                transactions[resource] = None
+            else:
+                transactions[resource] = previous_tx + hop.transactions
+            if resource not in frames:
+                frames[resource] = hop.transaction_frame
+            elif frames[resource] != hop.transaction_frame:
+                frames[resource] = None
+
     def accounting(self):
         """Physical wire of the selected phases, with no aggregate setup term.
 
@@ -650,21 +731,9 @@ class DirectMeshPlan:
                     for hop in route.hops:
                         routed_useful += hop.useful_bytes
                         physical_wire += hop.wire_bytes
-                        for resource in hop.demand:
-                            useful[resource] = (
-                                useful.get(resource, 0.0) + hop.useful_bytes)
-                            wire[resource] = (
-                                wire.get(resource, 0.0) + hop.wire_bytes)
-                            previous_tx = transactions.get(resource, 0)
-                            if hop.transactions is None or previous_tx is None:
-                                transactions[resource] = None
-                            else:
-                                transactions[resource] = (
-                                    previous_tx + hop.transactions)
-                            if resource not in frames:
-                                frames[resource] = hop.transaction_frame
-                            elif frames[resource] != hop.transaction_frame:
-                                frames[resource] = None
+                        self._accumulate_hop_resources(
+                            hop, useful, wire, transactions, frames
+                        )
                         path_latency += hop.latency_ms
                     max_path_latency = max(max_path_latency, path_latency)
         uniform_frames = {

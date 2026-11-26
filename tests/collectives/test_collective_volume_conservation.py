@@ -510,3 +510,74 @@ def test_pd_handoff_build_normalizes_explicit_pool_capacity_mapping():
     assert handoff.receive_pool_capacity_bytes == ((1, 128),)
     assert handoff.receive_capacity_bytes == ((1, 64),)
     assert handoff.receive_buffer_ids == ((1, "pool"),)
+
+
+def test_direct_peer_per_rank_credits_repeated_messages_and_mixed_framing():
+    from mindie_sim.prediction.collectives import TransportOptions
+    from mindie_sim.prediction.communication import MessageFlow
+
+    # 1. joint_plan(direct_peer) retains per-rank receive_capacity_bytes pools matching transport_plan.
+    raw_dp = case(tp=4)
+    raw_dp["machine"]["links"][0].update(semantics="per_pair", capacity_bytes_per_ms=64, latency_us=10000)
+    topo_dp = topology(raw_dp)
+    ranks = range(4)
+    opts = TransportOptions(chunk_bytes=64, receive_capacity_bytes=tuple((r, 64) for r in ranks))
+    flows = [MessageFlow(i, j, 64) for i in ranks for j in ranks if i != j]
+    direct = topo_dp.joint_plan(exchange(192), {0: 192}, algorithm="direct_peer", transport=opts)
+    outcomes = []
+    for start in (direct.start_participants, topo_dp.transport_plan(flows, transport=opts).start):
+        eng = Engine(topo_dp.resources())
+        start(eng, "tx", {i: eng.submit(str(i)) for i in ranks})
+        eng.advance()
+        outcomes.append((len(eng.pools), eng.now))
+    assert outcomes == [(4, 33.0), (4, 33.0)]
+
+    # 2. Compact repeated MessageFlow(messages=2) reserves credits and charges per-message startup.
+    topo_rep = per_pair_topology(2, capacity=64)
+    rep_outcomes = []
+    for flow_list in ([MessageFlow(0, 1, 64, 2)], [MessageFlow(0, 1, 64), MessageFlow(0, 1, 64)]):
+        plan = topo_rep.transport_plan(flow_list, chunk_bytes=64, hop_startup_us=1000.0, receive_capacity_bytes=64)
+        eng = Engine(plan.resources())
+        run = plan.start(eng, "tx", {i: eng.submit(str(i)) for i in plan.ranks})
+        eng.advance()
+        rep_outcomes.append((max(ev.time for ev in run.completions), sum(eng.serviced.values())))
+    assert rep_outcomes == [(4.0, 128.0), (4.0, 128.0)]
+
+    # 3. Shared receive pools avoid whole-message deadlock and honor receive_buffer_ids with per-peer capacity.
+    from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
+
+    raw_deadlock = case(tp=3)
+    raw_deadlock["model"].update(num_heads=6, num_kv_heads=6, hidden_size=96, head_dim=16)
+    raw_deadlock["machine"]["links"] = [
+        {"name": "l02", "members": [0, 2], "semantics": "per_pair", "capacity_bytes_per_ms": 64},
+        {"name": "l12", "members": [1, 2], "semantics": "per_pair", "capacity_bytes_per_ms": 64},
+    ]
+    topo_dl = topology(raw_deadlock)
+    pt_dl = PeerTraffic.from_mapping({"kind": "matrix", "payload_bytes": ((0, 0, 128), (0, 0, 128), (0, 0, 0))}, 3)
+    grp_dl = DirectPeerGroup((0, 1, 2), ((0, 128.0), (1, 128.0), (2, 0.0)), 1, topo_dl,
+                             peer_traffic=pt_dl, chunk_bytes=64, receive_capacity_bytes=((2, 128.0),))
+    eng_dl = Engine(topo_dl.resources())
+    rel_dl = (eng_dl.submit("rel0", release=3.0), eng_dl.submit("rel1", release=6.0))
+    done_dl = grp_dl.start_participants(eng_dl, "dl", {r: eng_dl.submit(f"r{r}") for r in (0, 1, 2)}, release_events={2: rel_dl})
+    eng_dl.advance(until=tuple(done_dl.values()) + rel_dl, first=False)
+    assert all(ev.done for ev in done_dl.values()) and done_dl[2].time == pytest.approx(5.0)
+    grp_buf = DirectPeerGroup((0, 1, 2), ((0, 64.0), (1, 64.0), (2, 0.0)), 1, topo_dl,
+                              peer_traffic=pt_dl, chunk_bytes=64, receive_capacity_bytes_per_peer=64,
+                              receive_buffer_ids=((2, "buf"),))
+    assert grp_buf._receive_pool_spec(0, 2) == grp_buf._receive_pool_spec(1, 2) == (64.0, "transport:rx:buf")
+
+    # 4. Mixed unframed and framed hops on a shared port publish wire bytes without TypeError.
+    raw_mix = case(tp=4)
+    raw_mix["machine"]["links"] = [
+        {"name": "a", "members": [0, 1], "semantics": "per_pair", "capacity_bytes_per_ms": 64, "endpoint_ids": {"0": "nic"}},
+        {"name": "b", "members": [0, 2, 3], "semantics": "per_pair", "capacity_bytes_per_ms": 64, "endpoint_ids": {"0": "nic"}, "transaction_bytes": 64},
+    ]
+    topo_mix = topology(raw_mix)
+    op_mix = exchange(192)
+    for alg in ("pairwise", "oneshot"):
+        plan = topo_mix.joint_plan(op_mix, {0: 192}, algorithm=alg)
+        eng = Engine(topo_mix.resources())
+        plan.start(eng, alg, eng.submit("ready"))
+        eng.advance()
+        actual = sum(v for k, v in eng.serviced.items() if ":pair" in k)
+        assert topo_mix.accounting(op_mix, 0).physical_wire_bytes == pytest.approx(actual) == pytest.approx(1024.0)

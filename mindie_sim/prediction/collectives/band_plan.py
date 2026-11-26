@@ -191,6 +191,13 @@ def _integer_peer_row(raw_row: Sequence[float], row_idx: int) -> tuple[int, ...]
     return tuple(result)
 
 
+def _snap_integral(value: float) -> float:
+    nearest = round(value)
+    if math.isclose(value, nearest, rel_tol=1e-12, abs_tol=1e-9):
+        return float(nearest)
+    return float(value)
+
+
 def api_bytes_from_link_volume(
     family: str, group_size: int, link_bytes: float, metadata: Mapping | None = None
 ) -> float:
@@ -201,11 +208,11 @@ def api_bytes_from_link_volume(
     if vol <= 0.0 or group_size <= 1:
         return 0.0
     if family == "allreduce":
-        return vol * float(group_size) / float(TWO_PHASES * (group_size - 1))
+        return _snap_integral(vol * float(group_size) / float(TWO_PHASES * (group_size - 1)))
     if family in {"reduce_scatter", "alltoall"}:
-        return vol * float(group_size) / float(group_size - 1)
+        return _snap_integral(vol * float(group_size) / float(group_size - 1))
     if family == "allgather":
-        return vol / float(group_size - 1)
+        return _snap_integral(vol / float(group_size - 1))
     return vol
 
 
@@ -378,31 +385,54 @@ class BandCollectivePlan:
         *,
         available_resources: Mapping[str, object] | frozenset[str] | set[str],
     ) -> BandCollectivePlan | None:
-        """Retain local-rank transfers and HBM staging on an isolated engine."""
+        """Retain local-rank/relay transfers and member HBM staging on an isolated engine."""
         scoped_groups: list[BandCollectiveGroup] = []
         for group in self.groups:
-            if not (set(group.ranks) & local_ranks):
-                continue
+            has_member = bool(set(group.ranks) & local_ranks)
             lowered = group.lowered
             scoped_phases = []
             for phase in lowered.phases:
-                chosen = [
-                    t for t in phase.transfers
-                    if t.source in local_ranks or t.destination in local_ranks
-                ]
                 kept_transfers = []
-                for transfer in chosen:
+                for transfer in phase.transfers:
+                    endpoint_local = (
+                        transfer.source in local_ranks
+                        or transfer.destination in local_ranks
+                    )
                     kept_hops = []
                     for hop in transfer.hops:
+                        if not (
+                            endpoint_local
+                            or hop.source in local_ranks
+                            or hop.destination in local_ranks
+                        ):
+                            continue
                         res = tuple(r for r in hop.resources if r in available_resources)
                         if res:
                             kept_hops.append(replace(hop, resources=res))
                     if kept_hops:
-                        kept_transfers.append(replace(transfer, hops=tuple(kept_hops)))
+                        orig_has_per_hop = any(
+                            h.flow_cap_bytes_per_ms is not None for h in transfer.hops
+                        )
+                        kept_caps = [
+                            h.flow_cap_bytes_per_ms for h in kept_hops
+                            if h.flow_cap_bytes_per_ms is not None
+                        ]
+                        kept_cap = (
+                            min(kept_caps) if kept_caps
+                            else (None if orig_has_per_hop else transfer.flow_cap_bytes_per_ms)
+                        )
+                        kept_transfers.append(replace(
+                            transfer,
+                            hops=tuple(kept_hops),
+                            flow_cap_bytes_per_ms=kept_cap,
+                        ))
                 scoped_phases.append(replace(phase, transfers=tuple(kept_transfers)))
-            scoped_groups.append(
-                replace(group, lowered=_with_recomputed_phases(lowered, scoped_phases))
-            )
+            if not has_member and not any(p.transfers for p in scoped_phases):
+                continue
+            scoped_lowered = _with_recomputed_phases(lowered, scoped_phases)
+            if not has_member:
+                scoped_lowered = replace(scoped_lowered, local_hbm_bytes_per_rank=0.0)
+            scoped_groups.append(replace(group, lowered=scoped_lowered))
         if not scoped_groups:
             return None
         return replace(self, groups=tuple(scoped_groups))
@@ -614,13 +644,14 @@ def _lower_group_with_sibling_fallback(
     communicator_id: str,
     coset_id: str,
     allow_sibling_fallback: bool,
+    dtype: str | None = None,
 ) -> LoweredCollective:
     del allow_sibling_fallback
     return lower_collective(
         family, ranks, topology, api_bytes,
         stack=stack, expansion_mode=expansion_mode,
         peer_matrix=peer_matrix, send_splits=send_splits, recv_splits=recv_splits,
-        communicator_id=communicator_id, coset_id=coset_id,
+        communicator_id=communicator_id, coset_id=coset_id, dtype=dtype,
     )
 
 
@@ -634,9 +665,11 @@ def build_band_collective_plan(
     peer=None,
     stack: str = "default",
     expansion_mode: str | None = None,
+    dtype: str | None = None,
 ) -> BandCollectivePlan:
     """Lower all groups in a cohort through ``lower_collective`` into one plan."""
     stack = str(metadata.get("collective_stack", stack) or stack)
+    resolved_dtype = dtype or metadata.get("dtype") or metadata.get("payload_dtype")
     multi_group = len(unique_groups) > 1
     groups: list[BandCollectiveGroup] = []
     for idx, ranks in enumerate(unique_groups):
@@ -676,6 +709,7 @@ def build_band_collective_plan(
                 communicator_id=str(metadata.get("collective_id", "")),
                 coset_id=f"g{idx}",
                 allow_sibling_fallback=multi_group,
+                dtype=resolved_dtype,
             )
         else:
             volumes = {rank: volume_by_rank[rank] for rank in ranks}
@@ -706,6 +740,7 @@ def build_band_collective_plan(
                     communicator_id=str(metadata.get("collective_id", "")),
                     coset_id=f"g{idx}",
                     allow_sibling_fallback=multi_group,
+                    dtype=resolved_dtype,
                 )
             else:
                 vol = next(iter(volumes.values()), 0.0)
@@ -716,6 +751,7 @@ def build_band_collective_plan(
                     communicator_id=str(metadata.get("collective_id", "")),
                     coset_id=f"g{idx}",
                     allow_sibling_fallback=multi_group,
+                    dtype=resolved_dtype,
                 )
         groups.append(BandCollectiveGroup(ranks=ranks, lowered=lowered, topology=topology))
     return BandCollectivePlan(family=family, groups=tuple(groups), topology=topology)

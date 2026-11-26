@@ -133,34 +133,50 @@ def _mesh(ranks, wire):
     return tuple(tuple(0 if i == j else wire for j in range(ranks)) for i in range(ranks))
 
 
-def _producer_fragment_bytes(selection, count):
+def _producer_lane_fragments(selection, count, rank=0):
     r, n, width = selection.ranks, selection.payload_bytes, selection.dtype_bytes
     usable = count // r * r
     cut = (usable - r) // r
     sizes = tuple(_partition(part, cut) for part in _partition(n // width, r))
-    return tuple(size * width for group in sizes for size in group if size)
+    return cut, tuple(
+        tuple(sizes[(idx + rank) % r][lane] * width
+              for idx in range(r) if sizes[(idx + rank) % r][lane])
+        for lane in range(cut)
+    )
 
 
-def _phase_specs(owner_jobs, selection, count, details):
+def _phase_specs(owner_jobs, selection, count, details, rank=0):
     """Emit causally ordered flag and payload phases without coalescing transfers."""
     r, n = selection.ranks, selection.payload_bytes
     specs = [('precopy', (), owner_jobs['precopy'], (), 'send')]
     if details['branch'] == 'producer_consumer':
-        # Producer-consumer (aiv_all_gather_mesh_1d.h:104-145): consumers poll
-        # each peer's fragment flag via WaitFlag(targetRank) and pull each
-        # positive fragment via GetGmIn(targetRank) — both are remote reads.
-        flag_names = []
-        copy_names = []
-        for idx, frag_bytes in enumerate(_producer_fragment_bytes(selection, count)):
-            flag_name = f'gather_ready_{idx}'
-            copy_name = f'gather_copy_{idx}'
-            specs.append((flag_name, ('precopy',), {}, _mesh(r, FLAG_BYTES), 'read'))
-            specs.append((copy_name, (flag_name,), {}, _mesh(r, frag_bytes), 'read'))
-            flag_names.append(flag_name)
-            copy_names.append(copy_name)
-        gather_after = tuple(flag_names) if flag_names else ('precopy',)
-        specs.append(('gather', gather_after, owner_jobs['gather'], (), 'send'))
-        tail = ('gather', *copy_names)
+        # Producer-consumer (aiv_all_gather_mesh_1d.h:66-114): each consumer
+        # lane waits for a fragment flag, copies the fragment locally and over
+        # the fabric, and finishes its local copy before polling the next flag.
+        cut, lane_table = _producer_lane_fragments(selection, count, rank)
+        lane_tails = []
+        idx = 0
+        for lane, lane_frags in enumerate(lane_table):
+            prev = 'precopy'
+            lane_owners = tuple(r + peer * cut + lane for peer in range(r))
+            for step, frag_bytes in enumerate(lane_frags):
+                flag_name = f'gather_ready_{idx}'
+                copy_name = f'gather_copy_{idx}'
+                wait_owners = {
+                    owner: (owner_jobs['gather'][owner][2 * step],)
+                    for owner in lane_owners
+                }
+                copy_owners = {
+                    owner: (owner_jobs['gather'][owner][2 * step + 1],)
+                    for owner in lane_owners
+                }
+                specs.append((flag_name, (prev,), wait_owners, _mesh(r, FLAG_BYTES), 'read'))
+                specs.append((copy_name, (flag_name,), copy_owners, _mesh(r, frag_bytes), 'read'))
+                prev = copy_name
+                idx += 1
+            if prev != 'precopy':
+                lane_tails.append(prev)
+        tail = tuple(lane_tails) if lane_tails else ('precopy',)
     else:
         # RunCtrlCore (aiv_all_gather_mesh_1d.h:168-184): readiness write,
         # remote payload read, ack write, and post-arrival ack wait are
@@ -211,7 +227,9 @@ def contract(selection, available, rank=0):
     owner_jobs, count, details = jobs(selection,available,rank)
     n = selection.payload_bytes
     phases, all_counts = [], {}
-    for name, after, owners, exchange, direction in _phase_specs(owner_jobs, selection, count, details):
+    for name, after, owners, exchange, direction in _phase_specs(
+        owner_jobs, selection, count, details, rank
+    ):
         demand, counts = {}, {}
         for actions in owners.values():
             for action in actions:
@@ -241,12 +259,13 @@ def build(op, geometry):
     raw = dict(op.metadata)['hccl_phase']
     selection = HcclSelection(**raw['selection'])
     units = geometry.resource_units.get('vector',geometry.compute_units)
-    owner_jobs,count,details = jobs(selection,units,raw.get('rank',0))
+    rank = raw.get('rank', 0)
+    owner_jobs, count, details = jobs(selection, units, rank)
     phase_owners = {
         name: owners
-        for name, _, owners, _, _ in _phase_specs(owner_jobs, selection, count, details)
+        for name, _, owners, _, _ in _phase_specs(owner_jobs, selection, count, details, rank)
     }
-    plan = contract(selection,units,raw.get('rank',0))
+    plan = contract(selection, units, rank)
     phase = next(p for p in plan.phases if p.name == raw['phase'])
     selected = phase_owners[phase.name]
     if geometry.buffers.get('ub',0) < UB_RESIDENCY:
