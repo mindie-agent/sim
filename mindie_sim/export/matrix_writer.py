@@ -131,13 +131,16 @@ HW_NOMINAL_COLUMNS: tuple[str, ...] = (
     "L2 Cache(MiB)",
     "UB per Core(KiB)",
     "Nominal Clock(MHz)",
-    "BF16 Cube Peak(TFLOPS)",
+    "Nominal Cube Peak(TFLOPS)",
+    "Nominal Vector Peak(TFLOPS)",
+    "Nominal Total Peak Cube+Vector(TFLOPS)",
     "INT8 Cube Peak(TOPS)",
     "FP8 Cube Peak(TFLOPS)",
-    "Vector Peak(TOPS)",
+    "Vector FP32 Lane Peak(TOPS)",
     "HBM Peak(GB/s)",
     "Intra-Node Link Peak(GB/s)",
     "BF16 Cube Peak(FLOPs/s)",
+    "HF32 Cube Peak(FLOPs/s)",
     "FP32 Cube Peak(FLOPs/s)",
     "INT8 Cube Peak(Ops/s)",
     "FP8 Cube Peak(FLOPs/s)",
@@ -246,6 +249,10 @@ _KIB_FLOAT = 1024.0
 _TERA_FLOAT = 1e12
 _US_PER_MS = 1000.0
 _MAX_SCAN_BYTES = 64 * 1024 * 1024
+# Datasheet FP16/BF16 Vector FMA peak = 8x unified FP32 single-instruction lane rate
+# (2x full-register width * 2x FP16-vs-FP32 lane packing * 2 FLOPs/FMA).
+_VECTOR_FP16_FMA_PER_FP32_LANE = 8.0
+_PEAK_TFLOPS_DECIMALS = 4
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _PRIVATE_PATH_RE = re.compile(
@@ -457,10 +464,20 @@ def assert_zero_internal_jargon(bundle_dir: str | Path) -> None:
 def _nominal_spec_row(spec: HardwareNominalSpec) -> list[Any]:
     bf16_flops = spec.cube_peaks_flops_per_s.get("bf16", spec.cube_peaks_flops_per_s.get("fp16", 0.0))
     fp32_flops = spec.cube_peaks_flops_per_s.get("fp32", spec.cube_peaks_flops_per_s.get("hf32", 0.0))
+    hf32_flops = spec.cube_peaks_flops_per_s.get("hf32", fp32_flops)
     int8_ops = spec.cube_peaks_flops_per_s.get("int8", 0.0)
-    fp8_flops = spec.cube_peaks_flops_per_s.get("fp8_e4m3", spec.cube_peaks_flops_per_s.get("mxfp8", 0.0))
-    int4_ops = spec.cube_peaks_flops_per_s.get("int4", spec.cube_peaks_flops_per_s.get("mxfp4", 0.0))
-    sio_b_s = spec.raw_link_peaks_bytes_per_s.get("d2d_intra_pkg", spec.raw_link_peaks_bytes_per_s.get("sio", 0.0))
+    fp8_flops = spec.cube_peaks_flops_per_s.get(
+        "fp8_e4m3", spec.cube_peaks_flops_per_s.get("mxfp8", spec.cube_peaks_flops_per_s.get("hifloat8", 0.0)),
+    )
+    int4_ops = spec.cube_peaks_flops_per_s.get(
+        "int4", spec.cube_peaks_flops_per_s.get("mxfp4", spec.cube_peaks_flops_per_s.get("fp4_e2m1", 0.0)),
+    )
+    vec_fma_flops = float(spec.vector_peak_ops_per_s) * _VECTOR_FP16_FMA_PER_FP32_LANE
+    total_cube_vec_flops = float(bf16_flops) + vec_fma_flops
+    sio_b_s = spec.raw_link_peaks_bytes_per_s.get(
+        "d2d_intra_package",
+        spec.raw_link_peaks_bytes_per_s.get("d2d_intra_pkg", spec.raw_link_peaks_bytes_per_s.get("sio", 0.0)),
+    )
     link_b_s = spec.raw_link_peaks_bytes_per_s.get(
         "d2d_intra_node", next(iter(spec.raw_link_peaks_bytes_per_s.values()), 0.0),
     )
@@ -477,13 +494,16 @@ def _nominal_spec_row(spec: HardwareNominalSpec) -> list[Any]:
         round(float(spec.l2_capacity_bytes) / _MIB_FLOAT, 2),
         round(float(spec.ub_capacity_bytes) / _KIB_FLOAT, 2),
         round(float(spec.nominal_clock_mhz), 2),
-        round(bf16_flops / _TERA_FLOAT, 3),
+        round(float(bf16_flops) / _TERA_FLOAT, _PEAK_TFLOPS_DECIMALS),
+        round(vec_fma_flops / _TERA_FLOAT, _PEAK_TFLOPS_DECIMALS),
+        round(total_cube_vec_flops / _TERA_FLOAT, _PEAK_TFLOPS_DECIMALS),
         round(int8_ops / _TERA_FLOAT, 3),
         round(fp8_flops / _TERA_FLOAT, 3),
         round(float(spec.vector_peak_ops_per_s) / _TERA_FLOAT, 3),
         round(float(spec.hbm_peak_bytes_per_s) / BYTES_PER_GB, 2),
         round(link_b_s / BYTES_PER_GB, 2),
         float(bf16_flops),
+        float(hf32_flops),
         float(fp32_flops),
         float(int8_ops),
         float(fp8_flops),
@@ -741,6 +761,27 @@ def _populate_table_sheet(
                 ws.set_cell(row_offset, col_idx, str(val), style=STYLE_TEXT)
 
 
+def _populate_hardware_nominal_sheet(
+    ws: Worksheet, nominal_rows: Sequence[Sequence[Any]],
+) -> None:
+    _populate_table_sheet(ws, HW_NOMINAL_COLUMNS, nominal_rows)
+    cube_idx = HW_NOMINAL_COLUMNS.index("Nominal Cube Peak(TFLOPS)") + 1
+    vec_idx = HW_NOMINAL_COLUMNS.index("Nominal Vector Peak(TFLOPS)") + 1
+    tot_idx = HW_NOMINAL_COLUMNS.index("Nominal Total Peak Cube+Vector(TFLOPS)") + 1
+    cube_col = column_letter(cube_idx)
+    vec_col = column_letter(vec_idx)
+    for r_idx, row in enumerate(nominal_rows, start=2):
+        ws.set_cell(r_idx, cube_idx, row[cube_idx - 1], style=STYLE_FLOAT2)
+        ws.set_cell(r_idx, vec_idx, row[vec_idx - 1], style=STYLE_FLOAT2)
+        ws.set_cell(
+            r_idx,
+            tot_idx,
+            row[tot_idx - 1],
+            formula=f"={cube_col}{r_idx}+{vec_col}{r_idx}",
+            style=STYLE_FLOAT2,
+        )
+
+
 def _write_executive_summary_xlsx(
     path: Path,
     nominal_rows: Sequence[Sequence[Any]],
@@ -755,7 +796,7 @@ def _write_executive_summary_xlsx(
         if row[adm_col - 1] == "No":
             ws_step.set_cell(r_idx, adm_col, "No", style=STYLE_ALERT_HIGH)
     ws_hw = wb.create_sheet("Hardware_Nominal_Specs")
-    _populate_table_sheet(ws_hw, HW_NOMINAL_COLUMNS, nominal_rows)
+    _populate_hardware_nominal_sheet(ws_hw, nominal_rows)
     ws_cat = wb.create_sheet("Unique_Kernel_Catalog")
     _populate_table_sheet(ws_cat, CATALOG_COLUMNS, catalog_rows)
     wb.save(path)
@@ -779,7 +820,7 @@ def _write_model_operator_breakdown_xlsx(
     wb = Workbook()
     # Sheet 1: Hardware_Nominal_Specs (un-derated datasheet denominators)
     ws_hw = wb.create_sheet("Hardware_Nominal_Specs")
-    _populate_table_sheet(ws_hw, HW_NOMINAL_COLUMNS, nominal_rows)
+    _populate_hardware_nominal_sheet(ws_hw, nominal_rows)
     hw_last_row = max(2, len(nominal_rows) + 1)
 
     # Sheet 2: Step_Summary
@@ -806,6 +847,7 @@ def _write_model_operator_breakdown_xlsx(
 
     hw_sku_rng = _hw_col_range("Hardware SKU", hw_last_row)
     hw_bf16_rng = _hw_col_range("BF16 Cube Peak(FLOPs/s)", hw_last_row)
+    hw_hf32_rng = _hw_col_range("HF32 Cube Peak(FLOPs/s)", hw_last_row)
     hw_fp32_rng = _hw_col_range("FP32 Cube Peak(FLOPs/s)", hw_last_row)
     hw_int8_rng = _hw_col_range("INT8 Cube Peak(Ops/s)", hw_last_row)
     hw_fp8_rng = _hw_col_range("FP8 Cube Peak(FLOPs/s)", hw_last_row)
@@ -820,13 +862,15 @@ def _write_model_operator_breakdown_xlsx(
         vals = _outward_op_row_values(op_row, multi_stage=multi_stage)
         sku_match = f"MATCH({sku_col}{r_num},{hw_sku_rng},0)"
         dtype_low = str(op_row.cube_dtype or "bf16").strip().lower()
-        if dtype_low in {"fp32", "float32", "hf32"}:
+        if dtype_low == "hf32":
+            cube_rng = hw_hf32_rng
+        elif dtype_low in {"fp32", "float32"}:
             cube_rng = hw_fp32_rng
         elif dtype_low in {"int4", "fp4", "fp4_e2m1", "mxfp4", "mxfp4_e2m1"}:
             cube_rng = hw_int4_rng
         elif dtype_low in {"int8", "w8a8", "w4a8"}:
             cube_rng = hw_int8_rng
-        elif dtype_low.startswith(("fp8", "mxfp8", "w8a8_fp8")):
+        elif dtype_low.startswith(("fp8", "mxfp8", "w8a8_fp8", "hif8", "hifloat8")):
             cube_rng = hw_fp8_rng
         else:
             cube_rng = hw_bf16_rng
@@ -834,7 +878,7 @@ def _write_model_operator_breakdown_xlsx(
         vec_peak_expr = f"INDEX({hw_vec_rng},{sku_match})"
         hbm_peak_expr = f"INDEX({hw_hbm_rng},{sku_match})"
         tier_low = str(op_row.link_tier or "").lower()
-        if "sio" in tier_low or "intra_pkg" in tier_low:
+        if "sio" in tier_low or "intra_pkg" in tier_low or "intra_package" in tier_low:
             link_rng = hw_sio_rng
         elif "inter" in tier_low or "roce" in tier_low:
             link_rng = hw_inter_rng
@@ -965,18 +1009,28 @@ def _render_readme_md(
         "",
         "## Hardware Nominal Datasheet Specifications (Un-Derated, Utilization = 1.0)",
         "",
-        "| Hardware SKU | Arch | AIC | AIV | HBM (GiB) | L2 (MiB) | UB (KiB) | Clock (MHz) | BF16 (TFLOPS) | INT8 (TOPS) | FP8 (TFLOPS) | Vector (TOPS) | HBM Peak (GB/s) | Intra-Node Link (GB/s) |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Hardware SKU | Arch | AIC | AIV | HBM (GiB) | L2 (MiB) | UB (KiB) | Clock (MHz) | Nominal Cube Peak (TFLOPS) | Nominal Vector Peak (TFLOPS) | Nominal Total Peak Cube+Vector (TFLOPS) | INT8 Cube (TOPS) | FP8 Cube (TFLOPS) | HBM Peak (GB/s) | Intra-Node Link (GB/s) |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
+    hw_idx = {name: i for i, name in enumerate(HW_NOMINAL_COLUMNS)}
     for nr in nominal_rows:
         lines.append(
-            f"| {nr[0]} | {nr[1]} | {nr[2]} | {nr[3]} | {nr[4]} | {nr[5]} | {nr[6]} | {nr[7]} | "
-            f"{nr[8]} | {nr[9]} | {nr[10]} | {nr[11]} | {nr[12]} | {nr[13]} |"
+            f"| {nr[hw_idx['Hardware SKU']]} | {nr[hw_idx['Architecture']]} | {nr[hw_idx['AIC Cores']]} | "
+            f"{nr[hw_idx['AIV Cores']]} | {nr[hw_idx['HBM Capacity(GiB)']]} | {nr[hw_idx['L2 Cache(MiB)']]} | "
+            f"{nr[hw_idx['UB per Core(KiB)']]} | {nr[hw_idx['Nominal Clock(MHz)']]} | "
+            f"{float(nr[hw_idx['Nominal Cube Peak(TFLOPS)']]):.2f} | "
+            f"{float(nr[hw_idx['Nominal Vector Peak(TFLOPS)']]):.2f} | "
+            f"{float(nr[hw_idx['Nominal Total Peak Cube+Vector(TFLOPS)']]):.2f} | "
+            f"{nr[hw_idx['INT8 Cube Peak(TOPS)']]} | {nr[hw_idx['FP8 Cube Peak(TFLOPS)']]} | "
+            f"{nr[hw_idx['HBM Peak(GB/s)']]} | {nr[hw_idx['Intra-Node Link Peak(GB/s)']]} |"
         )
     lines.extend([
         "",
         "## Roofline, MFU & MBU Definitions",
         "",
+        "- **Nominal Cube Peak(TFLOPS)**: Pure BF16/FP16 Cube matrix peak (`AIC` units only); used as `P_cube_nominal` for Cube Roofline and `MFU(%)`.",
+        "- **Nominal Vector Peak(TFLOPS)**: Full-register FP16/BF16 Vector FMA peak (`AIV` units only, `8x` unified FP32 single-instruction lane rate `Vector Peak(Ops/s)`); Vector Roofline uses pure Vector Peak (`P_vec_nominal`), never combined `Cube + Vector`.",
+        "- **Nominal Total Peak Cube+Vector(TFLOPS)**: `Nominal Cube Peak(TFLOPS) + Nominal Vector Peak(TFLOPS)`, reconciling pure unit peaks to headline Ascend datasheet totals (for example, `432.54 + 54.07 = 486.60 TFLOPS` on `Ascend950DT_9582` at `1650 MHz`, `270.34 + 16.90 = 287.23 TFLOPS` on `Ascend910B4-1` / `Ascend910_9362` at `1650 MHz`, `313.34 TFLOPS` on `Ascend910B3`, and `376.01 TFLOPS` on `Ascend910B2`).",
         "- **Theoretical Roofline(us)**: `max(FLOPs / P_cube_nominal, VectorOps / P_vec_nominal, (HBM_Read + HBM_Write) / B_hbm_nominal, CommBytes / B_link_raw_nominal) * 1e6` using strictly un-derated nominal datasheet peaks (`utilization = 1.0, launch_us = 0`).",
         "- **MFU(%)**: `FLOPs / (Duration_s * P_cube_nominal) * 100`.",
         "- **HBM Bandwidth Utilization(%)**: `(HBM_Read + HBM_Write) / (Duration_s * B_hbm_nominal) * 100` (physical HBM DQ pin throughput matching `msprof`).",
