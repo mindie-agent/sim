@@ -30,7 +30,9 @@ FORMATS = {"torch.bfloat16": "bf16", "bfloat16": "bf16",
            "torch.float32": "fp32", "float32": "fp32"}
 
 
-def resolve_compressed_int4(raw, base, *, has_mla: bool = False, has_kda: bool = False):
+def resolve_compressed_int4(
+    raw, base, *, has_mla: bool = False, has_kda: bool = False, num_experts: int = 0,
+):
     """Return a W4A16/W4A8 plan, or ``None`` when the descriptor is not exact."""
     from .hf_config import resolve_indexed_layer_exclusions, resolve_role_exclusions
     if raw.get("format") != "pack-quantized":
@@ -68,6 +70,7 @@ def resolve_compressed_int4(raw, base, *, has_mla: bool = False, has_kda: bool =
         native=base.native_format,
         has_mla=has_mla,
         has_kda=has_kda,
+        num_experts=num_experts,
     )
     categories = list(NATIVE_ROLES)
     for pattern in remaining_ignores:

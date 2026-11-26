@@ -5189,8 +5189,8 @@
     },
     "minimax-m3.1-flash": {
       "auxiliary_modes": {
-        "kind": "mtp",
-        "layers": 7,
+        "kind": "dspark",
+        "layers": 5,
         "standalone": false
       },
       "builder": "minimax_m3",
@@ -5336,7 +5336,7 @@
         "window": 0
       },
       "config": "mindie_sim/catalog/configs/minimax-m3.1-flash.json",
-      "config_sha256": "b013b928b8d4127a3ad0ae90caa74b3ec0069fc32e8b97e09b061a3b7a5bea1a",
+      "config_sha256": "c2073c4919b6f563f48612409987910b992fbb4bf22418e6a5ea8c1c654b0734",
       "family": "minimax_m3",
       "parameter_scope": "text_backbone",
       "quantization": {

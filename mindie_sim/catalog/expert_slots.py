@@ -155,11 +155,28 @@ def expert_slot_plan(
     ids_by_rank_list: list[tuple[int, ...]] = []
     base_ids_list: list[tuple[int, ...]] = []
     redundant_ids_list: list[tuple[int, ...]] = []
+    raw_base_by_rank = [
+        _base_ids(rank, base_count, experts, ep, padded=padded_base)
+        for rank, base_count in enumerate(base)
+    ]
+    copy_counts = [ZERO] * experts
+    for ids in raw_base_by_rank:
+        for eid in ids:
+            copy_counts[eid] += ONE
     for rank, base_count in enumerate(base):
-        base_ids = _base_ids(rank, base_count, experts, ep, padded=padded_base)
+        base_ids = raw_base_by_rank[rank]
         base_set = set(base_ids)
-        candidates = [expert for expert in range(experts) if expert not in base_set]
-        extra_ids = tuple(candidates[:extra_total])
+        if extra_total > ZERO:
+            start = (int(rank) * int(base_count) + int(base_count)) % experts
+            candidates = sorted(
+                (eid for eid in range(experts) if eid not in base_set),
+                key=lambda eid: (copy_counts[eid], (eid - start) % experts),
+            )
+            extra_ids = tuple(candidates[:extra_total])
+            for eid in extra_ids:
+                copy_counts[eid] += ONE
+        else:
+            extra_ids = ()
         base_ids_list.append(tuple(sorted(base_ids)))
         redundant_ids_list.append(extra_ids)
         ids_by_rank_list.append(tuple(sorted((*base_ids, *extra_ids))))

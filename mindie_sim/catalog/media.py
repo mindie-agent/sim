@@ -39,7 +39,6 @@ from mindie_sim.schema.parallel import ParallelSpec
 VISION_NORM_OPS_PER_ELEMENT = 5.0
 VISION_SOFTMAX_OPS_PER_ELEMENT = 5.0
 VISION_ACT_OPS_PER_ELEMENT = 4.0
-VISION_FP32_SCORE_BYTES = 4.0
 VISION_QKV_PROJECTIONS = 3
 
 
@@ -63,15 +62,19 @@ def media_geometry(
     frames = max(1, int(meta.get("media_frames", 1) or 1))
     patch = max(1, int(vision.patch_size))
     temporal = max(1, int(vision.temporal_patch))
+    frame_groups = max(1, math.ceil(frames / temporal))
     if height > 0 and width > 0:
         grid_h = max(1, height // patch)
         grid_w = max(1, width // patch)
-        frame_groups = max(1, math.ceil(frames / temporal))
         return grid_h * grid_w * frame_groups, grid_h, grid_w, frames
     media_tokens = int(
         getattr(runtime, "media_tokens", 0) if media_tokens is None else media_tokens
     )
-    patch_tokens = vision.patch_tokens_for_media(media_tokens) if media_tokens else 0
+    if not media_tokens:
+        return 0, 0, 0, frames
+    patch_tokens = vision.patch_tokens_for_media(media_tokens)
+    if _uses_spatial_temporal_tpool(vision):
+        patch_tokens *= frame_groups
     return patch_tokens, 0, 0, frames
 
 
@@ -141,6 +144,10 @@ def _post_merge_positions(
 ) -> int:
     """Post-merge language token positions honoring per-axis spatial padding and tpool."""
     if grid_h <= 0 or grid_w <= 0:
+        if _uses_spatial_temporal_tpool(vision):
+            temporal = max(1, int(vision.temporal_patch))
+            frame_groups = max(1, math.ceil(max(1, int(frames)) / temporal))
+            return vision.merged_tokens(math.ceil(patch_tokens / frame_groups))
         return vision.merged_tokens(patch_tokens)
     temporal = max(1, int(vision.temporal_patch))
     merged_groups = (
@@ -220,13 +227,13 @@ def _lower_vision_layer_attention(
         )
         ordered.append(qkv_bias)
         qkv_ready = qkv_bias.op_id
-    score_bytes = float(score_pairs * local_heads) * VISION_FP32_SCORE_BYTES
     q_bytes = float(patch_tokens * local_query_width) * dtype_bytes(dtype)
     attn_meta = (
         ("attention_group_count", len(seq_lens)),
         ("attention_max_seq_len", attn_k_len),
         ("attention_score_pairs", score_pairs),
         ("attention_seq_lens", seq_lens),
+        ("attention_score_boundary", "fused_on_chip"),
     )
     qk = OpSpec(
         op_id=f"{prefix}.qk", family="attention_qk", phase=mode,
@@ -236,9 +243,9 @@ def _lower_vision_layer_attention(
         padded_shape=(patch_tokens, attn_k_len, local_heads, head_dim),
         launch_shape=(patch_tokens, attn_k_len, local_heads, head_dim),
         flops=2.0 * float(local_heads * score_pairs * head_dim),
-        hbm_bytes=2.0 * q_bytes + score_bytes,
+        hbm_bytes=2.0 * q_bytes,
         mte2_bytes=2.0 * q_bytes,
-        mte3_bytes=score_bytes,
+        mte3_bytes=0.0,
         deps=(qkv_ready,), recipe="catalog_vision_qk", dtype=dtype,
         metadata=attn_meta,
     )
@@ -247,6 +254,7 @@ def _lower_vision_layer_attention(
         requests=requests, elements=max(1, score_pairs * local_heads),
         ops_per_element=VISION_SOFTMAX_OPS_PER_ELEMENT, dtype="fp32",
         family="attention_softmax", phase=mode, recipe="catalog_vision_softmax",
+        read_bytes_override=0.0, write_bytes_override=0.0, hbm_bytes_override=0.0,
         metadata=attn_meta,
     )
     pv = OpSpec(
@@ -257,8 +265,8 @@ def _lower_vision_layer_attention(
         padded_shape=(patch_tokens, attn_k_len, local_heads, head_dim),
         launch_shape=(patch_tokens, attn_k_len, local_heads, head_dim),
         flops=2.0 * float(local_heads * score_pairs * head_dim),
-        hbm_bytes=2.0 * q_bytes + score_bytes,
-        mte2_bytes=q_bytes + score_bytes,
+        hbm_bytes=2.0 * q_bytes,
+        mte2_bytes=q_bytes,
         mte3_bytes=q_bytes,
         deps=(soft.op_id,), recipe="catalog_vision_pv", dtype=dtype,
         metadata=attn_meta,
@@ -760,16 +768,30 @@ def lower_media(
                   ("norm_eps", vision.norm_eps)),
     )
     ops.append(final_norm)
+    merge_in_elems = max(1, patch_tokens * vision.hidden_size)
+    merge_out_elems = max(1, text_positions * vision.aligner_input_width)
+    tpool_reduces = _uses_spatial_temporal_tpool(vision) and merge_in_elems > merge_out_elems
+    merge_dtype_bytes = dtype_bytes(dtype)
+    merge_meta: tuple[tuple[str, Any], ...] = (
+        ("merge_area", vision.merge_area),
+        ("patch_tokens", patch_tokens),
+        ("post_merge_tokens", text_positions),
+    )
+    if tpool_reduces:
+        temporal = max(1, int(vision.temporal_patch))
+        tpool_groups = max(1, math.ceil(max(1, int(frames)) / temporal))
+        merge_meta += (("temporal_pool_groups", tpool_groups),)
     merge = vector_op(
         op_id="vision.merge", deps=(final_norm.op_id,), stage=stage,
         layer=vision.layers, requests=requests,
-        elements=max(1, text_positions * vision.aligner_input_width),
+        elements=max(merge_in_elems, merge_out_elems) if tpool_reduces else merge_out_elems,
         ops_per_element=1.0, dtype=dtype, family="vision_merge", phase=mode,
         recipe="catalog_vision_merge",
-        semantic_family="spatial_merge_concat",
+        semantic_family="temporal_pool_spatial_merge" if tpool_reduces else "spatial_merge_concat",
         shape=(text_positions, vision.aligner_input_width),
-        metadata=(("merge_area", vision.merge_area), ("patch_tokens", patch_tokens),
-                  ("post_merge_tokens", text_positions)),
+        read_bytes_override=float(merge_in_elems) * merge_dtype_bytes if tpool_reduces else None,
+        write_bytes_override=float(merge_out_elems) * merge_dtype_bytes if tpool_reduces else None,
+        metadata=merge_meta,
     )
     ops.append(merge)
     proj_ops, last = _lower_vision_projector(

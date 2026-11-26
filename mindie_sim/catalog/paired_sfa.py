@@ -175,6 +175,37 @@ def _kda_state_page_bytes(plan, shards: int, proposals: int) -> int:
     return int(sp.recurrent_bytes + sp.conv_bytes)
 
 
+def _paired_sfa_phases(case, runtime, explicit_phase: str | None) -> tuple[str | None, ...]:
+    """Resolve active cache-representation phases for paired-SFA page sizing."""
+    if explicit_phase is not None and str(explicit_phase).strip():
+        return (str(explicit_phase).strip().lower(),)
+    scenario = getattr(case, "scenario", None)
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    single_spine = meta.get("single_spine")
+    spine_mode = single_spine.get("deployment_mode", "") if isinstance(single_spine, dict) else ""
+    raw_mode = str(
+        getattr(scenario, "deployment_mode", "")
+        or getattr(runtime, "deployment_mode", "")
+        or meta.get("deployment_role")
+        or meta.get("deployment_mode")
+        or spine_mode
+        or meta.get("pd_role")
+        or ""
+    ).strip().lower()
+    if raw_mode in {"pd_prefill", "prefill", "prefill_only"}:
+        return ("prefill",)
+    if raw_mode in {"pd_decode", "decode", "decode_only"}:
+        return ("decode",)
+    return ("prefill", "decode")
+
+
+def _mla_row_bytes_for_phases(model, plan, phases: tuple[str | None, ...]) -> int:
+    return max(
+        cache_format(model, "mla_kv", plan=plan, phase=ph).row_bytes(plan.cache_row_elements)
+        for ph in phases
+    )
+
+
 def _project_paired_sfa_stage(
     model,
     runtime,
@@ -191,6 +222,7 @@ def _project_paired_sfa_stage(
     draft_kind: str,
     draft_cap: int,
     start_group_id: int,
+    phases: tuple[str | None, ...] = ("prefill", "decode"),
 ):
     from .cache import index_row_bytes, layer_cache_components
 
@@ -235,7 +267,7 @@ def _project_paired_sfa_stage(
         state_width = _ceil_div(len(recurrent), state_groups) if state_groups else 0
         main_slots = max(len(main), state_width)
         index = sum(
-            index_row_bytes(model, plan.index_dim, plan=plan)
+            max(index_row_bytes(model, plan.index_dim, plan=plan, phase=ph) for ph in phases)
             for plan in main if plan.owns_index_k
         )
         rec_pages = state_groups * slots
@@ -324,7 +356,7 @@ def _project_paired_sfa_stage(
     return group_dicts, descriptors, group_id
 
 
-def _paired_sfa_stage_entries(case, layer_stage, query_tokens):
+def _paired_sfa_stage_entries(case, layer_stage, query_tokens, *, phase: str | None = None):
     """Build global paired-SFA membership once and project onto PP stages."""
     model, runtime = case.model, case.runtime
     if dict(model.metadata).get("cache_allocator") != "paired_sfa":
@@ -360,8 +392,9 @@ def _paired_sfa_stage_entries(case, layer_stage, query_tokens):
         if getattr(plan, "index_k_owner_layer_id", -1) >= 0 and plan.index_k_owner_layer_id not in mla_indices:
             raise ModelingError("paired_sfa_index_owner_must_be_mla")
 
+    phases = _paired_sfa_phases(case, runtime, phase)
     rows = {
-        cache_format(model, "mla_kv", plan=plan).row_bytes(plan.cache_row_elements)
+        _mla_row_bytes_for_phases(model, plan, phases)
         for plan in all_main
     }
     if len(rows) != 1:
@@ -392,22 +425,24 @@ def _paired_sfa_stage_entries(case, layer_stage, query_tokens):
             model, runtime, p, stage=stage, plans=plans, main_page=main_page,
             block=block, slots=slots, proposals=proposals,
             query_tokens=query_tokens, draft=draft, draft_kind=draft_kind,
-            draft_cap=draft_cap, start_group_id=group_id,
+            draft_cap=draft_cap, start_group_id=group_id, phases=phases,
         )
         group_dicts.extend(stage_groups)
         descriptors.extend(stage_descs)
     return tuple(group_dicts), tuple(descriptors)
 
 
-def page_groups(case, layer_stage, query_tokens):
+def page_groups(case, layer_stage, query_tokens, *, phase: str | None = None):
     """Use ordinary CachePages, with history IDs plus bounded state IDs."""
-    groups, _ = _paired_sfa_stage_entries(case, layer_stage, query_tokens)
+    groups, _ = _paired_sfa_stage_entries(case, layer_stage, query_tokens, phase=phase)
     return groups
 
 
-def paired_sfa_group_descriptors(case, layer_stage, query_tokens) -> tuple[PairedSfaGroupDescriptor, ...]:
+def paired_sfa_group_descriptors(
+    case, layer_stage, query_tokens, *, phase: str | None = None,
+) -> tuple[PairedSfaGroupDescriptor, ...]:
     """Explicit group, stage, block-table, and overlay descriptors for paired SFA."""
-    _, descriptors = _paired_sfa_stage_entries(case, layer_stage, query_tokens)
+    _, descriptors = _paired_sfa_stage_entries(case, layer_stage, query_tokens, phase=phase)
     return descriptors
 
 
@@ -432,16 +467,15 @@ def minimum_block_size(
     del extra
     if dict(model.metadata).get("cache_allocator") != "paired_sfa":
         return 0
-    if not any(plan.indexer for plan in model.layer_plans):
-        return 0
     normalized = normalize_formats(model)
     main = [plan for plan in normalized.layer_plans if plan.attention == "mla"]
     recurrent = [plan for plan in normalized.layer_plans if plan.attention == "kda"]
     if not main or not recurrent:
         return 0
     row_bytes = min(
-        cache_format(normalized, "mla_kv", plan=plan).row_bytes(plan.cache_row_elements)
+        cache_format(normalized, "mla_kv", plan=plan, phase=ph).row_bytes(plan.cache_row_elements)
         for plan in main
+        for ph in ("prefill", "decode")
     )
     if row_bytes <= 0:
         return 0

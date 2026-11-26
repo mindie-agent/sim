@@ -239,7 +239,7 @@ def _indexed_subpath_categories(
     )
 
 
-_INDEXED_LAYER_EXPERT_RE = re.compile(r"\bexperts\.(\d+)\.")
+_INDEXED_LAYER_EXPERT_RE = re.compile(r"\bexperts\.(\d+)(?:\.|$)")
 
 
 def resolve_indexed_layer_exclusions(
@@ -344,7 +344,8 @@ ALIASES = {
     "n_routed_experts": ("num_routed_experts", "num_local_experts",
                          "num_experts", "moe_num_experts"),
     "num_experts_per_tok": ("top_k", "num_experts_per_token", "moe_top_k",
-                            "top_k_experts"),
+                            "moe_topk", "top_k_experts"),
+    "moe_intermediate_size": ("expert_ffn_hidden_size", "expert_intermediate_size"),
     "n_shared_experts": ("num_shared_experts",),
     "first_k_dense_replace": ("first_k_dense_layers",),
     "shared_expert_intermediate_size": ("shared_intermediate_size", "share_expert_dim"),
@@ -427,7 +428,8 @@ NATIVE_ADAPTER_FIELDS = set("""
 activation_situ_beta activation_situ_linear_beta attn_res_block_size
 candidate_block_size candidate_source_layer_id candidate_topk_blocks compress_ratios
 deepstack_visual_indexes dflash_config downsample_ratio dspark_block_size
-dspark_markov_rank dspark_n_routed_experts dspark_num_experts_per_tok
+dspark_config dspark_ffn_hidden_size dspark_markov_rank dspark_n_routed_experts
+dspark_num_experts_per_tok dspark_num_hidden_layers dspark_sliding_window
 dspark_target_layer_ids enable_confidence_head engram_head_dim engram_layer_ids
 engram_max_ngram_size engram_n_heads engram_num_embeddings engram_pad_token_id
 engram_storage_mode expert_dtype hc_mult hc_sinkhorn_iters image_token_id
@@ -752,9 +754,19 @@ def resolve_quant(c):
     if not raw and weight == native:
         return base, gaps
     has_mla, has_kda = _config_arch_flags(c)
+    num_exp = int(
+        c.get("n_routed_experts")
+        or c.get("num_routed_experts")
+        or c.get("num_local_experts")
+        or c.get("num_experts")
+        or c.get("moe_num_experts")
+        or 0
+    )
     if method == "compressed-tensors":
         from .compressed_int4 import resolve_compressed_int4
-        resolved = resolve_compressed_int4(raw, base, has_mla=has_mla, has_kda=has_kda)
+        resolved = resolve_compressed_int4(
+            raw, base, has_mla=has_mla, has_kda=has_kda, num_experts=num_exp,
+        )
         if resolved is not None:
             return resolved, gaps
     if method == "fp8":
@@ -770,7 +782,6 @@ def resolve_quant(c):
                 gaps.append(f"quant_scale_format_unmodeled:{scale}:{native}_proxy")
                 return base, gaps
             excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
-            num_exp = int(c.get("n_routed_experts") or c.get("num_local_experts") or c.get("num_experts") or 0)
             layer_overrides, global_excluded = resolve_indexed_layer_exclusions(
                 excluded, native=native, has_mla=has_mla, has_kda=has_kda, num_experts=num_exp,
             )
