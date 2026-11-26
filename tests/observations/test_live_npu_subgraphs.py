@@ -676,3 +676,36 @@ def test_exhaustive_bijection_perturbation_every_kernel_and_edge_fails(tmp_path:
                     d.code == "DEPENDENCY_ORDER_MISMATCH" and d.node_id == v_id and u_id in d.detail
                     for d in rep_inv.dag_order_diffs
                 )
+
+
+def test_single_rank_collective_scope_host_api_mismatch_and_fp32_fractal_nz_shape():
+    """Verify single-rank compute leaves collective_group empty, causal parity checks host CANN API, and FP32 FRACTAL_NZ uses C0=8."""
+    from mindie_sim.compose import compose_case
+    import mindie_sim.observations.subgraph_parity as sp
+    from mindie_sim.observations.service_fitting_capture import _validate_matrix_weight
+    from mindie_sim.schema.operators import OpSpec, TensorPrecisionABI
+
+    sku = "Ascend950DT_9582"
+    case = compose_case("glm-5.3-flash", sku, tp=1, dp=1, ep=1, layers=1, quant="bf16", prompt_tokens=8, output_tokens=2)
+    _, nodes = sp.build_predicted_nodes_from_case(case, tokens=1, context=8, sequences=1)
+    assert sum(x.collective_group == "d2d" for x in nodes) == 0
+    n0 = nodes[0]
+    dag_cast = sp.correlate_trace_view_events((
+        dict(ph="s", cat="flow", ts=1, id="1", args=dict(stream_id="0", cann_api=n0.api_or_symbol, vllm_scope=n0.node_id)),
+        dict(ph="X", cat="kernel", name="Cast", ts=2, dur=1, args=dict(flow_id="1", stream_id="0", stream_lane=n0.stream_lane, task_type=n0.task_type, input_shapes=n0.input_shapes)),
+    ))
+    rep_cast = sp.SubgraphParityChecker().compare(signature_id="cast", hardware_sku=sku, device_arch="A5", config_payload=case, observed_dags=(dag_cast,), predicted_nodes=(n0,))
+    assert rep_cast.passed and not rep_cast.all_diffs()
+
+    dag_api = sp.correlate_trace_view_events((
+        dict(ph="s", cat="flow", ts=1, id="1", args=dict(stream_id="0", cann_api="aclnnMlaPrologV4WeightNz", vllm_scope="mla")),
+        dict(ph="X", cat="kernel", name="MlaPrologV3", ts=2, dur=1, args=dict(flow_id="1", stream_id="0", stream_lane="compute", task_type="MIX_AIC")),
+    ))
+    pred_api = sp.PredictedKernelNode("mla", 0, "compute", "MIX_AIC", "aclnnMlaPrologV3WeightNz", vllm_scope="mla")
+    rep_api = sp.SubgraphParityChecker().compare(signature_id="mla", hardware_sku=sku, device_arch="A5", config_payload={}, observed_dags=(dag_api,), predicted_nodes=(pred_api,))
+    assert not rep_api.passed and any(d.code == "EXPANSION_MISMATCH" for d in rep_api.all_diffs())
+
+    shape = (4, 32, 64)
+    op_fp32 = OpSpec("mm", "gemm", "decode", 0, 0, (), shape, shape, shape, shape, flops=16384, dtype="fp32", precision_abi=TensorPrecisionABI("dense", "fp32", weight_dtype="fp32", weight_layout="FRACTAL_NZ"))
+    weight_dims = tuple(map(int, sp._format_input_shapes(op_fp32, {"transpose_b": False}).split(";")[1].split(",")))
+    assert weight_dims == (4, 4, 16, 8) and _validate_matrix_weight(weight_dims, 64, 32, "FRACTAL_NZ", "DT_FLOAT")[1] is None

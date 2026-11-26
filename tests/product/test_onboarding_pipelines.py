@@ -193,7 +193,8 @@ def _raw_l0_samples(sku: str, *, scale: float = 1.0, cann_version: str = "9.2.0"
 
 
 def _a2_probe_payload(sku: str = A2_SKU, *, endpoint: str = "prod-cluster-01.corp") -> dict[str, Any]:
-    return {"aclrt_soc_name": sku, "endpoint_alias": endpoint, "dies_per_package": A2_ORACLE["dies"], "platform_config_ini": f"[SoCInfo]\nsoc_version={sku}\ncompute_arch={A2_ORACLE['arch_id']}\nai_core_cnt={A2_ORACLE['aic']}\nvector_core_cnt={A2_ORACLE['aiv']}\nl2_size={A2_ORACLE['l2']}\nub_size={A2_ORACLE['ub']}\n", "npu_smi_common": f"Chip ID : 0\nAicore Count : {A2_ORACLE['aic']}\nAicore Freq(MHZ) : 1650\n"}
+    clk_mhz = int(round(float((ascend_profiles()[sku].get("source") or {}).get("declaration", {}).get("configured_clock_mhz", 1500))))
+    return {"aclrt_soc_name": sku, "endpoint_alias": endpoint, "dies_per_package": A2_ORACLE["dies"], "platform_config_ini": f"[SoCInfo]\nsoc_version={sku}\ncompute_arch={A2_ORACLE['arch_id']}\nai_core_cnt={A2_ORACLE['aic']}\nvector_core_cnt={A2_ORACLE['aiv']}\nl2_size={A2_ORACLE['l2']}\nub_size={A2_ORACLE['ub']}\n", "npu_smi_common": f"Chip ID : 0\nAicore Count : {A2_ORACLE['aic']}\nAicore Freq(MHZ) : {clk_mhz}\n"}
 
 
 @contextmanager
@@ -589,3 +590,48 @@ def test_whitebox_runner_l1_l2_l3_gemm_grouped_gemm_and_isolation(tmp_path):
     t1.join(timeout=10)
     t2.join(timeout=10)
     assert seen_rec.get("a2") == "ascend_paged_mla_decode_arch22" and "AuditScaffold" not in ascend_profiles()
+
+
+def test_onboarding_residue_bound_clock_scaffold_and_kv_head_wave_alignment():
+    """Verify residue-phase lower bounds never exceed Engine time, SKU scaffolding scales clock peaks, and attention wave holdouts honor local KV heads."""
+    from mindie_sim.backends.ascend import apply_observed_aicore_clock
+    from mindie_sim.compose import compose_case
+    from mindie_sim.onboarding.contracts import SocProbeRecord
+    from mindie_sim.onboarding.operator_pipeline import _certify_stages_dual_bound, _collect_stages
+    from mindie_sim.onboarding.sku_pipeline import _scaffold_sku_profile, _validate_profile_against_probe
+    from mindie_sim.onboarding.whitebox_runner import _resolve_step_dims, materialize_sku_hardware
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.program.pipeline import PipelinePhase, PipelineTemplate, PipelineTemplateProgram
+    from mindie_sim.prediction.structure import parse_case
+
+    st_a, st_b = (Stage("copy", work={"hbm": n}) for n in (1000, 100))
+    phase = PipelinePhase("steady", (st_a,), 4, residue_stages=((st_a,), (st_b,)))
+    prog = PipelineTemplateProgram(PipelineTemplate(0, 1, (phase,)))
+    ok_lb, lb_ns, _ = _certify_stages_dual_bound(_collect_stages(prog), Geometry(1, rates={"hbm": 1e9}))
+    eng = Engine([Resource("hbm", 1e6)], backend="python")
+    done = prog.start(eng, "copy", eng.submit("ready"))
+    eng.advance(until=(done,))
+    assert ok_lb and 0 < lb_ns <= round(done.time * 1e6) and eng.serviced["hbm"] == pytest.approx(2200.0)
+
+    profiles = ascend_profiles()
+    base_sku = "Ascend950DT_9582"
+    base_prof = profiles[base_sku]
+    dev = base_prof["device"]
+    probe = SocProbeRecord("ClockAuditSku", dev["compute_arch"]["preset"], base_prof["architecture"], dev["compute_units"], dev["resource_units"]["vector"], dev["memory_bytes"], dev["buffers"]["l2"], dev["buffers"]["ub"], 1, 1, aicore_freq_mhz=1500)
+    entry = _scaffold_sku_profile(probe, profiles, base_template_sku=base_sku)
+    die = materialize_sku_hardware(probe.soc_name, profile_override=entry).dies[0]
+    ref_dev = apply_observed_aicore_clock(dict(dev, observed_aicore_freq_mhz=probe.aicore_freq_mhz), base_prof)
+    assert not _validate_profile_against_probe(probe, entry)[0]
+    assert die.peak("bf16") == pytest.approx(ref_dev["compute_peaks"]["bf16"])
+    bad_probe = SocProbeRecord("ClockAuditSku", dev["compute_arch"]["preset"], base_prof["architecture"], dev["compute_units"], dev["resource_units"]["vector"], dev["memory_bytes"], dev["buffers"]["l2"], dev["buffers"]["ub"], 1, 1, aicore_freq_mhz=1650)
+    assert any(c.field == "aicore_freq_mhz" for c in _validate_profile_against_probe(bad_probe, entry)[0])
+    assert any(c.field == "aicore_freq_mhz" for c in _validate_profile_against_probe(probe, base_prof)[0])
+
+    case = parse_case(compose_case("qwen3-32b", A2_SKU, tp=1, dp=1, ep=1, layers=1, prompt_tokens=8, output_tokens=2))
+    die_q, kv_h = case.machine.dies[0], case.model.num_kv_heads
+    plan = synthesize_operator_cliff_plan(OperatorCliffParameters("gqa", "attention", 2, die_q.compute_units, dict(die_q.buffers)["l2"], context_min=1, context_max=128, local_kv_heads=kv_h), sku=A2_SKU)
+    assert verify_cliff_plan_integrity(plan.to_dict()) == plan.plan_sha256
+    bxkv_pts = [pt for pt in plan.heldout_points if pt.axis == "batch_x_kv_heads"]
+    assert sorted(pt.value for pt in bxkv_pts) == [32, 48]
+    for pt in bxkv_pts:
+        _resolve_step_dims(pt.to_dict(), local_kv=kv_h, cid="gqa")

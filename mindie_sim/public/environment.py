@@ -686,39 +686,6 @@ class ExecutionEnvironment:
             replay_scope=replay_scope, captured=captured,
             external_inputs=external_inputs, wait=wait)
 
-    @staticmethod
-    def _register_deferred_recipe_restore(
-        execution: Execution,
-        steps: Mapping[int, Any],
-        previous_recipes: RecipeBook,
-    ) -> None:
-        """Keep deferred profile/custom recipes live until lazy submission finishes."""
-        pending_events = tuple(dict.fromkeys(
-            step.completion for step in steps.values()
-            if not getattr(step.completion, "done", False)
-        ))
-        if not pending_events:
-            execution.recipes = previous_recipes
-            return
-        active_submits = int(getattr(execution, "_t15_pending_submits", 0))
-        if active_submits == 0:
-            execution._t15_saved_recipes = previous_recipes
-        execution._t15_pending_submits = active_submits + 1
-        remaining = [len(pending_events)]
-
-        def _on_step_done(_ev, ex=execution, rem=remaining):
-            rem[0] -= 1
-            if rem[0] > 0:
-                return
-            left = max(0, int(getattr(ex, "_t15_pending_submits", 1)) - 1)
-            ex._t15_pending_submits = left
-            if left == 0 and hasattr(ex, "_t15_saved_recipes"):
-                ex.recipes = ex._t15_saved_recipes
-                delattr(ex, "_t15_saved_recipes")
-
-        for ev in pending_events:
-            execution.engine.on_complete(ev, _on_step_done, native_hook=True)
-
     def _run_replicas(
         self,
         replica_ops: Mapping[int, Sequence[OpSpec]],
@@ -754,11 +721,13 @@ class ExecutionEnvironment:
         borrowed = execution is not None
         previous_observer = None
         previous_recipes = None
+        previous_lazy = False
         if execution is None:
             execution = self.execution(recipes=None, on_operator=observe)
         else:
             previous_observer = execution.on_operator
             previous_recipes = execution.recipes
+            previous_lazy = bool(getattr(execution, "lazy_frontier", False))
             if wait:
                 def observe_existing(original, obs_replica, program, ready, complete):
                     if previous_observer is not None:
@@ -771,34 +740,36 @@ class ExecutionEnvironment:
             setattr(execution, "_t15_submit_index", iteration + 1)
         except (AttributeError, TypeError):
             iteration = 0
-        defer_restore = borrowed and not wait
-        succeeded = False
+        eager_override = borrowed and not wait and (profile is not None or recipes is not None)
+        book = None
         try:
             if recipes is not None:
-                if borrowed and getattr(execution, "_t15_pending_submits", 0) > 0:
-                    pending_profiles = {
-                        k: v for k, v in previous_recipes.recipes.items()
-                        if k.startswith("user-profile:")
-                    }
-                    execution.recipes = _overlay_recipes(recipes, pending_profiles)
-                else:
-                    execution.recipes = recipes
+                execution.recipes = recipes
             expanded, book = self._prepare_replicas(
                 replica_ops, profile, service_id, execution,
                 replay_scope=replay_scope, iteration=iteration)
             execution.recipes = book
+            if eager_override:
+                execution.lazy_frontier = False
             result = self._execute_replicas(
                 execution, expanded, input_ready_ms=input_ready_ms,
                 replay_scope=replay_scope, captured=captured,
                 external_inputs=external_inputs, wait=wait,
                 iteration=iteration)
-            if defer_restore and (profile is not None or recipes is not None):
-                self._register_deferred_recipe_restore(
-                    execution, result["steps"], previous_recipes)
-            succeeded = True
         finally:
-            if borrowed and (not defer_restore or not succeeded):
+            if borrowed:
+                transient_ids = {
+                    id(b) for b in (recipes, book)
+                    if b is not None and b is not previous_recipes
+                }
+                if transient_ids:
+                    prep_cache = getattr(execution, "_prepare_cache", None)
+                    if isinstance(prep_cache, dict):
+                        for cache_key in [k for k in prep_cache if k and k[0] in transient_ids]:
+                            prep_cache.pop(cache_key, None)
                 execution.recipes = previous_recipes
+                if eager_override:
+                    execution.lazy_frontier = previous_lazy
             if borrowed and wait:
                 execution.on_operator = previous_observer
         rows = ([{
@@ -869,6 +840,120 @@ class ExecutionEnvironment:
                 member_to_cohort[(p, members[p][0])] = (cohort_key, cohort_ops)
         return member_to_cohort
 
+    @staticmethod
+    def _attribute_band_plan_aux(
+        per_rep: dict[int, dict[str, float]],
+        attributed_keys: set[str],
+        band_plan: Any,
+        rank_owner: Mapping[int, int],
+    ) -> None:
+        from mindie_sim.prediction.collectives.ports import (
+            die_injection_resource_name,
+            sdma_flow_resource_name,
+        )
+
+        def _add(rep: int | None, key: str, amount: float) -> None:
+            if rep in per_rep and amount:
+                per_rep[rep][key] = per_rep[rep].get(key, 0.0) + amount
+                attributed_keys.add(key)
+
+        for group in band_plan.groups:
+            lowered = group.lowered
+            ns = str(getattr(lowered, "namespace", "") or "")
+            group_ranks = frozenset(lowered.group)
+            has_inj = lowered.die_injection_ceiling_bytes_per_ms is not None
+            for phase in lowered.phases:
+                for transfer in phase.transfers:
+                    sdma_ms = (
+                        transfer.wire_bytes / float(transfer.flow_cap_bytes_per_ms)
+                        if transfer.flow_cap_bytes_per_ms is not None else 0.0
+                    )
+                    for hop in transfer.hops:
+                        src_rep, dst_rep = rank_owner.get(int(hop.source)), rank_owner.get(int(hop.destination))
+                        if has_inj and hop.source in group_ranks:
+                            _add(src_rep, die_injection_resource_name(hop.source, "tx", namespace=ns), transfer.wire_bytes)
+                        if has_inj and hop.destination in group_ranks:
+                            _add(dst_rep, die_injection_resource_name(hop.destination, "rx", namespace=ns), transfer.wire_bytes)
+                        if sdma_ms > 0.0:
+                            _add(src_rep, sdma_flow_resource_name(hop.source, "tx", namespace=ns), sdma_ms)
+                            _add(dst_rep, sdma_flow_resource_name(hop.destination, "rx", namespace=ns), sdma_ms)
+
+    @staticmethod
+    def _cohort_replica_serviced(
+        execution: Execution,
+        expanded_cohort: Mapping[int, tuple[OpSpec, ...]],
+        total_serviced: Mapping[str, float],
+    ) -> dict[int, dict[str, float]]:
+        """Attribute cohort collective link, band-aux, and rank-local serviced work per replica."""
+        from mindie_sim.prediction.collectives import plan_options as collective_options
+        from mindie_sim.prediction.sharding.local_tp import collective_requires_cohort
+
+        per_rep: dict[int, dict[str, float]] = {p: {} for p in expanded_cohort}
+        local_keys_by_rep: dict[int, set[str]] = {p: set() for p in expanded_cohort}
+        price_ro = CostModel(
+            execution.case,
+            hardware=execution.cost.hardware_view,
+            primitive_table=execution.cost.primitive_table,
+        )
+        link_groups: dict[tuple[int, str], list[tuple[int, OpSpec, Any, float]]] = {}
+        for p, rep_ops in expanded_cohort.items():
+            for eop in rep_ops:
+                sc = execution.stage_contexts.get((p, eop.stage))
+                if sc is not None:
+                    local_keys_by_rep[p].update(str(v) for v in sc.resource_names.values())
+                if _is_zero_work(eop):
+                    continue
+                prep_op, prep_recipe = execution.prepare(eop, p)
+                link_vol = float(price_ro.price(prep_op, "none").work.get("link", 0.0))
+                if link_vol > 0.0 or collective_requires_cohort(prep_op, execution.topology):
+                    link_groups.setdefault((eop.stage, _collective_key(eop)), []).append(
+                        (p, prep_op, prep_recipe, link_vol),
+                    )
+        attributed_keys: set[str] = set()
+        dp = max(1, execution.case.runtime.parallel.dp)
+        for (stage, _ckey), entries in link_groups.items():
+            if not any(vol > 0.0 for _, _, _, vol in entries):
+                continue
+            band_plan = None
+            _fp, first_op, first_recipe, _fv = entries[0]
+            first_algo = getattr(first_recipe, "algorithm", None)
+            if first_algo in {"ring", "pairwise"} and not collective_options(first_recipe, first_op):
+                vols = {p: vol for p, _, _, vol in entries}
+                band_plan = execution.topology.band_collective_plan(
+                    first_op, vols, algorithm=first_algo,
+                )
+            for p, prep_op, prep_recipe, link_vol in entries:
+                transport = execution.transport_options_for(prep_op, p, "none")
+                acc = execution.topology.accounting(
+                    prep_op, p, volume=link_vol,
+                    transport=transport, recipe=prep_recipe, band_plan=band_plan,
+                )
+                for res_key, amount in acc.wire_by_resource.items():
+                    if amount:
+                        per_rep[p][res_key] = per_rep[p].get(res_key, 0.0) + float(amount)
+                        attributed_keys.add(res_key)
+            if band_plan is not None:
+                rank_owner = {
+                    int(rk): r
+                    for r in range(dp)
+                    for rk in execution.topology.ranks(r, stage)
+                }
+                ExecutionEnvironment._attribute_band_plan_aux(
+                    per_rep, attributed_keys, band_plan, rank_owner,
+                )
+        for key, value in total_serviced.items():
+            if not value or key.startswith("link:") or key in attributed_keys:
+                continue
+            for p, local_keys in local_keys_by_rep.items():
+                if key in local_keys:
+                    per_rep[p][key] = float(value)
+        if not attributed_keys:
+            for key, value in total_serviced.items():
+                if value and key.startswith("link:"):
+                    for p in per_rep:
+                        per_rep[p][key] = float(value)
+        return per_rep
+
     def operator_report(
         self,
         ops: Sequence[OpSpec] | Mapping[int, Sequence[OpSpec] | OpSpec],
@@ -883,7 +968,7 @@ class ExecutionEnvironment:
         for rep_ops in replica_ops.values():
             self._validate(rep_ops, allow_external_inputs=True)
         member_to_cohort = self._operator_cohort_plan(replica_ops, recipes)
-        cohort_results: dict[Any, tuple[dict[str, Any], Execution]] = {}
+        cohort_results: dict[Any, tuple[dict[str, Any], Execution, dict[int, dict[str, float]]]] = {}
         rows = []
         timeline = []
         total = 0.0
@@ -899,11 +984,16 @@ class ExecutionEnvironment:
                             p: (replace(peer_op, deps=()),)
                             for p, peer_op in cohort_ops.items()
                         }
-                        cohort_results[cohort_key] = self._run_replicas(
+                        res_c, exec_c, exp_c = self._run_replicas(
                             isolated_cohort, profile, service_id,
                             input_ready_ms=input_ready_ms, recipes=recipes,
-                        )[:2]
-                    result, execution = cohort_results[cohort_key]
+                        )
+                        rep_serviced = self._cohort_replica_serviced(
+                            exec_c, exp_c, res_c["serviced"],
+                        )
+                        cohort_results[cohort_key] = (res_c, exec_c, rep_serviced)
+                    result, execution, rep_serviced = cohort_results[cohort_key]
+                    serviced_for_row = rep_serviced.get(rep, {})
                     physical = [row for row in result["rows"] if row["replica"] == rep]
                     ready_times = [
                         row["ready_ms"] for row in physical
@@ -920,6 +1010,7 @@ class ExecutionEnvironment:
                     result, execution, _ = self._run(
                         (isolated,), profile, service_id,
                         input_ready_ms=input_ready_ms, recipes=recipes, replica=rep)
+                    serviced_for_row = result["serviced"]
                     physical = result["rows"]
                     start_ms = result["charge_ready_ms"]
                     complete_ms = result["complete_ms"]
@@ -931,7 +1022,7 @@ class ExecutionEnvironment:
                 row, events = _operator_report_row(
                     op, rep, multi_mapped=multi_mapped, physical=physical,
                     start_ms=start_ms, complete_ms=complete_ms, duration=duration,
-                    input_ready_ms=input_ready_ms, serviced=result["serviced"],
+                    input_ready_ms=input_ready_ms, serviced=serviced_for_row,
                     execution=execution)
                 timeline.extend(events)
                 rows.append(row)

@@ -46,7 +46,9 @@ _SAMPLE_KEYS = frozenset({
     "arch_family", "hardware", "single", "boundary", "observed_expansion_mode",
     "observed_execution", "requested_expansion_mode", "profiler_evidence",
     "stack", "cann", "algorithm", "protocol", "machine", "stack_binding",
-    "payload_bytes", "size_bytes", "work", "dtype",
+    "payload_bytes", "size_bytes", "work", "dtype", "comm_dtype",
+    "compute_dtype", "direction", "comm_quant_mode", "comm_mode",
+    "quant_mode", "expand_x_dtype", "y_dtype",
     "measurement", "transport_window", "direction_observed",
     "algorithm_identified",
 })
@@ -274,6 +276,11 @@ def _bucket_add(buckets, sample, index):
     key = (
         "repeat_index" in sample, "run_id" in sample, sample.get("run_id") or None,
         _dtype(sample.get("dtype")) if sample.get("dtype") else None,
+        _dtype(sample.get("comm_dtype")) if sample.get("comm_dtype") else None,
+        _dtype(sample.get("compute_dtype")) if sample.get("compute_dtype") else None,
+        sample.get("direction"),
+        sample.get("comm_quant_mode"), sample.get("comm_mode"), sample.get("quant_mode"),
+        sample.get("expand_x_dtype"), sample.get("y_dtype"),
         int(pay) if pay is not None else None,
         bool(sample["single"]) if sample.get("single") is not None else None,
         "boundary" in sample, sample.get("boundary"),
@@ -512,12 +519,22 @@ def _chain_row(values, campaign, origin, default_dtype, default_observed,
         raise ValueError(f"a5_mc2_chain_row_missing_chain:{campaign}")
     dtype = _dtype(values.get("dtype") or default_dtype)
     swiglu = legs.get("swiglu_quant", legs.get("swiglu"))
-    normalized = {
-        "dispatch": legs.get("dispatch", 0.0),
-        "gate_up": legs.get("gate_up", legs.get("gmm_gate_up", 0.0)),
-        "down": legs.get("down", legs.get("gmm_down", 0.0)),
-        "combine": legs.get("combine", 0.0),
-    }
+    has_split_gmm = any(k in legs for k in ("gate_up", "gmm_gate_up", "down", "gmm_down"))
+    if "grouped_matmul" in legs:
+        if has_split_gmm:
+            raise ValueError(f"a5_mc2_chain_row_ambiguous_gmm_legs:{campaign}")
+        normalized = {
+            "dispatch": legs.get("dispatch", 0.0),
+            "grouped_matmul": legs["grouped_matmul"],
+            "combine": legs.get("combine", 0.0),
+        }
+    else:
+        normalized = {
+            "dispatch": legs.get("dispatch", 0.0),
+            "gate_up": legs.get("gate_up", legs.get("gmm_gate_up", 0.0)),
+            "down": legs.get("down", legs.get("gmm_down", 0.0)),
+            "combine": legs.get("combine", 0.0),
+        }
     normalized["swiglu_quant" if dtype != "bf16" else "swiglu"] = swiglu or 0.0
     ep = values.get("ranks") or values.get("ep") or values.get("world_size") or 1
     rep = int(values.get("repeat_index")
@@ -564,7 +581,10 @@ def _chain_record(campaign, origin, dtype, ep, experts, tokens, legs, chain_ms,
         "stage_legs_ms": {
             "quant": legs.get("swiglu_quant", legs.get("swiglu", 0.0)),
             "all_to_allv_dispatch": legs["dispatch"],
-            "grouped_matmul": legs["gate_up"] + legs["down"],
+            "grouped_matmul": (
+                legs["grouped_matmul"] if "grouped_matmul" in legs
+                else legs.get("gate_up", 0.0) + legs.get("down", 0.0)
+            ),
             "all_to_allv_combine": legs["combine"],
         },
     }
@@ -780,7 +800,9 @@ _EXPAND_KEYS = frozenset({
     "observed_expansion_mode", "observed_execution",
     "requested_expansion_mode", "profiler_evidence", "stack",
     "cann", "algorithm", "protocol", "machine", "stack_binding",
-    "payload_bytes", "size_bytes", "work", "dtype",
+    "payload_bytes", "size_bytes", "work", "dtype", "comm_dtype",
+    "compute_dtype", "direction", "comm_quant_mode", "comm_mode",
+    "quant_mode", "expand_x_dtype", "y_dtype",
     "measurement", "transport_window", "direction_observed",
     "algorithm_identified",
 })
@@ -878,9 +900,14 @@ def _base_row(document, label, origin, collective, world, scope, pair, payload,
         "run_id": run_id or label, "repeat_index": int(repeat_index or 0),
         "split": split, "source": origin, "boundary": boundary,
         "measurement": measurement, "transport_window": window,
-        "direction_observed": bool(measurement.get("direction_observed", False)),
-        "algorithm_identified": bool(measurement.get(
-            "algorithm_identified", algorithm_identified)),
+        "direction_observed": bool(
+            row["direction_observed"] if row.get("direction_observed") is not None
+            else measurement.get("direction_observed", False)
+        ),
+        "algorithm_identified": bool(
+            row["algorithm_identified"] if row.get("algorithm_identified") is not None
+            else measurement.get("algorithm_identified", algorithm_identified)
+        ),
         **{k: row[k] for k in ("_repeats", "_weights") if k in row},
     }
     if declared_comm_dtype is not None or collective in _MC2_CALLBACK_COLLECTIVES:
@@ -1338,11 +1365,15 @@ def _condition_rows(row, document, label, origin, default_dtype, default_world,
     placement = row.get("placement") or document.get("placement", "")
     declared_scope = _explicit_scope(row.get("placement_scope")) or default_scope
     scope = declared_scope or _explicit_scope(placement) or _scope("", world)
-    explicit = _explicit_pair(row.get("p2p_pair")) or _explicit_pair(row.get("pair"))
-    pair = explicit if collective == "p2p_send_recv" else None
+    explicit = (
+        _explicit_pair(row.get("p2p_pair"))
+        or _explicit_pair(row.get("pair"))
+        or _explicit_pair(row.get("p2p_scope"))
+    )
+    pair = (explicit or default_pair) if collective == "p2p_send_recv" else None
     if collective == "p2p_send_recv":
         scope = scope if declared_scope else (_pair_scope(pair, world) or scope)
-        pair = pair or default_pair or _pair(
+        pair = pair or _pair(
             row.get("p2p_scope"), collective, scope, world)
     payload = row.get("payload_bytes", row.get("size_bytes", row.get("work")))
     duration = _row_duration(row)
@@ -1387,10 +1418,10 @@ def _condition_rows(row, document, label, origin, default_dtype, default_world,
         evidence=default_evidence)]
 
 
-def _add_series(rows, document, label, origin, dtype, common, series, single=False):
+def _add_series(rows, document, label, origin, dtype, common, series, single=False, default_pair=None):
     collective, world, scope, pair, points = series
     collective = _collective(collective)
-    pair = pair or _pair("", collective, scope, world)
+    pair = pair or _pair(default_pair or "", collective, scope, world)
     for payload, duration in points:
         rows.append(_base_row(
             document, label, origin, collective, world, scope, pair, payload,
@@ -1495,6 +1526,24 @@ def _ingest_raw_points(rows, document, label, origin, default_dtype, common,
                       point.get("observed_execution", observed)),
             profiler_evidence=point.get("profiler_evidence", evidence))
         sel = _selectors(document, point)
+        raw_meas = point.get("measurement", document.get("measurement"))
+        if isinstance(raw_meas, Mapping):
+            eff_meas: Any = dict(raw_meas)
+        elif direction in _MC2_DIRECTIONS:
+            eff_meas = _mc2_callback_measurement(
+                direction,
+                algorithm_identified=(point.get("algorithm", document.get("algorithm")) is not None),
+            )
+        else:
+            eff_meas = raw_meas
+        dir_obs = point.get("direction_observed", document.get("direction_observed"))
+        alg_id = point.get("algorithm_identified", document.get("algorithm_identified"))
+        if isinstance(eff_meas, dict):
+            if dir_obs is not None:
+                eff_meas["direction_observed"] = bool(dir_obs)
+            if alg_id is not None:
+                eff_meas["algorithm_identified"] = bool(alg_id)
+        pt_window = point.get("transport_window", document.get("transport_window"))
         key = (
             collective, direction, comm_dtype, point_scope,
             ep_world, int(point.get("link_bytes")),
@@ -1504,19 +1553,23 @@ def _ingest_raw_points(rows, document, label, origin, default_dtype, common,
             observed_point, point.get("requested_expansion_mode"),
             point.get("algorithm"),
             point.get("boundary", document.get("boundary")),
+            _canonical_semantic(eff_meas),
+            _canonical_semantic(pt_window),
+            bool(dir_obs) if dir_obs is not None else None,
+            bool(alg_id) if alg_id is not None else None,
             resolved_point["regime"], resolved_point["unconfirmed_tag"],
             resolved_point["profiler_confirmed"],
             (sel["stack"], sel["cann"], sel["algorithm"],
              _protocol_key(sel["protocol"])),
         )
-        entry = lane.setdefault(key, (point, [], set()))
-        entry[1].append(float(point["ms"]))
+        entry = lane.setdefault(key, (point, eff_meas, [], set()))
+        entry[2].append(float(point["ms"]))
         if is_mc2:
-            entry[2].add(compute_dtype)
-    for key, (point, values, comp_dtypes) in sorted(lane.items(), key=str):
+            entry[3].add(compute_dtype)
+    for key, (point, eff_meas, values, comp_dtypes) in sorted(lane.items(), key=str):
         (collective, direction, comm_dtype, point_scope, series_world,
          payload, single, split, run_id, repeat_index, observed_point,
-         requested_point, _, _, _, _, _, _) = key
+         requested_point, _, _, _, _, dir_obs_key, alg_id_key, _, _, _, _) = key
         row_payload = {**point, "dtype": comm_dtype, "comm_dtype": comm_dtype}
         row_payload.pop("compute_dtype", None)
         ordered_comp = sorted(comp_dtypes)
@@ -1526,11 +1579,12 @@ def _ingest_raw_points(rows, document, label, origin, default_dtype, common,
             row_payload["compute_dtypes"] = ordered_comp
         if direction in _MC2_DIRECTIONS:
             row_payload["direction"] = direction
-            if not isinstance(row_payload.get("measurement"), Mapping) and not isinstance(document.get("measurement"), Mapping):
-                row_payload["measurement"] = _mc2_callback_measurement(
-                    direction,
-                    algorithm_identified=(point.get("algorithm", document.get("algorithm")) is not None),
-                )
+        if isinstance(eff_meas, Mapping):
+            row_payload["measurement"] = dict(eff_meas)
+        if dir_obs_key is not None:
+            row_payload["direction_observed"] = dir_obs_key
+        if alg_id_key is not None:
+            row_payload["algorithm_identified"] = alg_id_key
         rows.append(_base_row(
             document, label, origin, collective, series_world,
             point_scope, None, payload, median(values),
@@ -1552,6 +1606,12 @@ def _campaign_conditions(document, label, origin):
     dtype = _dtype(document.get("dtype") or protocol.get("dtype"))
     world = document.get("world_size") or document.get("ranks")
     scope = _explicit_scope(document.get("placement_scope"))
+    doc_placement = document.get("placement", "")
+    default_pair = (
+        _explicit_pair(document.get("p2p_pair"))
+        or _explicit_pair(document.get("p2p_scope"))
+        or _explicit_pair(protocol.get("p2p_scope"))
+    )
     observed = document.get(
         "observed_expansion_mode",
         document.get("observed_execution", "not_observed"))
@@ -1566,16 +1626,17 @@ def _campaign_conditions(document, label, origin):
     rows = []
     for row in document.get("conditions") or document.get("comm_conditions") or ():
         rows.extend(_condition_rows(
-            row, document, label, origin, dtype, world, scope, None,
+            row, document, label, origin, dtype, world, scope, default_pair,
             observed, requested, evidence))
     for series in document.get("series") or ():
-        _add_series(rows, document, label, origin, dtype, common, series)
+        _add_series(rows, document, label, origin, dtype, common, series, default_pair=default_pair)
     _ingest_raw_points(
         rows, document, label, origin, dtype, common,
         requested, observed, evidence)
     for coll, direction, comm_dtype, compute_dtype, series_world, points in (
         document.get("mc2_comm_series") or ()
     ):
+        series_scope = scope or _explicit_scope(doc_placement) or _scope(doc_placement, series_world)
         meas = _mc2_callback_measurement(
             direction, algorithm_identified=(document.get("algorithm") is not None))
         series_row = {
@@ -1586,14 +1647,15 @@ def _campaign_conditions(document, label, origin):
         for payload, duration in points:
             rows.append(_base_row(
                 document, label, origin, _collective(coll), series_world,
-                _scope("", series_world), None, payload, duration, comm_dtype,
+                series_scope, None, payload, duration, comm_dtype,
                 bool(document.get("single")), series_row, **common))
     for lane_dtype, series_world, points in document.get("all_to_allv_series") or ():
+        series_scope = scope or _explicit_scope(doc_placement) or _scope(doc_placement, series_world)
         _add_series(
             rows, document, label, origin, lane_dtype, common,
-            ("all_to_allv", series_world, _scope("", series_world), None, points))
+            ("all_to_allv", series_world, series_scope, None, points))
     for series in document.get("single_anchors") or ():
-        _add_series(rows, document, label, origin, dtype, common, series, True)
+        _add_series(rows, document, label, origin, dtype, common, series, True, default_pair=default_pair)
     return rows
 
 

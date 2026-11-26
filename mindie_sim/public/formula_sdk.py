@@ -834,6 +834,34 @@ def _terminal_op_ids(replacement: tuple[Any, ...]) -> tuple[str, ...]:
     return terminals or (ops[-1].op_id,)
 
 
+def _namespace_replacement_ops(
+    replacement: tuple[Any, ...],
+    prefix: str,
+    used_ids: set[str],
+) -> tuple[Any, ...]:
+    rename: dict[str, str] = {}
+    for idx, op in enumerate(replacement):
+        if isinstance(op, OpSpec) and op.op_id:
+            base = f"{prefix}/{op.op_id}" if prefix else op.op_id
+            cand = base
+            seq = 1
+            while cand in used_ids or cand in rename.values():
+                cand = f"{base}#{seq}"
+                seq += 1
+            rename[op.op_id] = cand
+            used_ids.add(cand)
+    if not rename:
+        return replacement
+    patched: list[Any] = []
+    for op in replacement:
+        if isinstance(op, OpSpec) and op.op_id in rename:
+            new_deps = tuple(rename.get(dep, dep) for dep in op.deps)
+            patched.append(replace(op, op_id=rename[op.op_id], deps=new_deps))
+        else:
+            patched.append(op)
+    return tuple(patched)
+
+
 def _replace_sequence_with_impl(
     items: tuple[Any, ...],
     bound_impl_ops: tuple[Any, ...],
@@ -853,26 +881,52 @@ def _replace_sequence_with_impl(
     # Use 1:1 per-op_id mapping only for single-op replacements or when multiple
     # distinct ops in the incoming group already match distinct implementation ops.
     use_per_id = len(bound_impl_ops) == 1 or len(set(impl_by_id) & incoming_ids) > 1
+    match_flags: list[tuple[bool, bool]] = []
+    for item in items:
+        is_per_id = use_per_id and isinstance(item, OpSpec) and item.op_id in impl_by_id
+        is_seq_match = not is_per_id and (
+            (isinstance(item, OpSpec) and (
+                (not use_per_id and item.op_id in impl_by_id)
+                or _op_matches_kernel_identity(
+                    item, kernel_name=kernel_name, slug=slug, abi_signature_id=abi_signature_id,
+                )
+            ))
+            or (isinstance(item, FormulaKernelSpec) and _formula_matches_kernel(
+                item, kernel_name=kernel_name, abi_signature_id=abi_signature_id,
+            ))
+        )
+        match_flags.append((is_per_id, is_seq_match))
+    seq_match_count = sum(1 for _, is_seq in match_flags if is_seq)
+    used_ids: set[str] = {
+        item.op_id for item, (_is_per_id, is_seq) in zip(items, match_flags)
+        if isinstance(item, OpSpec) and item.op_id and not is_seq
+    }
     entries: list[tuple[Any, str | None]] = []
     id_remap: dict[str, tuple[str, ...]] = {}
-    for item in items:
-        if use_per_id and isinstance(item, OpSpec) and item.op_id in impl_by_id:
+    occ_idx = 0
+    for item, (is_per_id, is_seq_match) in zip(items, match_flags):
+        if is_per_id:
             rep_op = impl_by_id[item.op_id]
+            inherited = tuple(dep for dep in item.deps if dep != rep_op.op_id)
+            if inherited:
+                merged_deps = tuple(dict.fromkeys((*inherited, *rep_op.deps)))
+                rep_op = replace(rep_op, deps=merged_deps)
+            used_ids.add(rep_op.op_id)
             entries.append((rep_op, item.op_id))
             continue
-        matched_op = isinstance(item, OpSpec) and (
-            (not use_per_id and item.op_id in impl_by_id)
-            or _op_matches_kernel_identity(
-                item, kernel_name=kernel_name, slug=slug, abi_signature_id=abi_signature_id,
-            )
-        )
-        matched_formula = isinstance(item, FormulaKernelSpec) and _formula_matches_kernel(
-            item, kernel_name=kernel_name, abi_signature_id=abi_signature_id,
-        )
-        if matched_op or matched_formula:
+        if is_seq_match:
+            occ_idx += 1
             inherited = item.deps if isinstance(item, OpSpec) else ()
-            seq = _attach_entry_deps(bound_impl_ops, inherited)
             source_id = item.op_id if isinstance(item, OpSpec) else None
+            impl_ids = {op.op_id for op in bound_impl_ops if isinstance(op, OpSpec) and op.op_id}
+            needs_namespace = seq_match_count > 1 or bool(impl_ids & used_ids)
+            if needs_namespace:
+                prefix = source_id or f"call{occ_idx}"
+                scoped_ops = _namespace_replacement_ops(bound_impl_ops, prefix, used_ids)
+            else:
+                used_ids.update(impl_ids)
+                scoped_ops = bound_impl_ops
+            seq = _attach_entry_deps(scoped_ops, inherited)
             for elem in seq:
                 entries.append((elem, source_id))
             if source_id:

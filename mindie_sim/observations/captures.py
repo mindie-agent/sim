@@ -229,6 +229,7 @@ import re
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.parallel import DieIndex, GlobalRank, RankCoord
 
 CAPTURE_URI_SCHEME = "capture://"
 _JSON_SUFFIXES = frozenset({".json", ".jsonl", ".ndjson"})
@@ -244,8 +245,12 @@ _FIRST_SOURCE_ROW = 1
 _ASCEND_DEVICE_ID_MASK = 0x1F
 _ASCEND_TRACK_TYPE_MASK = 0x3E0
 _ASCEND_HARDWARE_TRACK = 0x1C0
-_TRACE_DEVICE_LABEL = re.compile(r"(?:device|npu|rank)(?: id)?[ _:-]+(?P<rank>[0-9]+)", re.IGNORECASE)
-_TRACE_RANK_KEYS = ("device_rank", "rank_id", "rank", "device_id", "device", "Device_id", "Device Id", "Device ID")
+_TRACE_GLOBAL_RANK_LABEL = re.compile(r"rank(?: id)?[ _:-]+(?P<rank>[0-9]+)", re.IGNORECASE)
+_TRACE_LOCAL_DEVICE_LABEL = re.compile(r"(?:device|npu)(?: id)?[ _:-]+(?P<device>[0-9]+)", re.IGNORECASE)
+_TRACE_GLOBAL_RANK_KEYS = ("device_rank", "rank_id", "rank")
+_TRACE_LOCAL_DEVICE_KEYS = ("device_id", "device", "Device_id", "Device Id", "Device ID")
+_TRACE_RANK_KEYS = (*_TRACE_GLOBAL_RANK_KEYS, *_TRACE_LOCAL_DEVICE_KEYS)
+_TRACE_HOST_CATEGORIES = frozenset({"cpu_op", "python_function", "cann_api", "host"})
 _EVENT_ID_KEYS = ("event_id", "id", "name")
 _TASK_ID_KEYS = ("Task Id", "Task ID", "task_id", "taskId")
 _CONNECTION_ID_KEYS = ("Connection Id", "Connection ID", "connection_id", "connectionId")
@@ -426,28 +431,82 @@ def _trace_args(row: Mapping[str, Any]) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
 
 
-def _trace_rank(row: Mapping[str, Any]) -> int | None:
+def _trace_coords(row: Mapping[str, Any]) -> tuple[GlobalRank | None, DieIndex | None]:
     args = _trace_args(row)
-    ranks = {int(value) for source in (row, args) for key in _TRACE_RANK_KEYS
-             if (value := source.get(key)) is not None and str(value).isascii() and str(value).isdecimal()}
-    if len(ranks) > 1:
+    global_ranks = {
+        int(value) for source in (row, args) for key in _TRACE_GLOBAL_RANK_KEYS
+        if (value := source.get(key)) is not None and not isinstance(value, bool)
+        and str(value).isascii() and str(value).isdecimal()
+    }
+    local_devices = {
+        int(value) for source in (row, args) for key in _TRACE_LOCAL_DEVICE_KEYS
+        if (value := source.get(key)) is not None and not isinstance(value, bool)
+        and str(value).isascii() and str(value).isdecimal()
+    }
+    for source in (row, args):
+        if isinstance(coord := source.get("rank_coord"), RankCoord):
+            global_ranks.add(int(coord.global_rank))
+            local_devices.add(int(coord.die_index))
+    if len(global_ranks) > 1 or len(local_devices) > 1:
         raise ModelingError("capture_rank_mismatch:conflicting_trace_rank_fields")
-    return next(iter(ranks), None)
+    g_rank = GlobalRank(next(iter(global_ranks))) if global_ranks else None
+    l_dev = DieIndex(next(iter(local_devices))) if local_devices else None
+    return g_rank, l_dev
 
 
-def _trace_process_rank(row: Mapping[str, Any]) -> int | None:
+def _trace_rank(row: Mapping[str, Any]) -> int | None:
+    g_rank, l_dev = _trace_coords(row)
+    return int(g_rank) if g_rank is not None else (int(l_dev) if l_dev is not None else None)
+
+
+def _trace_process_coords(row: Mapping[str, Any]) -> tuple[GlobalRank | None, DieIndex | None]:
     label = str(_trace_args(row).get("name", ""))
-    rank = _trace_rank(row)
+    row_rank, row_device = _trace_coords(row)
     pid = row.get("pid")
-    track_rank = None
-    if device := _TRACE_DEVICE_LABEL.fullmatch(label):
-        track_rank = int(device["rank"])
+    track_rank = GlobalRank(int(m["rank"])) if (m := _TRACE_GLOBAL_RANK_LABEL.fullmatch(label)) else None
+    track_device: DieIndex | None = None
+    if device := _TRACE_LOCAL_DEVICE_LABEL.fullmatch(label):
+        track_device = DieIndex(int(device["device"]))
     elif (label == "Ascend Hardware" and type(pid) is int and pid >= _ASCEND_HARDWARE_TRACK
           and pid & _ASCEND_TRACK_TYPE_MASK == _ASCEND_HARDWARE_TRACK):
-        track_rank = pid & _ASCEND_DEVICE_ID_MASK
-    if rank is not None and track_rank is not None and rank != track_rank:
+        track_device = DieIndex(pid & _ASCEND_DEVICE_ID_MASK)
+    if row_rank is not None and track_rank is not None and row_rank != track_rank:
         raise ModelingError("capture_rank_mismatch:conflicting_trace_process_rank_fields")
-    return rank if rank is not None else track_rank
+    if row_device is not None and track_device is not None and row_device != track_device:
+        raise ModelingError("capture_rank_mismatch:conflicting_trace_process_rank_fields")
+    return (row_rank if row_rank is not None else track_rank,
+            row_device if row_device is not None else track_device)
+
+
+def _record_trace_pid_rank(meta: dict[str, Any], pid: int | str, row: Mapping[str, Any]) -> None:
+    args = _trace_args(row)
+    g_ranks = {
+        int(v) for src in (row, args) for k in _TRACE_GLOBAL_RANK_KEYS
+        if (v := src.get(k)) is not None and not isinstance(v, bool)
+        and str(v).isascii() and str(v).isdecimal()
+    }
+    for src in (row, args):
+        if isinstance(coord := src.get("rank_coord"), RankCoord):
+            g_ranks.add(int(coord.global_rank))
+    if len(g_ranks) != 1:
+        return
+    r_val = next(iter(g_ranks))
+    pid_ranks = meta.setdefault("_trace_pid_ranks", {})
+    if pid not in pid_ranks:
+        pid_ranks[pid] = r_val
+    elif pid_ranks[pid] != r_val:
+        pid_ranks[pid] = None
+
+
+_TRACE_HOST_PROCESS_TOKENS = frozenset({"python", "python3", "pytorch", "cpu", "host", "cann", "ascendcl", "runtime"})
+
+
+def _is_host_process_label(label: str) -> bool:
+    low = label.strip().lower()
+    if not low or low == "ascend hardware":
+        return False
+    first = low.split()[0]
+    return low in _TRACE_HOST_PROCESS_TOKENS or first in _TRACE_HOST_PROCESS_TOKENS
 
 
 def _capture_metadata(
@@ -460,11 +519,25 @@ def _capture_metadata(
     for trace, row in rows:
         if trace:
             processes = meta.setdefault("_trace_processes", {})
-            if row.get("ph") == "M" and row.get("name") == "process_name":
-                pid = row.get("pid")
-                if isinstance(pid, (int, str)) and (rank := _trace_process_rank(row)) is not None:
-                    if processes.setdefault(pid, rank) != rank:
+            host_processes = meta.setdefault("_trace_host_processes", set())
+            pid = row.get("pid")
+            if row.get("ph") == "M" and row.get("name") == "process_name" and isinstance(pid, (int, str)):
+                label = str(_trace_args(row).get("name", ""))
+                if _is_host_process_label(label):
+                    if pid in processes:
                         raise ModelingError("capture_rank_mismatch:conflicting_trace_process_ranks")
+                    host_processes.add(pid)
+                else:
+                    coords = _trace_process_coords(row)
+                    if coords[0] is not None or coords[1] is not None:
+                        if pid in host_processes or processes.setdefault(pid, coords) != coords:
+                            raise ModelingError("capture_rank_mismatch:conflicting_trace_process_ranks")
+                    else:
+                        if pid in processes:
+                            raise ModelingError("capture_rank_mismatch:conflicting_trace_process_ranks")
+                        host_processes.add(pid)
+            elif row.get("ph") == "X" and isinstance(pid, (int, str)):
+                _record_trace_pid_rank(meta, pid, row)
             continue
         if _json_kernel_start(row) is not None:
             meta["_timed_json_rows"] = True
@@ -628,16 +701,18 @@ def _unique_event_id(sources: Iterable[Mapping[str, Any]], keys: Iterable[str]) 
 
 def _json_event_names(
     row: Mapping[str, Any], record: int, rank: int, target_events: frozenset[str],
+    *, local_device: int | None = None,
 ) -> frozenset[str]:
     sources = (row, _trace_args(row))
     tasks = set(_event_field_ids(sources, _TASK_ID_KEYS))
     connections = set(_event_field_ids(sources, _CONNECTION_ID_KEYS))
     streams = set(_event_field_ids(sources, _STREAM_ID_KEYS)) or set(_event_field_ids((row,), ("tid",)))
     raw = set(_event_field_ids(sources, _EVENT_ID_KEYS)) | tasks | connections
+    dev_ids = {local_device} if local_device is not None else {rank}
     qualified = {
         f"row:{record}", *(f"task:{task}" for task in tasks), *(f"conn:{conn}" for conn in connections),
-        *(selector for stream in streams for task in tasks
-          for selector in (f"stream:{stream}:task:{task}", f"dev:{rank}:stream:{stream}:task:{task}")),
+        *(f"stream:{stream}:task:{task}" for stream in streams for task in tasks),
+        *(f"dev:{dev}:stream:{stream}:task:{task}" for dev in dev_ids for stream in streams for task in tasks),
     }
     return target_events.intersection(qualified | {name for name in raw if not name.startswith(_SELECTOR_PREFIXES)})
 
@@ -675,28 +750,47 @@ def _json_capture_rows(
     windows: _RankWindows | None, target_events: frozenset[str] | None,
 ) -> Iterator[_CaptureRow]:
     processes = meta.get("_trace_processes", {})
+    host_processes = meta.get("_trace_host_processes", ())
+    pid_ranks = meta.get("_trace_pid_ranks", {})
     header_ranks = meta.get("_header_ranks", ())
     default_rank = next(iter(header_ranks)) if len(header_ranks) == 1 and not trace_format else None
     source = (row for trace, row in meta["_capture_rows"]() if trace == trace_format)
     for record, row in enumerate(source, start=_FIRST_SOURCE_ROW):
         if trace_format and row.get("ph") != "X":
             continue
+        pid = row.get("pid")
+        if trace_format and (pid in host_processes
+                             or str(row.get("cat") or "").strip().lower() in _TRACE_HOST_CATEGORIES):
+            continue
         start_field = ("ts", _NS_PER_US) if trace_format else _json_kernel_start(row)
         if start_field is None:
             continue
-        process_rank = processes.get(row.get("pid"), default_rank)
-        explicit_rank = _trace_rank(row)
-        rank = explicit_rank if explicit_rank is not None else process_rank
+        proc_rank, proc_device = processes.get(pid, (default_rank, None))
+        row_rank, row_device = _trace_coords(row)
+        if trace_format:
+            if proc_rank is not None and row_rank is not None and row_rank != proc_rank:
+                raise ModelingError(f"capture_rank_mismatch:{case_id}:trace_process_conflict")
+            if proc_device is not None and row_device is not None and row_device != proc_device:
+                raise ModelingError(f"capture_rank_mismatch:{case_id}:trace_process_conflict")
+        mapped_pid_rank = pid_ranks.get(pid) if trace_format and pid in processes else None
+        resolved_rank = (
+            row_rank if row_rank is not None
+            else proc_rank if proc_rank is not None
+            else mapped_pid_rank if mapped_pid_rank is not None
+            else row_device if row_device is not None
+            else proc_device
+        )
+        rank = int(resolved_rank) if resolved_rank is not None else None
+        local_dev = (int(row_device) if row_device is not None
+                     else int(proc_device) if proc_device is not None else None)
         if rank is None and not trace_format:
             raise ModelingError(f"capture_rank_mismatch:{case_id}:timed_json_event_rank_absent")
         if rank not in boundary.device_ranks:
             continue
         seen_ranks.add(rank)
-        if trace_format and process_rank is not None and rank != process_rank:
-            raise ModelingError(f"capture_rank_mismatch:{case_id}:trace_process_conflict")
         names = frozenset()
         if target_events is not None:
-            names = _json_event_names(row, record, rank, target_events)
+            names = _json_event_names(row, record, rank, target_events, local_device=local_dev)
             if not names:
                 continue
             for key in ("clock_operator", "clock_domain"):
@@ -749,12 +843,14 @@ def _selected_rows(
 
 
 def _host_trace_rows(meta: Mapping[str, Any]) -> Iterator[tuple[_HostThread, Mapping[str, Any]]]:
+    host_processes = meta.get("_trace_host_processes", ())
     for trace, row in meta["_capture_rows"]():
         if not trace or row.get("ph") not in ("X", "s"):
             continue
         pid, tid = row.get("pid"), row.get("tid")
         if (type(pid) in (int, str) and type(tid) in (int, str)
-                and pid not in meta["_trace_processes"] and _trace_rank(row) is None):
+                and pid not in meta["_trace_processes"]
+                and (pid in host_processes or _trace_rank(row) is None)):
             yield (pid, tid), row
 
 
@@ -859,10 +955,54 @@ def _verify_l1_ownership(
                 raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={row.rank}")
 
 
+def _verify_paired_rung_capture(
+    case_id: str, boundary: Any, format_name: str,
+    selected: Mapping[int, list[_CaptureRow]], occurrences: frozenset[_KernelOccurrence],
+    rows: Callable[[_RankWindows | None, frozenset[str] | None], Iterator[_CaptureRow]],
+    *, arm_a_measured_ns: int | None, arm_b_measured_ns: int | None,
+) -> tuple[int, CaptureVerificationReceipt]:
+    start_name, end_name = boundary.start_event.strip(), boundary.end_event.strip()
+    if start_name == end_name:
+        raise ModelingError(f"capture_paired_rung_arms_ambiguous:{case_id}")
+    arm_pairs: dict[int, tuple[_CaptureRow, _CaptureRow]] = {}
+    for rank, local_rows in selected.items():
+        row_a = next(row for row in local_rows if start_name in row.names)
+        row_b = next(row for row in local_rows if end_name in row.names)
+        if row_a.occurrence == row_b.occurrence:
+            raise ModelingError(f"capture_paired_rung_arms_ambiguous:{case_id}:rank={rank}")
+        arm_pairs[rank] = (row_a, row_b)
+    operator = boundary.clock_operator
+    if any(row.start is None for local_rows in selected.values() for row in local_rows):
+        actual_a = round(max(row_a.end for row_a, _ in arm_pairs.values()))
+        actual_b = round(max(row_b.end for _, row_b in arm_pairs.values()))
+    else:
+        win_a = {rank: (row_a.start, row_a.end) for rank, (row_a, _) in arm_pairs.items()}
+        win_b = {rank: (row_b.start, row_b.end) for rank, (_, row_b) in arm_pairs.items()}
+        spans_a: dict[int, list[tuple[Decimal, Decimal]]] = {r: [] for r in win_a}
+        spans_b: dict[int, list[tuple[Decimal, Decimal]]] = {r: [] for r in win_b}
+        if operator == "busy_union":
+            for r_row in rows(win_a, None):
+                if r_row.end > r_row.start:
+                    spans_a[r_row.rank].append((r_row.start, r_row.end))
+            for r_row in rows(win_b, None):
+                if r_row.end > r_row.start:
+                    spans_b[r_row.rank].append((r_row.start, r_row.end))
+        actual_a = round(max(_timed_rank_duration(case_id, format_name, operator, left, right, spans_a[r])
+                             for r, (left, right) in win_a.items()))
+        actual_b = round(max(_timed_rank_duration(case_id, format_name, operator, left, right, spans_b[r])
+                             for r, (left, right) in win_b.items()))
+    if arm_a_measured_ns is not None and abs(actual_a - arm_a_measured_ns) > _CAPTURE_ROUNDING_NS:
+        raise ModelingError(f"capture_duration_mismatch:{case_id}:arm_a:declared={arm_a_measured_ns}:actual={actual_a}")
+    if arm_b_measured_ns is not None and abs(actual_b - arm_b_measured_ns) > _CAPTURE_ROUNDING_NS:
+        raise ModelingError(f"capture_duration_mismatch:{case_id}:arm_b:declared={arm_b_measured_ns}:actual={actual_b}")
+    return actual_b - actual_a, CaptureVerificationReceipt(occurrences)
+
+
 def _verify_timed_capture(
     case_id: str, boundary: Any, format_name: str, target_events: frozenset[str],
     rows: Callable[[_RankWindows | None, frozenset[str] | None], Iterator[_CaptureRow]], seen_ranks: set[int],
-    trace_meta: Mapping[str, Any] | None = None,
+    trace_meta: Mapping[str, Any] | None = None, *,
+    arm_a_measured_ns: int | None = None, arm_b_measured_ns: int | None = None,
 ) -> tuple[int, CaptureVerificationReceipt]:
     if not boundary.device_ranks:
         raise ModelingError(f"capture_rank_mismatch:{case_id}:requested_ranks_absent")
@@ -872,6 +1012,11 @@ def _verify_timed_capture(
     composite = kind in L1_COMPOSITE_BOUNDARY_KINDS
     selected = _selected_rows(case_id, format_name, boundary, target_events, rows(None, target_events), seen_ranks)
     occurrences = frozenset(row.occurrence for local_rows in selected.values() for row in local_rows)
+    if kind == "paired_rung_delta":
+        return _verify_paired_rung_capture(
+            case_id, boundary, format_name, selected, occurrences, rows,
+            arm_a_measured_ns=arm_a_measured_ns, arm_b_measured_ns=arm_b_measured_ns,
+        )
     if single_kernel:
         for rank, local_rows in selected.items():
             if (count := len(local_rows)) != 1:
@@ -926,6 +1071,8 @@ def verify_capture_file_consistency(
     stream_chunk_bytes: int,
     extract_meta_fn: Callable[..., dict[str, Any]],
     measured_ns: int | None = None,
+    arm_a_measured_ns: int | None = None,
+    arm_b_measured_ns: int | None = None,
 ) -> CaptureVerificationReceipt | None:
     """Bind one-based source rows and field-qualified events to a raw capture.
 
@@ -966,6 +1113,7 @@ def verify_capture_file_consistency(
             duration, receipt = _verify_timed_capture(
                 case_id, boundary, format_name, target_events, rows, seen_ranks,
                 trace_meta=meta if format_name == "trace" else None,
+                arm_a_measured_ns=arm_a_measured_ns, arm_b_measured_ns=arm_b_measured_ns,
             )
             if measured_ns is None or abs(duration - measured_ns) > _CAPTURE_ROUNDING_NS:
                 raise ModelingError(f"capture_duration_mismatch:{case_id}:declared={measured_ns}:actual={duration}")
@@ -1007,6 +1155,8 @@ def verify_capture_file_consistency(
         kind = getattr(boundary, "boundary_kind", "")
         if kind == "device_kernel":
             raise ModelingError(f"capture_device_kernel_occurrence_unavailable:{case_id}")
+        if kind == "paired_rung_delta":
+            raise ModelingError(f"capture_paired_rung_rows_unavailable:{case_id}")
         if kind in L1_COMPOSITE_BOUNDARY_KINDS:
             raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:no_device_rows")
     return receipt
