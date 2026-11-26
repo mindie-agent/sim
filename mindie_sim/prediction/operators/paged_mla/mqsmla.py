@@ -151,6 +151,8 @@ SOFTMAX_ROW_REDUCE_OPS = 26
 ACCUM_NONFIRST_OPS = 3
 # Declared AIC ownership bounds of the source wrapper.
 MAX_MQSMLA_AIC_CORES = 36
+# Upstream op_dsl/mixed_quant_sparse_flash_mla.py:3522 PA block size ceiling.
+DSL_MAX_PAGE_SIZE = 1024
 #: ``aclnnMixedQuantSparseFlashMla`` packed-KV modes of the arch35 kernel.
 KV_QUANT_BF16 = 0
 KV_QUANT_FP8 = 1
@@ -766,6 +768,22 @@ def _mqsmla_owner_program(context, aic, aivs, stream, head_counts, *, addressing
     ))
 
 
+def _coerce_abi_bindings(raw_bindings) -> tuple:
+    from collections.abc import Mapping
+    if not raw_bindings:
+        return ()
+    out = []
+    for item in raw_bindings:
+        if isinstance(item, Mapping):
+            from .family_mqsmla import manifest_binding_from_dict
+            parsed = manifest_binding_from_dict(item)
+            if parsed is not None:
+                out.append(parsed)
+        elif item is not None:
+            out.append(item)
+    return tuple(out)
+
+
 def build(op, geometry):
     meta = dict(op.metadata)
     shape = meta["mqsmla_geometry"]
@@ -821,6 +839,9 @@ def build(op, geometry):
     soc_arch, sku_id = _soc_arch_from_geometry(geometry, sku_override=meta.get("abi_sku_id"))
     sequences = tuple(shape["sequences"])
     active_q = sum(int(q) for q, _ in sequences)
+    page_size = int(meta.get("abi_page_size") or _MQS_DEFAULT_PAGE_SIZE)
+    if quant_mode is None and page_size > DSL_MAX_PAGE_SIZE:
+        raise ModelingError(f"mqsmla_dsl_page_size_exceeds_limit:{page_size}>{DSL_MAX_PAGE_SIZE}")
     abi_verdict = verify_mqsmla_abi(
         soc_arch=soc_arch,
         sku_id=sku_id,
@@ -831,9 +852,10 @@ def build(op, geometry):
         compressed_cache=bool(shape.get("ratio")),
         topk_present=bool(shape.get("topk")),
         topk=int(shape.get("topk") or 0),
+        page_size=page_size,
         pr_track=str(meta.get("abi_pr_track") or "shipping"),
         track_spec=meta.get("abi_track_spec"),
-        manifest_bindings=tuple(meta.get("abi_manifest_bindings") or ()),
+        manifest_bindings=_coerce_abi_bindings(meta.get("abi_manifest_bindings")),
     )
     if not is_abi_admitted(abi_verdict):
         raise ModelingError(f"mqsmla_abi_not_admitted:{abi_verdict.status}:{abi_verdict.rejection_reason}")

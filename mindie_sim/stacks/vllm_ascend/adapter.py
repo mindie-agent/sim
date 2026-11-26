@@ -1370,6 +1370,62 @@ def _resolve_sparse_kv_offload_option(
     return binding[2]
 
 
+def _select_mqsmla_binding(
+    model: ModelSpec,
+    *,
+    hw: str,
+    phase: str,
+    parallel: ParallelSpec,
+    manifest_hits: tuple[Any, ...],
+) -> tuple[str, str, tuple[tuple[str, Any], ...]] | None:
+    """Bind A5 MQSMLA DSL decode recipe only when admitted by an active manifest binding."""
+    if hw != "a5" or phase not in {"decode", "mixed"} or int(parallel.cp or 1) != 1:
+        return None
+    if not any(b.mechanism_id == "mqsmla_dsl_544_320" for b in manifest_hits):
+        return None
+    from mindie_sim.catalog.cache_format import CacheFormat, cache_format
+    from mindie_sim.prediction.operators.paged_mla.family_mqsmla import (
+        FORMATS as MQSMLA_FORMATS,
+        KV_QUANT_FP8,
+        KV_QUANT_MXFP8,
+        quant_mode_of as mqsmla_quant_mode_of,
+    )
+    from mindie_sim.prediction.operators.paged_mla.mqsmla import (
+        MQSMLA_HEAD_WIDTH,
+        MQSMLA_ROPE_WIDTH,
+        RECIPE as MQSMLA_RECIPE,
+        supported_heads,
+    )
+    v41_layers = tuple(
+        p for p in model.layer_plans
+        if str(p.attention).lower() == "mla"
+        and str(getattr(p, "mla_variant", "") or "") == "latent_mqa"
+        and str(getattr(p, "cache_kind", "") or "") == "window_compressed"
+    )
+    if not v41_layers or not any(p.compressor_kind == "gated_ring" for p in v41_layers):
+        return None
+    if str(model.activation_dtype).strip().lower() != "bf16":
+        return None
+    if dict(model.metadata).get("cache_representations") is not None:
+        if mqsmla_quant_mode_of(model, MQSMLA_HEAD_WIDTH) not in {KV_QUANT_FP8, KV_QUANT_MXFP8}:
+            if any(
+                cache_format(model, region) != CacheFormat(**decl)
+                for region, decl in MQSMLA_FORMATS.items()
+            ):
+                return None
+    tp = max(1, int(parallel.tp or 1))
+    if any(
+        int(p.num_kv_heads or 0) != 1
+        or int(p.head_dim or 0) != MQSMLA_HEAD_WIDTH
+        or int(p.qk_rope_head_dim or 0) != MQSMLA_ROPE_WIDTH
+        or not supported_heads(int(p.num_heads or 0) // tp)
+        or (int(getattr(p, "o_groups", 0) or 0) and int(p.o_groups) % tp != 0)
+        for p in v41_layers
+    ):
+        return None
+    return ("mqsmla_attention", MQSMLA_RECIPE, ())
+
+
 def _select_recipe_bindings(
     model: ModelSpec,
     *,
@@ -1425,6 +1481,12 @@ def _select_recipe_bindings(
         if mla_binding is not None:
             bindings.append(mla_binding)
             origins.append((mla_binding[0], "stack_profile"))
+        mqsmla_binding = _select_mqsmla_binding(
+            model, hw=hw, phase=phase, parallel=parallel, manifest_hits=manifest_hits,
+        )
+        if mqsmla_binding is not None:
+            bindings.append(mqsmla_binding)
+            origins.append((mqsmla_binding[0], "stack_profile"))
 
     if "kda" in attns and track != "eager":
         for kda_binding in _select_kda_bindings(

@@ -342,7 +342,11 @@ def _lower_selection_gather(
     die = int(ctx.geometry.rank or 0)
     hbm_name = context.resource_names["hbm"]
     pipe_role = "mte2_aiv" if "mte2_aiv" in context.resource_names else "mte2"
-    pipe_units = context.resource_units.get(pipe_role, 1)
+    pipe_row = context.resource_names[pipe_role]
+    pipe_units = max(1, int(context.resource_units.get(
+        pipe_row, context.resource_units.get(pipe_role, context.resource_units.get("mte2", 1))
+    )))
+    pipe_rate = float(context.rates[pipe_row]) / float(pipe_units)
     bus = HbmBusSpec(die, 1, 1, 0, row_r=hbm_name, row_w=hbm_name, ctr_r=hbm_name, ctr_w=hbm_name)
     l2_cap = _l2_capacity_bytes(ctx)
     aiv_programs = []
@@ -357,7 +361,10 @@ def _lower_selection_gather(
                 key.backing_allocation, key.tensor_version, die, owner, "read", pipe_role,
                 plan.runs[0].rows * width, plan, reuse_key=key,
             )
-            bound = context.bind_access(pat, hbm_bus=bus)
+            bound = context.bind_access(
+                pat, hbm_bus=bus,
+                copy_hit_bytes_per_ms=pipe_rate, copy_miss_bytes_per_ms=pipe_rate,
+            )
             st_name = "read" if idx == 0 else f"read-{idx}"
             read_stages.append(Stage(
                 st_name,

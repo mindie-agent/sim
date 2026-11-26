@@ -571,6 +571,21 @@ def _source_attention_and_moe_mechanisms() -> tuple[OptimizationMechanism, ...]:
             apply=_apply_csa2_indexer_epilogue,
         ),
         OptimizationMechanism(
+            id="mqsmla_dsl_544_320", category="attention_fusion",
+            phases=("decode",),
+            summary="Non-CANN TileLang DSL MixedQuantSparseFlashMla (544B FP8 + 320B FP4 packed KV) on A5",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(
+                    p.mla_variant == "latent_mqa"
+                    and p.cache_kind == "window_compressed"
+                    and int(p.compress_ratio or 0) > 0
+                    for p in ctx.model.layer_plans
+                )
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, mqsmla_dsl_544_320_active=True),
+        ),
+        OptimizationMechanism(
             id="in_kernel_gdn_decode_gate", category="recurrent", phases=("decode",),
             summary="Fold GDN gating/L2Norm into recurrent_gated_delta_rule and skip output buffer zeroing",
             eligible=lambda ctx: (

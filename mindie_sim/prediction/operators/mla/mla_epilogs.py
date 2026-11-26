@@ -693,22 +693,35 @@ def _indexer_quant_cache_available(arch: str) -> bool:
     return default_abi_registry().is_shipping_available(INDEXER_QUANT_CACHE, arch)
 
 
+_IQC_MX_GROUP_SIZE = 32
+_IQC_HIFP4_GROUP_SIZE = 64
+
+
 def _indexer_quant_cache_operands_supported(
     input_dtype: str, payload_dtype: str, scale_dtype: str, *, packed_elements: int = 1,
+    width: int = 0, scale_count: int = 0,
 ) -> bool:
-    """Enforce CANN ``indexer_quant_cache_contract.h::IsValidQuantTypes``."""
+    """Enforce CANN ``indexer_quant_cache_contract.h::IsValidQuantTypes`` & scale stride."""
     x = str(input_dtype or "").strip().lower()
     cache = str(payload_dtype or "").strip().lower()
     scale = str(scale_dtype or "").strip().lower()
     if x not in _IQC_INPUT_DTYPES:
         return False
     if cache in _IQC_FP8_DTYPES and scale in _IQC_E8M0_SCALES:
+        if width > 0 and scale_count > 0:
+            expected_scales = (width + _IQC_MX_GROUP_SIZE - 1) // _IQC_MX_GROUP_SIZE
+            return scale_count == expected_scales
         return True
     if packed_elements == 1 and cache in _IQC_NORMAL_DTYPES and scale in _IQC_FP32_SCALES:
-        return True
+        return scale_count <= 1
     if (cache in _IQC_FP4_DTYPES or (cache == "uint8" and packed_elements == _PACKED_FP4_ELEMENTS)) and scale in _IQC_E8M0_SCALES:
+        if width > 0 and scale_count > 0:
+            expected_scales = (width + _IQC_MX_GROUP_SIZE - 1) // _IQC_MX_GROUP_SIZE
+            return scale_count == expected_scales
         return True
     if cache in _IQC_HIFP4_DTYPES and scale in _IQC_HIFP4_SCALES:
+        if width > 0 and scale_count > 0:
+            return width % _IQC_HIFP4_GROUP_SIZE == 0 and scale_count == width // _IQC_HIFP4_GROUP_SIZE
         return True
     return False
 
@@ -736,9 +749,11 @@ def index_row_quantization(builder, store_id, quantize_id, *, width, native, arc
         return store_id
     metadata = dict(quantize.metadata)
     packed = int(metadata.get("packed_elements") or 1)
+    scale_count = int(metadata.get("scale_count") or 0)
+    input_dtype = str(metadata.get("input_format") or quantize.dtype)
     if not _indexer_quant_cache_operands_supported(
-        quantize.dtype, metadata.get("output_format"), metadata.get("scale_format"),
-        packed_elements=packed,
+        input_dtype, metadata.get("output_format"), metadata.get("scale_format"),
+        packed_elements=packed, width=width, scale_count=scale_count,
     ):
         return store_id
     inputs = tuple(quantize.deps)
@@ -754,6 +769,7 @@ def index_row_quantization(builder, store_id, quantize_id, *, width, native, arc
             ("native_kind", INDEXER_QUANT_CACHE),
             ("fused_members", (quantize.op_id, store.op_id)),
             ("payload_dtype", metadata.get("output_format")),
+            ("slot_table_bytes", 0.0),
             ("cache_epilog", {
                 "kind": INDEXER_QUANT_CACHE,
                 "payload_dtype": metadata.get("output_format"),
@@ -1149,6 +1165,122 @@ def _emit_packed_mxfp4_index_store(
     )
 
 
+def _produce_keypool_index_cache(
+    b, plan, pool_binding, views, deps, model, quant, q, runtime, parallel, *, pcp_prefill=False,
+):
+    from mindie_sim.prediction.operators.sparse_indexer import index_pool
+    kpool_source, kpool_views, kpool_q = deps, views, q
+    if pcp_prefill and int(parallel.pcp) > 1:
+        kpool_views = tuple(
+            replace(v, q_len=int(v.global_q_len or v.q_len),
+                    query_ranges=((0, int(v.global_q_len or v.q_len)),))
+            if v.phase == "prefill" else v
+            for v in views
+        )
+        kpool_q = max(q * int(parallel.pcp), sum(v.q_len for v in kpool_views))
+        kpool_source = emit_pcp_hidden_gather_restore(
+            b.ops, prefix=b.prefix,
+            gather_name="pcp_keypool_hidden_gather",
+            restore_name="pcp_keypool_hidden_restore",
+            stage=b.common["stage"], layer=plan.index,
+            requests=b.common["requests"], mode=b.common["phase"],
+            dep=deps, local_rows=q, global_rows=kpool_q,
+            hidden=model.hidden_size, pcp=int(parallel.pcp),
+            act_dtype=model.activation_dtype, runtime=runtime,
+            source="vllm_ascend.attention.indexer_kpool",
+            stream=CP_DECODE_COMM_STREAM,
+        )
+    native_pool = bool(
+        pool_binding
+        and pool_binding.name == "vllm_ascend_cann_keypool_caller")
+    if native_pool:
+        from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import supported as native_pool_supported
+        # Both native cache production and analytical fallback retain the full K/V batch.
+        native_pool = native_pool_supported(
+            views=kpool_views, plan=plan, model=model, quant=quant)
+    pool_module = pool_binding.module if native_pool else index_pool
+    producer_options = (pool_binding.options if native_pool else {})
+    return pool_module.producer(
+        b, source=kpool_source, views=kpool_views, plan=plan, model=model, quant=quant,
+        padded_tokens=kpool_q, **producer_options)
+
+
+def _emit_index_cache_store(
+    b, plan, views, model, quant, normalized, *, ratio, index_rows, index_rows_by_view,
+    quant_rows, c2_token_aligned, runtime, native_indexer, parallel, idx_block,
+    sharded_index, machine, store_rank_candidates, raw_block,
+):
+    last = b.ops[-1]
+    quantize_id = (last.op_id if last.family == "quantize"
+                   and last.op_id == b.prefix + ".index_key_quantize" else None)
+    if sharded_index and index_rows:
+        if ratio > 1:
+            index_store_rows = _store_rows(
+                [view.q_len for view in views], views, parallel,
+                int(raw_block) if raw_block is not None else max(1, idx_block * ratio),
+                rank_candidates=store_rank_candidates, ratio=ratio,
+            )
+        else:
+            index_store_rows = _store_rows(
+                index_rows_by_view, views, parallel, idx_block,
+                rank_candidates=store_rank_candidates,
+            )
+    else:
+        index_store_rows = index_rows
+    total_row_b = index_row_bytes(model, plan.index_dim)
+    arch = _resolve_arch(runtime, machine)
+    q_meta = dict(last.metadata) if quantize_id is not None else {}
+    packed_elems = int(q_meta.get("packed_elements") or 1)
+    scale_count = int(q_meta.get("scale_count") or 0)
+    q_input_dtype = str(q_meta.get("input_format") or last.dtype)
+    iqc_supported = (
+        quantize_id is not None
+        and _indexer_quant_cache_available(arch)
+        and _indexer_quant_cache_operands_supported(
+            q_input_dtype, q_meta.get("output_format"), q_meta.get("scale_format"),
+            packed_elements=packed_elems, width=plan.index_dim, scale_count=scale_count,
+        )
+    )
+    if quantize_id is not None and native_indexer and packed_elems > 1 and arch == "A5":
+        return _emit_packed_mxfp4_index_store(
+            b, last, quant_rows=quant_rows, index_store_rows=index_store_rows,
+            total_row_b=total_row_b, width=plan.index_dim,
+        )
+    if quantize_id is not None and native_indexer and not iqc_supported:
+        # Target arch or operand tuple lacks shipping aclnnIndexerQuantCache:
+        # keep dynamic quant (FP32 scale) + scale cast + two slot-indexed scatters.
+        return _emit_decomposed_index_quant_store(
+            b, last, normalized=normalized, index_rows=quant_rows,
+            index_store_rows=index_store_rows, total_row_b=total_row_b, quant=quant,
+            c2_token_aligned=c2_token_aligned,
+        )
+    index_store = b.store("index_store", (normalized,), index_store_rows,
+                          total_row_b, quant.index_dtype)
+    if quantize_id is not None:
+        return index_row_quantization(
+            b, index_store, quantize_id, width=plan.index_dim,
+            native=native_indexer, arch=arch)
+    if native_indexer:
+        from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import SCATTER_PA_KV_RECIPE, SCATTER_PA_KV_SOURCE
+        store_op = next((item for item in reversed(b.ops)
+                         if item.op_id == index_store), None)
+        if store_op is not None and store_op.family == "cache_store":
+            upgraded = replace(
+                store_op,
+                family="kv_cache_write",
+                recipe=SCATTER_PA_KV_RECIPE,
+                metadata=store_op.metadata + (
+                    ("native_kind", KV_SCATTER_EPILOG),
+                    ("native_cache_store", True),
+                    ("zero_external_casts", True),
+                    ("native_source", SCATTER_PA_KV_SOURCE),
+                ),
+            )
+            b.ops = [upgraded if item.op_id == index_store else item
+                     for item in b.ops]
+    return index_store
+
+
 def _produce_index_cache(
     b, plan, pool_binding, views, deps, model, quant, q, long_store, compressed_latent, ratio,
     valid, fused_compressor, runtime, native_indexer, index_rope, parallel, idx_block,
@@ -1157,41 +1289,10 @@ def _produce_index_cache(
 ):
     index_store = pool_weights = None
     if plan.owns_index_k and plan.index_kpool > 1:
-        from mindie_sim.prediction.operators.sparse_indexer import index_pool
-        kpool_source, kpool_views, kpool_q = deps, views, q
-        if pcp_prefill and int(parallel.pcp) > 1:
-            kpool_views = tuple(
-                replace(v, q_len=int(v.global_q_len or v.q_len),
-                        query_ranges=((0, int(v.global_q_len or v.q_len)),))
-                if v.phase == "prefill" else v
-                for v in views
-            )
-            kpool_q = max(q * int(parallel.pcp), sum(v.q_len for v in kpool_views))
-            kpool_source = emit_pcp_hidden_gather_restore(
-                b.ops, prefix=b.prefix,
-                gather_name="pcp_keypool_hidden_gather",
-                restore_name="pcp_keypool_hidden_restore",
-                stage=b.common["stage"], layer=plan.index,
-                requests=b.common["requests"], mode=b.common["phase"],
-                dep=deps, local_rows=q, global_rows=kpool_q,
-                hidden=model.hidden_size, pcp=int(parallel.pcp),
-                act_dtype=model.activation_dtype, runtime=runtime,
-                source="vllm_ascend.attention.indexer_kpool",
-                stream=CP_DECODE_COMM_STREAM,
-            )
-        native_pool = bool(
-            pool_binding
-            and pool_binding.name == "vllm_ascend_cann_keypool_caller")
-        if native_pool:
-            from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import supported as native_pool_supported
-            # Both native cache production and analytical fallback retain the full K/V batch.
-            native_pool = native_pool_supported(
-                views=kpool_views, plan=plan, model=model, quant=quant)
-        pool_module = pool_binding.module if native_pool else index_pool
-        producer_options = (pool_binding.options if native_pool else {})
-        index_store, pool_weights = pool_module.producer(
-            b, source=kpool_source, views=kpool_views, plan=plan, model=model, quant=quant,
-            padded_tokens=kpool_q, **producer_options)
+        index_store, pool_weights = _produce_keypool_index_cache(
+            b, plan, pool_binding, views, deps, model, quant, q, runtime, parallel,
+            pcp_prefill=pcp_prefill,
+        )
     elif plan.owns_index_k:
         index_source = long_store if plan.index_input == "compressed" else deps
         if plan.index_input == "compressed":
@@ -1278,73 +1379,14 @@ def _produce_index_cache(
         normalized = index_representation(
             b, "index_key", normalized, quant_rows, plan.index_dim,
             quant=quant, model=model, rotate_basis=_indexer_rotates_basis(plan, model))
-        last = b.ops[-1]
-        quantize_id = (last.op_id if last.family == "quantize"
-                       and last.op_id == b.prefix + ".index_key_quantize" else None)
-        if sharded_index and index_rows:
-            if ratio > 1:
-                index_store_rows = _store_rows(
-                    [view.q_len for view in views], views, parallel,
-                    int(raw_block) if raw_block is not None else max(1, idx_block * ratio),
-                    rank_candidates=store_rank_candidates, ratio=ratio,
-                )
-            else:
-                index_store_rows = _store_rows(
-                    index_rows_by_view, views, parallel, idx_block,
-                    rank_candidates=store_rank_candidates,
-                )
-        else:
-            index_store_rows = index_rows
-        total_row_b = index_row_bytes(model, plan.index_dim)
-        arch = _resolve_arch(runtime, machine)
-        q_meta = dict(last.metadata) if quantize_id is not None else {}
-        packed_elems = int(q_meta.get("packed_elements") or 1)
-        iqc_supported = (
-            quantize_id is not None
-            and _indexer_quant_cache_available(arch)
-            and _indexer_quant_cache_operands_supported(
-                last.dtype, q_meta.get("output_format"), q_meta.get("scale_format"),
-                packed_elements=packed_elems,
-            )
+        index_store = _emit_index_cache_store(
+            b, plan, views, model, quant, normalized,
+            ratio=ratio, index_rows=index_rows, index_rows_by_view=index_rows_by_view,
+            quant_rows=quant_rows, c2_token_aligned=c2_token_aligned,
+            runtime=runtime, native_indexer=native_indexer, parallel=parallel,
+            idx_block=idx_block, sharded_index=sharded_index, machine=machine,
+            store_rank_candidates=store_rank_candidates, raw_block=raw_block,
         )
-        if quantize_id is not None and native_indexer and packed_elems > 1 and arch == "A5":
-            index_store = _emit_packed_mxfp4_index_store(
-                b, last, quant_rows=quant_rows, index_store_rows=index_store_rows,
-                total_row_b=total_row_b, width=plan.index_dim,
-            )
-        elif quantize_id is not None and native_indexer and not iqc_supported:
-            # Target arch or operand tuple lacks shipping aclnnIndexerQuantCache:
-            # keep dynamic quant (FP32 scale) + scale cast + two slot-indexed scatters.
-            index_store = _emit_decomposed_index_quant_store(
-                b, last, normalized=normalized, index_rows=quant_rows,
-                index_store_rows=index_store_rows, total_row_b=total_row_b, quant=quant,
-                c2_token_aligned=c2_token_aligned,
-            )
-        else:
-            index_store = b.store("index_store", (normalized,), index_store_rows,
-                                  total_row_b, quant.index_dtype)
-            if quantize_id is not None:
-                index_store = index_row_quantization(
-                    b, index_store, quantize_id, width=plan.index_dim,
-                    native=native_indexer, arch=arch)
-            elif native_indexer:
-                from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import SCATTER_PA_KV_RECIPE, SCATTER_PA_KV_SOURCE
-                store_op = next((item for item in reversed(b.ops)
-                                 if item.op_id == index_store), None)
-                if store_op is not None and store_op.family == "cache_store":
-                    upgraded = replace(
-                        store_op,
-                        family="kv_cache_write",
-                        recipe=SCATTER_PA_KV_RECIPE,
-                        metadata=store_op.metadata + (
-                            ("native_kind", KV_SCATTER_EPILOG),
-                            ("native_cache_store", True),
-                            ("zero_external_casts", True),
-                            ("native_source", SCATTER_PA_KV_SOURCE),
-                        ),
-                    )
-                    b.ops = [upgraded if item.op_id == index_store else item
-                             for item in b.ops]
     return index_store, pool_weights
 
 
@@ -1400,6 +1442,12 @@ def _select_index_rows(
             if bf16_indexer.name != li.IMPLEMENTATION:
                 raise ModelingError("mla_lightning_indexer_selected_not_bf16")
             view = views[0]
+            w_op = next((item for item in reversed(b.ops) if item.op_id == weights), None)
+            w_out_dtype = (
+                str(dict(w_op.metadata).get("output_format") or w_op.dtype
+                    or model.activation_dtype).strip().lower()
+                if w_op is not None else model.activation_dtype
+            )
             topk = b.add(li.make_op(
                 query_rows=view.q_len, context=view.context,
                 op_id=b.prefix + ".index_lightning",
@@ -1410,7 +1458,7 @@ def _select_index_rows(
                 page_size=int(getattr(runtime, "kv_block_size", 0)
                               or DEFAULT_BLOCK_SIZE),
                 kv_heads=1, query_dtype=model.activation_dtype,
-                cache_dtype=index_cache_dtype(model), weight_dtype="fp32",
+                cache_dtype=index_cache_dtype(model), weight_dtype=w_out_dtype,
                 query_lengths=(view.q_len,), context_lengths=(view.context,),
                 binding_revision=str(getattr(runtime, "vllm_version", "unknown")),
                 runtime_version=str(getattr(runtime, "vllm_version", "unknown")),

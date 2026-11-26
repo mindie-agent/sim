@@ -675,6 +675,19 @@ def _dense_mla_default(case, phase, tokens, dense_mla, *, kernels, pipes, parall
                      if not reason else {}))}
 
 
+def _is_arch35_machine(machine) -> bool:
+    if str(getattr(machine, "arch_family", "") or "").strip().upper() == "A5":
+        return True
+    for die in getattr(machine, "dies", ()) or ():
+        ca = getattr(die, "compute_arch", None)
+        preset = str(
+            getattr(ca, "preset", "") or getattr(ca, "arch_id", "") or ""
+        ).strip()
+        if preset in {"npu_arch_3510", "DAV_3510"}:
+            return True
+    return False
+
+
 def attention_defaults(case, phase, *, tokens=1):
     prior_kernels = case.runtime.kernels or {}
     prior_keys = {
@@ -738,13 +751,19 @@ def attention_defaults(case, phase, *, tokens=1):
             else:
                 packed = case.model.quant.kv_dtype == "int8"
                 if packed:
-                    from mindie_sim.prediction.operators.paged_mla.indexed_quant_attention import VECTOR_BUFFER_BYTES
-                    if any(d.pool_units("ub") != d.compute_units * 2
-                           or dict(d.buffers).get("ub", 0) < VECTOR_BUFFER_BYTES
-                           or any(d.units(role) != d.compute_units * ratio for role, ratio in (
-                               ("vector", 2), ("mte2_aiv", 2), ("mte3", 2),
-                               ("mte2_aic", 1), ("mte1", 1), ("fixpipe", 1)))
-                           for d in case.machine.dies):
+                    from mindie_sim.prediction.operators.paged_mla.indexed_quant_attention import (
+                        INDEXED_ROPE_DIM, VECTOR_BUFFER_BYTES,
+                    )
+                    if _is_arch35_machine(case.machine) and any(
+                        p.qk_rope_head_dim != INDEXED_ROPE_DIM for p in layers
+                    ):
+                        reason = "packed_int8_indexed_attention_arch35_requires_rope64"
+                    elif any(d.pool_units("ub") != d.compute_units * 2
+                             or dict(d.buffers).get("ub", 0) < VECTOR_BUFFER_BYTES
+                             or any(d.units(role) != d.compute_units * ratio for role, ratio in (
+                                 ("vector", 2), ("mte2_aiv", 2), ("mte3", 2),
+                                 ("mte2_aic", 1), ("mte1", 1), ("fixpipe", 1)))
+                             for d in case.machine.dies):
                         reason = "packed_indexed_scratch_or_paired_pipe_domain"
                 if reason:
                     records.append({"family": family, "selection": "preserved", "reason": reason})

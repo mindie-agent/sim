@@ -796,6 +796,30 @@
       ]
     },
     {
+      "mechanism_id": "mqsmla_dsl_544_320",
+      "state": "unmerged_pr",
+      "ref": "cann/ops-transformer@2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+      "archs": [
+        "a5"
+      ],
+      "notes": "Non-CANN TileLang DSL MixedQuantSparseFlashMla (544B FP8 window + 320B FP4 compressed KV) for A5 decode",
+      "provenance": {
+        "repository": "cann/ops-transformer",
+        "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "relative_path": "attention/mixed_quant_sparse_flash_mla/op_dsl/mixed_quant_sparse_flash_mla.py",
+        "source_sha256": "7202ee9ae83ac0ceb553b1d0aeeab1cb8bc7e4b05e9ef6e84356ea493e27d74c"
+      },
+      "provenance_scope": "external_package_snapshot",
+      "lowering_pass_id": "mqsmla_dsl_544_320",
+      "capability_predicates": [
+        "has_csa2_compressed_indexer"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
+    },
+    {
       "mechanism_id": "gdn_strided_gate_zero_copy",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21466",

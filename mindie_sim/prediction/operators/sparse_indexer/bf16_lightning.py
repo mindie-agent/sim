@@ -81,7 +81,7 @@ _DEFAULT_KEY_PAGE_ROWS = 128
 _QUERY_RANK = 3
 _PAGED_KEY_CACHE_RANK = 4
 _CAUSAL_MASK_MODE = 3
-WEIGHT_DTYPES = frozenset({"fp32"})
+WEIGHT_DTYPES = frozenset({"fp32", "bf16", "fp16"})
 _DTYPE_ALIASES = {"bfloat16": "bf16", "float32": "fp32", "float16": "fp16"}
 
 
