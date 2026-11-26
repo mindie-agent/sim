@@ -62,6 +62,9 @@ def _delegate(command: str, rest: tuple[str, ...], *, prog: str) -> int | None:
     if command == "diff-campaigns":
         from mindie_sim.observations.campaign_reconcile import diff_main
         return diff_main(list(rest), prog=f"{prog} obs diff-campaigns")
+    if command == "matrix":
+        from .matrix import matrix_main
+        return matrix_main(list(rest), prog=f"{prog} matrix")
     return None
 
 

@@ -300,14 +300,42 @@ def export_structure(
     return spine.project_structure(prepared, request)
 
 
+def build_operator_matrix(spec: Any, /, **kwargs: Any) -> Any:
+    """Evaluate a multi-model operator matrix via the unified single spine."""
+    from mindie_sim.export.operator_matrix import build_operator_matrix as _build_matrix
+    return _build_matrix(spec, **kwargs)
+
+
+def export_operator_matrix(spec_or_manifest: Any, out_dir: str | Path, /, **kwargs: Any) -> Any:
+    """Export the outward pure-English multi-file operator matrix package."""
+    from mindie_sim.export.matrix_writer import export_operator_matrix as _export_matrix
+    return _export_matrix(spec_or_manifest, out_dir, **kwargs)
+
+
+def build_bench_plan(spec_or_manifest: Any, /, **kwargs: Any) -> Any:
+    """Compile a deduplicated, SHA-256-sealed ``mindie-bench-plan/2`` plan."""
+    from mindie_sim.export.operator_matrix import build_bench_plan as _build_plan
+    return _build_plan(spec_or_manifest, **kwargs)
+
+
+def reconcile_campaign(campaign: Any, /, **kwargs: Any) -> dict[str, Any]:
+    """Fail-closed reconciliation of a ``mindie-bench-campaign/1`` manifest."""
+    from mindie_sim.observations.campaign_reconcile import reconcile_campaign as _reconcile
+    return _reconcile(campaign, **kwargs)
+
+
 __all__ = [
+    "build_bench_plan",
+    "build_operator_matrix",
     "compose_case",
     "evaluate_service",
     "evaluate_step",
     "evaluate_three_tiers",
+    "export_operator_matrix",
     "export_structure",
     "model_target_ceiling",
     "optimize_ladder",
+    "reconcile_campaign",
     "solve_deployment",
     "solve_optimal_deployment",
     "solve_sla",

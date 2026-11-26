@@ -146,7 +146,21 @@ from .models import (
     TraceScheduleEntry,
     WeightLedgerRow,
 )
-from .ooxml import Workbook, Worksheet, cell_ref, column_letter
+from .matrix_writer import (
+    MatrixExportReceipt,
+    assert_zero_internal_jargon,
+    export_operator_matrix,
+)
+from .ooxml import ChartSeries, LineChartSpec, Workbook, Worksheet, cell_ref, column_letter
+from .operator_matrix import (
+    build_bench_plan,
+    build_bench_plans_by_sku,
+    build_operator_matrix,
+    derive_physical_seq_cliffs,
+    enumerate_parallel_arms,
+    evaluate_hbm_admissibility,
+    render_subgraph_plan_v1_compat,
+)
 from .public_view import (
     PUBLIC_ARTIFACT_KEYS,
     PUBLIC_CONFIG_FIELD_ORDER,
@@ -202,6 +216,18 @@ __all__ = [
     "ActionRoadmapRow",
     "AlignedComparisonRow",
     "AscendKernelDescriptor",
+    "ChartSeries",
+    "LineChartSpec",
+    "MatrixExportReceipt",
+    "assert_zero_internal_jargon",
+    "build_bench_plan",
+    "build_bench_plans_by_sku",
+    "build_operator_matrix",
+    "derive_physical_seq_cliffs",
+    "enumerate_parallel_arms",
+    "evaluate_hbm_admissibility",
+    "export_operator_matrix",
+    "render_subgraph_plan_v1_compat",
     "BACKEND_ASCENDC",
     "BACKEND_CANN",
     "BACKEND_CATLASS",
