@@ -569,3 +569,131 @@ def test_cli_report_forwards_mtp_aliases_and_pd_decode_slo_flags() -> None:
         assert float(rt_dict.get("mtp_acceptance_length", 0.0)) == pytest.approx(MTP_FIVE_ACCEPT)
         assert step_col.tokens == 1 + MTP_FIVE_TOKENS
         assert step_col.scope == "model"
+
+
+def test_bundle_ragged_memory_asymmetric_cohorts_pp_mbu_observations_and_draft_prepare() -> None:
+    from dataclasses import replace
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export.bundle import _remap_link_ranks
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
+    from mindie_sim.prediction.results import RequestView
+
+    # 1. Ragged RequestViews (including BSND + padded_tokens) and idle DP tuples delegate HBM sizing to Memory receipt.
+    c_rag = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], dp=1, tp=4, layers=2))
+    views = (RequestView(request_id="long", phase="decode", q_len=1, context=32768, samples=1),) + tuple(
+        RequestView(request_id=f"s{i}", phase="decode", q_len=1, context=128, samples=1) for i in range(127)
+    )
+    b_rag = build_export_bundle(c_rag, request=StepRequest("decode", 1, 32768, 128, "model", requests=views), apply_target_envelope=False)
+    rcpt = Memory(c_rag, workspace_tokens=128).resident_memory_receipt(phase="decode", request_views=views)
+    assert b_rag.memory_ledger.max_stage_hbm_bytes == pytest.approx(float(rcpt.peak_die_hbm_bytes), abs=1.0)
+    bsnd_v = (
+        RequestView(request_id="a", phase="prefill", q_len=16, context=0, samples=1),
+        RequestView(request_id="b", phase="prefill", q_len=64, context=0, samples=1),
+    )
+    b_bsnd = build_export_bundle(c_rag, request=StepRequest("prefill", 64, 0, 2, "model", requests=bsnd_v, layout="BSND", padded_tokens=256), apply_target_envelope=False)
+    rcpt_bsnd = Memory(c_rag, workspace_tokens=256).resident_memory_receipt(phase="prefill", request_views=bsnd_v)
+    assert b_bsnd.memory_ledger.max_stage_hbm_bytes == pytest.approx(float(rcpt_bsnd.peak_die_hbm_bytes), abs=1.0)
+    mix_v = (
+        RequestView(request_id="d0", phase="decode", q_len=1, context=128, samples=1),
+        RequestView(request_id="d1", phase="decode", q_len=1, context=128, samples=0),
+    )
+    b_mix = build_export_bundle(c_rag, request=StepRequest("decode", 1, 128, 2, "model", requests=mix_v), apply_target_envelope=False)
+    assert b_mix.avg_accepted_tokens == pytest.approx(0.5, abs=1e-9)
+
+    # 2. Asymmetric DP tuples (including idle replica and heterogeneous hardware cohorts) evaluate all cohorts and take max span.
+    c_dp = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], dp=2, tp=1, layers=1))
+    b_lo_hi = build_export_bundle(c_dp, request=StepRequest("decode", 1, 256, (1, 16), "model"), apply_target_envelope=False)
+    b_hi_lo = build_export_bundle(c_dp, request=StepRequest("decode", 1, 256, (16, 1), "model"), apply_target_envelope=False)
+    assert b_lo_hi.step_span_ns == b_hi_lo.step_span_ns
+    assert b_lo_hi.throughput_tokens_per_s == pytest.approx(b_hi_lo.throughput_tokens_per_s, rel=1e-9)
+    b_idle = build_export_bundle(c_dp, request=StepRequest("decode", 1, 128, (0, 16), "model"), apply_target_envelope=False)
+    r_idle = Memory(c_dp, workspace_tokens=16).resident_memory_receipt(phase="decode", sequence_tokens=129, batch_per_dp=(0, 16))
+    assert b_idle.memory_ledger.max_stage_hbm_bytes == pytest.approx(float(r_idle.peak_die_hbm_bytes), abs=1.0)
+    d0, d1 = c_dp.machine.dies[0], c_dp.machine.dies[1]
+    d1_slow = replace(d1, rates=tuple((k, v * 0.5) for k, v in d1.rates))
+    c_het_dp = replace(c_dp, machine=replace(c_dp.machine, dies=(d0, d1_slow)))
+    c_rev_dp = replace(c_dp, machine=replace(c_dp.machine, dies=(replace(d1_slow, rank=0), replace(d0, rank=1))))
+    v_one = (RequestView(request_id="r0", phase="decode", q_len=1, context=128, samples=1),)
+    b_hd1 = build_export_bundle(c_het_dp, request=StepRequest("decode", 1, 128, 1, "model", requests=v_one), apply_target_envelope=False)
+    b_hd2 = build_export_bundle(c_rev_dp, request=StepRequest("decode", 1, 128, 1, "model", requests=v_one), apply_target_envelope=False)
+    assert b_hd1.step_span_ns == b_hd2.step_span_ns
+    lk_sw = _remap_link_ranks(replace(c_dp.machine.links[0], members=(0, 1), endpoint_rates=((0, 80.0), (1, 40.0)), endpoint_ids=((0, "a"), (1, "b"))), {0: 1, 1: 0})
+    assert lk_sw.members == (1, 0) and lk_sw.endpoint_rates == ((1, 80.0), (0, 40.0)) and lk_sw.endpoint_ids == ((1, "a"), (0, "b"))
+
+    # 3. Multi-stage PP network MBU normalizes by active pipeline stage count and per-stage die peaks.
+    c_pp = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], layers=2, pp=2, tp=1, prompt_tokens=128, output_tokens=8))
+    s0_d, s1_d = c_pp.machine.dies[0], c_pp.machine.dies[1]
+    c_pp_het = replace(c_pp, machine=replace(c_pp.machine, dies=(s0_d, replace(s1_d, rates=tuple((k, v * 0.5) for k, v in s1_d.rates)))))
+    b_pp = build_export_bundle(c_pp_het, request=StepRequest("decode", 1, 128, 1, "model"), apply_target_envelope=False)
+    eff = analyze_network_efficiency(c_pp_het, phase="decode", tokens=1, context=128, sequences=1, scope="model")
+    assert b_pp.network_mbu == pytest.approx(100.0 * float(eff["network_mbu"]), abs=0.2)
+
+    # 4. Attaching observations_path preserves target track synthesis and 4-stage waterfall.
+    c_tgt = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], layers=2, prompt_tokens=128, output_tokens=8, feature_track="target")
+    r_tgt = StepRequest("decode", 1, 128, 1, "model")
+    obs_csv = Path(__file__).resolve().parents[1] / "fixtures" / "observations" / "operator-kernels.csv"
+    b_no_obs = build_export_bundle(c_tgt, request=r_tgt, observations_path=None, target_max_trials=1)
+    b_with_obs = build_export_bundle(c_tgt, request=r_tgt, observations_path=obs_csv, target_max_trials=1)
+    assert b_no_obs.step_span_ns == b_with_obs.step_span_ns
+    assert b_no_obs.step_l_star_ns == b_with_obs.step_l_star_ns
+    assert len(b_no_obs.stage_waterfall) == len(b_with_obs.stage_waterfall) == 4
+
+    # 5. Step-level and per-view draft_prepare=True forward cleanly into structure_inputs_from_graphs on speculative prefill.
+    c_dp_prep = compose_case("kimi-k3.1", REPRESENTATIVE_SKUS["a5"], layers=1, tp=1, ep=1, mtp_proposal_tokens=5, prompt_tokens=64, output_tokens=8)
+    b_dp_prep = build_export_bundle(c_dp_prep, request=StepRequest("prefill", 64, 0, 1, "model", draft_prepare=True), apply_target_envelope=False)
+    assert any("draft" in op.op_id for op in b_dp_prep.operators)
+    v_dp = (RequestView(request_id="p0", phase="prefill", q_len=64, context=0, samples=1, draft_prepare=True),)
+    b_dp_view = build_export_bundle(c_dp_prep, request=StepRequest("prefill", 64, 0, 1, "model", requests=v_dp, draft_prepare=False), apply_target_envelope=False)
+    assert any("draft" in op.op_id for op in b_dp_view.operators)
+
+
+def test_trace_hbm_bound_cross_stage_flows_mla_contracts_and_prolog_fusion() -> None:
+    from dataclasses import replace
+    from math import prod
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export.trace_exporter import iter_msprof_trace_events
+
+    # 1. Active HBM Memory counter stays bounded by stage workspace/HBM peak.
+    c_tr = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=2, layers=2, prompt_tokens=2048, output_tokens=32, concurrency=8)
+    b_tr = build_export_bundle(c_tr, request=StepRequest("decode", 1, 2048, 8, "model"), apply_target_envelope=False)
+    peak_gib = max(
+        float(e["args"]["Active_Total_GiB"])
+        for e in iter_msprof_trace_events(b_tr, include_pipe_lanes=False)
+        if e.get("name") == "Active HBM Memory (GiB)"
+    )
+    assert peak_gib <= round(b_tr.memory_ledger.max_stage_hbm_bytes / float(1 << 30), 3) + 0.001
+
+    # 2. Scheduled and forward-ordered PP=2 traces preserve exact cross-stage SetFlag_WaitFlag dependencies.
+    c_pp2 = compose_case("qwen3-30b-a3b", REPRESENTATIVE_SKUS["a3"], tp=2, ep=2, pp=2, layers=4, prompt_tokens=256, output_tokens=32, concurrency=2)
+    b_pp2 = build_export_bundle(c_pp2, request=StepRequest("decode", 1, 256, 2, "model"), apply_target_envelope=False)
+    owners = {o.occurrence for o in b_pp2.operators}
+    expected_cross = sum(1 for o in b_pp2.operators for p in o.predecessors if p in owners and p.stage != o.occurrence.stage)
+    for bundle_obj in (b_pp2, replace(b_pp2, operators=tuple(sorted(b_pp2.operators, key=lambda o: (-o.occurrence.stage, o.start_us))))):
+        flows = [e for e in iter_msprof_trace_events(bundle_obj, include_pipe_lanes=False) if e.get("cat") == "SetFlag_WaitFlag"]
+        src_pid = {e["id"]: e["pid"] for e in flows if e.get("ph") == "s"}
+        emitted_cross = sum(1 for e in flows if e.get("ph") == "f" and src_pid[e["id"]] // 100 != e["pid"] // 100)
+        assert expected_cross == 2 and emitted_cross == expected_cross
+
+    # 3. MLA latent_attention_batch and BMM contracts preserve authoritative tensor views and element counts.
+    c_mla = compose_case("deepseek-v3", REPRESENTATIVE_SKUS["a3"], tp=4, ep=1, layers=4, quant="w8a8_dynamic", prompt_tokens=128, output_tokens=8, concurrency=2)
+    c_mla["runtime"].get("kernels", {}).get("lowerings", {}).pop("native_fusion", None)
+    b_mla = build_export_bundle(c_mla, request=StepRequest("decode", 1, 128, 2, "model"), apply_target_envelope=False)
+    att = next(o for o in b_mla.operators if o.op_id.endswith(".latent_attention_batch"))
+    v_op = next(o for o in b_mla.operators if o.op_id.endswith(".v_expand"))
+    q_op = next(o for o in b_mla.operators if o.op_id.endswith(".q_absorb"))
+    o_elems = prod(map(int, re.search(r"O:\[([\d,]+)\]", att.tensor_contract).group(1).split(",")))
+    x_elems = prod(map(int, re.search(r"x:\[([\d,]+)\]", v_op.tensor_contract).group(1).split(",")))
+    w_elems = prod(map(int, re.search(r"W_bmm:\[([\d,]+)\]", v_op.tensor_contract).group(1).split(",")))
+    lp0 = parse_case(c_mla).model.layer_plans[0]
+    assert o_elems == x_elems == v_op.shape[0] * v_op.shape[2]
+    assert w_elems == (lp0.num_heads // 4) * lp0.kv_lora_rank * lp0.v_head_dim
+    assert "W_bmm:[32,128,512]" in q_op.tensor_contract and "y:[2,32,512]" in q_op.tensor_contract
+
+    # 4. RoPE + unfused-gate MLA natively fuses aclnnMlaPrologV3WeightNz on target track.
+    c_rope_bef = compose_case("deepseek-v3", REPRESENTATIVE_SKUS["a5"], dp=2, tp=2, ep=4, dcp=2, layers=4, prompt_tokens=256, output_tokens=32, concurrency=2, feature_track="shipping")
+    c_rope_bef["runtime"].get("kernels", {}).get("lowerings", {}).pop("native_fusion", None)
+    c_rope_aft = compose_case("deepseek-v3", REPRESENTATIVE_SKUS["a5"], dp=2, tp=2, ep=4, dcp=2, layers=4, prompt_tokens=256, output_tokens=32, concurrency=2, feature_track="target")
+    b_rope_bef = build_export_bundle(c_rope_bef, request=StepRequest("decode", 1, 256, 2, "model"), apply_target_envelope=False)
+    b_rope_aft = build_export_bundle(c_rope_aft, request=StepRequest("decode", 1, 256, 2, "model"), apply_target_envelope=False)
+    assert len([o for o in b_rope_bef.operators if "MLA Prolog" in o.submodule]) >= 7
+    assert any(o.ascend_kernel == "aclnnMlaPrologV3WeightNz" and "mla_prolog" in o.op_id for o in b_rope_aft.operators)

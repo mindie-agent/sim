@@ -233,12 +233,18 @@ def _dispatch_predict_step(args: argparse.Namespace) -> object:
             media_tokens_per_sequence=args.media_tokens_per_sequence,
             draft_prepare=args.draft_prepare,
         )
+        ext_inputs = (
+            {"analysis_input": 0.0}
+            if args.scope == "body" or any("analysis_input" in op.deps for g in ops.values() for op in g)
+            else None
+        )
         with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
             body = (
                 operator_costs(case, ops, primitives=store)
                 if view == "operators"
                 else graph_costs(
                     case, ops, primitives=store,
+                    external_inputs=ext_inputs,
                     include_submission=bool(args.include_submission),
                     isolated=bool(args.isolated),
                 )

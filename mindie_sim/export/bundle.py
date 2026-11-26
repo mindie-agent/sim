@@ -44,9 +44,12 @@ from mindie_sim.optimization.dual_bound import (
 )
 from mindie_sim.optimization.ladder import solve_target_step_receipt
 from mindie_sim.prediction.body_defaults import consume_target_declaration
+from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
 from mindie_sim.prediction.efficiency.capacity_window import _resolve_speculative_tokens
+from mindie_sim.prediction.efficiency.sla import _cohort_hw_signature
 from mindie_sim.prediction.evaluation import EvaluationContext
+from mindie_sim.prediction.execution.dispatch import cohorts
 from mindie_sim.prediction.execution.layer_runs import (
     _is_target_body_op,
     discover_layer_cohorts,
@@ -55,6 +58,7 @@ from mindie_sim.prediction.execution.layer_runs import (
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operator_analysis import cohort_sequence_counts
+from mindie_sim.prediction.operators.attention.common import RECTANGULAR_SEQUENCE_LAYOUTS
 from mindie_sim.prediction.results import (
     CaseInput,
     EngineStepReceipt,
@@ -94,7 +98,11 @@ from .kernel_catalog import (
     resolve_operator_display_dtype,
     strip_op_prefix,
 )
-from .memory_ledger import compute_memory_quant_ledger
+from .memory_ledger import (
+    _resolve_case_overrides,
+    _resolve_ledger_workspace_tokens,
+    compute_memory_quant_ledger,
+)
 from .models import (
     ARCHETYPE_ORDER_FALLBACK,
     BINDING_STATE_BOUND,
@@ -1008,10 +1016,15 @@ def _extract_structure_registry_view(
         if (semantic_graphs is not None and 0 in semantic_graphs)
         else r0_phys
     )
+    eff_draft_prepare = bool(step_req.draft_prepare) or any(
+        bool(getattr(v, "draft_prepare", False)) for v in (step_req.requests or ())
+    )
     s_graphs, options = structure_inputs_from_graphs(
         eff_case, sem_graphs,
         phase=step_req.phase, tokens=step_req.tokens, context=step_req.context,
         sequences=step_req.sequences, scope=step_req.scope, replicas=[0],
+        media_tokens_per_sequence=step_req.media_tokens_per_sequence,
+        draft_prepare=eff_draft_prepare,
         physical_graphs=r0_phys,
     )
     report = export_op_structure(s_graphs, native_evidence=True, **options)
@@ -1851,27 +1864,43 @@ def _reorder_rows_by_archetype(
 
 
 def _compute_network_efficiency_summary(
-    rows: Sequence[OperatorExportRow], step_span_us: float, peaks: Mapping[str, Any],
+    rows: Sequence[OperatorExportRow],
+    step_span_us: float,
+    peaks: Mapping[str, Any],
+    *,
+    active_stage_count: int = 1,
+    peaks_by_stage: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> tuple[float, float, float, float, float, dict[str, float], dict[str, dict[str, float]]]:
-    tot_vec = sum(r.vector_ops * r.repeat_count for r in rows)
-    tot_hbm = sum(r.hbm_total_bytes * r.repeat_count for r in rows)
     tot_link = sum(r.link_bytes * r.repeat_count for r in rows)
     step_s = max(step_span_us / US_PER_SECOND, MIN_POSITIVE_SECONDS)
+    stage_step_s = step_s * float(max(1, int(active_stage_count)))
     default_dt = str(peaks.get("default_dtype") or "").strip()
     cube_peak = _die_cube_peak_rate(peaks["die"], default_dt, default_dt)
     vec_peak = float(peaks.get("vector_peak_ops_per_s") or 0.0)
     hbm_peak = float(peaks.get("hbm_peak_bytes_per_s") or 0.0)
     link_peak = float(peaks.get("link_peak_bytes_per_s") or 0.0)
+    stage_peaks_map = peaks_by_stage or {}
 
     cube_busy_s = 0.0
+    vec_busy_s = 0.0
+    hbm_busy_s = 0.0
     for r in rows:
+        st_peaks = stage_peaks_map.get(int(r.occurrence.stage), peaks)
         if r.flops > 0.0:
             op_peak = float(r.cube_peak_flops_per_s) if float(r.cube_peak_flops_per_s) > 0.0 else cube_peak
             if op_peak > 0.0:
                 cube_busy_s += (r.flops * r.repeat_count) / op_peak
-    cube_mfu = min(100.0, 100.0 * cube_busy_s / step_s)
-    vec_mfu = min(100.0, 100.0 * (tot_vec / step_s) / vec_peak) if vec_peak > 0.0 else 0.0
-    hbm_mbu = min(100.0, 100.0 * (tot_hbm / step_s) / hbm_peak) if hbm_peak > 0.0 else 0.0
+        if r.vector_ops > 0.0:
+            st_vec = float(st_peaks.get("vector_peak_ops_per_s") or vec_peak)
+            if st_vec > 0.0:
+                vec_busy_s += (r.vector_ops * r.repeat_count) / st_vec
+        if r.hbm_total_bytes > 0.0:
+            st_hbm = float(st_peaks.get("hbm_peak_bytes_per_s") or hbm_peak)
+            if st_hbm > 0.0:
+                hbm_busy_s += (r.hbm_total_bytes * r.repeat_count) / st_hbm
+    cube_mfu = min(100.0, 100.0 * cube_busy_s / stage_step_s)
+    vec_mfu = min(100.0, 100.0 * vec_busy_s / stage_step_s)
+    hbm_mbu = min(100.0, 100.0 * hbm_busy_s / stage_step_s)
     link_util = min(100.0, 100.0 * (tot_link / step_s) / link_peak) if link_peak > 0.0 else 0.0
 
     by_bound_dur: dict[str, float] = defaultdict(float)
@@ -2318,11 +2347,26 @@ def _extract_scenario_meta(
             elif all(not getattr(v, "samples", True) for v in active_views):
                 avg_accepted = 0.0
             else:
-                q_width, avg_accepted = _resolve_speculative_tokens(
+                q_width, base_acc = _resolve_speculative_tokens(
                     parsed, output_budget=output_toks, tokens_per_seq=int(step_req.tokens),
                     emitted_tokens_per_seq=None,
                 )
                 proposals = min(proposals, q_width - 1)
+                expected_sum = 0.0
+                for v in active_views:
+                    if not getattr(v, "samples", True):
+                        continue
+                    v_props = int(getattr(v, "draft_proposal_tokens", 0) or 0)
+                    v_q = max(1, int(getattr(v, "q_len", 1) or 1))
+                    if v_props > 0 or v_q > 1:
+                        _, v_acc = _resolve_speculative_tokens(
+                            parsed, output_budget=output_toks, tokens_per_seq=max(v_q, 1 + v_props),
+                            emitted_tokens_per_seq=None,
+                        )
+                        expected_sum += float(v_acc)
+                    else:
+                        expected_sum += float(base_acc) if proposals > 0 else 1.0
+                avg_accepted = expected_sum / float(len(active_views))
         else:
             total_req_toks = sum(
                 max(0, int(getattr(v, "global_q_len", 0) or v.q_len))
@@ -2908,11 +2952,100 @@ def _resolve_bundle_step_context(
         raise ModelingError("rewrite_plan_conflicts_with_apply_target_envelope_false")
     ext_plan = load_rewrite_plan(rewrite_plan) if rewrite_plan is not None else None
     has_explicit_edits = ext_plan is not None and bool(getattr(ext_plan, "edits", ()))
+    has_view_draft_prepare = any(bool(getattr(v, "draft_prepare", False)) for v in (step_req.requests or ()))
     include_draft = (
-        step_req.scope == "model" and spec_tokens > 0 and step_req.tokens > 1
+        step_req.scope == "model" and spec_tokens > 0
+        and (step_req.tokens > 1 or bool(step_req.draft_prepare) or has_view_draft_prepare)
         and getattr(parsed.model, "auxiliary", None) is not None
     )
     return parsed, track_name, step_req, seq_count, cluster_conc, ext_plan, has_explicit_edits, include_draft
+
+
+def _remap_link_ranks(lk: Any, rank_swap: Mapping[int, int]) -> Any:
+    """Remap all rank-keyed fields on a ``Link`` atomically during cohort projection."""
+    new_members = tuple(rank_swap.get(int(m), int(m)) for m in lk.members)
+    new_rates = tuple((rank_swap.get(int(r), int(r)), rate) for r, rate in getattr(lk, "endpoint_rates", ()))
+    new_ids = tuple((rank_swap.get(int(r), int(r)), eid) for r, eid in getattr(lk, "endpoint_ids", ()))
+    return replace(lk, members=new_members, endpoint_rates=new_rates, endpoint_ids=new_ids)
+
+
+def _cohort_case_for_group(parsed: Case, group: tuple[int, ...], base_group: tuple[int, ...]) -> Case:
+    """Project a heterogeneous DP cohort's dies and links onto ``base_group`` slots for evaluation."""
+    if group == base_group or len(group) != len(base_group):
+        return parsed
+    p = parsed.runtime.parallel
+    stride = max(1, int(p.pp)) * max(1, int(p.tp) * int(p.pcp))
+    src_idx = [r * stride + k for r in group for k in range(stride)]
+    dst_idx = [r * stride + k for r in base_group for k in range(stride)]
+    dies = list(parsed.machine.dies)
+    if max(src_idx, default=-1) >= len(dies) or max(dst_idx, default=-1) >= len(dies):
+        return parsed
+    rank_swap: dict[int, int] = {}
+    for d_i, s_i in zip(dst_idx, src_idx):
+        d_rank = int(dies[d_i].rank)
+        s_rank = int(dies[s_i].rank)
+        rank_swap[s_rank] = d_rank
+        rank_swap[d_rank] = s_rank
+        dies[d_i], dies[s_i] = replace(dies[s_i], rank=d_rank), replace(dies[d_i], rank=s_rank)
+    new_links = tuple(_remap_link_ranks(lk, rank_swap) for lk in parsed.machine.links)
+    new_tcs = tuple(
+        _remap_link_ranks(tc, rank_swap) if hasattr(tc, "members") else tc
+        for tc in getattr(parsed.machine, "transfer_channels", ())
+    )
+    return replace(
+        parsed,
+        machine=replace(parsed.machine, dies=tuple(dies), links=new_links, transfer_channels=new_tcs),
+    )
+
+
+_PRELIM_SPAN_NS_IDX = 9
+_SYNTH_SPAN_NS_IDX = 13
+
+
+def _distinct_cohort_workloads(
+    parsed: Case, step_req: StepRequest,
+) -> tuple[tuple[tuple[int, ...], Case, StepRequest], ...]:
+    """Return distinct active DP cohort evaluation slices when multi-cohort asymmetry exists."""
+    groups = [tuple(int(r) for r in grp) for grp in cohorts(parsed.runtime.parallel, parsed.machine)]
+    if len(groups) <= 1:
+        return ()
+    hw0 = _cohort_hw_signature(parsed, groups[0])
+    if step_req.requests:
+        seen_hw: list[Any] = []
+        req_slices: list[tuple[tuple[int, ...], Case, StepRequest]] = []
+        for grp in groups:
+            hw_sig = _cohort_hw_signature(parsed, grp)
+            if any(hw_sig == prev for prev in seen_hw):
+                continue
+            seen_hw.append(hw_sig)
+            c_case = parsed if hw_sig == hw0 else _cohort_case_for_group(parsed, grp, groups[0])
+            req_slices.append((grp, c_case, step_req))
+        if len(req_slices) <= 1:
+            return ()
+        return tuple(req_slices)
+    dp = max(1, int(parsed.runtime.parallel.dp))
+    if isinstance(step_req.sequences, int):
+        per_rep = [int(step_req.sequences)] * dp
+    else:
+        counts = cohort_sequence_counts(step_req.sequences, range(dp))
+        per_rep = [int(counts[r]) for r in range(dp)]
+    seen: list[tuple[Any, tuple[int, ...]]] = []
+    slices: list[tuple[tuple[int, ...], Case, StepRequest]] = []
+    for grp in groups:
+        g_seqs = tuple(per_rep[r] for r in grp)
+        if not any(v > 0 for v in g_seqs):
+            continue
+        hw_sig = _cohort_hw_signature(parsed, grp)
+        sig_key = (hw_sig, g_seqs)
+        if any(sig_key == prev for prev in seen):
+            continue
+        seen.append(sig_key)
+        c_case = parsed if hw_sig == hw0 else _cohort_case_for_group(parsed, grp, groups[0])
+        c_req = replace(step_req, sequences=(g_seqs[0] if len(g_seqs) == 1 else g_seqs))
+        slices.append((grp, c_case, c_req))
+    if len(slices) <= 1 and (not slices or (slices[0][0] == groups[0] and slices[0][1] is parsed)):
+        return ()
+    return tuple(slices)
 
 
 def _evaluate_bundle_prelim_rows(
@@ -3031,9 +3164,11 @@ def build_export_bundle(
     spine = default_spine()
     should_synthesize = True if rewrite_plan is not None else (
         apply_target_envelope if apply_target_envelope is not None
-        else (track_name == "target" and step_eval is None and observations_path is None)
+        else (track_name == "target" and step_eval is None)
     )
-    defer_prelim = should_synthesize and step_eval is None and observations_path is None and not streams
+    cohort_workloads = () if step_eval is not None else _distinct_cohort_workloads(parsed, step_req)
+    defer_prelim = should_synthesize and step_eval is None and not streams
+    cohort_prelims: list[tuple[tuple[int, ...], Case, StepRequest, tuple[Any, ...]]] = []
     if defer_prelim:
         eff_case = parsed
         prelim_rows: list[OperatorExportRow] = []
@@ -3047,6 +3182,30 @@ def build_export_bundle(
         )
         unfolded_span_ns, unfolded_idle_ns = 0, 0
         step_l_star_ns, step_cert_valid, step_tight_res = 0, True, ""
+    elif cohort_workloads:
+        best_res: tuple[Any, ...] | None = None
+        best_key: tuple[int, int] = (-1, 0)
+        for grp, c_case, c_req in cohort_workloads:
+            cand = _evaluate_bundle_prelim_rows(
+                spine, c_case, c_req, None, replay,
+                archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
+                use_archetype_dedup=use_archetype_dedup,
+                primitive_table=primitive_table, streams=streams,
+            )
+            cohort_prelims.append((grp, c_case, c_req, cand))
+            cand_key = (int(cand[_PRELIM_SPAN_NS_IDX]), -int(grp[0]))
+            if best_res is None or cand_key > best_key:
+                best_res = cand
+                best_key = cand_key
+        assert best_res is not None
+        (
+            eff_case, prelim_rows, demands_ns, peaks_by_stage, archetypes,
+            op_spec_by_key, graph_id, pipelines, rebound_primitive_table,
+            unfolded_span_ns, unfolded_idle_ns,
+        ) = best_res
+        step_l_star_ns, step_cert_valid, step_tight_res = _certify_step_lower_bound(
+            prelim_rows, demands_ns, step_span_ns=unfolded_span_ns,
+        )
     else:
         (
             eff_case, prelim_rows, demands_ns, peaks_by_stage, archetypes,
@@ -3070,28 +3229,77 @@ def build_export_bundle(
     engine_step_receipt: EngineStepReceipt | None = None
     reverted_to_native_baseline = False
     if should_synthesize:
-        (
-            prelim_rows, demands_ns, archetypes,
-            audit_triggers, plan_digest, plan_verified,
-            applied_edit_receipts, stream_core_budget_summary, moe_route_summary,
-            co_design_opportunities, stage_waterfall,
-            engine_step_receipt, reverted_to_native_baseline,
-            unfolded_span_ns, unfolded_idle_ns, step_l_star_ns, step_cert_valid,
-            op_spec_by_key,
-            st_eff_case, st_peaks, st_gid, st_pipes, st_pt,
-        ) = _apply_target_envelope_to_rows(
-            prelim_rows, demands_ns, archetypes, parsed=parsed, eff_case=eff_case,
-            step_req=step_req, cluster_conc=cluster_conc, op_spec_by_key=op_spec_by_key,
-            peaks_by_stage=peaks_by_stage, ext_plan=ext_plan,
-            rebound_primitive_table=rebound_primitive_table, allow_unbound_formula=allow_unbound_formula,
-            spine=spine, replay=replay, rep_lp_by_idx=rep_lp_by_idx, streams=streams,
-            target_max_trials=target_max_trials,
-            deferred_prelim=defer_prelim, use_archetype_dedup=use_archetype_dedup,
-        )
-        if defer_prelim:
+        if cohort_workloads:
+            synth_candidates: list[tuple[tuple[int, ...], tuple[Any, ...]]] = []
+            if defer_prelim:
+                for grp, c_case, c_req in cohort_workloads:
+                    c_pt = (
+                        False if primitive_table is False
+                        else EvaluationContext.create(c_case, None, None, primitive_table=primitive_table).bindings.primitive_table
+                    )
+                    s_res = _apply_target_envelope_to_rows(
+                        [], [], archetypes, parsed=c_case, eff_case=c_case,
+                        step_req=c_req, cluster_conc=cluster_conc, op_spec_by_key={},
+                        peaks_by_stage={}, ext_plan=ext_plan,
+                        rebound_primitive_table=c_pt, allow_unbound_formula=allow_unbound_formula,
+                        spine=spine, replay=replay, rep_lp_by_idx=rep_lp_by_idx, streams=streams,
+                        target_max_trials=target_max_trials,
+                        deferred_prelim=True, use_archetype_dedup=use_archetype_dedup,
+                    )
+                    synth_candidates.append((grp, s_res))
+            else:
+                for grp, c_case, c_req, cand in cohort_prelims:
+                    (
+                        c_eff, c_rows, c_dems, c_peaks, c_archs,
+                        c_specs, _, _, c_pt, _, _,
+                    ) = cand
+                    s_res = _apply_target_envelope_to_rows(
+                        c_rows, c_dems, c_archs, parsed=c_case, eff_case=c_eff,
+                        step_req=c_req, cluster_conc=cluster_conc, op_spec_by_key=c_specs,
+                        peaks_by_stage=c_peaks, ext_plan=ext_plan,
+                        rebound_primitive_table=c_pt, allow_unbound_formula=allow_unbound_formula,
+                        spine=spine, replay=replay, rep_lp_by_idx=rep_lp_by_idx, streams=streams,
+                        target_max_trials=target_max_trials,
+                        deferred_prelim=False, use_archetype_dedup=use_archetype_dedup,
+                    )
+                    synth_candidates.append((grp, s_res))
+            _, best_synth = max(synth_candidates, key=lambda item: (int(item[1][_SYNTH_SPAN_NS_IDX]), -int(item[0][0])))
+            (
+                prelim_rows, demands_ns, archetypes,
+                audit_triggers, plan_digest, plan_verified,
+                applied_edit_receipts, stream_core_budget_summary, moe_route_summary,
+                co_design_opportunities, stage_waterfall,
+                engine_step_receipt, reverted_to_native_baseline,
+                unfolded_span_ns, unfolded_idle_ns, step_l_star_ns, step_cert_valid,
+                op_spec_by_key,
+                st_eff_case, st_peaks, st_gid, st_pipes, st_pt,
+            ) = best_synth
             eff_case, peaks_by_stage, graph_id, pipelines, rebound_primitive_table = (
                 st_eff_case, st_peaks, st_gid, st_pipes, st_pt,
             )
+        else:
+            (
+                prelim_rows, demands_ns, archetypes,
+                audit_triggers, plan_digest, plan_verified,
+                applied_edit_receipts, stream_core_budget_summary, moe_route_summary,
+                co_design_opportunities, stage_waterfall,
+                engine_step_receipt, reverted_to_native_baseline,
+                unfolded_span_ns, unfolded_idle_ns, step_l_star_ns, step_cert_valid,
+                op_spec_by_key,
+                st_eff_case, st_peaks, st_gid, st_pipes, st_pt,
+            ) = _apply_target_envelope_to_rows(
+                prelim_rows, demands_ns, archetypes, parsed=parsed, eff_case=eff_case,
+                step_req=step_req, cluster_conc=cluster_conc, op_spec_by_key=op_spec_by_key,
+                peaks_by_stage=peaks_by_stage, ext_plan=ext_plan,
+                rebound_primitive_table=rebound_primitive_table, allow_unbound_formula=allow_unbound_formula,
+                spine=spine, replay=replay, rep_lp_by_idx=rep_lp_by_idx, streams=streams,
+                target_max_trials=target_max_trials,
+                deferred_prelim=defer_prelim, use_archetype_dedup=use_archetype_dedup,
+            )
+            if defer_prelim:
+                eff_case, peaks_by_stage, graph_id, pipelines, rebound_primitive_table = (
+                    st_eff_case, st_peaks, st_gid, st_pipes, st_pt,
+                )
         unfolded_l_star_check, _, step_tight_res = _certify_step_lower_bound(
             prelim_rows, demands_ns, step_span_ns=unfolded_span_ns,
         )
@@ -3232,14 +3440,63 @@ def _build_bundle_memory_and_sla(
         )
         ledger_seq_len = max(req_ctx + horizon_tokens, int(step_req.tokens))
     ledger_conc = max(1, seq_count if seq_count > 0 else (len(step_req.requests) if step_req.requests else 1))
-    mem_ledger = compute_memory_quant_ledger(
-        parsed, phase=step_req.phase,
-        seq_len=ledger_seq_len,
-        concurrency=ledger_conc, weight_quant=weight_quant,
-        cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
-        include_vision_tower=include_vision_tower,
-        apply_preset_to_ignored=apply_preset_to_ignored,
-    )
+    asym_batch: tuple[int, ...] = ()
+    if not step_req.requests and not isinstance(step_req.sequences, int):
+        dp_n = max(1, int(parsed.runtime.parallel.dp))
+        counts = cohort_sequence_counts(step_req.sequences, range(dp_n))
+        cand_batch = tuple(int(counts[r]) for r in range(dp_n))
+        if len(set(cand_batch)) > 1:
+            asym_batch = cand_batch
+    if step_req.requests or asym_batch:
+        hw_sku = str(getattr(parsed.machine, "sku", "") or getattr(parsed.machine, "name", ""))
+        hw_family = normalize_hw_family(hw_sku or str(getattr(parsed.machine, "arch_family", "")))
+        mem_case, _, _ = _resolve_case_overrides(
+            parsed,
+            hw_family=hw_family,
+            weight_quant=weight_quant,
+            cache_dtype=cache_dtype,
+            engram_host_offload=engram_host_offload,
+            include_vision_tower=include_vision_tower,
+            apply_preset_to_ignored=apply_preset_to_ignored,
+        )
+        if step_req.requests:
+            rectangular = str(step_req.layout or "").strip().upper() in RECTANGULAR_SEQUENCE_LAYOUTS
+            view_extent = sum(
+                int(v.physical_q_len if rectangular else v.logical_q_len)
+                for v in step_req.requests
+            )
+            req_ws_tokens = max(1, int(step_req.padded_tokens or 0), view_extent)
+            anchored_receipt = Memory(mem_case, workspace_tokens=req_ws_tokens).resident_memory_receipt(
+                phase=step_req.phase,
+                request_views=step_req.requests,
+            )
+        else:
+            ws_tok = _resolve_ledger_workspace_tokens(
+                mem_case, phase=step_req.phase, resolved_seq=ledger_seq_len, resolved_conc=ledger_conc,
+            )
+            anchored_receipt = Memory(mem_case, workspace_tokens=ws_tok).resident_memory_receipt(
+                phase=step_req.phase,
+                sequence_tokens=ledger_seq_len,
+                batch_per_dp=asym_batch,
+            )
+        mem_ledger = compute_memory_quant_ledger(
+            mem_case,
+            phase=step_req.phase,
+            seq_len=ledger_seq_len,
+            concurrency=ledger_conc,
+            memory_receipt=anchored_receipt,
+        )
+        if apply_preset_to_ignored:
+            mem_ledger = replace(mem_ledger, apply_preset_to_ignored=True)
+    else:
+        mem_ledger = compute_memory_quant_ledger(
+            parsed, phase=step_req.phase,
+            seq_len=ledger_seq_len,
+            concurrency=ledger_conc, weight_quant=weight_quant,
+            cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
+            include_vision_tower=include_vision_tower,
+            apply_preset_to_ignored=apply_preset_to_ignored,
+        )
     meta_dict = dict(parsed.runtime.metadata)
     eff_handoff = (
         max(0.0, float(handoff_tpot_ms if handoff_tpot_ms is not None else (meta_dict.get("handoff_tpot_ms", 0.0) or 0.0)))
@@ -3638,8 +3895,9 @@ def _assemble_export_bundle(
     )
     tight_res = tuple(unfolded_tight_res)
     p0 = peaks_by_stage.get(0) or _die_peaks_for_stage(eff_case, 0, 0)
+    active_stages = max(1, len(peaks_by_stage))
     cube_mfu, vec_mfu, hbm_mbu, link_util, net_roof, exposed_us, b_mix = _compute_network_efficiency_summary(
-        final_rows, step_span_us, p0,
+        final_rows, step_span_us, p0, active_stage_count=active_stages, peaks_by_stage=peaks_by_stage,
     )
     gap_radar = _build_bundle_gap_radar(
         final_rows, rank_order, step_span_us=step_span_us, top_k_radar=top_k_radar,

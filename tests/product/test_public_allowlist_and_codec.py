@@ -853,3 +853,20 @@ def test_vllm_ascend_launch_codec_roundtrip_and_cli_infeasible_honesty(
         assert rec_cap["feasible"] is True
         assert rec_cap["requested_concurrency"] == 64
         assert rec_cap["agent_brief"]["scenario_and_parallelism"]["concurrency_per_dp"] == 4
+
+
+def test_agent_brief_fractional_acceptance_tpot_and_sla_parity() -> None:
+    from dataclasses import replace
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export import build_agent_brief, build_export_bundle
+    from mindie_sim.prediction.results import StepRequest
+
+    c_raw = compose_case("qwen3-32b", "a3", dp=1, tp=1, layers=1, prompt_tokens=128, output_tokens=8)
+    b_base = build_export_bundle(c_raw, request=StepRequest("decode", 1, 128, 1, "model"), apply_target_envelope=False)
+    step_ms = b_base.step_span_us / 1000.0
+    b_sub = replace(b_base, avg_accepted_tokens=0.5, tpot_slo_ms=step_ms * 1.5, sla_regime="SLA_VIOLATED")
+    brief = build_agent_brief(b_sub)
+    kpi = brief["kpis_before_vs_after"]["after"]
+    assert kpi["effective_tpot_ms"] == pytest.approx(step_ms / 0.5, rel=1e-6)
+    assert kpi["sla_verdict"] == "FAIL"
+    assert kpi["sla_regime"] == "SLA_VIOLATED"

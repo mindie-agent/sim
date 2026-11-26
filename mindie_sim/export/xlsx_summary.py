@@ -249,17 +249,17 @@ def _populate_summary_deployment_block(
     eff_cc = int(ref.cluster_concurrency) if getattr(ref, "cluster_concurrency", None) is not None and (int(ref.cluster_concurrency) > 0 or int(ref.sequences) == 0) else (mem.concurrency * mem.dp)
     cc_formula = f"=G{SUM_ROW_MODE}*{mem.dp}" if eff_cc == mem.concurrency * mem.dp else None
     pd_pool = ref.pd_pool_summary if isinstance(ref.pd_pool_summary, Mapping) else None
+    eff_total_dies = _summary_total_dies(ref)
     dies_detail = f"DP={mem.dp} × TP={mem.tp} × PP={mem.pp} (PCP={mem.pcp})"
     if pd_pool:
-        used_d = int(pd_pool.get("used_dies", ref.deployment_total_dies or mem.total_dies) or mem.total_dies)
-        dies_detail = f"{dies_detail} | PD Cluster={used_d} dies ({int(pd_pool.get('prefill_instances', 0) or 0)}P + {int(pd_pool.get('decode_instances', 0) or 0)}D)"
+        dies_detail = f"{dies_detail} | PD Cluster={eff_total_dies} dies ({int(pd_pool.get('prefill_instances', 0) or 0)}P + {int(pd_pool.get('decode_instances', 0) or 0)}D)"
     weight_gib = mem.weight_footprint_per_die_bytes / float(GIB_BYTES)
     native_gib = mem.native_bf16_weight_footprint_per_die_bytes / float(GIB_BYTES)
     offload_note = f" | Host DRAM Offload={mem.max_stage_host_offload_bytes / float(GIB_BYTES):.2f} GiB (不计入 NPU HBM)" if mem.max_stage_host_offload_bytes > 0.0 else ""
     vit_note = f" | ViT={mem.vision_weight_bytes_per_die / float(GIB_BYTES):.2f} GiB ({'已计入' if mem.include_vision_tower else '纯文本默认排除'})" if mem.vision_weight_bytes_per_die > 0.0 else ""
     weight_detail = f"GiB/Die ({mem.weight_quant_display or mem.weight_quant}) [原生 BF16: {native_gib:.2f} GiB/die, 压缩 {mem.weight_compression_ratio:.2f}x]{offload_note}{vit_note}"
     rows = (
-        (SUM_ROW_MODEL, "模型与总层数 (Model & Total Layers)", ref.model_name, None, STYLE_MERGED, layers_txt, "总卡数 (Total Dies)", mem.total_dies, None, STYLE_INT, dies_detail),
+        (SUM_ROW_MODEL, "模型与总层数 (Model & Total Layers)", ref.model_name, None, STYLE_MERGED, layers_txt, "总卡数 (Total Dies)", eff_total_dies, None, STYLE_INT, dies_detail),
         (SUM_ROW_HW, "硬件 SKU & 拓扑 (Hardware / Topology)", ref.hardware_sku, None, STYLE_TEXT, f"{topo_txt} | {ref.hardware_die_summary}", "并行切分策略 (Full Parallelism)", par_short, None, STYLE_MERGED, par_detail),
         (SUM_ROW_MODE, "部署形态 (Deployment Mode)", ref.deployment_mode or "Unspecified", None, STYLE_MERGED, f"Phase={ref.phase.upper()} | Capture={ref.graph_capture_mode} | {mode_tag} {format_binding_badge(ref.binding_state or BINDING_STATE_BOUND)} | {track_txt}", "单 DP 活跃并发 (Active Concurrency / DP)", mem.concurrency, None, STYLE_INPUT_NUM, f"Active requests per DP replica (DP={mem.dp})"),
         (SUM_ROW_LEN, "业务输入/输出长度 (Prompt / Output)", f"{ref.prompt_tokens} / {ref.output_tokens}", None, STYLE_TEXT, f"Context={ref.context_tokens} tok, Output={ref.output_tokens} tok, SeqLen={mem.seq_len}", "集群总并发 (Cluster Total Concurrency)", eff_cc, cc_formula, STYLE_KPI_HIGHLIGHT, f"= 单 DP 活跃并发 × DP ({mem.dp})"),
@@ -278,6 +278,20 @@ def _populate_summary_deployment_block(
         ws.set_cell(r, SUM_RIGHT_VAL_COL, r_val, formula=r_f, style=r_st)
         ws.set_cell(r, SUM_RIGHT_DETAIL_START, r_det, style=STYLE_TEXT_WRAP)
         ws.merge_range(r, SUM_RIGHT_DETAIL_START, r, SUMMARY_COLS)
+
+
+def _summary_total_dies(ref: ExportBundle) -> int:
+    """Resolve the Summary ``G4`` total-die count, honoring PD pool cluster sizing."""
+    pd_pool = ref.pd_pool_summary if isinstance(ref.pd_pool_summary, Mapping) else None
+    if pd_pool:
+        used = int(pd_pool.get("used_dies", 0) or 0)
+        if used <= 0:
+            used = int(pd_pool.get("prefill_used_dies", 0) or 0) + int(pd_pool.get("decode_used_dies", 0) or 0)
+        if used > 0:
+            return used
+        if int(getattr(ref, "deployment_total_dies", 0) or 0) > 0:
+            return int(ref.deployment_total_dies)
+    return max(1, int(ref.memory_ledger.total_dies))
 
 
 def _pd_cluster_tps_cells(bundle: ExportBundle, col: str) -> tuple[float, str | None, str] | None:
@@ -375,6 +389,8 @@ def _populate_summary_kpi_block(
     b_cc = int(bundle.cluster_concurrency) if (int(getattr(bundle, "cluster_concurrency", 0) or 0) > 0 or int(bundle.sequences) == 0) else max(1, bundle.memory_ledger.concurrency * bundle.memory_ledger.dp)
     a_cc = int(after.cluster_concurrency) if (int(getattr(after, "cluster_concurrency", 0) or 0) > 0 or int(after.sequences) == 0) else max(1, after.memory_ledger.concurrency * after.memory_ledger.dp)
     same_deploy = bundle.memory_ledger.total_dies == after.memory_ledger.total_dies and b_cc == a_cc and abs(b_acc - acc) <= MIN_DENOM_EPS
+    g4_dies = _summary_total_dies(after)
+    a_dies = max(1, after.memory_ledger.total_dies)
     b_dies = max(1, bundle.memory_ledger.total_dies)
 
     r_step, r_tpot, r_sla = SUM_KPI_STEP_ROW, SUM_KPI_TPOT_ROW, SUM_KPI_SLA_ROW
@@ -383,16 +399,16 @@ def _populate_summary_kpi_block(
     tpot_b_f = (
         f"=IF($B${SUM_ROW_SPEC}>0,B{r_step}/$B${SUM_ROW_SPEC},B{r_step}){b_hfs}"
         if (b_is_decode and a_is_decode and same_deploy)
-        else (f"=B{r_step}/{b_acc!r}{b_hfs}" if b_is_decode else f"=B{r_step}")
+        else ((f"=B{r_step}/{b_acc!r}{b_hfs}" if b_acc > 0.0 else f"=B{r_step}{b_hfs}") if b_is_decode else f"=B{r_step}")
     )
     tpot_a_f = (
         f"=IF($B${SUM_ROW_SPEC}>0,C{r_step}/$B${SUM_ROW_SPEC},C{r_step}){a_hfs}"
         if a_is_decode else f"=C{r_step}"
     )
-    dtps_b_f = f"=IF($G${SUM_ROW_MODEL}>0,B{r_ctps}/$G${SUM_ROW_MODEL},0)" if same_deploy else f"=B{r_ctps}/{b_dies}"
+    dtps_b_f = f"=IF($G${SUM_ROW_MODEL}>0,B{r_ctps}/$G${SUM_ROW_MODEL},0)" if (same_deploy and g4_dies == b_dies) else f"=B{r_ctps}/{b_dies}"
     ctps_b_f: str | None = f"=IF(B{r_step}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}*1000/B{r_step},0)" if same_deploy else f"=IF(B{r_step}>0,{b_cc}*{b_acc!r}*1000/B{r_step},0)"
     ctps_a_f: str | None = f"=IF(C{r_step}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}*1000/C{r_step},0)"
-    dtps_a_f = f"=IF($G${SUM_ROW_MODEL}>0,C{r_ctps}/$G${SUM_ROW_MODEL},0)"
+    dtps_a_f = f"=IF($G${SUM_ROW_MODEL}>0,C{r_ctps}/$G${SUM_ROW_MODEL},0)" if g4_dies == a_dies else f"=C{r_ctps}/{a_dies}"
     ctps_note = "= 集群总并发 × 平均每步接受 Token 数 × 1000 / 单步耗时"
     b_pd, a_pd = _pd_cluster_tps_cells(bundle, "B"), _pd_cluster_tps_cells(after, "C")
     if b_pd is not None:
@@ -508,18 +524,30 @@ def _write_summary_util_and_wall_rows(ws: Worksheet, bundle: ExportBundle, after
     a_cc = int(after.cluster_concurrency) if (int(getattr(after, "cluster_concurrency", 0) or 0) > 0 or int(after.sequences) == 0) else max(1, a_mem.concurrency * a_mem.dp)
     b_acc = max(0.0, float(bundle.avg_accepted_tokens))
     a_acc = max(0.0, float(after.avg_accepted_tokens))
-    a_exp = float(a_cc) * a_acc / float(max(1, a_mem.total_dies))
-    b_exp = float(b_cc) * b_acc / float(max(1, b_mem.total_dies))
+    g4_dies = _summary_total_dies(after)
+    a_dies = max(1, a_mem.total_dies)
+    b_dies = max(1, b_mem.total_dies)
+    a_exp = float(a_cc) * a_acc / float(a_dies)
+    b_exp = float(b_cc) * b_acc / float(b_dies)
     same_d = (
-        b_mem.total_dies == a_mem.total_dies
+        b_dies == a_dies
         and b_cc == a_cc
         and abs(b_acc - a_acc) <= MIN_DENOM_EPS
     )
-    ntok_f = f"=IF($G${SUM_ROW_MODEL}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}/$G${SUM_ROW_MODEL},0)"
+    a_ntok_f = (
+        f"=IF($G${SUM_ROW_MODEL}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}/$G${SUM_ROW_MODEL},0)"
+        if g4_dies == a_dies
+        else f"=$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}/{a_dies}"
+    )
+    b_ntok_f = (
+        f"=IF($G${SUM_ROW_MODEL}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}/$G${SUM_ROW_MODEL},0)"
+        if g4_dies == b_dies
+        else f"=$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}/{b_dies}"
+    )
     write_row(ws, r_ntok, (
         ("单卡单步有效 Token 数 (N_tok_per_die)", None, STYLE_TEXT),
-        (b_ntok, ntok_f if (same_d and abs(b_ntok - b_exp) <= MIN_DENOM_EPS * max(1.0, abs(b_exp))) else None, STYLE_FLOAT3),
-        (a_ntok, ntok_f if abs(a_ntok - a_exp) <= MIN_DENOM_EPS * max(1.0, abs(a_exp)) else None, STYLE_FLOAT3),
+        (b_ntok, b_ntok_f if (same_d and abs(b_ntok - b_exp) <= MIN_DENOM_EPS * max(1.0, abs(b_exp))) else None, STYLE_FLOAT3),
+        (a_ntok, a_ntok_f if abs(a_ntok - a_exp) <= MIN_DENOM_EPS * max(1.0, abs(a_exp)) else None, STYLE_FLOAT3),
         (a_ntok - b_ntok, f"=C{r_ntok}-B{r_ntok}", STYLE_FLOAT3),
         ((a_ntok - b_ntok) / b_ntok if b_ntok > 0.0 else 0.0, f"=IF(B{r_ntok}>0,(C{r_ntok}-B{r_ntok})/B{r_ntok},0)", STYLE_PCT),
         (a_ntok / b_ntok if b_ntok > 0.0 else 0.0, f"=IF(B{r_ntok}>0,C{r_ntok}/B{r_ntok},0)", STYLE_RATIO),

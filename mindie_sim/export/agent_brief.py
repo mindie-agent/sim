@@ -105,9 +105,9 @@ def _bundle_track_label(bundle: ExportBundle) -> str:
 def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
     step_ms = bundle.step_span_us / US_PER_MS
     is_decode = bundle.phase == "decode"
-    acc = max(1.0, bundle.avg_accepted_tokens)
+    acc = max(0.0, float(bundle.avg_accepted_tokens))
     handoff_ms = float(getattr(bundle, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
-    tpot_ms = ((step_ms / acc) + handoff_ms) if is_decode else step_ms
+    tpot_ms = ((step_ms / acc if acc > 0.0 else step_ms) + handoff_ms) if is_decode else step_ms
     sla = bundle.tpot_slo_ms if is_decode else bundle.ttft_slo_ms
     l_star_ms = bundle.step_l_star_lean_us / US_PER_MS
     pool = project_pd_pool(bundle.pd_pool_summary) or {}

@@ -590,6 +590,7 @@ def _emit_op_and_pipes(
     include_pipe_lanes: bool,
     pipeline_info: tuple[int, tuple[str, ...]] | None,
     op_placement: Mapping[Any, tuple[int, int, float, str]],
+    pending_flows: list[tuple[Any, tuple[int, int, float, str], float]] | None = None,
 ) -> tuple[list[dict[str, Any]], tuple[int, int, float, str], int]:
     from .kernel_catalog import strip_op_prefix
 
@@ -615,6 +616,8 @@ def _emit_op_and_pipes(
     for pred in op.predecessors:
         src = op_placement.get(pred)
         if src is None:
+            if pending_flows is not None:
+                pending_flows.append((pred, placement, ts_start))
             continue
         src_pid, src_tid, src_end_us, src_name = src
         if src_pid == pid and src_tid == tid:
@@ -697,15 +700,25 @@ def _iter_counter_events_from_samples(
         sb = budget_by_stage.get(stage)
         if sb is None and mem_ledger.stage_budgets:
             sb = mem_ledger.stage_budgets[0]
-        resident_gib = (
-            max(0.0, (float(sb.total_hbm_bytes) - float(sb.workspace_peak_bytes)) / float(GIB_BYTES))
+        stage_total_gib = (
+            max(0.0, float(sb.total_hbm_bytes) / float(GIB_BYTES))
             if sb is not None else 0.0
         )
+        max_ws_gib = (
+            max(0.0, float(sb.workspace_peak_bytes) / float(GIB_BYTES))
+            if sb is not None
+            else max(0.0, float(mem_ledger.max_stage_workspace_bytes) / float(GIB_BYTES))
+        )
+        resident_gib = max(0.0, stage_total_gib - max_ws_gib) if sb is not None else 0.0
         stride = max(1, (len(samples) + MAX_COUNTER_SAMPLES - 1) // MAX_COUNTER_SAMPLES)
         for idx, (ts_us, bw_gbps, cube_pct, vec_pct, ws_gib) in enumerate(samples):
             if idx % stride != 0 and idx != len(samples) - 1:
                 continue
             bw_val = max(0.0, min(bw_gbps, hbm_peak_gbps if hbm_peak_gbps > 0.0 else bw_gbps))
+            bounded_ws_gib = min(max(0.0, ws_gib), max_ws_gib) if max_ws_gib > 0.0 else 0.0
+            active_total_gib = resident_gib + bounded_ws_gib
+            if stage_total_gib > 0.0:
+                active_total_gib = min(active_total_gib, stage_total_gib)
             yield {
                 "name": "HBM Bandwidth (GB/s)", "ph": "C", "ts": _round_us(ts_us),
                 "pid": pid, "tid": TID_METRICS_COUNTER, "args": {"HBM_BW_GBps": _round_metric(bw_val)},
@@ -723,7 +736,7 @@ def _iter_counter_events_from_samples(
                 "pid": pid, "tid": TID_METRICS_COUNTER,
                 "args": {
                     "Resident_GiB": _round_metric(resident_gib),
-                    "Active_Total_GiB": _round_metric(max(resident_gib, resident_gib + max(0.0, ws_gib))),
+                    "Active_Total_GiB": _round_metric(max(resident_gib, active_total_gib)),
                 },
             }
 
@@ -1075,6 +1088,8 @@ def _emit_entry_op_repeats(
     include_pipe_lanes: bool,
     pipeline_info: tuple[int, tuple[str, ...]] | None,
     op_placement: dict[Any, tuple[int, int, float, str]],
+    mirror_placement: dict[Any, tuple[int, int, float, str]] | None = None,
+    pending_flows: list[tuple[Any, tuple[int, int, float, str], float]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Emit one or ``in_reps`` consecutive spans for a collapsed tail/micro-split operator."""
     out: list[dict[str, Any]] = []
@@ -1091,12 +1106,44 @@ def _emit_entry_op_repeats(
             base_pid=base_pid, flow_id=flow_id, include_pipe_lanes=include_pipe_lanes,
             pipeline_info=pipeline_info,
             op_placement=op_placement if rep_idx == 0 else {},
+            pending_flows=pending_flows if rep_idx == 0 else None,
         )
         out.extend(events)
         task_id += 1
     if placement is not None:
         op_placement[op_eff.occurrence] = placement
+        if mirror_placement is not None:
+            mirror_placement[op_eff.occurrence] = placement
     return out, task_id, flow_id
+
+
+def _flush_pending_flows(
+    pending_flows: Sequence[tuple[Any, tuple[int, int, float, str], float]],
+    placements: Mapping[Any, tuple[int, int, float, str]],
+    flow_id: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Emit deferred ``SetFlag_WaitFlag`` flows whose producer occurred later in trace order."""
+    out: list[dict[str, Any]] = []
+    for pred_occ, (dst_pid, dst_tid, _dst_end, dst_name), dst_start_us in pending_flows:
+        src = placements.get(pred_occ)
+        if src is None:
+            continue
+        src_pid, src_tid, src_end_us, src_name = src
+        if src_pid == dst_pid and src_tid == dst_tid:
+            continue
+        dst_ts = max(src_end_us, dst_start_us)
+        sync_kind = "EventRecord/Wait" if src_pid != dst_pid else "StreamSync"
+        f_args = {"src_kernel": src_name, "dst_kernel": dst_name, "sync_kind": sync_kind}
+        out.append({
+            "name": f"SetFlag->{sync_kind}", "cat": "SetFlag_WaitFlag", "ph": "s",
+            "id": flow_id, "ts": _round_us(src_end_us), "pid": src_pid, "tid": src_tid, "args": f_args,
+        })
+        out.append({
+            "name": f"WaitFlag<-{sync_kind}", "cat": "SetFlag_WaitFlag", "ph": "f", "bp": "e",
+            "id": flow_id, "ts": _round_us(dst_ts), "pid": dst_pid, "tid": dst_tid, "args": f_args,
+        })
+        flow_id += 1
+    return out, flow_id
 
 
 def _iter_scheduled_full_model_trace(
@@ -1139,6 +1186,8 @@ def _iter_scheduled_full_model_trace(
     flow_id = 1
     launched_scopes: set[str] = set()
     scope_bounds: dict[str, list[float]] = {}
+    global_placement: dict[Any, tuple[int, int, float, str]] = {}
+    pending_flows: list[tuple[Any, tuple[int, int, float, str], float]] = []
 
     for entry, tpl, l_start, layer_span, layer_rec in entry_windows:
         layer_ops_map = layer_rec.get("ops", {}) if isinstance(layer_rec, Mapping) else {}
@@ -1167,7 +1216,7 @@ def _iter_scheduled_full_model_trace(
                 "args": {"Submodule": sub_name, "Layer": entry.label},
             }
 
-        op_placement: dict[Any, tuple[int, int, float, str]] = {}
+        local_placement: dict[Any, tuple[int, int, float, str]] = {}
         first_op_for_scope = entry.scope not in launched_scopes
         entry_sched_cnt = max(1, int(sched_counts.get(entry.archetype_id, 1)))
         entry_comp: dict[int, list[tuple[float, float]]] = defaultdict(list)
@@ -1205,12 +1254,19 @@ def _iter_scheduled_full_model_trace(
                     first_op_for_scope = False
 
             in_reps = _op_in_entry_repeats(op_eff, entry_sched_cnt)
+            use_global_placement = (
+                entry.full_layer_index is None
+                or op_eff.layer is None
+                or int(entry.full_layer_index) == int(op_eff.layer)
+            )
             events, task_id, flow_id = _emit_entry_op_repeats(
                 bundle, op_eff, op_ts=op_ts, in_reps=in_reps, task_id=task_id,
                 layer_label=entry.label, base_pid=base, flow_id=flow_id,
                 include_pipe_lanes=include_pipe_lanes,
                 pipeline_info=pipeline_by_occ.get(op_eff.occurrence),
-                op_placement=op_placement,
+                op_placement=global_placement if use_global_placement else local_placement,
+                mirror_placement=local_placement if use_global_placement else global_placement,
+                pending_flows=pending_flows if use_global_placement else None,
             )
             yield from events
             op_span = op_eff.dur_us * float(in_reps)
@@ -1234,6 +1290,9 @@ def _iter_scheduled_full_model_trace(
                 samples_by_die[d_k].append(
                     _layer_metric_sample(emitted_ops, l_start + layer_span * MIDPOINT_FRACTION, layer_span, bundle.hardware_peaks)
                 )
+
+    deferred_events, flow_id = _flush_pending_flows(pending_flows, global_placement, flow_id)
+    yield from deferred_events
 
     for sc_key, (s_lo, s_hi) in scope_bounds.items():
         if s_hi > s_lo:
@@ -1282,6 +1341,7 @@ def _iter_direct_trace(
             d_i = die_map.get(coord_i, 0)
             spans_by_die[d_i].append((idx_op, op_item.start_us, op_item.start_us + op_item.dur_us))
     op_placement: dict[Any, tuple[int, int, float, str]] = {}
+    pending_flows: list[tuple[Any, tuple[int, int, float, str], float]] = []
     layer_spans: list[tuple[str, float, float]] = []
     sub_spans: list[tuple[str, str, float, float]] = []
     flow_id = 1
@@ -1310,6 +1370,7 @@ def _iter_direct_trace(
             bundle, op, ts_start=op.start_us, task_id=task_id, layer_label=lbl,
             base_pid=base, flow_id=flow_id, include_pipe_lanes=include_pipe_lanes,
             pipeline_info=pipeline_by_occ.get(op.occurrence), op_placement=op_placement,
+            pending_flows=pending_flows,
         )
         yield from events
         op_placement[op.occurrence] = placement
@@ -1340,6 +1401,9 @@ def _iter_direct_trace(
             sub_spans[-1] = (lbl, op.submodule, min(sub_spans[-1][2], op.start_us), max(sub_spans[-1][3], op.end_us))
         else:
             sub_spans.append((lbl, op.submodule, op.start_us, op.end_us))
+
+    deferred_events, flow_id = _flush_pending_flows(pending_flows, op_placement, flow_id)
+    yield from deferred_events
 
     for lbl, lo, hi in layer_spans:
         if hi > lo:

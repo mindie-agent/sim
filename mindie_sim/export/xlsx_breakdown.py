@@ -199,6 +199,11 @@ def _kernel_with_backend(op: OperatorExportRow) -> str:
     return f"{kern} [{backend}]" if backend else kern
 
 
+def _safe_upt_from_ns(ns: int, ntok: float) -> float:
+    """Compute amortized ``us/(tok·die)`` matching live Excel ``IF(ntok>0, ..., 0)``."""
+    return (float(ns) / (NS_PER_US * ntok)) if ntok > MIN_DENOM_EPS else 0.0
+
+
 def _write_cmp_before_sides(
     ws: Worksheet, r_start: int, row_count: int, item: AlignedComparisonRow,
     rep: int, b_ntok: float, *, b_rep: int | None = None,
@@ -221,7 +226,7 @@ def _write_cmp_before_sides(
             b_ns = _op_exposed_int_ns(b_op, op_b_rep)
             b_exp_us = float(b_ns) / (NS_PER_US * float(max(1, op_b_rep))) if b_ns > 0 else 0.0
             b_ms = float(b_ns) / float(NS_PER_MS)
-            b_upt = float(b_ns) / (NS_PER_US * b_ntok)
+            b_upt = _safe_upt_from_ns(b_ns, b_ntok)
             before_ns_sum += b_ns
             before_upt_sum += b_upt
             mask_ref = a_primary if (a_primary is not None and len(item.before_ops) == 1 and len(item.after_ops) == 1) else b_op
@@ -279,7 +284,7 @@ def _write_cmp_after_cluster(
             a_exp_us = float(a_ns) / (NS_PER_US * float(max(1, op_a_rep))) if a_ns > 0 else 0.0
             a_ms = float(a_ns) / float(NS_PER_MS)
             l_ms = float(l_ns) / float(NS_PER_MS)
-            a_upt = float(a_ns) / (NS_PER_US * a_ntok)
+            a_upt = _safe_upt_from_ns(a_ns, a_ntok)
             aft_ns_sum += a_ns
             lstar_ns_sum += l_ns
             aft_upt_sum += a_upt
@@ -352,7 +357,7 @@ def _write_comparison_group(
         a_exp_us = float(aft_ns) / (NS_PER_US * float(max(1, a_rep))) if aft_ns > 0 else 0.0
         aft_ms = float(aft_ns) / float(NS_PER_MS)
         lstar_ms = float(lstar_ns) / float(NS_PER_MS)
-        aft_upt = float(aft_ns) / (NS_PER_US * a_ntok)
+        aft_upt = _safe_upt_from_ns(aft_ns, a_ntok)
         saved_ms = float(before_ns_sum - aft_ns) / float(NS_PER_MS)
         speedup = (before_ms_sum / aft_ms) if aft_ns > 0 else 0.0
         gap_ms = max(0.0, float(aft_ns - lstar_ns) / float(NS_PER_MS))
@@ -471,8 +476,8 @@ def _write_idle_wall_row(
     a_us = float(aft_idle_ns) / NS_PER_US
     b_ms = float(bef_idle_ns) / float(NS_PER_MS)
     a_ms = float(aft_idle_ns) / float(NS_PER_MS)
-    b_upt = float(bef_idle_ns) / (NS_PER_US * b_ntok)
-    a_upt = float(aft_idle_ns) / (NS_PER_US * a_ntok)
+    b_upt = _safe_upt_from_ns(bef_idle_ns, b_ntok)
+    a_upt = _safe_upt_from_ns(aft_idle_ns, a_ntok)
     spd = (b_ms / a_ms) if aft_idle_ns > 0 else 0.0
     write_row(ws, r_idle, (
         ("Idle / Host Wait / Bubble (idle_or_wait)", None, STYLE_MERGED),
@@ -535,8 +540,8 @@ def populate_comparison_breakdown_sheet(
     )
     write_headers(ws, 2, headers)
 
-    b_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
+    b_ntok = max(0.0, float(before_bundle.n_tok_per_die or 0.0))
+    a_ntok = max(0.0, float(after_bundle.n_tok_per_die or 0.0))
     acc_by_idx = {a.row_index: a for a in group_accounting}
     row_spans: dict[int, tuple[int, int]] = {}
     subtotal_rows: list[int] = []
@@ -726,9 +731,13 @@ def populate_measured_calibration_sheet(ws: Worksheet, bundle: ExportBundle) -> 
         formula = f"=SUM({c_let}{MEAS_DATA_START_ROW}:{c_let}{data_end})" if data_end >= MEAS_DATA_START_ROW else "=0"
         ws.set_cell(tot_row, col, val, formula=formula, style=STYLE_TOTAL_FLOAT3)
     meas_tot = sum(op.measured_sum_us or 0.0 for op in bundle.operators)
-    sim_tot = sum(op.dur_us for op in bundle.operators if op.measured_sum_us is not None)
+    sim_tot = sum(op.dur_us for op in bundle.operators if (op.measured_sum_us or 0.0) > 0.0)
     agg_ape = (abs(sim_tot - meas_tot) / meas_tot) if meas_tot > 0.0 else 0.0
-    ws.set_cell(tot_row, MEAS_COL_APE, agg_ape, formula=f"=IF(L{tot_row}>0,ABS(I{tot_row}-L{tot_row})/L{tot_row},0)", style=STYLE_TOTAL_PCT)
+    ape_formula = (
+        f'=IF(L{tot_row}>0,ABS(SUMIF(L{MEAS_DATA_START_ROW}:L{data_end},">0",I{MEAS_DATA_START_ROW}:I{data_end})-L{tot_row})/L{tot_row},0)'
+        if data_end >= MEAS_DATA_START_ROW else "=0"
+    )
+    ws.set_cell(tot_row, MEAS_COL_APE, agg_ape, formula=ape_formula, style=STYLE_TOTAL_PCT)
     ws.validate_max_column(MEAS_COLS)
 
 

@@ -700,6 +700,81 @@ def _resolve_local_kv_heads(
     return max(1, raw_kv // attn_tp)
 
 
+def _resolve_local_bmm_heads(
+    meta: Mapping[str, Any],
+    case: Case,
+    layer_plan: Any | None,
+) -> int:
+    """Resolve the rank-local head batch dimension for MLA ``q_absorb``/``v_expand`` BMM ops."""
+    ntv = meta.get("native_tensor_view")
+    if isinstance(ntv, Mapping):
+        batch = int(ntv.get("batch") or 0)
+        if batch > 0:
+            return batch
+        w_shape = ntv.get("weight_shape")
+        if (
+            isinstance(w_shape, Sequence)
+            and not isinstance(w_shape, (str, bytes))
+            and len(w_shape) >= GEMM_SHAPE_RANK
+        ):
+            b0 = int(w_shape[0] or 0)
+            if b0 > 0:
+                return b0
+    for key in ("matrix_groups", "local_heads", "num_heads_local"):
+        val = int(meta.get(key) or 0)
+        if val > 0:
+            return val
+    total_h = int(
+        (getattr(layer_plan, "num_heads", 0) if layer_plan is not None else 0)
+        or getattr(case.model, "heads", 0)
+        or 0
+    )
+    tp = max(1, int(case.runtime.parallel.tp))
+    return max(1, total_h // tp) if total_h > 0 else 0
+
+
+def _resolve_attention_output_head_dim(
+    op_id: str,
+    meta: Mapping[str, Any],
+    case: Case,
+    layer_plan: Any | None,
+    default_dim: int,
+) -> int:
+    """Resolve the attention output head dimension (distinguishing MLA ``dv=kv_lora_rank`` from ``dqk``)."""
+    atv = meta.get("attention_tensor_view")
+    if isinstance(atv, Mapping):
+        out_shape = atv.get("output_shape")
+        if isinstance(out_shape, Sequence) and not isinstance(out_shape, (str, bytes)) and out_shape:
+            dv_view = int(out_shape[-1] or 0)
+            if dv_view > 0:
+                return dv_view
+    low_op = str(op_id or "").lower()
+    attn_fam = str(meta.get("attention_family") or "").lower()
+    is_latent_mla = "latent" in low_op or "mla" in attn_fam or bool(meta.get("kv_lora_rank"))
+    if is_latent_mla:
+        kv_rank = int(
+            meta.get("kv_lora_rank")
+            or (getattr(layer_plan, "kv_lora_rank", 0) if layer_plan is not None else 0)
+            or getattr(case.model, "kv_lora_rank", 0)
+            or 0
+        )
+        if kv_rank > 0:
+            return kv_rank
+    v_hd = int(
+        meta.get("v_head_dim")
+        or (getattr(layer_plan, "v_head_dim", 0) if layer_plan is not None else 0)
+        or getattr(case.model, "v_head_dim", 0)
+        or 0
+    )
+    return v_hd if v_hd > 0 else int(default_dim)
+
+
+def _fmt_tensor_dims(shape: Any) -> str:
+    if isinstance(shape, Sequence) and not isinstance(shape, (str, bytes)) and shape:
+        return ",".join(str(int(d)) for d in shape)
+    return ""
+
+
 def _format_tensor_contract(
     op_id: str, family: str, recipe: str, shape: Sequence[int],
     dtype: str, meta: Mapping[str, Any], case: Case, layer_plan: Any | None,
@@ -740,7 +815,19 @@ def _format_tensor_contract(
     ):
         m_dim, n_dim, k_dim = dims
         if suffix in {"q_absorb", "v_expand"}:
-            return f"x:[{m_dim},{k_dim}] {act_dt} × W_bmm:[{k_dim},{n_dim}] {w_dt} -> y:[{m_dim},{n_dim}] {out_dt}"
+            ntv = meta.get("native_tensor_view")
+            if isinstance(ntv, Mapping):
+                in_sh = _fmt_tensor_dims(ntv.get("input_shape"))
+                w_sh = _fmt_tensor_dims(ntv.get("weight_shape"))
+                out_sh = _fmt_tensor_dims(ntv.get("output_shape"))
+                if in_sh and w_sh and out_sh:
+                    return f"x:[{in_sh}] {act_dt} × W_bmm:[{w_sh}] {w_dt} -> y:[{out_sh}] {out_dt}"
+            b_heads = _resolve_local_bmm_heads(meta, case, layer_plan)
+            if b_heads > 0 and m_dim % b_heads == 0:
+                b_tok = m_dim // b_heads
+                return f"x:[{b_heads},{b_tok},{k_dim}] {act_dt} × W_bmm:[{b_heads},{k_dim},{n_dim}] {w_dt} -> y:[{b_heads},{b_tok},{n_dim}] {out_dt}"
+            w_shape = f"[{b_heads},{k_dim},{n_dim}]" if b_heads > 0 else f"[{k_dim},{n_dim}]"
+            return f"x:[{m_dim},{k_dim}] {act_dt} × W_bmm:{w_shape} {w_dt} -> y:[{m_dim},{n_dim}] {out_dt}"
         comm_sfx = f" ({domain_tag})" if domain_tag else ""
         return f"x:[{m_dim},{k_dim}] {act_dt} × W:[{n_dim},{k_dim}] {w_dt} -> y:[{m_dim},{n_dim}] {out_dt}{comm_sfx}"
     if fam == "attention":
@@ -758,10 +845,17 @@ def _format_tensor_contract(
             )
             return f"Q:[{q_tok},{nh},{hd}] {act_dt} × KV:[{ctx},{n_kv},{hd}] -> O:[{q_tok},{nh},{v_hd}] {out_dt}"
         if len(dims) == GEMM_SHAPE_RANK:
-            q_tok, nh, dv = dims
+            q_tok, nh, dqk = dims
+            dv = _resolve_attention_output_head_dim(op_id, meta, case, layer_plan, dqk)
             topk = int(getattr(layer_plan, "index_topk", 0) or 0) if layer_plan is not None else 0
             kv_txt = f"SparseKV(topk={topk})" if topk > 0 else "PagedKV"
-            return f"Q:[{q_tok},{nh},{dv}] {act_dt} × {kv_txt} -> O:[{q_tok},{nh},{dv}] {out_dt}"
+            atv = meta.get("attention_tensor_view")
+            if isinstance(atv, Mapping):
+                q_sh = _fmt_tensor_dims(atv.get("query_shape"))
+                o_sh = _fmt_tensor_dims(atv.get("output_shape"))
+                if q_sh and o_sh:
+                    return f"Q:[{q_sh}] {act_dt} × {kv_txt} -> O:[{o_sh}] {out_dt}"
+            return f"Q:[{q_tok},{nh},{dqk}] {act_dt} × {kv_txt} -> O:[{q_tok},{nh},{dv}] {out_dt}"
     if fam in COLLECTIVE_FAMILIES or domain_tag:
         tag = domain_tag or f"TP={max(1, int(case.runtime.parallel.tp))}"
         if len(dims) >= MATRIX_2D_RANK:

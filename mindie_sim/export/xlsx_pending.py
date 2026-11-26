@@ -48,6 +48,7 @@ from .models import (
     PENDING_KIND_TO_IMPLEMENT,
     ExportBundle,
     PendingKernelItem,
+    bundle_step_int_ns,
     format_binding_badge,
 )
 from .public_view import is_same_public_config
@@ -231,6 +232,7 @@ class _StagePlan:
     direct_card_n: dict[str, str]
     attr_rows: tuple[_AttrRowRecord, ...]
     needs_fallback_table: bool
+    uses_receipt_stages: bool = False
 
 
 def _sanitize_backend_text(text: str) -> str:
@@ -310,6 +312,89 @@ def _build_stage_formula(
     return formula, exceeds
 
 
+def _safe_upt_from_ns(ns: int, ntok: float) -> float:
+    """Compute amortized ``us/(tok·die)`` matching live Excel ``IF(ntok>0, ..., 0)``."""
+    return (float(ns) / (float(NS_PER_US) * ntok)) if ntok > MIN_DENOM_EPS else 0.0
+
+
+def _compute_receipt_stage_upt(
+    *,
+    b_step_ns: int,
+    s1_ns: int,
+    s2_ns: int,
+    s3_ns: int,
+    a_step_ns: int,
+    b_ntok: float,
+    a_ntok: float,
+) -> dict[str, float]:
+    """Compute exact telescoping per-stage ``us/(tok·die)`` deltas from a committed 4-stage receipt."""
+    b_upt_tot = _safe_upt_from_ns(b_step_ns, b_ntok)
+    s1_upt = _safe_upt_from_ns(s1_ns, a_ntok)
+    s2_upt = _safe_upt_from_ns(s2_ns, a_ntok)
+    s3_upt = _safe_upt_from_ns(s3_ns, a_ntok)
+    a_upt_tot = _safe_upt_from_ns(a_step_ns, a_ntok)
+    return {
+        WF_STAGE_CONFIG: b_upt_tot - s1_upt,
+        WF_STAGE_FRAMEWORK: s1_upt - s2_upt,
+        WF_STAGE_KERNEL: s2_upt - s3_upt,
+        WF_STAGE_RESIDUAL: s3_upt - a_upt_tot,
+    }
+
+
+def _build_receipt_stage_overrides(
+    rcpt_ns: Mapping[str, int],
+    stage_upt: Mapping[str, float],
+    receipt: BreakdownSheetReceipt,
+    *,
+    s1_ns: int,
+    b_ntok: float,
+    a_ntok: float,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Build live Excel Waterfall formulas anchored to Sheet 2 totals and committed receipt stages."""
+    nonzero = [
+        st for st in _STAGES_ORDERED
+        if int(rcpt_ns[st]) != 0 or abs(float(stage_upt[st])) > MIN_DENOM_EPS
+    ]
+    anchor_st = nonzero[-1] if nonzero else WF_STAGE_RESIDUAL
+    wf_ms: dict[str, str] = {}
+    wf_upt: dict[str, str] = {}
+    diff_ntok = abs(b_ntok - a_ntok) > MIN_DENOM_EPS
+    for st in _STAGES_ORDERED:
+        if st == anchor_st:
+            continue
+        delta_ns = int(rcpt_ns[st])
+        ms_val = float(delta_ns) / float(NS_PER_MS)
+        wf_ms[st] = "=0" if delta_ns == 0 else f"={ms_val!r}"
+        if st == WF_STAGE_CONFIG and diff_ntok:
+            s1_ms = float(s1_ns) / float(NS_PER_MS)
+            wf_upt[st] = (
+                f"=IF({SUM_BEF_NTOK_REF}>0,{SUM_BEF_STEP_REF}*1000/{SUM_BEF_NTOK_REF},0)"
+                f"-IF({SUM_AFT_NTOK_REF}>0,{s1_ms!r}*1000/{SUM_AFT_NTOK_REF},0)"
+            )
+        else:
+            r_st = _STAGE_META[st][0]
+            wf_upt[st] = "=0" if delta_ns == 0 else f"=IF({SUM_AFT_NTOK_REF}>0,B{r_st}*1000/{SUM_AFT_NTOK_REF},0)"
+    other_ms_rows = [_STAGE_META[s][0] for s in _STAGES_ORDERED if s != anchor_st and int(rcpt_ns[s]) != 0]
+    other_upt_rows = [
+        _STAGE_META[s][0] for s in _STAGES_ORDERED
+        if s != anchor_st and (int(rcpt_ns[s]) != 0 or abs(float(stage_upt[s])) > MIN_DENOM_EPS)
+    ]
+    gt = int(receipt.grand_total_row)
+    if gt >= CMP_DATA_START_ROW:
+        j_let = column_letter(CMP_COL_BEF_EXP_MS)
+        p_let = column_letter(CMP_COL_AFT_EXP_MS)
+        x_let = column_letter(CMP_COL_BEF_UPT)
+        y_let = column_letter(CMP_COL_AFT_UPT)
+        ms_tot_expr = f"'{SHEET_BREAKDOWN}'!{j_let}{gt}-'{SHEET_BREAKDOWN}'!{p_let}{gt}"
+        upt_tot_expr = f"'{SHEET_BREAKDOWN}'!{x_let}{gt}-'{SHEET_BREAKDOWN}'!{y_let}{gt}"
+    else:
+        ms_tot_expr = f"{SUM_BEF_STEP_REF}-{SUM_AFT_STEP_REF}"
+        upt_tot_expr = f"{SUM_BEF_UPT_REF}-{SUM_AFT_UPT_REF}"
+    wf_ms[anchor_st] = f"={ms_tot_expr}" + "".join(f"-B{r}" for r in other_ms_rows)
+    wf_upt[anchor_st] = f"={upt_tot_expr}" + "".join(f"-E{r}" for r in other_upt_rows)
+    return wf_ms, wf_upt
+
+
 def _compile_stage_plan(
     wf: WaterfallSummary,
     receipt: BreakdownSheetReceipt,
@@ -319,11 +404,10 @@ def _compile_stage_plan(
     target_bundle: ExportBundle,
 ) -> _StagePlan:
     """Compile exact int-ns 4-stage Sheet 4 Waterfall formulas and visible A:N fallback table."""
-    del wf
     ref_before = before_bundle if before_bundle is not None else target_bundle
     same_cfg = is_same_public_config(ref_before, target_bundle)
-    b_ntok = max(float(ref_before.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    a_ntok = max(float(target_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
+    b_ntok = max(0.0, float(ref_before.n_tok_per_die or 0.0))
+    a_ntok = max(0.0, float(target_bundle.n_tok_per_die or 0.0))
 
     stage_ns: dict[str, int] = {st: 0 for st in _STAGES_ORDERED}
     stage_upt: dict[str, float] = {st: 0.0 for st in _STAGES_ORDERED}
@@ -384,7 +468,7 @@ def _compile_stage_plan(
         idle_b_ms = float(receipt.idle_before_ns) / float(NS_PER_MS)
         idle_a_ms = float(receipt.idle_after_ns) / float(NS_PER_MS)
         idle_s_ms = float(idle_saved_ns) / float(NS_PER_MS)
-        idle_s_upt = (float(receipt.idle_before_ns) / (NS_PER_US * b_ntok)) - (float(receipt.idle_after_ns) / (NS_PER_US * a_ntok))
+        idle_s_upt = _safe_upt_from_ns(int(receipt.idle_before_ns), b_ntok) - _safe_upt_from_ns(int(receipt.idle_after_ns), a_ntok)
         stage_ns[idle_st] += idle_saved_ns
         stage_upt[idle_st] += idle_s_upt
         unsplit_spans[idle_st].append((receipt.idle_row, receipt.idle_row))
@@ -447,6 +531,38 @@ def _compile_stage_plan(
         ):
             needs_fallback = True
 
+    uses_receipt_stages = False
+    eng_rcpt = getattr(target_bundle, "engine_step_receipt", None)
+    rcpt_stages = tuple(getattr(eng_rcpt, "stages", ()) or ()) if eng_rcpt is not None else ()
+    b_step_ns = int(wf.before_step_ns) if int(wf.before_step_ns) > 0 else bundle_step_int_ns(ref_before)
+    a_step_ns = int(wf.after_step_ns) if int(wf.after_step_ns) > 0 else bundle_step_int_ns(target_bundle)
+    if (
+        before_bundle is not None
+        and len(rcpt_stages) >= len(_STAGES_ORDERED)
+        and all(str(getattr(st, "status", "")) == "committed" for st in rcpt_stages[: len(_STAGES_ORDERED)])
+        and int(getattr(rcpt_stages[0], "span_ns", -1)) == b_step_ns
+    ):
+        s0_ns, s1_ns, s2_ns, s3_ns = (int(rcpt_stages[i].span_ns) for i in range(len(_STAGES_ORDERED)))
+        rcpt_ns = {
+            WF_STAGE_CONFIG: s0_ns - s1_ns,
+            WF_STAGE_FRAMEWORK: s1_ns - s2_ns,
+            WF_STAGE_KERNEL: s2_ns - s3_ns,
+            WF_STAGE_RESIDUAL: s3_ns - a_step_ns,
+        }
+        rcpt_upt = _compute_receipt_stage_upt(
+            b_step_ns=b_step_ns, s1_ns=s1_ns, s2_ns=s2_ns, s3_ns=s3_ns, a_step_ns=a_step_ns,
+            b_ntok=b_ntok, a_ntok=a_ntok,
+        )
+        upt_differs = any(abs(rcpt_upt[st] - stage_upt[st]) > WF_RECON_TOL_MS for st in _STAGES_ORDERED)
+        if rcpt_ns != stage_ns or upt_differs:
+            stage_ns = rcpt_ns
+            stage_upt = rcpt_upt
+            direct_wf_ms, direct_wf_upt = _build_receipt_stage_overrides(
+                rcpt_ns, stage_upt, receipt,
+                s1_ns=s1_ns, b_ntok=b_ntok, a_ntok=a_ntok,
+            )
+            uses_receipt_stages = True
+
     stage_ms = {st: float(stage_ns[st]) / float(NS_PER_MS) for st in _STAGES_ORDERED}
     return _StagePlan(
         stage_ms=stage_ms,
@@ -457,6 +573,7 @@ def _compile_stage_plan(
         direct_card_n=direct_card_n,
         attr_rows=tuple(attr_rows),
         needs_fallback_table=needs_fallback and bool(attr_rows),
+        uses_receipt_stages=uses_receipt_stages,
     )
 
 
@@ -1097,7 +1214,12 @@ def populate_pending_kernel_details_sheet(
         )
 
     if has_wf and waterfall is not None and stage_plan is not None:
-        if stage_plan.needs_fallback_table and fallback_t1 > 0 and fallback_t2 >= fallback_t1:
+        if (
+            stage_plan.needs_fallback_table
+            and not stage_plan.uses_receipt_stages
+            and fallback_t1 > 0
+            and fallback_t2 >= fallback_t1
+        ):
             wf_ms_f, wf_upt_f = _fallback_waterfall_formulas(fallback_t1, fallback_t2)
         else:
             wf_ms_f, wf_upt_f = stage_plan.direct_wf_ms, stage_plan.direct_wf_upt

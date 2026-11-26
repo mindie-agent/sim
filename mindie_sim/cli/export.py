@@ -77,6 +77,25 @@ def _read_bounded_json_object(path: str | Path, label: str) -> dict[str, Any]:
     return data
 
 
+def _parse_nonneg_token_shorthand(raw: str | int) -> int:
+    """Parse non-negative token shorthand (allowing ``0`` for cold prefill context)."""
+    if isinstance(raw, bool):
+        raise argparse.ArgumentTypeError("token_shorthand_invalid_bool")
+    text = str(raw).strip().lower().replace("_", "").replace(",", "")
+    if text.startswith("-"):
+        raise argparse.ArgumentTypeError(f"token_shorthand_must_be_non_negative:{raw}")
+    stem = text[:-1] if text.endswith(("k", "m")) else text
+    try:
+        if stem and float(stem) == 0.0:
+            return 0
+    except ValueError:
+        pass
+    try:
+        return parse_token_shorthand(raw)
+    except (ValueError, ModelingError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _add_common_export_args(cmd: argparse.ArgumentParser) -> None:
     cmd.add_argument("case", help="path to MindIE-Sim case JSON file")
     cmd.add_argument(
@@ -85,7 +104,7 @@ def _add_common_export_args(cmd: argparse.ArgumentParser) -> None:
     )
     cmd.add_argument("--phase", choices=("prefill", "decode"), default="decode")
     cmd.add_argument("--tokens", type=int, default=1)
-    cmd.add_argument("--context", type=parse_token_shorthand, default=None)
+    cmd.add_argument("--context", type=_parse_nonneg_token_shorthand, default=None)
     cmd.add_argument("--sequences", type=int, default=1)
     cmd.add_argument("--scope", choices=("body", "model"), default="model")
     cmd.add_argument(
