@@ -283,6 +283,25 @@ def _merge_matrix_flops(left, right):
     return tuple(totals.items())
 
 
+def _resolve_lowrank_hc_mult(hc_norm, hc_down, op) -> int:
+    for item in (hc_down, hc_norm, op):
+        raw = dict(item.metadata).get("hc_mult")
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            return raw
+    for item in (hc_norm, hc_down, op):
+        for decl in dict(item.metadata).get("structure_subgraphs", ()):
+            raw = dict(decl.get("tensor_view") or {}).get("hc")
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+                return raw
+    if (hc_norm.local_shape and op.local_shape
+            and len(hc_norm.local_shape) >= 2 and len(op.local_shape) >= 2):
+        hidden = int(op.local_shape[1])
+        hc_dim = int(hc_norm.local_shape[1])
+        if hidden > 0 and hc_dim >= hidden and hc_dim % hidden == 0:
+            return hc_dim // hidden
+    return LOWRANK_HC_DEFAULT_MULT
+
+
 def _try_fuse_lowrank_hc_ideal(
     op, hc_norm, hc_down, hc_silu, hc_up, *,
     by_id, users, replacements, removed, aliases,
@@ -299,11 +318,19 @@ def _try_fuse_lowrank_hc_ideal(
     up_weight_read = max(0.0, float(hc_up.mte2_bytes) - float(hc_silu.mte3_bytes))
     fused_read = float(hc_norm.mte2_bytes) + down_weight_read + up_weight_read
     rows = int(op.local_shape[0]) if op.local_shape else 0
-    hc_mult = int(dict(hc_down.metadata).get("hc_mult", LOWRANK_HC_DEFAULT_MULT) or LOWRANK_HC_DEFAULT_MULT)
-    gate_slice_bytes = min(
-        float(hc_down.mte3_bytes),
-        float(rows * hc_mult) * dtype_bytes(op.dtype or "bf16"),
+    chain_ids = {item.op_id for item in chain}
+    has_external_gate_consumer = any(
+        user_id not in chain_ids and user_id not in removed
+        for user_id in users[hc_down.op_id]
     )
+    if has_external_gate_consumer:
+        hc_mult = _resolve_lowrank_hc_mult(hc_norm, hc_down, op)
+        gate_slice_bytes = min(
+            float(hc_down.mte3_bytes),
+            float(rows * hc_mult) * dtype_bytes(op.dtype or "bf16"),
+        )
+    else:
+        gate_slice_bytes = 0.0
     fused_write = float(op.mte3_bytes) + gate_slice_bytes
     fused_flops = float(hc_down.flops) + float(hc_up.flops)
     fused_matrix = _merge_matrix_flops(hc_down.matrix_flops, hc_up.matrix_flops)

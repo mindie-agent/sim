@@ -303,20 +303,36 @@ class Scheduler:
             # do not turn a transient async reservation into an unserved request.
             phase = "decode" if decode else "prefill"
             valid_tokens = state.computed + allocation
-            if not self._resize_memory(
+            reserved = self._resize_memory(
+                state.request.request_id,
+                valid_tokens + lookahead,
+                query_tokens=verify_width,
+                phase=phase,
+                valid_tokens=valid_tokens,
+            )
+            if not reserved and lookahead > 0:
+                lookahead = 0
+                reserved = self._resize_memory(
                     state.request.request_id,
-                    valid_tokens + lookahead,
+                    valid_tokens,
                     query_tokens=verify_width,
                     phase=phase,
-                    valid_tokens=valid_tokens):
-                lookahead = 0
-                if not self._resize_memory(
-                        state.request.request_id,
-                        valid_tokens,
-                        query_tokens=verify_width,
-                        phase=phase,
-                        valid_tokens=valid_tokens):
-                    continue
+                    valid_tokens=valid_tokens,
+                )
+            while not reserved and decode and proposal > 0:
+                proposal -= 1
+                allocation = q + proposal
+                verify_width = 1 + proposal
+                valid_tokens = state.computed + allocation
+                reserved = self._resize_memory(
+                    state.request.request_id,
+                    valid_tokens,
+                    query_tokens=verify_width,
+                    phase=phase,
+                    valid_tokens=valid_tokens,
+                )
+            if not reserved:
+                continue
             state.pending_context = state.computed + allocation
             state.reserved_tokens = allocation
             if not state.started:

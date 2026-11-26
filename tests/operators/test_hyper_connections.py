@@ -677,3 +677,106 @@ def test_attnres_token_program_honors_engine_live_l2_reservations():
     het_dec = Execution(dec_case, CostModel(dec_case), engine=het_eng, namespace="decode:", include_submission=False)
     _, het_plan = het_dec.prepare(op, replica=1)
     assert het_plan.work.resources.get("l2", 0.0) > 0.0
+
+
+def test_lowrank_hc_ideal_fusion_honors_declared_hc_mult():
+    from tests._support.builders import dense_case
+    from mindie_sim.prediction.operator_analysis import target_operators
+
+    case = dense_case(layers=1, lowering_passes=("mhc_boundary_ideal",))
+    layer = replace(case.model.layer_plans[0], hyper_connections=True, hc_mult=8, hc_lowrank=16)
+    case = replace(case, model=replace(case.model, layer_plans=(layer,)))
+    ops = target_operators(case, phase="decode", tokens=1, context=8, apply_body_defaults=False)
+    mix = next(o for o in ops if dict(o.metadata).get("mhc_lowrank_fused_pre"))
+    assert mix.mte3_bytes == pytest.approx(2.0 * (case.model.hidden_size + layer.hc_mult))
+
+    model_ops = target_operators(
+        case, phase="decode", tokens=1, context=8, scope="model", apply_body_defaults=False,
+    )
+    head_mix = next(o for o in model_ops if o.op_id.endswith(".hc_head_gate_mix"))
+    assert head_mix.mte3_bytes == pytest.approx(2.0 * case.model.hidden_size)
+
+
+def test_model_scope_layer_limit_and_iteration_moe_cohort_lowering():
+    from tests._support.builders import dense_case, plan, view
+    from tests._support.memory_cases import case as mem_case
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.results import LoweringRequest
+    from mindie_sim.prediction.spine import PredictionSpine
+
+    two_layer = dense_case(layers=2)
+    for scope in ("body", "model"):
+        ops = target_graphs(
+            two_layer, phase="decode", tokens=1, context=4, scope=scope,
+            layer_limit=1, apply_body_defaults=False,
+        )[0]
+        qkv = [o for o in ops if o.family == "qkv_projection"]
+        assert [o.layer for o in qkv] == [0]
+        assert sum(o.flops for o in qkv) == pytest.approx(8192.0)
+
+    raw = mem_case(dp=2, ep=2)
+    raw["model"].update(layers=1, ffn="moe", num_experts=4, top_k=2, moe_intermediate_size=64)
+    raw["runtime"]["routing"] = {"policy": "balanced"}
+    cohort_case = parse_case(raw)
+    it = tuple((r, plan(*(view(f"r{r}.{i}", context=8) for i in range(n)))) for r, n in enumerate((1, 3)))
+    tg = target_graphs(
+        cohort_case, phase="decode", tokens=1, context=8, sequences=(1, 3),
+        scope="model", apply_body_defaults=False,
+    )
+    tg_rows = [next(o.local_shape[0] for o in ops if "gate_up" in o.recipe) for ops in tg.values()]
+    step_fwd = PredictionSpine().lower(cohort_case, LoweringRequest(iterations=it))
+    step_rev = PredictionSpine().lower(cohort_case, LoweringRequest(iterations=tuple(reversed(it))))
+    fwd_rows = [next(o.local_shape[0] for o in r.ops if "gate_up" in o.recipe) for r in step_fwd.graph.logical]
+    rev_rows = [next(o.local_shape[0] for o in r.ops if "gate_up" in o.recipe) for r in step_rev.graph.logical]
+    assert tg_rows == fwd_rows == rev_rows == [4, 4]
+
+    # Expanded speculative decode views are counted once, not double-counted.
+    raw_spec = mem_case(dp=2, ep=2)
+    raw_spec["model"].update(layers=1, ffn="moe", num_experts=4, top_k=1, moe_intermediate_size=64)
+    raw_spec["runtime"]["routing"] = {"policy": "balanced"}
+    raw_spec["runtime"]["metadata"] = {"spec_method": "ngram"}
+    spec_case = parse_case(raw_spec)
+    it_spec = (
+        (0, plan(RequestView("a", 3, 8, True, "decode", draft_verify=True, draft_proposal_tokens=2, draft_advanced_tokens=3))),
+        (1, plan(view("b", context=8))),
+    )
+    step_spec = PredictionSpine().lower(spec_case, LoweringRequest(iterations=it_spec))
+    assert [next(o.local_shape[0] for o in r.ops if "gate_up" in o.recipe) for r in step_spec.graph.logical] == [2, 2]
+
+    # Explicit cohort=True routing realization receives EP-group routing_views.
+    raw_exp = mem_case(dp=2, ep=2)
+    raw_exp["model"].update(layers=1, ffn="moe", num_experts=4, top_k=1, moe_intermediate_size=64)
+    raw_exp["runtime"]["routing"] = {"realizations": [{
+        "scope": "body", "layer": 0, "phase": "decode", "cohort": True, "tokens": 2,
+        "requests": [
+            {"request_id": "req0", "q_len": 1, "topk_ids": [0], "source_owner": 0},
+            {"request_id": "req1", "q_len": 1, "topk_ids": [2], "source_owner": 1},
+        ],
+        "expert_placement": [[0, 0], [0, 1], [1, 0], [1, 1]],
+    }]}
+    step_exp = PredictionSpine().lower(
+        parse_case(raw_exp), LoweringRequest(iterations=((0, plan(view("req0", context=8))), (1, plan(view("req1", context=8))))),
+    )
+    exp_ops = [next(o for o in r.ops if "gate_up" in o.recipe) for r in step_exp.graph.logical]
+    assert [o.local_shape[0] for o in exp_ops] == [1, 1]
+    assert all(dict(o.metadata).get("routing_basis") != "probability_moments" for o in exp_ops)
+
+    # Independent dense DP replicas stay uncoupled; mixed-phase EP cohorts stay order-invariant.
+    spine = PredictionSpine()
+    raw_dense = mem_case(dp=2, tp=1, ep=1)
+    raw_dense["model"]["layers"] = 1
+    raw_dense["runtime"].update(graph_mode="aclgraph", graph_capture_mode="full", graph_capture_keys=[4])
+    dense_case = parse_case(raw_dense)
+    dense_req = LoweringRequest(iterations=((0, plan(view("d0", context=8))), (1, plan())))
+    dense_rw = spine.rewrite.apply(spine.stacks.resolve_base(dense_case, dense_req))
+    assert dense_rw.padded_tokens[1] == 0
+
+    raw_mix = mem_case(dp=4, ep=4)
+    raw_mix["model"].update(layers=1, ffn="moe", num_experts=4, top_k=2, moe_intermediate_size=64)
+    raw_mix["runtime"].update(graph_mode="aclgraph", graph_capture_mode="full", graph_capture_keys=[4])
+    mix_case = parse_case(raw_mix)
+    dec_first = LoweringRequest(iterations=((0, plan(view("d0", context=8))), (1, plan(RequestView("p1", 1, 0, True, "prefill"))), (2, plan()), (3, plan())))
+    pre_first = LoweringRequest(iterations=((0, plan(RequestView("p0", 1, 0, True, "prefill"))), (1, plan(view("d1", context=8))), (2, plan()), (3, plan())))
+    p_dec = spine.rewrite.apply(spine.stacks.resolve_base(mix_case, dec_first)).padded_tokens
+    p_pre = spine.rewrite.apply(spine.stacks.resolve_base(mix_case, pre_first)).padded_tokens
+    assert (p_dec[2], p_dec[3]) == (p_pre[2], p_pre[3]) == (0, 0)

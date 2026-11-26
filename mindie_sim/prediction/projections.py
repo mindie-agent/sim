@@ -11,7 +11,11 @@
 """
 from dataclasses import replace
 
-from mindie_sim.catalog.ops import compute_dtype_for, matrix_output_format
+from mindie_sim.catalog.ops import (
+    compute_dtype_for,
+    matrix_output_format,
+    precision_abi_for_gemm,
+)
 from mindie_sim.schema.operators import TensorPrecisionABI
 
 _REPLICATED_SHARD = "replicated"
@@ -74,10 +78,10 @@ def effective_linear_method(quant, category) -> str:
         return "mx_fp4"
     if mx_scale and wf in _MXFP8_FORMATS and af in _MXFP8_FORMATS:
         return "mx_fp8"
-    if wf in {"int4", "w4a8", "int4_weight"}:
+    if wf in {"int4", "w4a8", "w4a16", "int4_weight"}:
         return "w4a8" if af == "int8" else "w4a16"
     if wf in {"int8", "w8a8"} or af == "int8":
-        return "w8a8"
+        return "w8a8" if (wf == "w8a8" or af == "int8") else "w8a16"
     if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
         return "fp8"
     return "none"
@@ -85,72 +89,49 @@ def effective_linear_method(quant, category) -> str:
 
 def precision_abi_for(quant, category, *, prequant: str = "") -> TensorPrecisionABI:
     """Build canonical TensorPrecisionABI for one matrix role."""
-    q = quant.for_category(category)
-    wf = str(q.format_for(category) or "bf16")
-    compute, act = compute_dtype_for(q, category)
-    out_fmt = matrix_output_format(
-        q, category, activation_dtype=act, prequant=prequant or q.native_format or "",
-    )
-    method = effective_linear_method(q, category)
-    is_float = wf.lower() in _FLOAT_FORMATS and act.lower() in _FLOAT_FORMATS
-    weight_scale_dtype = ""
-    weight_scale_bytes = 0
-    weight_block: tuple[int, ...] = ()
-    act_group_size = 0
-    act_scale_dtype = ""
-    act_scale_pack = ""
-    if not is_float:
-        weight_scale_dtype = str(q.execution_weight_scale_format() or q.scale_format or "")
-        weight_scale_bytes = max(0, int(round(float(q.execution_weight_scale_bytes() or q.scale_bytes or 0.0))))
-        raw_block = tuple(int(d) for d in (q.weight_block or ()) if int(d) >= 1)
-        weight_block = raw_block
-        act_group_size = max(0, int(q.activation_group_size or 0))
-        act_scale_dtype = str(q.execution_activation_scale_format(act) or "")
-        act_scale_pack = str(q.activation_scale_pack or "")
-    accum = "int32" if compute == "int8" else "fp32"
-    return TensorPrecisionABI(
-        linear_method=method,
-        input_dtype=act,
-        weight_dtype=wf,
-        output_dtype=out_fmt,
-        compute_dtype=compute,
-        accum_dtype=accum,
-        weight_layout=str(getattr(q, "weight_layout", "") or "ND"),
-        weight_block=weight_block,
-        weight_scale_dtype=weight_scale_dtype,
-        weight_scale_bytes=weight_scale_bytes,
-        act_group_size=act_group_size,
-        act_scale_dtype=act_scale_dtype,
-        act_scale_pack=act_scale_pack,
-    )
+    return precision_abi_for_gemm(quant, category, prequant_dtype=prequant)
 
 
 def _representation(quant, category):
     q = quant.for_category(category)
-    wf = str(q.format_for(category) or "")
-    compute, act = compute_dtype_for(q, category)
-    out_fmt = matrix_output_format(q, category, activation_dtype=act, prequant=q.native_format or "")
-    method = effective_linear_method(q, category)
-    if wf.lower() in _FLOAT_FORMATS and act.lower() in _FLOAT_FORMATS:
-        return (wf, compute, act, out_fmt, method, (), 0, "", 0.0, 0, "", "", "ND")
+    abi = precision_abi_for_gemm(q, category)
+    if abi.linear_method == "dense":
+        return (
+            abi.linear_method, abi.input_dtype, abi.weight_dtype,
+            abi.output_dtype, abi.compute_dtype, abi.accum_dtype,
+        )
     return (
-        wf, compute, act, out_fmt, method,
-        tuple(q.weight_block), int(q.expert_block),
-        str(q.execution_weight_scale_format() or q.scale_format or ""),
+        abi.linear_method,
+        abi.input_dtype,
+        abi.weight_dtype,
+        abi.output_dtype,
+        abi.compute_dtype,
+        abi.accum_dtype,
+        abi.weight_layout,
+        abi.weight_block,
+        tuple(q.weight_block),
+        int(q.expert_block),
+        abi.weight_scale_dtype,
         float(q.execution_weight_scale_bytes() or q.scale_bytes or 0.0),
-        int(q.activation_group_size or 0),
-        str(q.execution_activation_scale_format(act) or ""),
-        str(q.activation_scale_pack or ""),
-        str(getattr(q, "weight_layout", "") or "ND"),
+        str(q.execution_int8_weight_metadata() or ""),
+        abi.act_group_size,
+        abi.act_scale_dtype,
+        abi.act_scale_pack,
     )
 
 
 def _attach_precision_abi(b, op_id: str, category: str) -> str:
     if not b.ops or b.ops[-1].op_id != op_id:
         return op_id
-    abi = precision_abi_for(b.quant, category, prequant=getattr(b.model, "activation_dtype", ""))
     op = b.ops[-1]
+    abi = op.precision_abi
+    if abi is None:
+        abi = precision_abi_for(b.quant, category, prequant=getattr(b.model, "activation_dtype", ""))
     meta = dict(op.metadata)
+    if (op.precision_abi is abi
+            and meta.get("linear_method") == abi.linear_method
+            and meta.get("precision_abi_signature") == abi.abi_signature):
+        return op_id
     meta["linear_method"] = abi.linear_method
     meta["precision_abi_signature"] = abi.abi_signature
     b.ops[-1] = replace(op, precision_abi=abi, metadata=tuple(sorted(meta.items())))

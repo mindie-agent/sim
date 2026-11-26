@@ -630,3 +630,116 @@ def test_storage_shape_determines_physical_weight_bytes_for_prefetch():
     assert replace(w_nz, storage_bytes=4096).nbytes == 4096
     with pytest.raises(FeasibilityError, match="tensor_storage_shape_invalid"):
         TensorValue("bad", "bf16", (17, 17), role="weight", layout="nz", storage_shape=())
+
+
+def test_stars_depth_one_fifo_and_single_tile_setup_and_allreduce_basis():
+    from tests._support.operator_cases import declared_case
+    from mindie_sim import target_operators
+    from mindie_sim.catalog.ops import comm_op
+    from mindie_sim.prediction.execution.streams import _collective_native_basis
+    from mindie_sim.prediction.execution.submission import StarsDescriptorQueue
+    from mindie_sim.prediction.program import RecipeBook, RecipeContext
+    from mindie_sim.prediction.program.catalog import submit_program
+    from mindie_sim.schema.device_input import StarsSpec
+
+    # 1. Depth-one STARS queue preserves same-stream credit FIFO across distinct ready events.
+    finish_times = []
+    for same_event in (True, False):
+        eng = Engine([Resource("aic", 1, "ms")], backend="python")
+        queue = StarsDescriptorQueue(StarsSpec("die", 1, 1, 1, 0, "descriptor_ready", "declared"))
+        host = eng.submit("host")
+        ready_a = eng.submit("a", after=(eng.submit("prepare", after=(host,)),))
+        ready_b = eng.submit("b", after=(host,))
+        for idx, ready in enumerate((ready_a, ready_a if same_event else ready_b)):
+            done, _ = queue.submit_kernel(
+                eng, replay=0, stream="main", kernel_occurrence=idx,
+                descriptor_ready=ready, work={"aic": 0.1},
+            )
+        eng.advance()
+        finish_times.append(round(done.time, 3))
+    assert finish_times == [0.202, 0.202]
+
+    # 2. One-tile state transfer preserves setup_ms latency without double-charging minimum_ms.
+    op_tx = comm_op(
+        op_id="send", deps=(), stage=0, layer=0, requests=("r",), link_bytes=16,
+        family="state_transfer", phase="prefill", recipe="pcp_recurrent_state_step0", shape=(16,),
+    )
+    link = "link:fabric"
+    ctx = RecipeContext(op_tx, {link: 16.0}, {"link": link}, {link: 16.0}, 2, setup_ms=2.0)
+    e_tx = Engine((Resource(link, 16.0),), backend="python")
+    prog = RecipeBook().select(op_tx).lower(ctx)
+    handle = submit_program(e_tx, prog, name="send", ready=e_tx.submit("ready"))
+    e_tx.advance(until=(handle.done,), max_steps=32)
+    assert handle.done.time == pytest.approx(3.0)
+
+    # 3. Ring AllReduce normalizes primitive name and recovers exact per-rank native bytes.
+    raw = declared_case(tp=4)
+    raw["model"]["layers"] = 1
+    ops = target_operators(raw, scope="body", phase="prefill", tokens=4, apply_body_defaults=False)
+    ar4 = next(o for o in ops if o.recipe == "ring_allreduce" and o.local_shape == (4, 32))
+    assert _collective_native_basis(ar4, 4) == ("all_reduce", math.prod(ar4.local_shape) * 2, "bf16")
+    ar3 = comm_op(
+        op_id="ar3", deps=(), stage=0, layer=0, requests=(), family="allreduce", phase="prefill",
+        recipe="ring_allreduce", link_bytes=2 * 2 / 3 * 256, shape=(4, 32),
+        metadata=(("group_axis", "tp"), ("payload_dtype", "bf16")),
+    )
+    assert _collective_native_basis(ar3, 3) == ("all_reduce", 256, "bf16")
+    ar_sub = comm_op(
+        op_id="ar_sub", deps=(), stage=0, layer=0, requests=(), family="allreduce", phase="prefill",
+        recipe="ring_allreduce", link_bytes=384, shape=(6, 32),
+        metadata=(("group_axis", "tp"), ("steps", 2), ("payload_dtype", "bf16")),
+    )
+    assert _collective_native_basis(ar_sub, 4) == ("all_reduce", 384, "bf16")
+
+
+def test_scheduler_speculative_width_narrowing_and_pd_memory_scope():
+    from tests._support.builders import dense_case, linear_model
+    from mindie_sim.prediction.capacity import Memory, MemoryPolicy
+    from mindie_sim.prediction.pd_connector.connector import _build_flow_memory_weights
+    from mindie_sim.prediction.pd_connector.handoff import PDTransfer
+    from mindie_sim.prediction.scheduler import Scheduler
+    from mindie_sim.prediction.structure import parse_case
+
+    # 1. Tight HBM narrows speculative verify width instead of retiring a feasible request.
+    base = dense_case(
+        layers=1, kv_block_size=1, gpu_memory_utilization=1.0, recover_ssm=True,
+        metadata=(("spec_method", "ngram"), ("draft_proposal_tokens", 3)),
+    )
+    req = replace(base.workload.requests[0], prompt_tokens=4, output_tokens=5)
+    base = parse_case(replace(base, model=linear_model("gdn", 1), workload=replace(base.workload, requests=(req,))))
+    policy = MemoryPolicy(derive_workspace=False)
+    mem0 = Memory(base, policy)
+    cap = int(mem0.fixed_per_rank[0] + mem0.cache_bytes(8, query_tokens=2)[0])
+    hw = replace(base.machine, dies=(replace(base.machine.dies[0], memory_bytes=cap),))
+    for budget in (4, 2):
+        case_b = replace(base, machine=hw, runtime=replace(base.runtime, max_num_batched_tokens=budget))
+        sched = Scheduler(case_b, [req], Memory(case_b, policy))
+        for tick in range(12):
+            if sched.schedule(tick):
+                sched.commit(tick + 1)
+        assert (sched.states[0].generated, sched.states[0].reason) == (5, None)
+
+    # 2. PD connector memory_work scopes strictly by (replica, stage, tier) even when request_id == "r0".
+    transfers = (
+        PDTransfer(0, 4, 100, source_stage=0, destination_stage=0, destination_tier="hbm",
+                   source_storage="pd:kv:r0:prefill:r0:rank0", destination_storage="pd:kv:r0:decode:r0:rank4"),
+        PDTransfer(0, 4, 900, source_stage=0, destination_stage=0, destination_tier="host",
+                   source_storage="pd:kv:r0:prefill:r0:rank0", destination_storage="pd:host:r0:decode:r0"),
+        PDTransfer(2, 6, 100, source_stage=0, destination_stage=0, destination_tier="hbm",
+                   source_storage="pd:kv:r0:prefill:r1:rank2", destination_storage="pd:kv:r0:decode:r1:rank6"),
+    )
+    fake_plan = SimpleNamespace(
+        flows=tuple(SimpleNamespace(flow=SimpleNamespace(payload_bytes=t.payload_bytes)) for t in transfers),
+    )
+    weights = _build_flow_memory_weights(fake_plan, {
+        "prefill:memory@r0:s0": 1000.0,
+        "prefill:memory@r1:s0": 100.0,
+        "decode:memory@r0:s0": 100.0,
+        "decode:host@r0:s0": 900.0,
+        "decode:memory@r1:s0": 100.0,
+    }, transfers=transfers)
+    assert weights == [
+        {"prefill:memory@r0:s0": 100.0, "decode:memory@r0:s0": 100.0},
+        {"prefill:memory@r0:s0": 900.0, "decode:host@r0:s0": 900.0},
+        {"prefill:memory@r1:s0": 100.0, "decode:memory@r1:s0": 100.0},
+    ]

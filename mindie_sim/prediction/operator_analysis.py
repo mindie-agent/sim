@@ -235,6 +235,36 @@ def _check_draft_preparation(case, phase, scope, enabled):
         optional_draft_spec(case.model, mode)
 
 
+def _slice_model_for_layer_limit(model, runtime, layer_limit):
+    """Apply ``layer_limit`` consistently to ``model`` and PP stage mapping."""
+    if layer_limit is None:
+        return model, runtime
+    total_layers = len(model.layer_plans) or int(model.layers)
+    limit = min(total_layers, max(1, int(layer_limit)))
+    if limit >= total_layers:
+        return model, runtime
+    sliced_model = replace(
+        model,
+        layers=limit,
+        layer_plans=tuple(model.layer_plans[:limit]),
+    )
+    sliced_runtime = runtime
+    pp = int(getattr(runtime.parallel, "pp", 1) or 1)
+    if runtime.pp_layer_partition or pp > 1:
+        base_counts = runtime.pp_layer_partition or tuple(
+            total_layers // pp + int(i < total_layers % pp)
+            for i in range(pp)
+        )
+        remaining = limit
+        sliced_counts = []
+        for count in base_counts:
+            take = min(int(count), remaining)
+            sliced_counts.append(take)
+            remaining -= take
+        sliced_runtime = replace(runtime, pp_layer_partition=tuple(sliced_counts))
+    return sliced_model, sliced_runtime
+
+
 def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
                 cohort_tokens=_UNSET, phase=None, replica=0, active_rows=None,
                 source_rows_by_replica=None, routing_global_tokens=None,
@@ -259,8 +289,9 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     else:
         global_tokens = cohort_tokens
     if scope == "model":
+        model, runtime = _slice_model_for_layer_limit(case.model, case.runtime, layer_limit)
         program = frontend.program(
-            IterationPlan(views), case.model, case.runtime, case.machine,
+            IterationPlan(views), model, runtime, case.machine,
             assembly="model", global_tokens=global_tokens,
             global_views=global_views, resource_fusion=resource_fusion,
             replica=replica, source_rows_by_replica=source_rows_by_replica,
@@ -883,13 +914,15 @@ def model_program(value, *, phase, tokens, context=0, sequences=1,
                     if len(participants) > 1 else None)
     if len(participants) > 1 and "cohort_views_by_replica" not in options:
         options = {**options, "cohort_views_by_replica": views_by_replica}
-    features = FeatureConfig.from_runtime(case.runtime, case.model,
+    layer_limit = options.pop("layer_limit", None)
+    model, runtime = _slice_model_for_layer_limit(case.model, case.runtime, layer_limit)
+    features = FeatureConfig.from_runtime(runtime, model,
                                            machine=case.machine)
     frontend = Frontend(
-        attention_policy=AttentionPolicy(**case.runtime.attention_policy),
+        attention_policy=AttentionPolicy(**runtime.attention_policy),
         features=features)
     program = frontend.program(
-        plan, case.model, case.runtime, case.machine, assembly=assembly,
+        plan, model, runtime, case.machine, assembly=assembly,
         global_views=global_views,
         global_tokens=(sum(v.q_len + v.draft_proposal_tokens
                            for v in global_views) if global_views else None),

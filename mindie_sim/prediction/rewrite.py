@@ -275,32 +275,148 @@ class RewritePipeline:
                 streams=tuple(streams),
             )
 
+        return self._apply_iterations(base, request, stream_by_rank, streams)
+
+    def _apply_iterations(
+        self,
+        base: ResolvedBase,
+        request: Any,
+        stream_by_rank: Mapping[int, StreamPlan],
+        streams: tuple[StreamPlan, ...],
+    ) -> RewrittenStep:
         from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
+        from mindie_sim.schema.workload import IterationPlan, selected_mode
+        from .execution.cohort_traffic import bind_cohort_traffic
+        from .execution.dispatch import cohorts as topology_cohorts
+        from .execution.rank_ledger import ep_replica_group
         from .frontend import Frontend
+        from .frontend.body import _verify_query_len
+        from .operator_analysis import (
+            _ep_routing_geometry_by_replica,
+            graph_padded_idle,
+            synchronize_moe_allgather_cohort,
+        )
+        from .sharding.local_tp import lower_local_projection_tp_cohort
 
         frontend = Frontend(
             attention_policy=AttentionPolicy(**base.case.runtime.attention_policy)
         )
-        logical_rows: list[RankOps] = []
-        executable_rows: list[RankOps] = []
-        request_views: dict[int, tuple[RequestView, ...]] = {}
-        padded_tokens: dict[int, int] = {}
-        known_replicas = {int(replica) for replica, _ in request.iterations}
+        iterations = tuple((int(replica), iteration) for replica, iteration in request.iterations)
+        known_replicas = {replica for replica, _ in iterations}
+        if len(known_replicas) != len(iterations):
+            raise ModelingError("iteration_duplicate_replica")
         unmatched = set(stream_by_rank) - known_replicas
         if unmatched:
             raise ModelingError(
                 "stream_plan_unmatched_rank:"
                 + ",".join(str(r) for r in sorted(unmatched))
             )
-        for replica, iteration in request.iterations:
-            replica = int(replica)
-            work = frontend(
-                iteration, base.case.model, base.case.runtime, base.case.machine,
-                replica=replica,
+        by_replica = dict(iterations)
+        topo_groups = [
+            tuple(int(r) for r in group)
+            for group in topology_cohorts(base.case.runtime.parallel, base.case.machine)
+        ]
+        assigned: set[int] = set()
+        iteration_groups: list[tuple[int, ...]] = []
+        for group in topo_groups:
+            present = tuple(r for r in group if r in by_replica)
+            if present:
+                iteration_groups.append(present)
+                assigned.update(present)
+        for replica, _ in iterations:
+            if replica not in assigned:
+                iteration_groups.append((replica,))
+                assigned.add(replica)
+
+        has_cohort_realization = any(
+            isinstance(item, Mapping) and bool(item.get("cohort", False))
+            for item in (base.case.runtime.routing.get("realizations") or ())
+        )
+        request_views: dict[int, tuple[RequestView, ...]] = {}
+        padded_tokens: dict[int, int] = {}
+        raw_graphs: dict[int, tuple[OpSpec, ...]] = {}
+        for group in iteration_groups:
+            if len(group) == 1:
+                replica = group[0]
+                work = frontend(
+                    by_replica[replica], base.case.model, base.case.runtime, base.case.machine,
+                    replica=replica,
+                )
+                request_views[replica] = work.plan.requests
+                padded_tokens[replica] = work.padded_tokens
+                raw_graphs[replica] = tuple(work.ops)
+                continue
+            logical_views = {r: tuple(by_replica[r].requests) for r in group}
+            routing_count_views = {
+                r: tuple(
+                    replace(v, q_len=_verify_query_len(v), draft_proposal_tokens=0)
+                    for v in logical_views[r]
+                )
+                for r in group
+            }
+            active_views = tuple(
+                v for r in group for v in logical_views[r] if not getattr(v, "padding", False)
             )
-            request_views[replica] = work.plan.requests
-            padded_tokens[replica] = work.padded_tokens
-            ops = tuple(work.ops)
+            cohort_phase = (
+                selected_mode(IterationPlan(active_views))
+                if active_views else "idle"
+            )
+            counts = {r: len(logical_views[r]) for r in group}
+            pad_idle = graph_padded_idle(base.case, cohort_phase, counts)
+            default_context = next((v.context for v in active_views), 0)
+            synced_counts, allgather_padded = synchronize_moe_allgather_cohort(
+                base.case, cohort_phase, routing_count_views,
+                pad_idle=pad_idle, default_context=default_context, prefix="iteration",
+            )
+            active_rows = {
+                r: sum(v.q_len for v in routing_count_views[r])
+                for r in group
+            }
+            global_views = tuple(v for r in group for v in logical_views[r])
+            ep_routing_by_r = _ep_routing_geometry_by_replica(
+                base.case, group, routing_count_views, active_rows, allgather_padded,
+            )
+            cohort_graphs: dict[int, tuple[OpSpec, ...]] = {}
+            for replica in group:
+                extra_padding = synced_counts[replica][len(logical_views[replica]):]
+                plan_in = (
+                    replace(by_replica[replica], requests=logical_views[replica] + extra_padding)
+                    if extra_padding else by_replica[replica]
+                )
+                cohort_tokens, source_rows, routing_tokens = ep_routing_by_r[replica]
+                cohort_kwargs: dict[str, Any] = {
+                    "global_tokens": cohort_tokens,
+                    "global_views": global_views,
+                    "source_rows_by_replica": source_rows,
+                    "routing_global_tokens": routing_tokens,
+                    "cohort_views_by_replica": logical_views,
+                }
+                if has_cohort_realization:
+                    ep_reps = ep_replica_group(
+                        base.case.runtime.parallel, base.case.machine, group, replica,
+                    )
+                    cohort_kwargs["routing_views"] = tuple(
+                        v for r in ep_reps for v in logical_views[r]
+                    )
+                work = frontend(
+                    plan_in, base.case.model, base.case.runtime, base.case.machine,
+                    replica=replica, **cohort_kwargs,
+                )
+                request_views[replica] = work.plan.requests
+                padded_tokens[replica] = work.padded_tokens
+                cohort_graphs[replica] = tuple(work.ops)
+            cohort_graphs = bind_cohort_traffic(base.case, cohort_graphs)
+            cohort_graphs = lower_local_projection_tp_cohort(
+                cohort_graphs,
+                model=base.case.model,
+                runtime=base.case.runtime,
+                machine=base.case.machine,
+            )
+            raw_graphs.update(cohort_graphs)
+        logical_rows: list[RankOps] = []
+        executable_rows: list[RankOps] = []
+        for replica, _ in iterations:
+            ops = tuple(raw_graphs[replica])
             logical_rows.append(RankOps(replica=replica, ops=ops))
             executable_rows.append(RankOps(
                 replica=replica,

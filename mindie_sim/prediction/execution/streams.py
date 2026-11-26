@@ -290,17 +290,60 @@ def _rank_token(context) -> str | None:
     return None
 
 
+_NATIVE_BASIS_FLOAT_TOL = 1e-9
+
+
+def _exact_collective_bytes(wire_bytes: float, numerator: int, denominator: int) -> Fraction:
+    raw = Fraction(str(wire_bytes)) * numerator / denominator
+    if raw.denominator == 1:
+        return raw
+    rounded = round(float(wire_bytes) * numerator / denominator)
+    reconstructed = float(rounded) * denominator / numerator
+    if abs(float(wire_bytes) - reconstructed) <= _NATIVE_BASIS_FLOAT_TOL * max(1.0, abs(float(wire_bytes))):
+        return Fraction(rounded)
+    return raw
+
+
+def _declared_comm_group_size(metadata: Mapping[str, Any], collective: str) -> int | None:
+    raw = metadata.get("comm_group_size")
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 1:
+        return raw
+    ranks = metadata.get("group_ranks")
+    if isinstance(ranks, (tuple, list)) and len(ranks) > 1:
+        return len(ranks)
+    steps = metadata.get("steps")
+    if isinstance(steps, int) and not isinstance(steps, bool) and steps > 0:
+        if collective == "all_reduce" and steps >= 2 and steps % 2 == 0:
+            return (steps // 2) + 1
+        return steps + 1
+    return None
+
+
 def _collective_native_basis(op, group_size):
     """Logical per-rank native input admitted by a TP/DP collective op."""
     metadata = dict(op.metadata)
     collective = str(metadata.get("collective", op.family)).lower()
-    collective = {"allgather": "all_gather", "reducescatter": "reduce_scatter",
-                  "alltoall": "all_to_all"}.get(collective, collective)
-    count = max(1, int(group_size) - 1)
+    collective = {
+        "allgather": "all_gather",
+        "reducescatter": "reduce_scatter",
+        "alltoall": "all_to_all",
+        "alltoallv": "all_to_allv",
+        "allreduce": "all_reduce",
+    }.get(collective, collective)
+    n = max(1, int(group_size))
+    declared_n = _declared_comm_group_size(metadata, collective)
+    if declared_n is not None and 1 < declared_n < n:
+        n = declared_n
+    count = max(1, n - 1)
     if collective == "all_gather" and op.link_bytes > 0:
-        expected = Fraction(str(op.link_bytes)) / count
+        expected = _exact_collective_bytes(op.link_bytes, 1, count)
     elif collective == "reduce_scatter" and op.link_bytes > 0:
-        expected = Fraction(str(op.link_bytes * group_size)) / count
+        expected = _exact_collective_bytes(op.link_bytes, n, count)
+    elif collective == "all_reduce" and op.link_bytes > 0:
+        expected = (
+            _exact_collective_bytes(op.link_bytes, n, 2 * count)
+            if n > 1 else Fraction(str(op.link_bytes))
+        )
     else:
         expected = Fraction(op.link_bytes) if op.link_bytes > 0 else None
     dtype = (metadata.get("payload_dtype") or metadata.get("dtype")
