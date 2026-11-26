@@ -17,8 +17,9 @@ from mindie_sim.schema.datapath import SourceRef
 from .hccl_contracts import select
 from mindie_sim.prediction.operators.collectives import hccl_aicpu, hccl_aiv, hccl_aiv_gather, hccl_ccu, hccl_ccu_two_die, hccl_analytic_hierarchy
 from mindie_sim.prediction.collectives import PairwiseCollective
+from mindie_sim.prediction.collectives.transport import DEFAULT_MAX_PHYSICAL_CHUNKS, chunk_count
 from mindie_sim.prediction.mechanism import PlannedRecipe, Work
-from mindie_sim.prediction.topology import DEFAULT_MAX_PHYSICAL_CHUNKS, TransportOptions
+from mindie_sim.prediction.topology import TransportOptions
 from .hccl_signals import RemoteNotify, RECIPE as SIGNAL
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
@@ -38,6 +39,11 @@ SOURCES: tuple[SourceRef, ...] = (
 )
 
 NETWORK = 'hccl_source_peer_exchange'
+# HCCL reduction op dtype eligibility (op_common.cc CheckDataType: no FP8/sub-byte/uint8/bool SUM).
+_HCCL_REDUCE_SUPPORTED_DTYPES = frozenset({
+    'int8', 'int16', 'int32', 'int64',
+    'fp16', 'float16', 'bf16', 'bfloat16', 'fp32', 'float32',
+})
 
 
 def _exact_dtype_bytes(dtype_name: str) -> int:
@@ -65,6 +71,8 @@ class SourceMeshPeers(PairwiseCollective):
         ):
             if meta.get(source) is not None:
                 result[target] = meta[source]
+        if 'transport_max_physical_chunks' in meta:
+            result['max_physical_chunks'] = meta['transport_max_physical_chunks']
         return result
 
     def resolve_transport(self, op):
@@ -145,6 +153,14 @@ def lower(ops, runtime, source_dtype):
         if not math.isclose(n,round(n),rel_tol=0,abs_tol=1e-6):
             raise ModelingError('hccl_caller_requires_integer_input_payload')
         options = {k:v for k,v in raw.items() if k != 'axes'}
+        effective_dtype = str(original.dtype or source_dtype or '').strip().lower()
+        if (not is_analytic
+                and original.family in {'allreduce', 'reduce_scatter'}
+                and effective_dtype
+                and effective_dtype not in _HCCL_REDUCE_SUPPORTED_DTYPES):
+            raise ModelingError(
+                f'hccl_reduction_dtype_unsupported:{original.family}:{effective_dtype}'
+            )
         op_dtype_width = _exact_dtype_bytes(original.dtype) if original.dtype else None
         if 'dtype_bytes' in options:
             if op_dtype_width is not None and options['dtype_bytes'] != op_dtype_width:
@@ -228,12 +244,20 @@ def lower(ops, runtime, source_dtype):
                     'collective':'alltoallv','collective_id':netids[phase.name],
                     'steps':r-1,'peer_volume_basis':'group_mean',
                     'peer_traffic':{'kind':'matrix','payload_bytes':phase.exchange}}
-                if (module is hccl_aiv_gather
-                        and (phase.name == 'gather' or phase.name.startswith('gather_copy_'))
-                        and network_meta.get('transport_chunk_bytes') is None):
+                is_aiv_ub_read = (
+                    (module is hccl_aiv_gather
+                     and (phase.name == 'gather' or phase.name.startswith('gather_copy_')))
+                    or (module is hccl_aiv
+                        and phase.name.startswith(('get_remote_lane_', 'gather_output_lane_')))
+                )
+                if is_aiv_ub_read and network_meta.get('transport_chunk_bytes') is None:
                     max_cell = max(max(row) for row in phase.exchange)
-                    if hccl_aiv.UB_BATCH < max_cell <= DEFAULT_MAX_PHYSICAL_CHUNKS * hccl_aiv.UB_BATCH:
+                    if max_cell > hccl_aiv.UB_BATCH:
                         network_meta['transport_chunk_bytes'] = hccl_aiv.UB_BATCH
+                        needed = chunk_count(float(max_cell), hccl_aiv.UB_BATCH)
+                        if ('transport_max_physical_chunks' not in network_meta
+                                and needed > DEFAULT_MAX_PHYSICAL_CHUNKS):
+                            network_meta['transport_max_physical_chunks'] = needed
                 network_meta.pop('reverse_of_collective',None)
                 wire = Work(resources={'link':sum(map(sum, phase.exchange))/r})
                 result.append(wire.apply(replace(original,op_id=netids[phase.name],deps=deps,

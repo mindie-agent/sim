@@ -185,7 +185,8 @@ def find_shared_port_keys(
     for link in links:
         is_port_sem = link.semantics in port_semantics
         is_pair_sem = link.semantics == "per_pair"
-        if not (is_port_sem or is_pair_sem):
+        is_shared_sem = link.semantics == "shared"
+        if not (is_port_sem or is_pair_sem or is_shared_sem):
             continue
         ch_decl = decls.get(getattr(link, "channel", ""))
         rail = _resolved_rail_id(link, ch_decl)
@@ -197,6 +198,10 @@ def find_shared_port_keys(
         if not explicit_port_identity:
             continue
         for rank in link.members:
+            if is_shared_sem:
+                _, explicit_ep = _resolved_endpoint_id(link, int(rank), ch_decl)
+                if not (explicit_ep or rail not in (0, "")):
+                    continue
             node = int(rank_node_lookup(rank))
             for direction in ("tx", "rx"):
                 key = link_port_key(link, rank, node, direction, channel_decl=ch_decl)

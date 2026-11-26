@@ -48,11 +48,33 @@ def _copy(name, after, size):
     return HcclPhase(name, after, (('hbm', 2 * size), ('hccl_copy', size)))
 
 
-def _sync(name, after):
+def _sync(name, after, *, signals=()):
     # One notify and its wait. Without a declared control rate, these remain
     # readiness plus explicit unpriced work, not fitted fixed microseconds.
     return HcclPhase(name, after, (('hccl_control', 2),),
-                     control_counts=(('notify', 1), ('wait', 1)))
+                     control_counts=(('notify', 1), ('wait', 1)),
+                     signals=signals)
+
+
+def _remote_handshake(base, suffix, after, edges, rank, *, fused=False):
+    """Order local record -> remote signal -> local wait while keeping _ack/_complete suffixes."""
+    sent = sum(src == rank for src, _ in edges)
+    received = sum(dst == rank for _, dst in edges)
+    if fused:
+        # WRITE_REDUCE_WITH_NOTIFY delivers completion with the payload arrival.
+        return (HcclPhase(base + suffix, after, (('hccl_control', received),),
+            control_counts=(('remote_notify_fused_with_payload', sent),
+                            ('remote_notify_wait', received))),)
+    record_name = base + suffix
+    signal_name = base + '_signal' + suffix
+    wait_name = base + '_wait' + suffix
+    return (
+        HcclPhase(record_name, after, (('hccl_control', sent),),
+                  control_counts=(('remote_notify_record', sent),)),
+        HcclPhase(signal_name, (record_name,), signals=edges),
+        HcclPhase(wait_name, (signal_name,), (('hccl_control', received),),
+                  control_counts=(('remote_notify_wait', received),)),
+    )
 
 
 def contract(selection, rank=0):
@@ -97,21 +119,32 @@ def contract(selection, rank=0):
                 previous = ('output_copy_ready',)
                 phases.append(_copy('scratch_to_output', previous,
                                     total - len(own.receive_slices) * shard))
-            phases.append(_sync(tag + '_ack', previous))
             matrix = tuple(tuple(len(schedules[src][index].send_slices) * shard
                                  if dst == schedules[src][index].send_to else 0
                                  for dst in range(r)) for src in range(r))
-            sent, received = sum(matrix[rank]), sum(row[rank] for row in matrix)
+            forward = tuple((src, dst) for src, row in enumerate(matrix)
+                            for dst, size in enumerate(row) if size)
+            reverse = tuple((dst, src) for src, dst in forward)
             reduce = kind == 'reduce_scatter'
+            read_round = kind == 'allgather' and last
+            ack_edges = forward if read_round else reverse
+            done_edges = reverse if read_round else forward
+            ack_phases = _remote_handshake(tag, '_ack', previous, ack_edges, rank)
+            phases.extend(ack_phases)
+            sent, received = sum(matrix[rank]), sum(row[rank] for row in matrix)
             work = (('hbm', sent + received * (2 if reduce else 1)),)
             if reduce:
                 work += (('hccl_reduce', received),)
-            phases.append(HcclPhase(tag + '_exchange', (tag + '_ack',), work,
+            phases.append(HcclPhase(tag + '_exchange', (ack_phases[-1].name,), work,
                 exchange=matrix,
+                native_direction='read' if read_round else 'send',
                 control_counts=(('directed_peer_messages', 1),
                                 ('payload_slices', len(own.send_slices)))))
-            phases.append(_sync(tag + '_complete', (tag + '_exchange',)))
-            previous = (tag + '_complete',)
+            done_phases = _remote_handshake(
+                tag, '_complete', (tag + '_exchange',), done_edges, rank, fused=reduce
+            )
+            phases.extend(done_phases)
+            previous = (done_phases[-1].name,)
 
     if s.collective == 'allgather':
         phases.append(_sync('thread_pre_sync', ()))

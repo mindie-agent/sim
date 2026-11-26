@@ -437,7 +437,10 @@ def test_ordinary_caller_preserves_wire_work_once_and_one_invocation(expansion,t
     groups={dict(op.metadata)['hccl_source_group'] for op in selected[0]}
     assert len(groups) == 2  # Attention and FFN each own one invocation.
     report=graph_costs(raw,selected,include_submission=True,isolated=True,input_ready_ms=7)
-    assert sum(wire(report).values()) == len(groups) * 2 * (2 * raw["model"]["hidden_size"])
+    oneshot_flags = 3 * 128 if (expansion, template) == ('AIV', 'mesh_oneshot') else 0
+    assert sum(wire(report).values()) == pytest.approx(
+        len(groups) * 2 * (2 * raw["model"]["hidden_size"] + oneshot_flags)
+    )
     assert report['execution']['submission']['eager_invocations']==2
     assert report['execution']['live_tasks']==report['execution']['live_programs']==0
     assert all(row['ready_ms']>=7 for row in report['timeline'])
@@ -460,3 +463,55 @@ def test_allgather_dispatch_executes_the_declared_expansion(expansion, template,
     assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
     assert all(row["ready_ms"] >= 7 for row in report["timeline"])
     assert any(row["recipe"] == recipe for row in report["timeline"])
+
+
+@pytest.mark.parametrize("expansion,template", [
+    ("AICPU_TS", "nhr"),
+    ("CCU_SCHED", "mesh_mem2mem_v1"),
+])
+def test_nhr_and_ccu_allgather_charge_pre_and_post_handshake_propagation(expansion, template):
+    from mindie_sim.schema.operators import OpSpec
+
+    raw = case(tp=2)
+    raw["machine"]["device"]["rates"].update(dict.fromkeys(
+        ("hbm", "hccl_copy", "hccl_control", "ccu_copy", "ccu_buffer_bytes", "ccu_control"),
+        1e10,
+    ))
+    raw["machine"]["links"][0].update(latency_us=10, capacity_bytes_per_ms=1e9)
+    raw["runtime"]["kernels"] = {"hccl": {"allgather": {"expansion": expansion, "template": template}}}
+    shape = (2, 16)
+    op = OpSpec("g", "allgather", "decode", 0, 0, (), shape, shape, shape, shape, dtype="bf16", link_bytes=32)
+    ops = lower((op,), parse_case(raw).runtime, "bf16")
+    report = graph_costs(raw, ops, isolated=False, trace_limit=0)
+    assert report["duration_ms"] * 1000.0 >= 30.0
+    assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
+
+
+def test_nhr_reduce_scatter_fuses_notify_and_handshakes_order_record_signal_wait():
+    from mindie_sim.schema.operators import OpSpec
+
+    shape = (2, 16)
+    op_rs = OpSpec("rs", "reduce_scatter", "decode", 0, 0, (), shape, shape, shape, shape, dtype="bf16", link_bytes=32)
+    raw_rs = case(tp=2)
+    raw_rs["machine"]["device"]["rates"].update(dict.fromkeys(("hbm", "hccl_copy", "hccl_reduce", "hccl_control"), 1e10))
+    raw_rs["machine"]["links"][0].update(latency_us=10, capacity_bytes_per_ms=1e9)
+    raw_rs["runtime"]["kernels"] = {"hccl": {"reduce_scatter": {"expansion": "AICPU_TS", "template": "nhr"}}}
+    rs_us = graph_costs(raw_rs, lower((op_rs,), parse_case(raw_rs).runtime, "bf16"), isolated=False, trace_limit=0)["duration_ms"] * 1000.0
+    assert 20.0 - 1e-6 <= rs_us < 25.0
+
+    raw_nhr_order = case(tp=2)
+    raw_nhr_order["machine"]["device"]["rates"].update(hbm=1e12, hccl_copy=1e12, hccl_reduce=1e12, hccl_control=1.0)
+    raw_nhr_order["machine"]["links"][0].update(latency_us=10000, capacity_bytes_per_ms=1e12)
+    raw_nhr_order["runtime"]["kernels"] = {"hccl": {"reduce_scatter": {"expansion": "AICPU_TS", "template": "nhr"}}}
+    rep_nhr = graph_costs(raw_nhr_order, lower((op_rs,), parse_case(raw_nhr_order).runtime, "bf16"), isolated=False, trace_limit=200)
+    ex_nhr = next(ev for ev in rep_nhr["timeline"] if ev["op_id"].endswith(".rs_0_exchange"))
+    assert ex_nhr["ready_ms"] >= 12.0 - 1e-9
+
+    raw_ccu_order = case(tp=2)
+    raw_ccu_order["machine"]["device"]["rates"].update(hbm=1e12, ccu_copy=1e12, ccu_buffer_bytes=1e12, ccu_control=1.0)
+    raw_ccu_order["machine"]["links"][0].update(latency_us=10000, capacity_bytes_per_ms=1e12)
+    raw_ccu_order["runtime"]["kernels"] = {"hccl": {"allgather": {"expansion": "CCU_SCHED", "template": "mesh_mem2mem_v1"}}}
+    op_ag = OpSpec("g", "allgather", "decode", 0, 0, (), shape, shape, shape, shape, dtype="bf16", link_bytes=32)
+    rep_ccu = graph_costs(raw_ccu_order, lower((op_ag,), parse_case(raw_ccu_order).runtime, "bf16"), isolated=False, trace_limit=200)
+    pw_ccu = next(ev for ev in rep_ccu["timeline"] if ev["op_id"].endswith(".peer_write"))
+    assert pw_ccu["ready_ms"] >= 13.0 - 1e-9

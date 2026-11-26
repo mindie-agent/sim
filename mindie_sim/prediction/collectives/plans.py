@@ -175,7 +175,14 @@ class _TopologyPlansMixin:
 
         paths = []
         for flow in frozen_flows:
-            count = chunk_count(flow.payload_bytes, chunk)
+            if (isinstance(flow.messages, bool)
+                    or not isinstance(flow.messages, int)
+                    or flow.messages < 0):
+                raise ModelingError(
+                    f"transport_flow_messages_invalid:{flow.messages}")
+            per_message = (chunk_count(flow.payload_bytes, chunk)
+                           if flow.messages else 0)
+            count = per_message * flow.messages
             if max_physical_chunks is not None and count > max_physical_chunks:
                 raise ModelingError(
                     "transport_chunk_expansion_unbounded:"
@@ -186,7 +193,7 @@ class _TopologyPlansMixin:
                 raise ModelingError(
                     f"transport_receive_capacity_zero:{flow.destination}")
             largest = (chunk_size_at(flow.payload_bytes, chunk, 0)
-                       if count else 0.0)
+                       if per_message else 0.0)
             if cap is not None and largest > cap + 1e-9:
                 raise ModelingError(
                     "transport_chunk_exceeds_receive_capacity:"
@@ -277,13 +284,17 @@ class _TopologyPlansMixin:
 
     def joint_plan(self, op, participants, *, algorithm="ring", max_inflight_per_rank=1,
                    chunk_bytes=None, hop_startup_us=0.0,
+                   receive_capacity_bytes=None,
+                   receive_buffer_ids=None,
                    receive_capacity_bytes_per_peer=None,
                    receive_buffer_id=None,
                    max_physical_chunks=DEFAULT_MAX_PHYSICAL_CHUNKS, transport=None):
         """[Cohesive-Pipeline] Bind complete cross-DP cohorts without inferring a runtime algorithm."""
         if transport is not None:
             options = TransportOptions.from_mapping(transport)
-            if (chunk_bytes is not None or receive_capacity_bytes_per_peer is not None
+            if (chunk_bytes is not None or receive_capacity_bytes is not None
+                    or receive_buffer_ids is not None
+                    or receive_capacity_bytes_per_peer is not None
                     or receive_buffer_id is not None
                     or max_inflight_per_rank != 1
                     or float(hop_startup_us or 0.0)
@@ -291,13 +302,34 @@ class _TopologyPlansMixin:
                 raise ModelingError("transport_options_conflict")
             chunk_bytes = options.chunk_bytes
             hop_startup_us = options.hop_startup_us
+            receive_capacity_bytes = options.receive_capacity_bytes
+            receive_buffer_ids = options.receive_buffer_ids
             receive_capacity_bytes_per_peer = (
                 options.receive_capacity_bytes_per_peer)
             receive_buffer_id = options.receive_buffer_id
             max_inflight_per_rank = options.max_inflight_per_rank
             max_physical_chunks = options.max_physical_chunks
+        else:
+            if receive_capacity_bytes is None:
+                receive_capacity_bytes = ()
+            elif isinstance(receive_capacity_bytes, Mapping):
+                receive_capacity_bytes = tuple(sorted(
+                    (int(rank), float(val)) for rank, val in receive_capacity_bytes.items()))
+            else:
+                receive_capacity_bytes = tuple(sorted(
+                    (int(rank), float(val)) for rank, val in receive_capacity_bytes))
+            if receive_buffer_ids is None:
+                receive_buffer_ids = ()
+            elif isinstance(receive_buffer_ids, Mapping):
+                receive_buffer_ids = tuple(sorted(
+                    (int(rank), str(val)) for rank, val in receive_buffer_ids.items()))
+            else:
+                receive_buffer_ids = tuple(sorted(
+                    (int(rank), str(val)) for rank, val in receive_buffer_ids))
         resolved = TransportOptions(
             chunk_bytes=chunk_bytes, hop_startup_us=hop_startup_us,
+            receive_capacity_bytes=receive_capacity_bytes,
+            receive_buffer_ids=receive_buffer_ids,
             receive_capacity_bytes_per_peer=receive_capacity_bytes_per_peer,
             receive_buffer_id=receive_buffer_id,
             max_inflight_per_rank=max_inflight_per_rank,
@@ -311,9 +343,13 @@ class _TopologyPlansMixin:
             raise ModelingError(f"joint_collective_algorithm_unsupported:{algorithm}")
         if (algorithm not in {"direct_peer", "startup_waves"}
                 and (chunk_bytes is not None or hop_startup_us
+                     or receive_capacity_bytes or receive_buffer_ids
                      or receive_capacity_bytes_per_peer is not None)):
             raise ModelingError(
                 f"{algorithm}_collective_does_not_accept_chunked_peer_options")
+        if algorithm == "startup_waves" and (receive_capacity_bytes or receive_buffer_ids):
+            raise ModelingError(
+                "startup_waves_collective_does_not_accept_per_rank_receive_capacity")
         family, unique_groups, volume_by_rank, metadata = self._joint_groups(
             op, participants)
         alltoall = str(family).strip().lower() in {"alltoall", "alltoallv"}
@@ -413,7 +449,9 @@ class _TopologyPlansMixin:
                     receive_capacity_bytes_per_peer=(
                         receive_capacity_bytes_per_peer),
                     receive_buffer_id=receive_buffer_id,
-                    max_physical_chunks=max_physical_chunks))
+                    max_physical_chunks=max_physical_chunks,
+                    receive_capacity_bytes=receive_capacity_bytes,
+                    receive_buffer_ids=receive_buffer_ids))
             elif algorithm == "startup_waves":
                 from ..collectives.waves import WaveGroup
                 wave_rounds = (startup.startup_rounds
@@ -809,16 +847,24 @@ class _TopologyPlansMixin:
                     for resource in hop.demand:
                         useful[resource] = useful.get(resource, 0) + hop.useful_bytes
                         wire[resource] = wire.get(resource, 0) + hop.wire_bytes
-                        transactions[resource] = (
-                            None if hop.transactions is None
-                            else transactions.get(resource, 0) + hop.transactions)
-                        if hop.transaction_frame is not None:
+                        previous_tx = transactions.get(resource, 0)
+                        if hop.transactions is None or previous_tx is None:
+                            transactions[resource] = None
+                        else:
+                            transactions[resource] = previous_tx + hop.transactions
+                        if resource not in transaction_frames:
                             transaction_frames[resource] = hop.transaction_frame
+                        elif transaction_frames[resource] != hop.transaction_frame:
+                            transaction_frames[resource] = None
                     path_latency += hop.latency_ms
                 max_path_latency = max(max_path_latency, path_latency)
                 latency = max(latency, path_latency * rounds)
+        uniform_frames = {
+            resource: frame for resource, frame in transaction_frames.items()
+            if frame is not None
+        }
         return self._work_with_capacity(CommunicationWork(
-            useful_by_rank, useful, wire, transactions, transaction_frames, count, latency,
+            useful_by_rank, useful, wire, transactions, uniform_frames, count, latency,
             routed_useful, physical_wire, max_path_latency,
         ))
 
@@ -842,6 +888,8 @@ class _TopologyPlansMixin:
             )
             if (opts.chunk_bytes is not None
                     or float(opts.hop_startup_us or 0.0) > 0.0
+                    or opts.receive_capacity_bytes
+                    or opts.receive_buffer_ids
                     or opts.receive_capacity_bytes_per_peer is not None
                     or opts.receive_buffer_id is not None
                     or (opts.max_inflight_per_rank is not None
@@ -952,6 +1000,7 @@ class _TopologyPlansMixin:
             return build_band_collective_plan(
                 self, norm_family, unique_groups, volume_by_rank, metadata,
                 peer=peer, stack=stack_id, expansion_mode=exp,
+                dtype=getattr(op, "dtype", None) or None,
             )
         except ModelingError as exc:
             if not exp and str(exc).startswith("collective_band_missing"):

@@ -687,3 +687,190 @@ def test_explicit_multinode_placement_and_subgroup_channel_utilization():
     name_pod = topo_inter_pod.route(0, 16)[0][0]
     assert name_pod.startswith("d2d_inter_pod:")
     assert topo_inter_pod.links[name_pod].capacity_bytes_per_ms == pytest.approx(25e6)
+
+
+def test_band_ring_causality_alltoallv_rounds_element_shards_and_per_hop_caps():
+    from dataclasses import replace
+    from _support.collective_cases import case as coll_case, exchange as coll_exchange, topology as coll_topo
+    from mindie_sim.prediction.collectives import TransportOptions
+
+    # 1. Band-selected ring uses rank-local send/arrival causality without a global round barrier.
+    raw_ring = coll_case(tp=4)
+    raw_ring["machine"]["links"] = [
+        {"name": f"edge{i}", "members": [i, (i + 1) % 4], "semantics": "per_pair",
+         "capacity_bytes_per_ms": 64, "latency_us": 10000 if i == 3 else 0,
+         "protocol_bands": [{"collective": "allgather", "algorithm": "ring"}]}
+        for i in range(4)
+    ]
+    topo_ring = coll_topo(raw_ring)
+    op_ag = coll_exchange(192, family="allgather")
+    ring_spans = []
+    for builder in (topo_ring.joint_plan, topo_ring.band_collective_plan):
+        plan = builder(op_ag, {0: 192}, algorithm="ring")
+        eng = Engine(topo_ring.resources())
+        done = plan.start(eng, "ag", eng.submit("ready"))
+        eng.advance()
+        ring_spans.append((done.time, sum(eng.serviced.values())))
+    assert ring_spans == [(13.0, 768.0), (13.0, 768.0)]
+
+    # 2. Explicit ring AllToAllV preserves (N-1) rounds and span matching balanced AllToAll.
+    topo_ring_a2a = Topology(_make_machine(SINGLE_DIE_SKU, num_devices=4, ranks_per_node=4), ParallelSpec(tp=4))
+    a2a_res = []
+    for fam in ("alltoall", "alltoallv"):
+        mat = ((1024,) * 4,) * 4 if fam == "alltoallv" else None
+        low = lower_collective(fam, range(4), topo_ring_a2a, 4096, expansion_mode="ring", peer_matrix=mat)
+        eng = Engine(topo_ring_a2a.resources())
+        ends = submit_lowered_collective(eng, "op", low, {r: eng.submit(str(r)) for r in low.group})
+        eng.advance()
+        a2a_res.append((low.band.algorithm, low.phases[0].rounds, low.total_wire_bytes, round(ends[0].time * 1000, 6)))
+    assert a2a_res[0] == a2a_res[1] and a2a_res[0][1] == 3
+
+    # 3. Element-aligned ReduceScatter shards never split one FP32 value into bytes.
+    topo_elem = Topology(_make_machine(DIRECT_MESH_SKU, num_devices=4, ranks_per_node=4), ParallelSpec(tp=4))
+    op_fp32 = replace(
+        coll_exchange(6, family="allreduce"), dtype="fp32",
+        metadata=(("group_axis", "tp"), ("expansion_mode", "ccu_sched")),
+    )
+    low_fp32 = topo_elem.band_collective_plan(op_fp32, {0: 6}).groups[0].lowered
+    assert [(ph.name, {x.payload_bytes for x in ph.transfers}, len(ph.transfers)) for ph in low_fp32.phases] == [
+        ("reduce_scatter", {4.0}, 3), ("all_gather", {4.0}, 3),
+    ]
+
+    # 4. Forwarding rank isolation retains transit hops touching local_ranks.
+    raw_chain = coll_case(dp=4)
+    raw_chain["machine"]["links"] = [
+        {"name": f"h{i}", "members": [i, i + 1], "semantics": "per_pair", "capacity_bytes_per_ms": 64,
+         "protocol_bands": [{"algorithm": "ring", "collective": "allgather"}]}
+        for i in range(3)
+    ]
+    topo_chain = coll_topo(raw_chain)
+    plan_chain = topo_chain.band_collective_plan(
+        coll_exchange(192, family="allgather", axis="dp"), {1: 192}, algorithm="ring", transport=TransportOptions(),
+    )
+    local_res = {r.name for r in topo_chain.resources_for_ranks([1])}
+    scoped = plan_chain.scoped_to_ranks(frozenset({1}), available_resources=local_res)
+    assert sum(scoped.accounting().wire_by_resource.values()) == pytest.approx(
+        sum(b for k, b in plan_chain.accounting().wire_by_resource.items() if k in local_res)
+    ) == pytest.approx(768.0)
+
+    # 5. Per-hop SDMA flow caps charge only the hop declaring the cap.
+    raw_cap = coll_case(dp=3)
+    cap_band = {"collective": "alltoallv", "algorithm": "direct", "payload_bytes_per_frame": 64, "wire_bytes_per_frame": 64}
+    raw_cap["machine"]["links"] = [
+        {"name": name, "channel": name, "scope": "node", "members": [idx, idx + 1],
+         "capacity_bytes_per_ms": 65536, "semantics": "per_pair", "protocol_bands": [cap_band]}
+        for idx, name in enumerate(("fast", "slow"))
+    ]
+    raw_cap["machine"]["transfer_channels"] = {"slow": {"single_peer_flow_cap_bytes_per_ms": 64}}
+    topo_cap = coll_topo(raw_cap)
+    low_cap = lower_collective("alltoallv", range(3), topo_cap, 64, peer_matrix=((0, 0, 64), (0, 0, 0), (0, 0, 0)))
+    eng_cap = Engine(topo_cap.resources())
+    ends_cap = submit_lowered_collective(eng_cap, "tx", low_cap, {r: eng_cap.submit(str(r)) for r in low_cap.group})
+    eng_cap.advance()
+    assert ends_cap[2].time == pytest.approx(64.0 / 65536.0 + 64.0 / 64.0)
+
+    # 6. Hierarchical 2D AllReduce aligns slice boundaries and conserves payload across ranks.
+    raw_h2d = ascend({"sku": DUAL_DIE_SMALL_SKU, "num_devices": 4})
+    for link in raw_h2d["links"]:
+        link["protocol_bands"] = [{"collective": "allreduce", "algorithm": "hierarchical_2d"}]
+    topo_h2d = Topology(Hardware.from_mapping(raw_h2d), ParallelSpec(tp=4))
+    for size in (32 * 2**20 + 4, 32 * 2**20 + 8):
+        assert lower_collective("allreduce", range(4), topo_h2d, size).total_payload_bytes == pytest.approx(6 * size)
+
+    # 7. Sparse ring AllToAllV retains slow earlier receives; explicit pairwise uses N-1 rounds.
+    from mindie_sim.prediction.collectives.band_plan import api_bytes_from_link_volume, build_band_collective_plan
+
+    raw_sparse = coll_case(tp=3)
+    raw_sparse["model"].update(num_heads=6, num_kv_heads=6, hidden_size=96, head_dim=16)
+    raw_sparse["machine"]["links"] = [
+        {"name": f"s{a}{b}", "members": [a, b], "semantics": "per_pair", "capacity_bytes_per_ms": 64,
+         "latency_us": 10000.0 if (a, b) == (2, 0) else 0.0,
+         "protocol_bands": [
+             {"collective": "alltoallv", "algorithm": "ring"},
+             {"collective": "reduce_scatter", "algorithm": "ring"},
+         ]}
+        for a, b in ((0, 1), (1, 2), (2, 0))
+    ]
+    topo_sparse = coll_topo(raw_sparse)
+    low_sparse = lower_collective("alltoallv", (0, 1, 2), topo_sparse, 64, peer_matrix=((0, 0, 0), (64, 0, 0), (64, 0, 0)))
+    eng_sparse = Engine(topo_sparse.resources())
+    done_sparse = submit_lowered_collective(eng_sparse, "sp", low_sparse, {r: eng_sparse.submit(str(r)) for r in (0, 1, 2)})
+    eng_sparse.advance()
+    assert done_sparse[0].time == pytest.approx(11.0)
+
+    raw_pw = coll_case(tp=4)
+    raw_pw["machine"]["links"] = [
+        {"name": f"p{i}{j}", "members": [i, j], "semantics": "per_pair", "capacity_bytes_per_ms": 1e9,
+         "latency_us": 1000.0, "protocol_bands": [{"collective": "alltoallv", "algorithm": "pairwise"}]}
+        for i in range(4) for j in range(i + 1, 4)
+    ]
+    topo_pw = coll_topo(raw_pw)
+    mat_pw = tuple(tuple(0 if i == j else 64 for j in range(4)) for i in range(4))
+    low_pw = lower_collective("alltoallv", range(4), topo_pw, 192, peer_matrix=mat_pw)
+    assert low_pw.phases[0].rounds == 3
+    eng_pw = Engine(topo_pw.resources())
+    done_pw = submit_lowered_collective(eng_pw, "pw", low_pw, {r: eng_pw.submit(str(r)) for r in range(4)})
+    eng_pw.advance()
+    assert max(ev.time for ev in done_pw.values()) >= 3.0 - 1e-6
+
+    # 8. Isolation preserves double-ring lane, external relay traffic, uncapped hops, and FP32 roundoff shards.
+    raw_dr = coll_case(tp=4)
+    raw_dr["machine"]["links"] = [
+        {"name": f"d{i}", "members": [i, (i + 1) % 4], "semantics": "per_pair", "capacity_bytes_per_ms": 64,
+         "protocol_bands": [{"collective": "allreduce", "algorithm": "double_ring"}]}
+        for i in range(4)
+    ]
+    topo_dr = coll_topo(raw_dr)
+    scoped_dr = topo_dr.band_collective_plan(coll_exchange(96, family="allreduce"), {0: 96.0}, algorithm="auto").scoped_to_ranks(
+        frozenset({0}), available_resources={r.name for r in topo_dr.resources()},
+    )
+    ccw_transfers = [t for p in scoped_dr.groups[0].lowered.phases for t in p.transfers if t.source == 1 and t.destination == 0]
+    assert ccw_transfers and all(t.lane_index == 1 for t in ccw_transfers)
+
+    raw_relay = coll_case(dp=3)
+    raw_relay["machine"]["links"] = [
+        {"name": name, "channel": name, "scope": "node", "members": [idx, idx + 1], "semantics": "per_pair",
+         "capacity_bytes_per_ms": 65536, "protocol_bands": [{"collective": "allgather", "algorithm": "ring"}]}
+        for idx, name in enumerate(("fast", "slow"))
+    ]
+    raw_relay["machine"]["transfer_channels"] = {"slow": {"single_peer_flow_cap_bytes_per_ms": 64}}
+    topo_relay = coll_topo(raw_relay)
+    plan_relay = build_band_collective_plan(topo_relay, "allgather", [(0, 2)], {0: 64.0, 2: 64.0}, {}, dtype="bf16")
+    scoped_mid = plan_relay.scoped_to_ranks(frozenset({1}), available_resources={r.name for r in topo_relay.resources()})
+    assert scoped_mid is not None and sum(scoped_mid.accounting().wire_by_resource.values()) == pytest.approx(256.0)
+    assert scoped_mid.groups[0].lowered.local_hbm_bytes_per_rank == 0.0
+    scoped_fast = plan_relay.scoped_to_ranks(frozenset({0}), available_resources={r.name for r in topo_relay.resources() if "fast" in r.name})
+    assert all(t.flow_cap_bytes_per_ms is None for p in scoped_fast.groups[0].lowered.phases for t in p.transfers)
+
+    assert api_bytes_from_link_volume("allreduce", 3, 28 * (4.0 / 3.0)) == 28.0
+    low_roundoff = lower_collective("reduce_scatter", (0, 1, 2), topo_sparse, 28 * (4 / 3) * 3 / 4, dtype="fp32")
+    assert sorted({t.payload_bytes for t in low_roundoff.phases[0].transfers}) == [8.0, 12.0]
+
+
+def test_shared_link_explicit_endpoint_port_and_fifo_credit_arbitration():
+    from _support.collective_cases import case as coll_case, topology as coll_topo
+    from mindie_sim.prediction.collectives.transfer import FiniteTransfer
+
+    # 1. Two shared links declaring one physical TX endpoint serialize at endpoint rate.
+    raw_shared = coll_case(dp=3)
+    raw_shared["machine"]["links"] = [
+        {"name": f"edge{d}", "members": [0, d], "semantics": "shared",
+         "capacity_bytes_per_ms": 1024, "endpoint_ids": {"0": "nic"}, "endpoint_rates": {"0": 64}}
+        for d in (1, 2)
+    ]
+    topo_shared = coll_topo(raw_shared)
+    plan_shared = topo_shared.transport_plan([MessageFlow(0, d, 64) for d in (1, 2)])
+    eng_shared = Engine(plan_shared.resources())
+    run_shared = plan_shared.start(eng_shared, "tx", {i: eng_shared.submit(str(i)) for i in plan_shared.ranks})
+    eng_shared.advance()
+    assert max(ev.time for ev in run_shared.completions) == pytest.approx(128.0 / 64.0)
+
+    # 2. Unlimited-credit FiniteTransfer preserves FIFO transaction-granule arbitration.
+    fifo_times = []
+    for slots in (None, 4):
+        eng_fifo = Engine((Resource("wire", 64, "bytes", policy="fifo"),))
+        done = FiniteTransfer({"wire": 256}, 64, slots).start(eng_fifo, "copy", eng_fifo.submit("ready"))
+        peer = eng_fifo.submit("peer", {"wire": 64}, release=0.5)
+        eng_fifo.advance()
+        fifo_times.append((done.time, peer.time))
+    assert fifo_times == [(5.0, 2.0), (5.0, 2.0)]
