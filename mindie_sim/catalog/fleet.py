@@ -387,6 +387,7 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
     sparse = c.get("sparse_attention_config")
     sparse = dict(sparse) if isinstance(sparse, Mapping) else {}
     sparse_on = bool(sparse.get("use_sparse_attention", False))
+    has_sparse_freq = sparse.get("sparse_attention_freq") is not None
     sparse_freq = [int(v) for v in (sparse.get("sparse_attention_freq") or ())]
     start = _int(sparse, "sparse_layers_start", layers); block = _int(sparse, "sparse_block_size")
     topk_blocks = _int(sparse, "sparse_topk_blocks"); local_blocks = _int(sparse, "sparse_local_block")
@@ -410,8 +411,10 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
     plans = []
     for index in range(layers):
         moe = moe_flags[index]
-        active = sparse_on and ((index < len(sparse_freq) and sparse_freq[index])
-                                or index >= start)
+        active = sparse_on and (
+            (index < len(sparse_freq) and bool(sparse_freq[index]))
+            if has_sparse_freq else (index >= start)
+        )
         if active and min(block, topk_blocks, index_heads, index_dim) <= 0:
             raise ModelingError(f"model_config_minimax_sparse_dims_missing:{index}")
         noaux = bool(moe and use_routing_bias)

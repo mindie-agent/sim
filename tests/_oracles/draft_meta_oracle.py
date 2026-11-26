@@ -85,6 +85,7 @@ def _vision_decl(v: Mapping[str, Any], *, layer_hidden: int) -> dict[str, Any]:
     merge = _i(v, "spatial_merge_size", DEFAULT_SPATIAL_MERGE) or DEFAULT_SPATIAL_MERGE
     hidden = _i(v, "hidden_size")
     temporal = _i(v, "temporal_patch_size", 1) or 1
+    in_channels = _i(v, "in_channels", _i(v, "in_chans", RGB_CHANNELS)) or RGB_CHANNELS
     return {
         "kind": "qwen3_5",
         "hidden": hidden,
@@ -92,9 +93,9 @@ def _vision_decl(v: Mapping[str, Any], *, layer_hidden: int) -> dict[str, Any]:
         "intermediate": _i(v, "intermediate_size"),
         "query": hidden,
         "qkv": RGB_CHANNELS * hidden,
-        "patch_width": RGB_CHANNELS * _i(v, "patch_size") ** 2 * temporal,
+        "patch_width": in_channels * _i(v, "patch_size") ** 2 * temporal,
         "pos": _i(v, "num_position_embeddings"),
-        "bias": False,
+        "bias": True,
         "gated": False,
         "norm_type": "layernorm",
         "aligner_in": hidden * merge * merge,
@@ -318,9 +319,16 @@ def _aux_decl(c: Mapping[str, Any], builder: str) -> dict[str, Any]:
         if mtp > 0:
             return {"kind": "mtp", "layers": mtp, "standalone": False}
     if builder == "minimax_m3":
-        modules = _i(c, "num_mtp_modules") or nextn
+        dspark_cfg = c.get("dspark_config") if isinstance(c.get("dspark_config"), Mapping) else {}
+        cfg_layers = _i(dspark_cfg, "num_hidden_layers") or _i(c, "dspark_num_hidden_layers")
+        modules = cfg_layers or _i(c, "num_mtp_modules") or nextn
         if modules > 0:
-            return {"kind": "mtp", "layers": modules, "standalone": False}
+            markov = (
+                _i(dspark_cfg, "dspark_markov_rank")
+                or _i(dspark_cfg, "markov_rank")
+                or _i(c, "dspark_markov_rank")
+            )
+            return {"kind": "dspark" if markov > 0 else "mtp", "layers": modules, "standalone": False}
     if builder == "step5" and nextn > 0:
         return {"kind": "mtp", "layers": nextn, "standalone": False}
     return {}

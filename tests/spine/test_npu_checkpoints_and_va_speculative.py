@@ -761,3 +761,197 @@ def test_renamed_model_invariance_for_speculative_and_recover_ssm() -> None:
         spec_method="mtp", proposal_count=3, opt_in_replayssm=False,
     )
     assert pol_default.enabled is False
+
+
+def test_explicit_org_repo_id_preserves_unquantized_identity_without_registry_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mindie_sim.catalog import npu_checkpoints as nc
+
+    offline = resolve_checkpoint_metadata(
+        "Qwen/Qwen3-32B", hw_family="a3", allow_network=False, cache_dir=tmp_path,
+    )
+    assert offline.repo_id == "Qwen/Qwen3-32B"
+    assert offline.checkpoint is None
+    assert offline.quant_spec is not None and offline.quant_spec.weight_format == "bf16"
+
+    def _fake_fetch(url: str, *, timeout_s: float = 10.0):
+        del timeout_s
+        if url.endswith("/config.json"):
+            return ({"model_type": "qwen3", "torch_dtype": "bfloat16"}, None)
+        return (None, "not_found")
+
+    monkeypatch.setattr(nc, "_fetch_json_url", _fake_fetch)
+    remote = resolve_checkpoint_metadata(
+        "Qwen/Qwen3-32B", hw_family="a3", allow_network=True, cache_dir=tmp_path / "remote",
+    )
+    assert remote.repo_id == "Qwen/Qwen3-32B"
+    assert remote.checkpoint is None
+    assert remote.quant_spec is not None and remote.quant_spec.weight_format == "bf16"
+
+    named_bf16 = resolve_checkpoint_metadata(
+        "org/w4a8-control", hw_family="a3", allow_network=True, cache_dir=tmp_path / "remote_named",
+    )
+    assert named_bf16.quant_spec is not None and named_bf16.quant_spec.weight_format == "bf16"
+
+    bare = resolve_checkpoint_metadata("qwen3-32b", hw_family="a3", allow_network=False)
+    assert bare.checkpoint is not None and bare.repo_id.startswith("Eco-Tech/")
+
+
+def test_standalone_quantize_config_matches_nested_config_in_local_and_remote_resolution(
+    tmp_path: Path,
+) -> None:
+    from mindie_sim.catalog.npu_checkpoints import _build_remote_result
+
+    base_cfg = {
+        "model_type": "llama", "num_hidden_layers": 2, "hidden_size": 128,
+        "num_attention_heads": 4, "num_key_value_heads": 2,
+        "intermediate_size": 256, "vocab_size": 512, "max_position_embeddings": 4096,
+    }
+    gptq_cfg = {"quant_method": "gptq", "bits": 4, "group_size": 128, "sym": True}
+
+    dir_nested = tmp_path / "nested-gptq"
+    dir_standalone = tmp_path / "standalone-gptq"
+    dir_nested.mkdir(parents=True)
+    dir_standalone.mkdir(parents=True)
+    (dir_nested / "config.json").write_text(
+        json.dumps({**base_cfg, "quantization_config": gptq_cfg}), encoding="utf-8",
+    )
+    (dir_standalone / "config.json").write_text(json.dumps(base_cfg), encoding="utf-8")
+    (dir_standalone / "quantize_config.json").write_text(json.dumps(gptq_cfg), encoding="utf-8")
+
+    res_nested = resolve_checkpoint_metadata(dir_nested, hw_family="a3")
+    res_standalone = resolve_checkpoint_metadata(dir_standalone, hw_family="a3")
+    assert res_nested.quant_spec is not None and res_standalone.quant_spec is not None
+    assert res_standalone.quant_spec.weight_format == res_nested.quant_spec.weight_format == "int4"
+    assert res_standalone.quant_spec.weight_block == res_nested.quant_spec.weight_block
+
+    remote_res = _build_remote_result(
+        "org/custom-gptq", "huggingface", "org/custom-gptq", "a3",
+        base_cfg, {}, gptq_cfg,
+    )
+    assert remote_res.quant_spec is not None and remote_res.quant_spec.weight_format == "int4"
+
+    awq_sidecar = {"w_bit": 4, "q_group_size": 32, "zero_point": True}
+    remote_awq = _build_remote_result(
+        "org/custom-awq", "huggingface", "org/custom-awq", "a3",
+        base_cfg, {}, awq_sidecar,
+    )
+    assert remote_awq.quant_spec is not None
+    assert remote_awq.quant_spec.weight_format == "int4"
+    assert remote_awq.quant_spec.weight_block == (1, 32)
+
+
+def test_classify_weight_tensor_quant_preserves_hf_tensor_quant_rule_fields() -> None:
+    from mindie_sim.catalog.checkpoint_reader import (
+        read_hf_quantization_config, read_modelslim_description_mapping,
+    )
+
+    fp8_qmap = read_hf_quantization_config({
+        "model_type": "qwen3", "num_hidden_layers": 2,
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [32, 32],
+            "scale_fmt": "ue8m0",
+            "modules_to_not_convert": ["lm_head"],
+        },
+    }, checkpoint_id="inline://fp8")
+    q_attn = classify_weight_tensor_quant("model.layers.0.self_attn.q_proj.weight", fp8_qmap)
+    q_head = classify_weight_tensor_quant("lm_head.weight", fp8_qmap)
+    assert q_attn.weight_format == "fp8_e4m3"
+    assert q_attn.scale_format == "fp8_e8m0"
+    assert q_attn.group_size == 32
+    assert q_head.weight_format == "bf16" and q_head.is_quantized is False
+
+    awq_qmap = read_hf_quantization_config({
+        "model_type": "llama", "num_hidden_layers": 2,
+        "quantization_config": {"quant_method": "awq", "bits": 4, "group_size": 128},
+    }, checkpoint_id="inline://awq")
+    q_proj = classify_weight_tensor_quant("model.layers.0.mlp.gate_proj.weight", awq_qmap)
+    assert q_proj.weight_format == "int4"
+    assert q_proj.group_size == 128
+
+    kimi_cfg = json.loads(
+        (Path(__file__).resolve().parents[2] / "mindie_sim/model_configs/kimi-k3.json")
+        .read_text(encoding="utf-8")
+    )
+    kimi_qmap = read_hf_quantization_config(kimi_cfg, checkpoint_id="inline://kimi-k3")
+    q_kimi_head = classify_weight_tensor_quant("lm_head.weight", kimi_qmap)
+    assert q_kimi_head.weight_format == "bf16" and q_kimi_head.is_quantized is False
+
+    draft_qmap = read_modelslim_description_mapping(
+        {
+            "mtp.0.q_proj.weight": "FLOAT",
+            "mtp.1.q_proj.weight": "W8A8_DYNAMIC",
+            "mtp.2.q_proj.weight": "W8A8_DYNAMIC",
+        },
+        checkpoint_id="inline://draft-exc",
+        base_config={"torch_dtype": "bfloat16"},
+    )
+    q_draft0 = classify_weight_tensor_quant("mtp.0.q_proj.weight", draft_qmap)
+    q_draft1 = classify_weight_tensor_quant("mtp.1.q_proj.weight", draft_qmap)
+    assert q_draft0.weight_format == "bf16" and q_draft0.is_quantized is False
+    assert q_draft1.weight_format == "int8" and q_draft1.is_quantized is True
+
+
+def test_minimax_dspark_companion_structural_parsing_and_draft_weight_dedup() -> None:
+    from dataclasses import replace
+    from mindie_sim.catalog.draft_weights import draft_terms, draft_weight_summary
+    from mindie_sim.catalog.specs import build_model_spec
+    from mindie_sim.catalog.types import AuxiliarySpec
+    from mindie_sim.catalog.weight_terms import term_bytes
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    flash = load_model("minimax-m3.1-flash")
+    assert flash.auxiliary is not None and flash.auxiliary.dspark is not None
+    dspark = flash.auxiliary.dspark
+    dspark.validate()
+    assert dspark.kind == "dspark"
+    assert dspark.layers == 5
+    assert dspark.block_size == 7
+    assert dspark.sliding_window == 4096
+    assert dspark.markov_rank == 256
+    assert dspark.target_layer_ids == (3, 17, 31, 45, 59)
+    assert dspark.confidence_enabled is True and dspark.confidence_executes is True
+    assert all(plan.window == 4096 for plan in dspark.layer_plans)
+
+    main_proj = next(t for t in draft_terms(dspark, flash) if t.name == "draft_main_proj")
+    assert main_proj.shard == "replicated"
+    assert term_bytes(main_proj, flash.quant, ParallelSpec(tp=8), 1) == pytest.approx(
+        term_bytes(main_proj, flash.quant, ParallelSpec(tp=1), 1)
+    )
+
+    synthetic_cfg = json.loads(
+        (Path(__file__).resolve().parents[2] / "mindie_sim/catalog/configs/minimax-m3.1-flash.json")
+        .read_text(encoding="utf-8")
+    )
+    synthetic_cfg["text_config"]["dspark_config"] = {
+        "num_hidden_layers": 3,
+        "dspark_block_size": 4,
+        "sliding_window": 2048,
+        "dspark_markov_rank": 128,
+        "dspark_target_layer_ids": [1, 3, 5],
+        "dspark_ffn_hidden_size": 4096,
+        "enable_confidence_head": True,
+        "confidence_head_with_markov": False,
+    }
+    synthetic = build_model_spec("synthetic-companion-alias", synthetic_cfg)
+    assert synthetic.auxiliary is not None and synthetic.auxiliary.dspark is not None
+    sd = synthetic.auxiliary.dspark
+    sd.validate()
+    assert (sd.kind, sd.layers, sd.block_size, sd.sliding_window, sd.markov_rank) == (
+        "dspark", 3, 4, 2048, 128,
+    )
+    assert sd.target_layer_ids == (1, 3, 5)
+    assert sd.confidence_enabled is True
+
+    base_params, base_bytes = draft_weight_summary(flash)
+    cloned_aux = AuxiliarySpec(
+        mtp=replace(dspark), dspark=replace(dspark),
+        standalone_draft=flash.auxiliary.standalone_draft,
+    )
+    cloned_flash = replace(flash, auxiliary=cloned_aux)
+    assert cloned_flash.auxiliary.mtp is not cloned_flash.auxiliary.dspark
+    dup_params, dup_bytes = draft_weight_summary(cloned_flash)
+    assert (dup_params, dup_bytes) == (base_params, base_bytes)

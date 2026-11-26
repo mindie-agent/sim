@@ -24,6 +24,7 @@ from mindie_sim.catalog.types import EngramSpec, EngramTableSpec, VisionSpec, me
 from mindie_sim.schema.common import ModelingError
 
 QKV_PROJECTION_COUNT = 3
+DEFAULT_IN_CHANNELS = 3
 
 
 def _vision_v41(config: Mapping[str, Any], text: Mapping[str, Any]) -> VisionSpec:
@@ -78,12 +79,16 @@ def _vision_qwen(config: Mapping[str, Any], text: Mapping[str, Any]) -> VisionSp
     merge = int(v.get("spatial_merge_size", 2) or 2)
     out_h = int(v.get("out_hidden_size", text["hidden_size"]))
     deepstack_indexes = tuple(int(idx) for idx in (v.get("deepstack_visual_indexes") or ()))
+    in_channels = int(
+        v.get("in_channels", v.get("in_chans", DEFAULT_IN_CHANNELS)) or DEFAULT_IN_CHANNELS
+    )
     return VisionSpec(
         kind="qwen3_5", layers=int(v["depth"]), hidden_size=hidden,
         intermediate_size=int(v["intermediate_size"]),
         num_heads=int(v["num_heads"]), qkv_width=QKV_PROJECTION_COUNT * hidden,
-        gated_mlp=False, activation="gelu", norm_type="layernorm", bias=False,
+        gated_mlp=False, activation="gelu", norm_type="layernorm", bias=True,
         patch_size=int(v["patch_size"]),
+        in_channels=in_channels,
         temporal_patch=int(v.get("temporal_patch_size", 1) or 1),
         merge_area=merge * merge, out_hidden_size=out_h,
         aligner_hidden_size=0,

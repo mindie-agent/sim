@@ -96,6 +96,22 @@
     "qk_norm_type": "per_head",
     "num_mtp_modules": 7,
     "num_nextn_predict_layers": 1,
+    "dspark_config": {
+      "num_hidden_layers": 5,
+      "dspark_block_size": 7,
+      "sliding_window": 4096,
+      "dspark_markov_rank": 256,
+      "dspark_target_layer_ids": [
+        3,
+        17,
+        31,
+        45,
+        59
+      ],
+      "dspark_ffn_hidden_size": 12288,
+      "enable_confidence_head": true,
+      "confidence_head_with_markov": true
+    },
     "swiglu_alpha": 1.702,
     "swiglu_limit": 7.0,
     "routed_scaling_factor": 2.0,

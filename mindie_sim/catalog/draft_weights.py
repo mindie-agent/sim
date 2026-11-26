@@ -259,6 +259,15 @@ def _draft_plan_terms(
     return terms
 
 
+def _feature_proj_sharding(draft: DraftSpec) -> str:
+    """Match frontend ``_replicated_feature_proj`` sharding for draft input projections."""
+    replicated = bool(
+        draft.kind in {"eagle", "eagle3"}
+        or (draft.kind in {"dspark", "mtp_dspark", "standalone_draft"} and draft.attention_kind == "gqa")
+    )
+    return "replicated" if replicated else "out_tp"
+
+
 def draft_terms(
     draft: DraftSpec, model: ModelSpec, *, standalone_heads_only: bool = False,
     ep: int = ONE,
@@ -268,11 +277,12 @@ def draft_terms(
         model, quant=require_model_quant(model),
     )
     dq = draft_quant(resolved_model, draft)
+    feature_sharding = _feature_proj_sharding(draft)
     terms: list[WeightTerm] = []
     if standalone_heads_only and draft.kind == "standalone_draft":
         # The standalone draft always consumes concatenated target features.
         terms.append(_t("draft_input_proj", h, draft.input_width,
-                        draft.input_projection_category, "out_tp"))
+                        draft.input_projection_category, feature_sharding))
         terms.extend([_t("draft_input_norm", h, 1, "norm"),
                       _t("draft_final_norm", h, 1, "norm")])
         if draft.target_shared_embedding:
@@ -294,7 +304,7 @@ def draft_terms(
             # from two independent H x H projections, so it must not be modelled
             # as ``dual_normalized``.
             terms.append(_t("draft_main_proj", h, _resolved_input_width(draft),
-                            draft.input_projection_category, "out_tp"))
+                            draft.input_projection_category, feature_sharding))
             terms.append(_t("draft_main_norm", h, ONE, "norm"))
         elif draft.input_mode == "dual_normalized":
             # Deployed V4 MTP input: enorm(decoder h) + hnorm(target h), then two
@@ -306,7 +316,7 @@ def draft_terms(
                             "replicated"))
         elif draft.input_mode != "normalized_concat":
             terms.append(_t("draft_input_proj", h, draft.input_width,
-                            draft.input_projection_category, "out_tp"))
+                            draft.input_projection_category, feature_sharding))
         if draft.embedding_owned and int(draft.embedding_count) > ZERO:
             terms.append(WeightTerm(
                 "draft_embedding", draft.vocab_size, h, "embedding",
@@ -362,7 +372,7 @@ def draft_weight_summary(
     else:
         if aux.mtp is not None:
             drafts.append(aux.mtp)
-        if aux.dspark is not None and aux.dspark is not aux.mtp:
+        if aux.dspark is not None and aux.dspark != aux.mtp:
             drafts.append(aux.dspark)
     params = 0.0
     weights = 0.0

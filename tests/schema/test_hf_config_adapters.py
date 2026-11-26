@@ -725,3 +725,234 @@ def test_compose_accepts_local_hf_dir_companion_quant_and_eco_tech_repo_id(tmp_p
     assert parsed_repo.model.quant is not None
     assert parsed_repo.model.quant.format_for("routed_expert") == "mxfp4"
     assert parsed_repo.model.quant.format_for("attn") == "fp8_e4m3"
+
+
+def test_redundant_expert_slot_plan_balances_nonlocal_copies() -> None:
+    from types import SimpleNamespace
+    from mindie_sim.catalog.expert_slots import expert_slot_plan
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    for experts, ep_size, redundant in ((4, 4, 1), (6, 4, 1), (8, 4, 1), (10, 4, 1)):
+        layer = SimpleNamespace(index=0, num_experts=experts)
+        plan = expert_slot_plan(
+            None, layer, ParallelSpec(ep=ep_size, redundant_experts_per_rank=redundant),
+        )
+        copies = plan.copies_per_expert()
+        assert len(copies) == experts
+        assert max(copies.values()) - min(copies.values()) <= 1
+        assert all(len(ids) == len(set(ids)) for ids in plan.expert_ids_by_rank)
+    plan_e6 = expert_slot_plan(
+        None, SimpleNamespace(index=0, num_experts=6),
+        ParallelSpec(ep=4, redundant_experts_per_rank=1),
+    )
+    assert [plan_e6.copies_per_expert()[i] for i in range(6)] == [2, 2, 2, 2, 2, 2]
+
+
+def test_compressed_int4_exclusion_invariance_under_expert_id_renumbering() -> None:
+    from mindie_sim.catalog.hf_config import resolve_quant
+
+    def _cfg(ignored_experts: tuple[int, ...]) -> dict[str, object]:
+        return {
+            "model_type": "qwen3_moe",
+            "num_hidden_layers": 2,
+            "num_experts": 8,
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["Linear"],
+                        "weights": {
+                            "num_bits": 4, "type": "int", "strategy": "group",
+                            "group_size": 128, "symmetric": True, "dynamic": False,
+                        },
+                        "input_activations": {
+                            "num_bits": 8, "type": "int", "symmetric": True,
+                            "dynamic": True, "strategy": "token",
+                        },
+                    },
+                },
+                "ignore": [f"model.layers.0.mlp.experts.{eid}" for eid in ignored_experts],
+            },
+        }
+
+    q_low, gaps_low = resolve_quant(_cfg((0, 1, 2, 3)))
+    q_high, gaps_high = resolve_quant(_cfg((4, 5, 6, 7)))
+    assert gaps_low == [] and gaps_high == []
+    ov_low = q_low.layer_quant_overrides_dict()["native_layers"]["0"]["category_overrides"]["routed_expert"]
+    ov_high = q_high.layer_quant_overrides_dict()["native_layers"]["0"]["category_overrides"]["routed_expert"]
+    assert ov_low["expert_quant_count"] == ov_high["expert_quant_count"] == 8
+    assert len(ov_low["expert_quant_overrides"][0]["expert_indices"]) == 4
+    assert len(ov_high["expert_quant_overrides"][0]["expert_indices"]) == 4
+    assert ov_low["expert_quant_overrides"][0]["fields"] == ov_high["expert_quant_overrides"][0]["fields"]
+
+
+def test_longcat_moe_alias_fields_resolve_without_gaps() -> None:
+    from mindie_sim.catalog.specs import build_model_spec
+
+    spec = build_model_spec("synthetic-alias-moe", {
+        "model_type": "llama",
+        "num_hidden_layers": 2,
+        "hidden_size": 1024,
+        "intermediate_size": 4096,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "num_experts": 16,
+        "moe_topk": 4,
+        "expert_ffn_hidden_size": 2048,
+        "vocab_size": 4096,
+        "max_position_embeddings": 8192,
+    })
+    assert spec.num_experts == 16
+    assert spec.top_k == 4
+    assert spec.moe_intermediate_size == 2048
+    assert dict(spec.metadata).get("unrecognized_config_fields", {}) == {}
+
+
+def test_sparse_attention_freq_zero_masks_sparse_layers_start() -> None:
+    from mindie_sim.catalog.specs import build_model_spec
+
+    spec = build_model_spec("synthetic-minimax-sparse", {
+        "model_type": "minimax_m3",
+        "num_hidden_layers": 4,
+        "hidden_size": 256,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "intermediate_size": 512,
+        "vocab_size": 4096,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "sparse_attention_config": {
+            "use_sparse_attention": True,
+            "sparse_layers_start": 0,
+            "sparse_attention_freq": [1, 0, 1, 0],
+            "sparse_block_size": 64,
+            "sparse_topk_blocks": 4,
+            "sparse_num_index_heads": 8,
+            "sparse_index_dim": 64,
+        },
+    })
+    assert [p.indexer for p in spec.layer_plans] == [True, False, True, False]
+    assert [p.index_topk for p in spec.layer_plans] == [256, 0, 256, 0]
+
+
+def test_qwen_vision_patch_embed_preserves_in_channels_and_bias() -> None:
+    from mindie_sim.catalog.vision import _vision_qwen
+
+    text = {"hidden_size": 256}
+    base_v = {
+        "depth": 2, "hidden_size": 256, "intermediate_size": 512, "num_heads": 4,
+        "patch_size": 14, "temporal_patch_size": 2, "spatial_merge_size": 2,
+        "out_hidden_size": 256,
+    }
+    v_default = _vision_qwen({"vision_config": base_v}, text)
+    v_rgba = _vision_qwen({"vision_config": {**base_v, "in_channels": 4}}, text)
+    assert v_default.in_channels == 3
+    assert v_default.patch_input_width == 3 * 2 * 14 * 14
+    assert v_default.bias is True
+    assert v_rgba.in_channels == 4
+    assert v_rgba.patch_input_width == 4 * 2 * 14 * 14
+    assert v_rgba.bias is True
+
+
+def test_moonvit_temporal_pooling_scales_video_tokens_and_fuses_vision_attention() -> None:
+    from types import SimpleNamespace
+    from mindie_sim.catalog.media import lower_media, media_geometry
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    kimi = load_model("kimi-k3")
+    assert kimi.vision is not None
+    rt_1f = SimpleNamespace(media_tokens=64, metadata=(("media_frames", 1),))
+    rt_8f = SimpleNamespace(media_tokens=64, metadata=(("media_frames", 8),))
+    p1, _, _, f1 = media_geometry(rt_1f, kimi.vision)
+    p8, _, _, f8 = media_geometry(rt_8f, kimi.vision)
+    assert f1 == 1 and f8 == 8
+    assert p8 == 8 * p1
+
+    expansion = lower_media(
+        model=kimi, runtime=rt_1f, parallel=ParallelSpec(tp=1),
+        quant=kimi.quant, mode="prefill",
+        views=(SimpleNamespace(request_id="req-0", semantic_phase="prefill"),),
+    )
+    qk = next(op for op in expansion.ops if op.op_id == "vision.l0.qk")
+    sm = next(op for op in expansion.ops if op.op_id == "vision.l0.softmax")
+    pv = next(op for op in expansion.ops if op.op_id == "vision.l0.pv")
+    assert qk.mte3_bytes == 0.0
+    assert sm.hbm_bytes == 0.0 and sm.mte2_bytes == 0.0 and sm.mte3_bytes == 0.0
+    assert pv.hbm_bytes == pytest.approx(pv.mte2_bytes + pv.mte3_bytes)
+    assert dict(qk.metadata).get("attention_score_boundary") == "fused_on_chip"
+
+    rt_video = SimpleNamespace(media_tokens=128, metadata=(("media_frames", 8),))
+    video_exp = lower_media(
+        model=kimi, runtime=rt_video, parallel=ParallelSpec(tp=1),
+        quant=kimi.quant, mode="prefill",
+        views=(SimpleNamespace(request_id="req-v", semantic_phase="prefill"),),
+    )
+    merge = next(op for op in video_exp.ops if op.op_id == "vision.merge")
+    assert merge.mte2_bytes == pytest.approx(4096 * kimi.vision.hidden_size * 2)
+    assert merge.mte3_bytes == pytest.approx(128 * kimi.vision.aligner_input_width * 2)
+    assert dict(merge.metadata).get("semantic_family") == "temporal_pool_spatial_merge"
+
+
+def test_deepseek_quant_honors_declared_expert_dtype() -> None:
+    from mindie_sim.catalog.quant import _quant_deepseek
+    from mindie_sim.catalog.specs import build_model_spec
+
+    q_fp8 = _quant_deepseek(
+        {"quantization_config": {"weight_block_size": [128, 128], "expert_dtype": "fp8"}},
+        v41=False,
+    )
+    q_default = _quant_deepseek(
+        {"quantization_config": {"weight_block_size": [128, 128]}},
+        v41=False,
+    )
+    assert q_fp8.name == "fp8_dynamic"
+    assert q_fp8.format_for("routed_expert") == "fp8_e4m3"
+    assert q_fp8.expert_block == 128
+    assert "routed_expert" not in q_fp8.category_overrides
+    assert q_default.name == "fp8_dynamic+mxfp4_experts"
+    assert q_default.format_for("routed_expert") == "mxfp4"
+
+    ds_cfg = json.loads(
+        (Path(__file__).resolve().parents[2] / "mindie_sim/model_configs/deepseek-v4.1-flash.json")
+        .read_text(encoding="utf-8")
+    )
+    ds_cfg["quantization_config"]["expert_dtype"] = "fp8"
+    spec_fp8 = build_model_spec("synthetic-ds-fp8-experts", ds_cfg)
+    assert spec_fp8.quant is not None
+    assert spec_fp8.quant.format_for("routed_expert") == "fp8_e4m3"
+
+
+def test_lm_head_quantization_respects_exclusions_and_category_overrides() -> None:
+    from mindie_sim.catalog.types import QuantSpec
+
+    q_unexcluded = QuantSpec(
+        name="w8a8", weight_format="int8", activation_format="int8",
+        exclusions=("norm", "router"),
+    )
+    q_excluded = QuantSpec(
+        name="w8a8", weight_format="int8", activation_format="int8",
+        exclusions=("norm", "router", "lm_head"),
+    )
+    q_overridden = QuantSpec(
+        name="w8a8", weight_format="int8", activation_format="int8",
+        exclusions=("norm", "router", "lm_head"),
+        category_overrides={"lm_head": {"weight_format": "int8"}},
+    )
+    assert q_unexcluded.format_for("lm_head") == "int8"
+    assert q_excluded.format_for("lm_head") == "bf16"
+    assert q_overridden.format_for("lm_head") == "int8"
+    assert q_overridden.source_format_for("lm_head") == "int8"
+
+    q_vis = QuantSpec(
+        name="bf16_vis_int8", weight_format="bf16", activation_format="bf16",
+        category_overrides={"vision": {"weight_format": "int8"}},
+    )
+    assert q_vis.format_for("vision") == "int8"
+    assert q_vis.for_category("vision").format_for("vision") == "int8"
+    assert q_vis.matrix_payload_bytes(128, 128, "vision") == pytest.approx(128 * 128)
+
+    mxfp4_all = quant_preset("mxfp4_all")
+    assert mxfp4_all.exclusions == ()
+    assert mxfp4_all.format_for("lm_head") == mxfp4_all.format_for("embedding") == "bf16"

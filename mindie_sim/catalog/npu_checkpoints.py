@@ -983,6 +983,120 @@ def _classify_from_quant_spec(
     return WeightTensorQuant("W8A8_DYNAMIC", "int8", "int8", "W8A8", sf if sf not in {"", "none"} else "fp32", wb_col or 1, True, f"quant_spec:{role_name}", role_name)
 
 
+_TENSOR_LAYER_RE = re.compile(
+    r"(?:^|\.)(?:layers|mtp|blocks|resblocks|proj|deepstack_merger_list)\.(\d+)(?=\.|$)"
+)
+_TENSOR_EXPERT_RE = re.compile(r"(?:^|\.)experts\.(\d+)(?=\.|$)")
+
+
+def _infer_tensor_coords(tensor_path: str) -> tuple[str, int | None, int | None]:
+    lower = tensor_path.lower()
+    parts = set(lower.split("."))
+    if (
+        lower.startswith("mtp.")
+        or ".mtp." in lower
+        or ".mtp_block." in lower
+        or "mtp" in parts
+        or "mtp_block" in parts
+        or "shared_head" in parts
+    ):
+        scope = "draft"
+    elif "vision_tower" in parts or "vision_model" in parts or "visual" in parts:
+        scope = "vision"
+    elif (
+        "mm_projector" in parts
+        or "multi_modal_projector" in parts
+        or "merger" in parts
+        or "aligner" in parts
+        or ".deepstack_merger_list." in lower
+    ):
+        scope = "projector"
+    else:
+        scope = "target"
+    layer_m = _TENSOR_LAYER_RE.search(lower)
+    expert_m = _TENSOR_EXPERT_RE.search(lower)
+    return (
+        scope,
+        int(layer_m.group(1)) if layer_m is not None else None,
+        int(expert_m.group(1)) if expert_m is not None else None,
+    )
+
+
+def _weight_quant_from_rule(
+    rule: Any, *, matched_pattern: str, category: str, native_format: str,
+) -> WeightTensorQuant:
+    raw_tag = str(rule.raw_tag).upper()
+    wf = str(rule.weight_dtype).strip().lower()
+    af = str(rule.activation_dtype or rule.weight_dtype or native_format).strip().lower()
+    is_q = wf not in _FLOAT_WEIGHT_TOKENS and raw_tag != "FLOAT"
+    sf = str(rule.scale_dtype or "none").strip().lower() if is_q else "none"
+    group = int(rule.group_size[-1]) if (is_q and rule.group_size) else 0
+    if not is_q:
+        ledger = "FP32" if "32" in wf else "BF16"
+    elif wf in {"mxfp4", "fp4", "fp4_e2m1"}:
+        ledger = "MXFP4"
+    elif wf in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
+        ledger = "MXFP8" if (sf in {"fp8_e8m0", "ue8m0"} and group == MXFP_GROUP_SIZE) else "FP8"
+    elif wf in {"int4", "w4a8", "w4a16"}:
+        if af in _FLOAT_WEIGHT_TOKENS:
+            ledger = "W4A16"
+        elif af in {"int4", "fp4", "fp4_e2m1"}:
+            ledger = "W4A4"
+        else:
+            ledger = "W4A8"
+    elif wf in {"int8", "w8a8", "w8a16"}:
+        ledger = "W8A16" if af in _FLOAT_WEIGHT_TOKENS else "W8A8"
+    else:
+        ledger = raw_tag
+    return WeightTensorQuant(
+        raw_tag=raw_tag, weight_format=wf, activation_format=af,
+        ledger_format=ledger, scale_format=sf,
+        group_size=group, is_quantized=is_q,
+        matched_pattern=matched_pattern, category=category,
+    )
+
+
+def _resolve_checkpoint_rule(qmap: CheckpointQuantMap, tensor_path: str) -> tuple[str | None, Any | None]:
+    """Resolve ``(exception_or_ignored_tag, matched_TensorQuantRule)`` preserving full HF rule fields."""
+    raw = str(tensor_path or "").strip()
+    if not raw:
+        return None, None
+    mod_path = raw[:-len(".weight")] if raw.endswith(".weight") else raw
+    scope, layer_id, expert_id = _infer_tensor_coords(mod_path)
+    candidates = (mod_path, raw) if mod_path != raw else (mod_path,)
+    for candidate in candidates:
+        exc = qmap.resolve_exception_or_ignored(
+            candidate, scope=scope, source_native_layer_id=layer_id, expert_id=expert_id,
+        )
+        if exc is not None:
+            return exc, None
+    for pat in qmap.ignored_modules:
+        if pat.startswith("re:"):
+            expr = pat[len("re:"):]
+            if expr and any(re.search(expr, candidate) is not None for candidate in candidates):
+                return "FLOAT", None
+    for candidate in candidates:
+        for rule in qmap.rules:
+            if rule.matches(
+                candidate, scope=scope, source_native_layer_id=layer_id, expert_id=expert_id,
+            ):
+                return None, rule
+    if qmap.source_format == "hf_quantization_config":
+        for rule in qmap.rules:
+            if rule.pattern.startswith("re:"):
+                expr = rule.pattern[len("re:"):]
+                if expr and any(re.search(expr, candidate) is not None for candidate in candidates):
+                    return None, rule
+        if "experts" in set(mod_path.lower().split(".")):
+            for rule in qmap.rules:
+                if rule.pattern == "*.experts.*":
+                    return None, rule
+        for rule in qmap.rules:
+            if rule.pattern == "*":
+                return None, rule
+    return None, None
+
+
 def classify_weight_tensor_quant(
     tensor_or_role_name: str,
     desc_or_quant_spec: Mapping[str, Any] | NpuCheckpointSpec | QuantSpec | CheckpointQuantMap,
@@ -996,11 +1110,24 @@ def classify_weight_tensor_quant(
         has_mla, has_kda, _ = infer_arch_flags_from_patterns(pats)
         cats = classify_tensor_categories(name, has_mla=has_mla, has_kda=has_kda)
         cat = cats[0] if cats else name
+        eff_native = desc_or_quant_spec.native_float_dtype or native_format
+        exc_tag, matched_rule = _resolve_checkpoint_rule(desc_or_quant_spec, name)
+        if exc_tag is not None:
+            return _weight_quant_from_tag(
+                exc_tag, matched_pattern=name, category=cat, native_format=eff_native,
+            )
+        if matched_rule is not None:
+            if matched_rule.weight_dtype:
+                return _weight_quant_from_rule(
+                    matched_rule, matched_pattern=name, category=cat, native_format=eff_native,
+                )
+            return _weight_quant_from_tag(
+                matched_rule.raw_tag, matched_pattern=name, category=cat, native_format=eff_native,
+            )
         raw_tag = resolve_checkpoint_tensor_tag(desc_or_quant_spec, name)
         if raw_tag is not None:
             return _weight_quant_from_tag(
-                raw_tag, matched_pattern=name, category=cat,
-                native_format=desc_or_quant_spec.native_float_dtype or native_format,
+                raw_tag, matched_pattern=name, category=cat, native_format=eff_native,
             )
         qspec = quant_spec_from_checkpoint_map(desc_or_quant_spec)
         return _classify_from_quant_spec(cat, qspec, native_format=native_format)
@@ -1183,18 +1310,35 @@ def _infer_offline_spec_for_repo(
         m_url, ms_url, hf_url = _repo_urls(repo_id)
         qspec = _quant_spec_from_preset(preset, kv_dtype=kv, checkpoint_repo=repo_id, checkpoint_url=m_url or ms_url or hf_url)
         return None, qspec, None, _validate_quant_spec_for_hardware(qspec, hw)
-    default_ckpt = resolve_default_checkpoint(normalize_model_key(repo_id), hw_family=hw)
-    if default_ckpt is not None:
-        qspec = default_ckpt.build_quant_spec()
-        return (
-            default_ckpt,
-            qspec,
-            default_ckpt.build_checkpoint_quant_map(),
-            _validate_quant_spec_for_hardware(qspec, hw),
-        )
+    if "/" not in repo_id:
+        default_ckpt = resolve_default_checkpoint(normalize_model_key(repo_id), hw_family=hw)
+        if default_ckpt is not None:
+            qspec = default_ckpt.build_quant_spec()
+            return (
+                default_ckpt,
+                qspec,
+                default_ckpt.build_checkpoint_quant_map(),
+                _validate_quant_spec_for_hardware(qspec, hw),
+            )
     m_url, ms_url, hf_url = _repo_urls(repo_id)
     qspec = _quant_spec_from_preset("bf16", kv_dtype=kv, checkpoint_repo=repo_id, checkpoint_url=m_url or ms_url or hf_url)
     return None, qspec, None, _validate_quant_spec_for_hardware(qspec, hw)
+
+
+def _standalone_quant_config(qcfg: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize a standalone ``quantize_config.json`` mapping for HF quant parsing."""
+    if not isinstance(qcfg, Mapping) or not qcfg:
+        return None
+    out = dict(qcfg)
+    if "group_size" not in out and out.get("q_group_size") is not None:
+        out["group_size"] = out["q_group_size"]
+    if "bits" not in out and out.get("w_bit") is not None:
+        out["bits"] = out["w_bit"]
+    if not out.get("quant_method") and any(
+        k in out for k in ("bits", "w_bit", "group_size", "q_group_size", "sym", "desc_act", "zero_point")
+    ):
+        out["quant_method"] = "awq" if ("zero_point" in out or "w_bit" in out or "q_group_size" in out) else "gptq"
+    return out if out.get("quant_method") else None
 
 
 def _resolve_local_checkpoint(path: Path, hw_family: str) -> CheckpointMetadataResult:
@@ -1226,6 +1370,14 @@ def _resolve_local_checkpoint(path: Path, hw_family: str) -> CheckpointMetadataR
     ):
         qmap = read_hf_quantization_config(
             cfg, checkpoint_id=f"local://{repo_label or 'checkpoint'}",
+        )
+        qspec = quant_spec_from_checkpoint_map(qmap, base_config=cfg or None)
+    elif (standalone_q := _standalone_quant_config(qcfg)) is not None:
+        qmap = read_hf_quantization_config(
+            standalone_q,
+            checkpoint_id=f"local://{repo_label or 'checkpoint'}",
+            base_config=cfg or None,
+            descriptor_path="quantize_config.json",
         )
         qspec = quant_spec_from_checkpoint_map(qmap, base_config=cfg or None)
     else:
@@ -1267,6 +1419,21 @@ def _build_remote_result(
         qmap = read_hf_quantization_config(cfg, checkpoint_id=repo_id or "remote://hf")
         qspec = quant_spec_from_checkpoint_map(
             qmap, base_config=cfg or None, checkpoint_url=m_url or ms_url or hf_url,
+        )
+    elif (standalone_q := _standalone_quant_config(qcfg)) is not None:
+        qmap = read_hf_quantization_config(
+            standalone_q,
+            checkpoint_id=repo_id or "remote://hf",
+            base_config=cfg or None,
+            descriptor_path="quantize_config.json",
+        )
+        qspec = quant_spec_from_checkpoint_map(
+            qmap, base_config=cfg or None, checkpoint_url=m_url or ms_url or hf_url,
+        )
+    elif cfg and ckpt is None:
+        qmap = read_hf_quantization_config(cfg, checkpoint_id=repo_id or "remote://hf")
+        qspec = quant_spec_from_checkpoint_map(
+            qmap, base_config=cfg, checkpoint_url=m_url or ms_url or hf_url,
         )
     else:
         qmap = fallback_qmap

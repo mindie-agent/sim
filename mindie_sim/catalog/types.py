@@ -41,7 +41,7 @@ _FP32_CATEGORIES = {
     "compressor_fp32_runtime",
 }
 _BF16_CATEGORIES = {
-    "norm", "router", "router_bias", "lm_head", "embedding", "vision",
+    "norm", "router", "router_bias", "embedding", "vision",
     "projector", "vision_pos", "image_token", "dspark_input",
     "compressor_bf16_runtime",
     "target_alias_embedding", "target_alias_lm_head",
@@ -254,6 +254,8 @@ class QuantSpec:
     #: expert indices to field overrides over the base expert representation.
     expert_quant_count: int = 0
     expert_quant_overrides: tuple[tuple[tuple[int, ...], tuple[tuple[str, Any], ...]], ...] = ()
+    #: Internal categories whose ``weight_format`` came from an explicit category override.
+    explicit_weight_categories: tuple[str, ...] = ()
 
     @staticmethod
     def _freeze_override_value(value: Any) -> Any:
@@ -299,7 +301,7 @@ class QuantSpec:
                 "int8", "fp8", "fp8_e4m3", "fp8_e5m2"}:
             raise ModelingError("quant_output_format_unsupported:" + self.output_format)
         # JSON mappings become immutable records before they enter model IDs.
-        for key in ("weight_block", "exclusions", "notes"):
+        for key in ("weight_block", "exclusions", "notes", "explicit_weight_categories"):
             object.__setattr__(self, key, tuple(getattr(self, key)))
         if isinstance(self.source, Mapping):
             object.__setattr__(self, "source", tuple(sorted(self.source.items())))
@@ -417,13 +419,13 @@ class QuantSpec:
         return default
 
     def format_for(self, category: str, *, source: bool = False, expert_id: int | None = None) -> str:
-        resolved = self.for_category(category)
-        if resolved is not self:
-            return resolved.format_for(category, source=source, expert_id=expert_id)
         cat = str(category)
+        resolved = self.for_category(cat)
+        if resolved is not self:
+            return resolved.format_for(cat, source=source, expert_id=expert_id)
         family = cat.split(".", 1)[0]
         if expert_id is not None and self.expert_quant_overrides and family in _EXPERT_CATEGORIES:
-            return self.for_expert(expert_id).format_for(category, source=source)
+            return self.for_expert(expert_id).format_for(cat, source=source)
         if source and family == "norm" and self.norm_gamma_declared("norm"):
             return self.norm_gamma_format("norm", source=True)
         if family in _FP32_CATEGORIES:
@@ -434,7 +436,11 @@ class QuantSpec:
             return self.native_format
         if cat == "mla_absorb":
             return self.format_for("mla", source=source)
-        if family in _BF16_CATEGORIES:
+        if (
+            family in _BF16_CATEGORIES
+            and cat not in self.explicit_weight_categories
+            and family not in self.explicit_weight_categories
+        ):
             return self.native_format
         if family in _EXPERT_CATEGORIES:
             return self.expert_weight_format
@@ -450,10 +456,10 @@ class QuantSpec:
 
     def source_format_for(self, category: str, *, expert_id: int | None = None) -> str:
         """Checkpoint representation before an explicit runtime conversion."""
-        resolved = self.for_category(category)
-        if resolved is not self:
-            return resolved.source_format_for(category, expert_id=expert_id)
         cat = str(category)
+        resolved = self.for_category(cat)
+        if resolved is not self:
+            return resolved.source_format_for(cat, expert_id=expert_id)
         if expert_id is not None and self.expert_quant_overrides and cat.split(".", 1)[0] in _EXPERT_CATEGORIES:
             return self.for_expert(expert_id).source_format_for(category)
         if cat == "norm" and self.norm_gamma_declared("norm"):
@@ -801,8 +807,17 @@ def _resolve_quant_category(spec: QuantSpec, cat: str) -> QuantSpec:
         changes.update(dict(overrides.get(name, ())))
     if not changes:
         return spec
-    if "weight_format" in changes:
+    if "weight_format" in changes and changes["weight_format"]:
         changes["expert_weight_format"] = changes["weight_format"]
+        matched = set(names)
+        changes["explicit_weight_categories"] = tuple(
+            sorted(set(spec.explicit_weight_categories) | matched)
+        )
+        if spec.exclusions:
+            changes["exclusions"] = tuple(
+                ex for ex in spec.exclusions
+                if ex not in matched and ex.split(".", 1)[0] not in matched
+            )
     return replace(spec, **changes, category_overrides=())
 
 

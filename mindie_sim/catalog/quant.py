@@ -162,30 +162,70 @@ _MXFP8_LINEAR_OVERRIDE = {
 }
 
 
+_DEEPSEEK_EXPERT_FORMAT_MAP: dict[str, str] = {
+    "fp4": "mxfp4", "mxfp4": "mxfp4", "fp4_e2m1": "mxfp4",
+    "fp8": "fp8_e4m3", "fp8_e4m3": "fp8_e4m3", "fp8_e5m2": "fp8_e5m2",
+    "bf16": "bf16", "bfloat16": "bf16",
+    "fp16": "fp16", "float16": "fp16",
+    "fp32": "fp32", "float32": "fp32",
+}
+
+
 def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
     q = c.get("quantization_config")
     q = q if isinstance(q, Mapping) else {}
     block = q.get("weight_block_size", [32, 32] if v41 else [128, 128])
     block = (int(block[0]), int(block[1]))
     scale_fmt = str(q.get("scale_fmt", "ue8m0")).lower()
-    scale_bytes = 1.0 if "e8m0" in scale_fmt else 4.0
-    return QuantSpec(
-        name="fp8_dynamic+mxfp4_experts",
-        weight_format="fp8_e4m3", activation_format="fp8_e4m3",
-        expert_weight_format="mxfp4",
-        weight_block=block, expert_block=MX_EXPERT_BLOCK,
-        scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
-        scale_bytes=scale_bytes, kv_dtype="bf16",
-        activation_group_size=block[1],
-        activation_scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
-        activation_scale_pack=2 if scale_bytes == 1 else 1,
-        index_dtype="int8", index_scale_dtype="fp16",
-        category_overrides=(
+    scale_bytes = 1.0 if "e8m0" in scale_fmt else FP32_SCALE_BYTES
+    raw_expert = str(q.get("expert_dtype") or c.get("expert_dtype") or "fp4").strip().lower()
+    expert_fmt = _DEEPSEEK_EXPERT_FORMAT_MAP.get(raw_expert, raw_expert)
+    is_mxfp4_experts = expert_fmt == "mxfp4"
+    if is_mxfp4_experts:
+        name = "fp8_dynamic+mxfp4_experts"
+        expert_block = MX_EXPERT_BLOCK
+        category_overrides: dict[str, Any] = (
             {} if v41 else {
                 "routed_expert": dict(_MXFP4_ROUTED_ACTIVATION),
                 "dspark_routed_expert": dict(_MXFP4_ROUTED_ACTIVATION),
             }
-        ),
+        )
+        notes = (
+            "ordinary linears use FP8 weights with the declared block scales; "
+            "routed experts use FP4 group32 with E8M0 scales",
+            "activation_scheme=dynamic is a kernel path, not a global model dtype",
+        )
+    else:
+        name = (
+            "fp8_dynamic"
+            if expert_fmt in {"fp8_e4m3", "fp8_e5m2"}
+            else f"fp8_dynamic+{expert_fmt}_experts"
+        )
+        expert_block = block[1]
+        category_overrides = (
+            {
+                "routed_expert": {"activation_format": expert_fmt},
+                "dspark_routed_expert": {"activation_format": expert_fmt},
+            }
+            if expert_fmt in {"bf16", "fp16", "fp32"} else {}
+        )
+        notes = (
+            f"ordinary linears use FP8 weights with the declared block scales; "
+            f"routed experts use declared {expert_fmt}",
+            "activation_scheme=dynamic is a kernel path, not a global model dtype",
+        )
+    return QuantSpec(
+        name=name,
+        weight_format="fp8_e4m3", activation_format="fp8_e4m3",
+        expert_weight_format=expert_fmt,
+        weight_block=block, expert_block=expert_block,
+        scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
+        scale_bytes=scale_bytes, kv_dtype="bf16",
+        activation_group_size=block[1],
+        activation_scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
+        activation_scale_pack=MX_EXPERT_SCALE_PACK if scale_bytes == 1 else 1,
+        index_dtype="int8", index_scale_dtype="fp16",
+        category_overrides=category_overrides,
         # V4.1 executes the Engram gate as an MXFP8 (32, 32) projection; the
         # earlier V4 checkpoint keeps it in the BF16 exclusion set.
         exclusions=(("router", "lm_head", "embedding", "norm", "mhc", "attn_res_proj",
@@ -194,12 +234,8 @@ def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
         source=merge_source({"quant_method": q.get("quant_method", "fp8"),
                              "weight_block_size": str(block),
                              "scale_fmt": scale_fmt,
-                             "expert_dtype": c.get("expert_dtype", "fp4")}),
-        notes=(
-            "ordinary linears use FP8 weights with the declared block scales; "
-            "routed experts use FP4 group32 with E8M0 scales",
-            "activation_scheme=dynamic is a kernel path, not a global model dtype",
-        ),
+                             "expert_dtype": raw_expert}),
+        notes=notes,
     )
 
 
@@ -433,7 +469,9 @@ def _quant_w4a4_mxfp4(
 
 
 def _quant_mxfp4_all(
-    *, exclusions: tuple[str, ...] = _STANDARD_MXFP4_EXCLUSIONS,
+    *,
+    exclusions: tuple[str, ...] = _STANDARD_MXFP4_EXCLUSIONS,
+    category_overrides: Mapping[str, Any] = (),
 ) -> QuantSpec:
     return QuantSpec(
         name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
@@ -445,6 +483,7 @@ def _quant_mxfp4_all(
         activation_scale_format="fp8_e8m0",
         activation_scale_pack=MX_EXPERT_SCALE_PACK,
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
+        category_overrides=category_overrides,
         exclusions=exclusions,
         source=merge_source({
             "quant_method": "mxfp4",
@@ -586,7 +625,10 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
     "mxfp4": _quant_mxfp4_all,
     "w4a4_mxfp4": _quant_w4a4_mxfp4,
     "w4a4-mxfp4": _quant_w4a4_mxfp4,
-    "mxfp4_all": lambda: _quant_mxfp4_all(exclusions=()),
+    "mxfp4_all": lambda: _quant_mxfp4_all(
+        exclusions=(),
+        category_overrides={"lm_head": {"weight_format": "bf16", "activation_format": "bf16"}},
+    ),
     "fp8_dynamic+mxfp4_experts": lambda: _quant_deepseek({}, v41=True),
     "mxfp4_routed_only": lambda: _quant_kimi({}),
     "w8a8_dynamic": _quant_w8a8_dynamic,

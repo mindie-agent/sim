@@ -748,3 +748,71 @@ def test_per_layer_kv_override_window_pages_shared_asymmetric_gqa_and_packed_mla
         return int(Memory(parse_case(raw)).cache_bytes(32768, padded=False)[0])
 
     assert _mla_draft_quote(1) - _mla_draft_quote(0) == 32768 * (512 + 4 * 4 + 64 * 2)
+
+
+def test_packed_scale_type_defers_custom_alignment_to_generic_row_pitch() -> None:
+    from mindie_sim.catalog.mqsmla_layout import packed_scale_type
+
+    fmt_aligned = CacheFormat(
+        dtype="fp8_e4m3", group_size=64, scale_dtype="uint8", alignment=512,
+    )
+    fmt_unaligned = CacheFormat(
+        dtype="fp8_e4m3", group_size=64, scale_dtype="uint8", alignment=1,
+    )
+    assert packed_scale_type(fmt_unaligned, fmt_unaligned) == "uint8"
+    assert packed_scale_type(fmt_aligned, fmt_aligned) is None
+
+    raw = compose_case("kimi-k3", hardware=SPARSE_OFFLOAD_SKU, tp=1, ep=1, layers=1,
+                       prompt_tokens=16, output_tokens=2)
+    raw["model"].setdefault("metadata", {})["cache_representations"] = {
+        "window": {"dtype": "fp8_e4m3", "group_size": 64, "scale_dtype": "uint8", "alignment": 512},
+        "compressed_kv": {"dtype": "fp8_e4m3", "group_size": 64, "scale_dtype": "uint8", "alignment": 512},
+    }
+    parsed = parse_case(raw)
+    planes = cache_row_split(parsed.model, "window", 512, plan=parsed.model.layer_plans[0])
+    assert sum(planes) == 1024
+
+
+def test_paired_sfa_phase_scoped_mla_row_bytes_and_mixed_kda_block_floor() -> None:
+    from mindie_sim.catalog.paired_sfa import minimum_block_size
+
+    raw = compose_case(
+        "kimi-k3.1", hardware=SPARSE_OFFLOAD_SKU, tp=8, ep=8, dcp=8, layers=4,
+        prompt_tokens=64, output_tokens=8,
+    )
+    raw["runtime"]["kv_block_size"] = 2048
+    raw["model"].setdefault("metadata", {})["cache_representations"] = {
+        "mla_kv": {"dtype": "int8", "group_size": 128, "scale_dtype": "fp16"},
+        "mla_kv:decode": {"dtype": "bf16"},
+    }
+    parsed = parse_case(raw)
+    stage = [0] * len(parsed.model.layer_plans)
+    g_colocated = page_groups(parsed, stage, query_tokens=1)
+    g_prefill = page_groups(parsed, stage, query_tokens=1, phase="prefill")
+    g_decode = page_groups(parsed, stage, query_tokens=1, phase="decode")
+    assert g_decode[0]["bytes_per_group_page"] > g_prefill[0]["bytes_per_group_page"]
+    assert g_colocated[0]["bytes_per_group_page"] == g_decode[0]["bytes_per_group_page"]
+
+    prefill_raw = deepcopy(raw)
+    prefill_raw["runtime"].setdefault("metadata", {})["deployment_role"] = "pd_prefill"
+    g_pd_prefill = page_groups(parse_case(prefill_raw), stage, query_tokens=1)
+    assert g_pd_prefill[0]["bytes_per_group_page"] == g_prefill[0]["bytes_per_group_page"]
+
+    both_overridden = deepcopy(raw)
+    both_overridden["model"]["metadata"]["cache_representations"] = {
+        "mla_kv": {"dtype": "bf16"},
+        "mla_kv:prefill": {"dtype": "int8", "group_size": 128, "scale_dtype": "fp16"},
+        "mla_kv:decode": {"dtype": "int8", "group_size": 128, "scale_dtype": "fp16"},
+    }
+    g_both = page_groups(parse_case(both_overridden), stage, query_tokens=1)
+    assert g_both[0]["bytes_per_group_page"] == g_prefill[0]["bytes_per_group_page"]
+
+    no_indexer = replace(
+        parsed.model,
+        layer_plans=tuple(
+            replace(plan, indexer=False, owns_index_k=False, owns_topk=False)
+            for plan in parsed.model.layer_plans
+        ),
+    )
+    floor = minimum_block_size(no_indexer, tp=8)
+    assert floor > 0 and floor % 16 == 0
