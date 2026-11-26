@@ -595,3 +595,170 @@ def test_service_intervals_and_periodic_skips_share_one_clock_law():
     assert all((len(observer.scope_events("periodic")) <= 8, result["exposed_breakdown_basis"]["periodic_skips"] == 3))
     assert sum(result["exposed_breakdown_ms"].values()) == pytest.approx(
         result["exposed_breakdown_basis"]["duration_ms"])
+
+
+def test_active_die_calibration_cohort_reuse_async_release_and_pd_l2_isolation():
+    from _support.axes import REPRESENTATIVE_SKUS
+    from _support.memory_cases import case as mem_case, linear_work as mem_linear
+    from mindie_sim import graph_costs
+    from mindie_sim.prediction.call_builders import build_aclnn_call
+    from mindie_sim.prediction.execution.cohort_reuse import prepare_cohort_graphs
+    from mindie_sim.prediction.runtime.l2_residency import (
+        RawDieL2Bytes, resolve_engine_admission_view,
+    )
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    # Idle spare die (different HBM or SKU) must not disable calibrated primitive binding on active die.
+    base = compose_case(
+        "qwen3-32b", REPRESENTATIVE_SKUS["a5"], layers=1, tp=1, dp=1,
+        num_devices=1, prompt_tokens=1, output_tokens=1,
+    )
+    hw = parse_case(base).machine.to_dict()
+    active_dev = hw["devices"][0]
+    spare_dev = {**active_dev, "rank": 1, "package": 1, "memory_bytes": active_dev["memory_bytes"] // 2}
+    other_sku_dev = {**spare_dev, "sku": REPRESENTATIVE_SKUS["a3"]}
+    mm = build_aclnn_call({"api": "aclnnMatmul", "m": 16, "n": 1024, "k": 1024})
+    d_active = graph_costs(parse_case({**base, "machine": {**hw, "devices": [active_dev]}}), mm.ops, recipes=mm.recipes, isolated=False)["duration_ms"]
+    d_spare = graph_costs(parse_case({**base, "machine": {**hw, "devices": [active_dev, spare_dev]}}), mm.ops, recipes=mm.recipes, isolated=False)["duration_ms"]
+    d_mixed = graph_costs(parse_case({**base, "machine": {**hw, "sku": "mixed", "devices": [active_dev, other_sku_dev]}}), mm.ops, recipes=mm.recipes, isolated=False)["duration_ms"]
+    assert d_spare == pytest.approx(d_active, rel=1e-12)
+    assert d_mixed == pytest.approx(d_active, rel=1e-12)
+
+    # Cohort template reuse rejects swapped producer wiring and mismatched TP rank slots.
+    dp_case = parse_case(mem_case(dp=2))
+    def mk_op(name, stream, deps=(), **work):
+        return OpSpec(name, "vector", "decode", 0, 0, (), (1,), (1,), (1,), (1,), stream=stream, deps=deps, **work)
+    g0 = (mk_op("a", "main", vector_ops=1e6), mk_op("b", "aux", hbm_bytes=1000), mk_op("end", "aux", ("a",), hbm_bytes=1e6))
+    g1 = (replace(g0[0], op_id="b"), replace(g0[1], op_id="a"), g0[2])
+    dur_off = graph_costs(dp_case, prepare_cohort_graphs(dp_case, {0: g0, 1: g1}, reuse="off").graphs[1], isolated=False)["duration_ms"]
+    dur_auto = graph_costs(dp_case, prepare_cohort_graphs(dp_case, {0: g0, 1: g1}, reuse="auto").graphs[1], isolated=False)["duration_ms"]
+    assert dur_auto == pytest.approx(dur_off, rel=1e-12)
+    tp_dp_case = parse_case(mem_case(dp=2, tp=2))
+    slot_g0 = (mk_op("x", "main", ("input@r0",), vector_ops=1e4),)
+    slot_g1 = (mk_op("x", "main", ("input@r3",), vector_ops=1e4),)
+    slot_prep = prepare_cohort_graphs(tp_dp_case, {0: slot_g0, 1: slot_g1}, reuse="auto")
+    assert slot_prep.template_reused is False and slot_prep.graphs[1][0].deps == ("input@r3",)
+
+    # Async schedule preparation still enforces batch release_ms.
+    async_raw = mem_case()
+    async_raw["runtime"]["async_scheduling"] = True
+    async_case = parse_case(async_raw)
+    def mk_work(step_idx):
+        plan = IterationPlan((RequestView("r", 1, 4 + step_idx, True, "decode"),), iteration=step_idx)
+        return mem_linear(plan, async_case.model, async_case.runtime, async_case.machine)
+    times = []
+    for prep in (False, True):
+        ex = Execution(async_case, CostModel(async_case))
+        ex.engine.advance(until=(ex.add(mk_work(0), 0, 0).completion,))
+        if prep:
+            ex.prepare_next(0)
+        batch = ex.add(mk_work(1), 0, 100)
+        ex.engine.advance(until=(batch.completion,))
+        times.append(batch.device_complete.time)
+    assert times[0] == pytest.approx(101.0) and times[1] == pytest.approx(101.0)
+
+    # Shared PD Engine isolates decode AdmissionMemoryView and registers decode dies.
+    p_case = parse_case(mem_case(tp=1))
+    d_raw = mem_case(tp=2)
+    d_raw["machine"]["devices"] = [{"rank": 2}, {"rank": 3}]
+    for link in d_raw["machine"].get("links", []):
+        link["members"] = [2, 3]
+    d_case = parse_case(d_raw)
+    shared = Engine([])
+    p_ex = Execution(p_case, CostModel(p_case), engine=shared, namespace="prefill:")
+    d_ex = Execution(d_case, CostModel(d_case), engine=shared, namespace="decode:")
+    assert p_ex.admission_memory_view is shared.admission_memory_view
+    assert d_ex.admission_memory_view is not p_ex.admission_memory_view
+    assert p_ex.admission_memory_view.pool_namespace == "prefill:"
+    assert d_ex.admission_memory_view.pool_namespace == "decode:"
+    assert d_ex.admission_memory_view.has_die(2) and d_ex.admission_memory_view.has_die(3)
+    assert d_ex._live_admission_memory_view() is d_ex.admission_memory_view
+    resolved = resolve_engine_admission_view(shared, die=2, raw_l2=RawDieL2Bytes(1024), pool_namespace="decode:")
+    assert resolved is not p_ex.admission_memory_view and resolved.pool_namespace == "decode:"
+
+
+def test_rank_table_cohort_replay_filtered_precedence_and_exposed_attribution():
+    from _support.collective_cases import case as coll_case, exchange
+    from _support.operator_cases import declared_case
+    from mindie_sim import graph_costs
+    from mindie_sim.catalog.ops import comm_op, vector_op
+    from mindie_sim.prediction.execution.operator_replay import cohort_operator_costs
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    # Explicit rank_table and DP-axis collectives route through cohort replay in both operator_costs and default graph_costs.
+    rt_raw = coll_case(dp=2, tp=2, ep=2)
+    rt_raw["runtime"].update(
+        rank_table=[[0, 2], [1, 3]],
+        kernels={"families": {"alltoall": {"kind": "pairwise_collective"}}},
+    )
+    rt_raw["model"].update(ffn="moe", num_experts=4, top_k=1, moe_intermediate_size=32)
+    rt_case = parse_case(rt_raw)
+    ex_op = exchange(100, axis="ep")
+    book = RecipeBook.from_mapping(rt_case.runtime.kernels)
+    cohort_ms = cohort_operator_costs(rt_case, {0: ex_op, 1: ex_op}, recipes=book)["duration_ms"]
+    replay_sum = operator_costs(rt_case, {0: (ex_op,), 1: (ex_op,)})["operator_sum_ms"]
+    rt_graph = graph_costs(rt_case, {0: (ex_op,), 1: (ex_op,)})
+    assert cohort_ms == pytest.approx(0.4)
+    assert replay_sum == pytest.approx(2 * cohort_ms)
+    assert rt_graph["duration_ms"] == pytest.approx(cohort_ms)
+    assert rt_graph["isolated"]["operator_sum_ms"] == pytest.approx(2 * cohort_ms)
+
+    dp_coll = coll_case(dp=2, tp=1, ep=1)
+    dp_coll["runtime"]["kernels"] = {"families": {"allreduce": {"kind": "ring_collective"}}}
+    dp_ar = comm_op(
+        op_id="dp_ar", deps=(), stage=0, layer=0, requests=(), phase="decode",
+        family="allreduce", recipe="dp_allreduce", link_bytes=100, shape=(16,),
+        metadata=(("group_axis", "dp"),),
+    )
+    dp_op_res = operator_costs(dp_coll, {0: (dp_ar,), 1: (dp_ar,)})
+    dp_gr_res = graph_costs(dp_coll, {0: (dp_ar,), 1: (dp_ar,)})
+    assert dp_op_res["operator_sum_ms"] == pytest.approx(dp_gr_res["isolated"]["operator_sum_ms"])
+    assert dp_gr_res["duration_ms"] > 0.0
+
+    # Filtering timeline_replicas preserves full DAG precedence without false cycles.
+    ep_raw = declared_case(dp=2, ep=2)
+    ep_raw["model"].update(layers=1, ffn="moe", num_experts=4, top_k=2, moe_intermediate_size=32)
+    def mk_ep_graph(rep):
+        kw = dict(stage=0, layer=0, requests=(), phase="decode")
+        pre = vector_op(op_id=f"p{rep}", deps=(), elements=16, ops_per_element=1, dtype="bf16",
+                        family="elementwise", recipe="scale", **kw)
+        ag = comm_op(op_id="g", deps=(pre.op_id,), family="allgather", recipe="ep_gather",
+                     link_bytes=32, shape=(16,), metadata=(("group_axis", "ep"),), **kw)
+        return pre, ag
+    full_res = graph_costs(ep_raw, {i: mk_ep_graph(i) for i in range(2)}, timeline_replicas=None)
+    sub_res = graph_costs(ep_raw, {i: mk_ep_graph(i) for i in range(2)}, timeline_replicas=(0,))
+    assert sub_res["duration_ms"] == pytest.approx(full_res["duration_ms"])
+    assert sub_res["bounds"]["precedence"]["duration_ms"] == pytest.approx(full_res["bounds"]["precedence"]["duration_ms"])
+    assert {row["replica"] for row in sub_res["timeline"]} == {0}
+
+    # Mixed-precision matrix_flops attributes cube service across all declared precision phases.
+    mix_raw = declared_case()
+    mix_raw["model"]["layers"] = 1
+    mix_raw["machine"]["device"]["compute_peaks"] = {"bf16": 100e9, "fp32": 1e9}
+    mix_op = OpSpec(
+        "mix", "native_fusion", "decode", 0, 0, (), (1, 1000, 500), (1, 1000, 500), (1,), (1,),
+        dtype="bf16", matrix_flops=(("bf16", 1_000_000), ("fp32", 1_000_000)), vector_ops=100_000,
+    )
+    mix_res = graph_costs(mix_raw, (mix_op,), isolated=False)
+    assert mix_res["exposed_breakdown_ms"]["cube"] == pytest.approx(mix_res["duration_ms"])
+    assert mix_res["exposed_breakdown_ms"]["vector"] == pytest.approx(0.0)
+
+    # Exposed breakdown selects the critical replica regardless of DP replica numbering or timeline_replicas.
+    renum_raw = declared_case(dp=2)
+    renum_raw["model"]["layers"] = 1
+    def mk_vec(rows):
+        return vector_op(op_id="v", deps=(), stage=0, layer=0, requests=(), phase="decode",
+                         family="elementwise", recipe="scale", elements=rows, ops_per_element=8, dtype="bf16")
+    r_lo = graph_costs(renum_raw, {0: (mk_vec(16),), 1: (mk_vec(128),)}, isolated=False)
+    r_hi = graph_costs(renum_raw, {0: (mk_vec(128),), 1: (mk_vec(16),)}, isolated=False)
+    r_filt = graph_costs(renum_raw, {0: (mk_vec(16),), 1: (mk_vec(128),)}, isolated=False, timeline_replicas=(0,))
+    assert r_lo["exposed_breakdown_ms"] is not None and r_hi["exposed_breakdown_ms"] is not None
+    assert r_lo["exposed_breakdown_ms"]["vector"] == pytest.approx(r_hi["exposed_breakdown_ms"]["vector"])
+    assert r_filt["exposed_breakdown_ms"] is not None
+    assert r_filt["exposed_breakdown_basis"]["replica"] == 1
+    assert r_filt["exposed_breakdown_ms"]["vector"] == pytest.approx(r_lo["exposed_breakdown_ms"]["vector"])
+    assert [row["replica"] for row in r_filt["timeline"]] == [0]

@@ -201,10 +201,28 @@ def _op_signature(
     request_slots: Mapping[str, str] = (),  # type: ignore[assignment]
     request_prefix: str = "",
     local_rank_slots: Mapping[int, str] | None = None,
+    producer_index: Mapping[str, int] | None = None,
 ) -> tuple:
     metadata = dict(getattr(op, "metadata", ()) or {})
     op_requests = tuple(getattr(op, "requests", ()) or ())
+    raw_deps = tuple(getattr(op, "deps", ()) or ())
+    if producer_index is not None:
+        dep_sig = tuple(
+            ("internal", producer_index[str(dep)]) if str(dep) in producer_index
+            else ("external", _normalized(
+                str(dep), request_pattern, request_slots, request_prefix, local_rank_slots,
+            ))
+            for dep in raw_deps
+        )
+    else:
+        dep_sig = _normalized(
+            raw_deps, request_pattern, request_slots, request_prefix, local_rank_slots,
+        )
     return (
+        _normalized(
+            str(getattr(op, "op_id", "")),
+            request_pattern, request_slots, request_prefix, local_rank_slots,
+        ),
         str(getattr(op, "family", "")), str(getattr(op, "recipe", "")),
         str(getattr(op, "phase", "")), int(getattr(op, "stage", 0)),
         str(getattr(op, "dtype", "")), str(getattr(op, "layout", "")),
@@ -227,10 +245,7 @@ def _op_signature(
         _freeze_attr(getattr(op, "owner_schedule", None)),
         tuple(getattr(op, "logical_precision_reqs", ()) or ()),
         str(getattr(op, "coverage", "") or ""),
-        _normalized(
-            tuple(getattr(op, "deps", ()) or ()),
-            request_pattern, request_slots, request_prefix, local_rank_slots,
-        ),
+        dep_sig,
         _normalized(
             tuple(getattr(op, "matrix_flops", ()) or ()),
             request_pattern, request_slots, request_prefix, local_rank_slots,
@@ -253,6 +268,8 @@ def _values_isomorphic(
     pat_r: re.Pattern | None,
     slots_r: Mapping[str, str],
     pfx_r: str,
+    rank_slots0: Mapping[int, str] | None = None,
+    rank_slots_r: Mapping[int, str] | None = None,
 ) -> bool:
     """Short-circuit structural equality matching per-graph slot-normalized values."""
     t0 = type(v0)
@@ -260,7 +277,10 @@ def _values_isomorphic(
     if t0 in _REBIND_ATOMIC and tr in _REBIND_ATOMIC:
         return v0 == vr
     if t0 is str and tr is str:
-        return _normalized(v0, pat0, slots0, pfx0) == _normalized(vr, pat_r, slots_r, pfx_r)
+        return (
+            _normalized(v0, pat0, slots0, pfx0, rank_slots0)
+            == _normalized(vr, pat_r, slots_r, pfx_r, rank_slots_r)
+        )
     if (t0 is tuple or t0 is list) and (tr is tuple or tr is list):
         if len(v0) != len(vr):
             return False
@@ -268,7 +288,9 @@ def _values_isomorphic(
             if type(a) in _REBIND_ATOMIC and type(b) in _REBIND_ATOMIC:
                 if a != b:
                     return False
-            elif not _values_isomorphic(a, b, pat0, slots0, pfx0, pat_r, slots_r, pfx_r):
+            elif not _values_isomorphic(
+                a, b, pat0, slots0, pfx0, pat_r, slots_r, pfx_r, rank_slots0, rank_slots_r,
+            ):
                 return False
         return True
     if t0 is dict and tr is dict:
@@ -281,10 +303,55 @@ def _values_isomorphic(
             if type(a) in _REBIND_ATOMIC and type(b) in _REBIND_ATOMIC:
                 if a != b:
                     return False
-            elif not _values_isomorphic(a, b, pat0, slots0, pfx0, pat_r, slots_r, pfx_r):
+            elif not _values_isomorphic(
+                a, b, pat0, slots0, pfx0, pat_r, slots_r, pfx_r, rank_slots0, rank_slots_r,
+            ):
                 return False
         return True
-    return _normalized(v0, pat0, slots0, pfx0) == _normalized(vr, pat_r, slots_r, pfx_r)
+    return (
+        _normalized(v0, pat0, slots0, pfx0, rank_slots0)
+        == _normalized(vr, pat_r, slots_r, pfx_r, rank_slots_r)
+    )
+
+
+def _deps_isomorphic(
+    deps0: tuple[Any, ...],
+    deps_r: tuple[Any, ...],
+    pat0: re.Pattern | None,
+    slots0: Mapping[str, str],
+    pfx0: str,
+    pat_r: re.Pattern | None,
+    slots_r: Mapping[str, str],
+    pfx_r: str,
+    seen0: Mapping[str, int] | None,
+    seen_r: Mapping[str, int] | None,
+    rank_slots0: Mapping[int, str] | None = None,
+    rank_slots_r: Mapping[int, str] | None = None,
+) -> bool:
+    if len(deps0) != len(deps_r):
+        return False
+    ranks_differ = rank_slots0 != rank_slots_r
+    if seen0 is not None and seen_r is not None:
+        for d0, dr in zip(deps0, deps_r):
+            s0, sr = str(d0), str(dr)
+            in0, in_r = s0 in seen0, sr in seen_r
+            if in0 != in_r:
+                return False
+            if in0:
+                if seen0[s0] != seen_r[sr]:
+                    return False
+            elif (s0 != sr or slots0 != slots_r or ranks_differ) and not _values_isomorphic(
+                s0, sr, pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
+                rank_slots0, rank_slots_r,
+            ):
+                return False
+        return True
+    if deps0 != deps_r or slots0 != slots_r or ranks_differ:
+        return _values_isomorphic(
+            deps0, deps_r, pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
+            rank_slots0, rank_slots_r,
+        )
+    return True
 
 
 def _ops_isomorphic(
@@ -298,10 +365,29 @@ def _ops_isomorphic(
     pfx_r: str,
     *,
     req_slots_r: Mapping[str, str] | None = None,
+    seen0: Mapping[str, int] | None = None,
+    seen_r: Mapping[str, int] | None = None,
+    rank_slots0: Mapping[int, str] | None = None,
+    rank_slots_r: Mapping[int, str] | None = None,
 ) -> bool:
-    """Structural isomorphism check enforcing request bijection and typed ABI equality."""
+    """Structural isomorphism check enforcing request bijection, producer wiring, and typed ABI equality."""
     eff_req_r = slots_r if req_slots_r is None else req_slots_r
-    if op0 == op_r and slots0 == eff_req_r:
+    ranks_differ = rank_slots0 != rank_slots_r
+    id0 = str(getattr(op0, "op_id", ""))
+    id_r = str(getattr(op_r, "op_id", ""))
+    if (id0 != id_r or slots0 != slots_r or ranks_differ) and not _values_isomorphic(
+        id0, id_r, pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
+        rank_slots0, rank_slots_r,
+    ):
+        return False
+    deps0 = tuple(getattr(op0, "deps", ()) or ())
+    deps_r = tuple(getattr(op_r, "deps", ()) or ())
+    if not _deps_isomorphic(
+        deps0, deps_r, pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
+        seen0, seen_r, rank_slots0, rank_slots_r,
+    ):
+        return False
+    if op0 == op_r and slots0 == eff_req_r and not ranks_differ:
         return True
     req0 = tuple(getattr(op0, "requests", ()) or ())
     req_r = tuple(getattr(op_r, "requests", ()) or ())
@@ -336,23 +422,21 @@ def _ops_isomorphic(
         return False
     if req0 and tuple(slots0.get(str(r), str(r)) for r in req0) != tuple(eff_req_r.get(str(r), str(r)) for r in req_r):
         return False
-    deps0 = tuple(getattr(op0, "deps", ()) or ())
-    deps_r = tuple(getattr(op_r, "deps", ()) or ())
-    if (deps0 != deps_r or slots0 != slots_r) and not _values_isomorphic(
-        deps0, deps_r, pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
-    ):
-        return False
     mf0 = tuple(getattr(op0, "matrix_flops", ()) or ())
     mf_r = tuple(getattr(op_r, "matrix_flops", ()) or ())
-    if (mf0 != mf_r or slots0 != slots_r) and not _values_isomorphic(
+    if (mf0 != mf_r or slots0 != slots_r or ranks_differ) and not _values_isomorphic(
         mf0, mf_r, pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
+        rank_slots0, rank_slots_r,
     ):
         return False
     raw_m0 = getattr(op0, "metadata", ()) or ()
     raw_mr = getattr(op_r, "metadata", ()) or ()
-    if raw_m0 == raw_mr and (not raw_m0 or slots0 == slots_r):
+    if raw_m0 == raw_mr and (not raw_m0 or (slots0 == slots_r and not ranks_differ)):
         return True
-    return _values_isomorphic(dict(raw_m0), dict(raw_mr), pat0, slots0, pfx0, pat_r, slots_r, pfx_r)
+    return _values_isomorphic(
+        dict(raw_m0), dict(raw_mr), pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
+        rank_slots0, rank_slots_r,
+    )
 
 
 def _graph_signature(
@@ -362,10 +446,15 @@ def _graph_signature(
     request_prefix: str = "",
     local_rank_slots: Mapping[int, str] | None = None,
 ) -> tuple:
-    return tuple(
-        _op_signature(op, request_pattern, request_slots, request_prefix, local_rank_slots)
-        for op in ops
-    )
+    seen_producers: dict[str, int] = {}
+    sigs = []
+    for idx, op in enumerate(ops):
+        sigs.append(_op_signature(
+            op, request_pattern, request_slots, request_prefix,
+            local_rank_slots, producer_index=seen_producers,
+        ))
+        seen_producers[str(getattr(op, "op_id", ""))] = idx
+    return tuple(sigs)
 
 
 def _replica_hardware_signature(case: Any, replica: int, placement: Any) -> tuple:
@@ -469,6 +558,26 @@ def _cohort_hardware_homogeneous(case: Any, ordered_keys: Sequence[int]) -> bool
         return bool(getattr(machine, "homogeneous", False))
 
 
+def _replica_local_rank_slots(case: Any, replica: int, topology: Any = None) -> dict[int, str] | None:
+    if case is None or getattr(case, "machine", None) is None or getattr(case, "runtime", None) is None:
+        return None
+    from mindie_sim.prediction.topology import Topology
+
+    try:
+        parallel = case.runtime.parallel
+        topo = topology if topology is not None else Topology(case.machine, parallel)
+        slots: dict[int, str] = {}
+        ordinal = 0
+        for stage in range(max(1, int(parallel.pp))):
+            for rk in topo.ranks(int(replica), stage):
+                if int(rk) not in slots:
+                    slots[int(rk)] = str(ordinal)
+                    ordinal += 1
+        return slots or None
+    except (ModelingError, ValueError, KeyError, IndexError):
+        return None
+
+
 def prove_homogeneous_cohort(
     case: Any, plans: Mapping[int, Any], *, selected_implementations: Any = None,
     initial_cache_states: Any = None,
@@ -485,7 +594,15 @@ def prove_homogeneous_cohort(
     elif len(ordered) > 1:
         base_ops = ordered[0]
         slots0, pat0, pfx0 = _request_slot_map(base_ops)
-        for graph in ordered[1:]:
+        shared_topo = None
+        if case is not None and getattr(case, "machine", None) is not None and getattr(case, "runtime", None) is not None:
+            from mindie_sim.prediction.topology import Topology
+            try:
+                shared_topo = Topology(case.machine, case.runtime.parallel)
+            except (ModelingError, ValueError, KeyError, IndexError):
+                shared_topo = None
+        rank_slots0 = _replica_local_rank_slots(case, int(ordered_keys[0]), shared_topo)
+        for rep_key, graph in zip(ordered_keys[1:], ordered[1:]):
             slots_r, pat_r, pfx_r = _request_slot_map(graph)
             if len(slots0) != len(slots_r):
                 reasons.append("asymmetric_replica_graph")
@@ -497,14 +614,22 @@ def prove_homogeneous_cohort(
                 meta_pfx_r = _common_prefix(meta_tokens_r)
             else:
                 meta_pat_r, meta_pfx_r = pat_r, pfx_r
-            if not all(
-                _ops_isomorphic(
+            rank_slots_r = _replica_local_rank_slots(case, int(rep_key), shared_topo)
+            seen0: dict[str, int] = {}
+            seen_r: dict[str, int] = {}
+            is_iso = True
+            for idx, (o0, o_r) in enumerate(zip(base_ops, graph)):
+                if not _ops_isomorphic(
                     o0, o_r, pat0, slots0, pfx0,
                     meta_pat_r, meta_slots_r, meta_pfx_r,
-                    req_slots_r=slots_r,
-                )
-                for o0, o_r in zip(base_ops, graph)
-            ):
+                    req_slots_r=slots_r, seen0=seen0, seen_r=seen_r,
+                    rank_slots0=rank_slots0, rank_slots_r=rank_slots_r,
+                ):
+                    is_iso = False
+                    break
+                seen0[str(getattr(o0, "op_id", ""))] = idx
+                seen_r[str(getattr(o_r, "op_id", ""))] = idx
+            if not is_iso:
                 reasons.append("asymmetric_replica_graph")
                 break
     if selected_implementations is not None:

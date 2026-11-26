@@ -570,3 +570,119 @@ def test_async_reader_holds_cross_two_service_iterations_and_last_use_release():
     assert scheduler.feedback(1.0)["pending_retired_requests"] == ["r"]
     assert scheduler.release_state_consumer("r", "pd-reader") is True
     assert (0, "r") not in scheduler.memory.owners
+
+
+def test_token_quotas_apply_to_disaggregated_serving_and_transitive_chains():
+    raw_pd = pd_case([{"id": "r", "prompt_tokens": 2, "output_tokens": 3}])
+    stop_one = predict(raw_pd, lower=linear_work, token_quotas={"r": 1}, event_limit=0)
+    assert stop_one["requests"][0]["generated_tokens"] == 1
+    assert stop_one["status"] == "incomplete"
+    assert stop_one["execution"]["cohort_stop"] == "token_quota"
+
+    stop_two = predict(raw_pd, lower=linear_work, token_quotas={"r": 2}, event_limit=0)
+    assert stop_two["requests"][0]["generated_tokens"] == 2
+    assert stop_two["status"] == "incomplete"
+
+    chain_raw = case(requests=[
+        {"id": req_id, "prompt_tokens": 1, "output_tokens": 3, "chain_id": 1}
+        for req_id in ("a", "b", "c")
+    ])
+    chain_res = predict(chain_raw, token_quotas={"a": 1}, lower=linear_work, event_limit=0)
+    assert chain_res["status"] == "incomplete"
+    assert chain_res["execution"]["cohort_stop"] == "token_quota"
+    assert [row["generated_tokens"] for row in chain_res["requests"]] == [1, 0, 0]
+
+    # Normal completion with quota == output_tokens still releases delayed chain successor.
+    done_chain = case(requests=[
+        {"id": "a", "prompt_tokens": 1, "output_tokens": 1, "chain_id": 1},
+        {"id": "b", "prompt_tokens": 1, "output_tokens": 1, "chain_id": 1},
+    ])
+    done_chain["runtime"]["serving_io"] = {"client_delivery_ms": 10.0}
+    done_res = predict(done_chain, token_quotas={"a": 1}, lower=linear_work, event_limit=0)
+    assert done_res["status"] == "modeled"
+    assert [row["generated_tokens"] for row in done_res["requests"]] == [1, 1]
+
+
+def test_decode_probe_per_die_capacity_cohort_capture_and_padding_h2d():
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.prediction.body_defaults import _gqa_tiles
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.operator_analysis import (
+        synchronize_moe_allgather_cohort, target_graphs,
+    )
+
+    # Asymmetric v_head_dim default GQA decode tiling fits L0B/L0C/UB without failing.
+    asym = case(prompt=1, output=1)
+    asym["model"].update(layers=1, hidden_size=128, num_heads=2, num_kv_heads=1, head_dim=64)
+    asym["machine"] = {"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a3"], "num_devices": 1}
+    asym["model"] = parse_case(asym).model.to_dict()
+    asym["model"]["layer_plans"][0]["v_head_dim"] = 512
+    asym["runtime"]["kernels"] = {"recipes": {}}
+    assert predict(parse_case(asym), scope="body", phase="decode", tokens=1, context=127, event_limit=0)["status"] == "modeled"
+
+    # Quantized INT8 KV GQA tiling accounts for UB dequantization buffers so every admitted tile executes cleanly.
+    qkv = case(prompt=1, output=1)
+    qkv["model"].update(
+        layers=1, hidden_size=128, num_heads=1, num_kv_heads=1, head_dim=128,
+        quant={"name": "kv_int8", "kv_dtype": "int8"},
+    )
+    qkv["machine"]["device"]["buffers"] = {"l1": 1 << 20, "l0a": 1 << 20, "l0b": 1 << 20, "l0c": 1 << 20, "ub": 4096}
+    qkv["runtime"]["kernels"] = {"recipes": {}}
+    qkv_case = parse_case(qkv)
+    qkv_tile = _gqa_tiles(qkv_case, qkv_case.model.layer_plans, tokens=1)
+    assert qkv_tile is not None and qkv_tile["key_tile"] == 2
+    assert predict(qkv_case, scope="body", phase="decode", tokens=1, context=16, event_limit=0)["status"] == "modeled"
+
+    # Per-die matched DCP capacity accepts heterogeneous dies and does not double-charge C8 scales.
+    het = case(tp=2)
+    het["model"].update(layers=1, num_kv_heads=1)
+    het["runtime"].update(
+        cp=2, dcp=2, cp_plan="dcp", kv_block_size=1, gpu_memory_utilization=1,
+        memory={"derive_workspace": False, "rank_token_owners": (2, 1)},
+    )
+    weight_b = int(Memory(parse_case(het)).weights[0])
+    het["machine"]["devices"] = [{"rank": idx, "memory_bytes": weight_b + cap} for idx, cap in enumerate((64, 32))]
+    het_case = parse_case(het)
+    het_mem = Memory(het_case, workspace_tokens=1)
+    assert probe_capacity(het_case, context=2, tokens=1)["status"] == "within_declared_capacity"
+    assert het_mem.resize(0, "r", 3) is True
+
+    c8 = case(tp=1)
+    c8["model"].update(
+        layers=1, hidden_size=128, num_heads=1, num_kv_heads=1, head_dim=128,
+        quant={"name": "kv_c8", "kv_dtype": "int8"},
+    )
+    c8["runtime"].update(kv_block_size=16, gpu_memory_utilization=1, memory={"derive_workspace": False})
+    c8_probe_base = parse_case(c8)
+    c8_mem = Memory(c8_probe_base, workspace_tokens=1)
+    assert c8_mem.c8_static_channel_scale_by_stage[0] > 0
+    c8_receipt = c8_mem.resident_memory_receipt(
+        phase="decode", sequence_tokens=16, batch_per_dp=(1,), query_tokens=1,
+    )
+    exact_hbm = int(c8_receipt.dies[0].simultaneous_live_hbm_bytes)
+    c8["machine"]["devices"] = [{"rank": 0, "memory_bytes": exact_hbm}]
+    assert probe_capacity(parse_case(c8), context=15, tokens=1)["status"] == "within_declared_capacity"
+
+    # Idle replica capture bucket matches synchronized cohort graph and incurs zero per-request H2D.
+    coh = case(dp=2, ep=2)
+    coh["model"].update(layers=1, ffn="moe", num_experts=4, top_k=1, moe_intermediate_size=32)
+    coh["runtime"].update(
+        graph_mode="aclgraph", graph_capture_mode="full", graph_capture_keys=[1, 4],
+        serving_io={"h2d": {"bytes_per_s": 1000, "bytes_per_request": 64}},
+    )
+    coh_case = parse_case(coh)
+    kw = dict(phase="decode", tokens=1, context=4, sequences=(3, 0))
+    probed_rows = probe_capacity(coh_case, **kw)["graph_query_tokens_by_replica"]
+    graph_ops = target_graphs(coh_case, scope="body", **kw)
+    actual_rows = {r: next(op for op in ops if op.family == "qkv_projection").local_shape[0] for r, ops in graph_ops.items()}
+    assert probed_rows == actual_rows == {0: 4, 1: 4}
+
+    views, _ = synchronize_moe_allgather_cohort(
+        coh_case, "decode", {0: (RequestView("r", 1, 4, True, "decode"),), 1: ()}, pad_idle=True,
+    )
+    idle_work = Frontend()(IterationPlan(views[1]), coh_case.model, coh_case.runtime, coh_case.machine, replica=1)
+    ex = Execution(coh_case, CostModel(coh_case), include_serving_io=True)
+    _, done = ex.serving_io.input(ex, "idle", 1, ex.engine.submit("ready"), idle_work)
+    ex.engine.advance(until=(done,))
+    assert ex.engine.serviced["h2d@r1"] == pytest.approx(0.0)

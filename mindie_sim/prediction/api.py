@@ -200,28 +200,43 @@ def _quota_exhausted(state, quota) -> bool:
     return request_id in quota and state.generated >= quota[request_id]
 
 
+def _blocked_by_quota_ancestor(state, scheduler, predecessor_of, quota) -> bool:
+    seen: set[str] = set()
+    cursor = state
+    while cursor is not None and cursor.request.request_id not in seen:
+        seen.add(cursor.request.request_id)
+        pred_id = predecessor_of.get(cursor.request.request_id)
+        if pred_id is None:
+            return False
+        prior = scheduler.by_id.get(pred_id)
+        if prior is None:
+            return False
+        if prior.done:
+            return False
+        if _quota_exhausted(prior, quota):
+            return True
+        if prior.release_ms != math.inf:
+            return False
+        cursor = prior
+    return False
+
+
 def _quota_boundary(schedulers, quota) -> bool:
     if not quota:
         return False
-    unfinished = False
     for scheduler in schedulers:
+        predecessor_of = {
+            successor.request.request_id: request_id
+            for request_id, successor in scheduler.successors.items()
+        }
         for state in scheduler.states:
             if state.done or _quota_exhausted(state, quota):
                 continue
-            if state.release_ms == math.inf:
-                predecessor = next(
-                    (request_id for request_id, successor
-                     in scheduler.successors.items() if successor is state),
-                    None)
-                if predecessor is not None:
-                    prior = scheduler.by_id.get(predecessor)
-                    if prior is not None and _quota_exhausted(prior, quota):
-                        continue
-            unfinished = True
-            break
-        if unfinished:
-            break
-    return not unfinished
+            if (state.release_ms == math.inf
+                    and _blocked_by_quota_ancestor(state, scheduler, predecessor_of, quota)):
+                continue
+            return False
+    return True
 
 
 @contextmanager
@@ -556,7 +571,8 @@ def predict(
         from .disaggregated import predict_pd
         return predict_pd(case, primitives=primitives, recipes=recipes, submission=submission,
                           memory_policy=memory_policy, lower=lower, trace_limit=trace_limit,
-                          event_limit=event_limit, primitive_table=primitive_table)
+                          event_limit=event_limit, token_quotas=token_quotas,
+                          primitive_table=primitive_table)
     case = parse_case(case)
     if case.model.is_standalone_draft:
         raise ModelingError("draft_requires_target_model:attach_auxiliary_to_target;catalog_inspection_available")

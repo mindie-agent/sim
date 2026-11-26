@@ -82,7 +82,7 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
                lower=None, trace_limit=DEFAULT_PD_TRACE_LIMIT,
                event_limit=DEFAULT_PD_EVENT_LIMIT, scope="serving", phase=None,
                tokens=None, context=None, sequences=None, published=None,
-               primitive_table=None):
+               token_quotas=None, primitive_table=None):
     # The direct PD entry enforces the same structural timing gate as predict.
     from ..efficiency.unmodeled_gate import assert_timing_supported
     assert_timing_supported(raw, entry="predict")
@@ -104,6 +104,11 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
     identifiers = [r.request_id for r in cases["prefill"].workload.requests]
     if len(identifiers) != len(set(identifiers)):
         raise ModelingError("request_ids_must_be_unique")
+    quota = {str(key): max(0, int(value))
+             for key, value in dict(token_quotas or {}).items()}
+    unknown = sorted(set(quota) - set(identifiers))
+    if unknown:
+        raise ModelingError("token_quota_unknown_request:" + ",".join(unknown))
     connector = PDConnector(raw["connector"])
     engine = Engine(connector.resources(), trace_limit=event_limit)
     memory = {name: Memory(case, memory_policy) for name, case in cases.items()}
@@ -148,22 +153,29 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
         scheduler.by_id = {state.request.request_id: state for state in scheduler.states}
         scheduler.successors = {key: shared[value.request.request_id] for key, value in scheduler.successors.items()}
     engine.now = min((r.request.arrival_ms for r in states), default=0)
-    serving_end, iterations, handoffs, handoff_bytes, handoff_records, traces = _run_pd_loop(
+    serving_end, iterations, handoffs, handoff_bytes, handoff_records, traces, stop_reason = _run_pd_loop(
         cases, engine, connector, memory, execution, lowerers, schedulers,
-        states, shared, placement, client_tails, published, trace_limit)
+        states, shared, placement, client_tails, published, trace_limit,
+        quota=quota)
     rows, boundaries = serving_boundaries(
         states, cases["prefill"].slo,
         host_results=any(pool.serving_io.enabled for pool in execution.values()),
         client_delivery=all(client_declared))
+    status = (
+        "incomplete" if stop_reason == "token_quota"
+        else "modeled" if all(state.finish_ms is not None for state in states)
+        else "infeasible"
+    )
     return {
         "schema": "mindie-sim.predict/2", "deployment": "disaggregated",
         **combine_coverage(case.model for case in cases.values()),
-        "status": "modeled" if all(state.finish_ms is not None for state in states) else "infeasible",
+        "status": status,
         "metrics": summarize(rows, cases["prefill"].slo, now_ms=serving_end),
         "metric_boundaries": boundaries,
         "throughput_window_boundary": "legacy_scheduler_completion",
         "requests": rows, "memory": {name: ledger.to_dict() for name, ledger in memory.items()},
         "execution": {**engine.summary(), "iterations": iterations,
+                      "cohort_stop": stop_reason, "token_quotas": dict(quota),
                       "handoffs": handoffs, "handoff_bytes": handoff_bytes,
                       "connector": connector.summary(),
                       "memory_binding": _memory_binding_report(engine, memory, execution),
@@ -183,9 +195,75 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
     }
 
 
+def _schedule_pd_pools(
+    cases, engine, memory, execution, lowerers, schedulers, states,
+    flights, consumer_release, consumer_registered, consumer_callbacks,
+    iterations, quota,
+):
+    from ..api import _quota_scope
+
+    for name, case in cases.items():
+        for group in cohorts(case.runtime.parallel, case.machine):
+            if any((name, replica) in flights for replica in group):
+                continue
+            pending_release = any(
+                state.location in {"waiting_transfer", "transferring"}
+                and not state.done for state in states
+            )
+            with _quota_scope(schedulers[name], quota):
+                plans = {
+                    r: schedulers[name][r].schedule(
+                        engine.now,
+                        defer_capacity_failure=name == "prefill" and pending_release,
+                    )
+                    if not schedulers[name][r].done else None
+                    for r in group
+                }
+            if not any(plans.values()):
+                _submit_pd_retirements(
+                    name, group, schedulers, memory, execution,
+                    engine, flights, iterations,
+                )
+                continue
+            steps = submit_batch(
+                case, schedulers[name], plans, execution[name],
+                lowerers[name], engine.now,
+            )
+            flights.update({(name, replica): step for replica, step in steps.items()})
+            if name == "decode":
+                _bind_pd_decode_consumer_releases(
+                    engine, steps, consumer_release,
+                    consumer_registered, consumer_callbacks,
+                )
+            iterations += len(steps)
+    return iterations
+
+
+def _bind_pd_decode_consumer_releases(
+    engine, steps, consumer_release, consumer_registered, consumer_callbacks,
+):
+    for replica in steps:
+        step = steps[replica]
+        for request in step.commits:
+            pending = {
+                rank: release
+                for rank, release in (consumer_release.get(request) or {}).items()
+                if not release.done and (request, rank) not in consumer_registered
+            }
+            consumer_registered.update((request, rank) for rank in pending)
+            _register_consumer_release(
+                engine, request, pending, step.device_complete,
+                on_consumer=lambda rank, request=request,
+                registry=consumer_callbacks: registry.get((request, rank)),
+            )
+
+
 def _run_pd_loop(cases, engine, connector, memory, execution, lowerers,
                  schedulers, states, shared, placement, client_tails,
-                 published, trace_limit):
+                 published, trace_limit, *, quota=None):
+    from ..api import _quota_boundary, _quota_exhausted, _quota_scope
+
+    quota = dict(quota or {})
     flights, transfers, traces = {}, {}, []
     # Real event handles for the three distinct PD boundaries.  They are not
     # fabricated sleeps: source is the prefill device-complete event, grant is
@@ -197,6 +275,7 @@ def _run_pd_loop(cases, engine, connector, memory, execution, lowerers,
     consumer_registered = set()
     handoff_records = []
     handoff_bytes, handoffs, iterations = 0, 0, 0
+    stop_reason = "drained"
 
     def source_release_callback(request_id, source_rank, source_state, prefill_replica):
         def release_source(rank=source_rank, state=source_state,
@@ -210,57 +289,38 @@ def _run_pd_loop(cases, engine, connector, memory, execution, lowerers,
             memory["prefill"].release(replica, req)
         return release_source
 
-    while not all(state.done for state in states):
+    while True:
+        real_done = all(state.done for state in states)
+        quota_reached = _quota_boundary(schedulers["prefill"], quota)
+        if real_done or quota_reached:
+            if not flights and not transfers:
+                stop_reason = "drained" if real_done else "token_quota"
+                break
         # Admit to the destination before making any external cache service
         # ready. Waiting transfers retain source ownership and exert backpressure.
-        for state in states:
-            if state.done or state.location != "waiting_transfer":
-                continue
-            request = state.request.request_id
-            volume = _admit_pd_handoff(
-                state, request, cases, engine, connector, memory, execution,
-                schedulers, placement, published, source_ready, consumer_release,
-                consumer_callbacks, source_release_state, source_release_callback,
-                transfers, handoff_records)
-            if volume is not None:
-                handoff_bytes += volume
-                handoffs += 1
-        for name, case in cases.items():
-            for group in cohorts(case.runtime.parallel, case.machine):
-                if any((name, replica) in flights for replica in group):
+        if not quota_reached:
+            for state in states:
+                if state.done or state.location != "waiting_transfer" or _quota_exhausted(state, quota):
                     continue
-                pending_release = any(state.location in {"waiting_transfer", "transferring"}
-                                      and not state.done for state in states)
-                plans = {r: schedulers[name][r].schedule(
-                    engine.now, defer_capacity_failure=name == "prefill" and pending_release)
-                         if not schedulers[name][r].done else None
-                         for r in group}
-                if any(plans.values()):
-                    steps = submit_batch(case, schedulers[name], plans, execution[name], lowerers[name], engine.now)
-                    flights.update({(name, replica): step for replica, step in steps.items()})
-                    if name == "decode":
-                        for request, step in ((request, steps[replica])
-                                              for replica in steps
-                                              for request in steps[replica].commits):
-                            pending = {
-                                rank: release
-                                for rank, release in (consumer_release.get(request) or {}).items()
-                                if not release.done
-                                and (request, rank) not in consumer_registered}
-                            consumer_registered.update(
-                                (request, rank) for rank in pending)
-                            _register_consumer_release(
-                                engine, request, pending, step.device_complete,
-                                on_consumer=lambda rank, request=request,
-                                registry=consumer_callbacks:
-                                    registry.get((request, rank)))
-                    iterations += len(steps)
-                else:
-                    _submit_pd_retirements(
-                        name, group, schedulers, memory, execution,
-                        engine, flights, iterations)
-        arrivals = [time for name, group in schedulers.items() for replica, scheduler in enumerate(group)
-                    if (name, replica) not in flights if (time := scheduler.next_arrival(engine.now)) is not None]
+                request = state.request.request_id
+                volume = _admit_pd_handoff(
+                    state, request, cases, engine, connector, memory, execution,
+                    schedulers, placement, published, source_ready, consumer_release,
+                    consumer_callbacks, source_release_state, source_release_callback,
+                    transfers, handoff_records)
+                if volume is not None:
+                    handoff_bytes += volume
+                    handoffs += 1
+            iterations = _schedule_pd_pools(
+                cases, engine, memory, execution, lowerers, schedulers, states,
+                flights, consumer_release, consumer_registered, consumer_callbacks,
+                iterations, quota,
+            )
+        arrivals = []
+        if not quota_reached:
+            with _quota_scope(schedulers["prefill"], quota):
+                arrivals = [time for name, group in schedulers.items() for replica, scheduler in enumerate(group)
+                            if (name, replica) not in flights if (time := scheduler.next_arrival(engine.now)) is not None]
         horizon = min(arrivals, default=math.inf)
         targets = (tuple(s.completion for s in flights.values())
                    + tuple(transfers.values())
@@ -271,6 +331,7 @@ def _run_pd_loop(cases, engine, connector, memory, execution, lowerers,
                 engine.advance(horizon=horizon)
                 engine.now = horizon
                 continue
+            stop_reason = "blocked"
             for state in states:
                 if not state.done:
                     state.reason = "decode_destination_capacity"
@@ -313,7 +374,7 @@ def _run_pd_loop(cases, engine, connector, memory, execution, lowerers,
             source_release_state, final_releases)
     serving_end = _drain_pd_tails(
         engine, memory, consumer_release, transfers, client_tails, final_releases)
-    return serving_end, iterations, handoffs, handoff_bytes, handoff_records, traces
+    return serving_end, iterations, handoffs, handoff_bytes, handoff_records, traces, stop_reason
 
 
 def _admit_pd_handoff(

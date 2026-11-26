@@ -53,20 +53,23 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode",
     if not padded_idle:
         from mindie_sim.prediction.operator_analysis import graph_padded_idle
         padded_idle = graph_padded_idle(case, phase, counts)
-    views = {}
-    for replica, count in counts.items():
-        if count == 0 and padded_idle:
-            views[replica] = (RequestView(
-                f"capacity{replica}:padding", 0, context, False, phase,
-                padding=True, draft_verify=False, draft_prepare=False),)
-        else:
-            views[replica] = tuple(
-                RequestView(f"capacity{replica}:{i}", tokens, context, False, phase)
-                for i in range(count))
+    from mindie_sim.prediction.operator_analysis import synchronize_moe_allgather_cohort
+
+    logical_views = {
+        replica: tuple(
+            RequestView(f"capacity{replica}:{i}", tokens, context, False, phase)
+            for i in range(count))
+        for replica, count in counts.items()
+    }
+    views, _ = synchronize_moe_allgather_cohort(
+        case, phase, logical_views, pad_idle=padded_idle,
+        default_context=context, prefix="capacity")
     selections = {r: GraphPolicy().select(group, case.runtime) if group else (None, "none")
                   for r, group in views.items()}
-    graph_rows = {r: max(tokens * counts[r], bucket or 0)
-                  for r, (bucket, _) in selections.items()}
+    graph_rows = {
+        r: max(sum(v.q_len + v.draft_proposal_tokens for v in views[r]), bucket or 0)
+        for r, (bucket, _) in selections.items()
+    }
     padded = {r: cohort_padded_tokens((group,), case.runtime) for r, group in views.items()}
     # Body queries, not the case's potentially 126K prefill request, determine
     # live activation workspace. KV grows with valid contexts, not padding.
@@ -79,7 +82,7 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode",
         batch_per_dp=tuple(counts.get(r, 0) for r in range(case.runtime.parallel.dp)),
         query_tokens=tokens,
     )
-    stage_cache: dict[tuple[int, int], float] = {}
+    stage_die_pairs: dict[tuple[int, int], list[tuple[float, float]]] = {}
     for die in receipt.dies:
         die_cache = float(
             die.kv_cache_allocated_bytes
@@ -88,10 +91,12 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode",
             + die.draft_cache_bytes
             + die.staging_bytes
         )
-        key = (int(die.replica), int(die.stage))
-        prev = stage_cache.get(key)
-        if prev is None or die_cache > prev:
-            stage_cache[key] = die_cache
+        rep_i, stg_i = int(die.replica), int(die.stage)
+        # Derive available cache headroom directly from the same DieResidentReceipt
+        # so fixed resident terms (including C8 static scales) are never subtracted twice.
+        fixed_non_cache = float(die.simultaneous_live_hbm_bytes) - die_cache
+        die_cap = float(die.usable_hbm_bytes) - fixed_non_cache
+        stage_die_pairs.setdefault((rep_i, stg_i), []).append((die_cache, die_cap))
     violations, rows = [], []
     runtime = case.runtime
     if context + tokens > runtime.max_model_len:
@@ -105,8 +110,14 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode",
                 violations.append({"constraint": constraint, "replica": replica,
                                    "required": required, "available": available})
         for stage, per_request in enumerate(cache):
-            required = stage_cache.get((replica, stage), per_request * count)
-            available = memory.capacity[replica][stage]
+            pairs = stage_die_pairs.get((replica, stage))
+            if pairs:
+                required, available = min(
+                    pairs, key=lambda pair: (pair[1] - pair[0], -pair[0]),
+                )
+            else:
+                required = per_request * count
+                available = memory.capacity[replica][stage]
             resident = (memory.weights[stage] + memory.workspace[stage]
                         + memory.policy.reserved + required)
             row = {"replica": replica, "stage": stage, "sequences": count,

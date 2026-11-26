@@ -1174,15 +1174,50 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self._attach_engine(engine if engine is not None else self._new_engine(), self.memory)
 
     def _attach_engine(self, engine, memory):
+        from ..runtime.l2_residency import (
+            _engine_primary_pool_namespace,
+            _normalize_pool_namespace,
+        )
+
         if memory is not None and not engine.bind_memory(memory, pools=("hbm",)):
             raise ModelingError("execution_memory_ledger_conflict")
+        req_ns = _normalize_pool_namespace(self.namespace)
         view = engine.admission_memory_view
         if view is None:
             view = self._build_admission_view()
             engine.attach_admission_memory_view(view)
+        else:
+            owner_ns = getattr(view, "pool_namespace", "") or _engine_primary_pool_namespace(engine)
+            ns_compatible = not req_ns or owner_ns is None or owner_ns == req_ns
+            covers_dies = all(view.has_die(int(die.rank)) for die in self.case.machine.dies)
+            if not ns_compatible or not covers_dies:
+                view = self._build_admission_view()
         self.engine, self.memory = engine, memory
         self.admission_memory_view = view
         self.allocation_versions = engine._allocation_versions
+
+    def _live_admission_memory_view(self):
+        """Return this Execution's namespace-compatible live AdmissionMemoryView."""
+        from ..runtime.l2_residency import (
+            _engine_primary_pool_namespace,
+            _normalize_pool_namespace,
+        )
+
+        own = getattr(self, "admission_memory_view", None)
+        engine = getattr(self, "engine", None)
+        eng_view = getattr(engine, "admission_memory_view", None) if engine is not None else None
+        if eng_view is None:
+            return own
+        req_ns = _normalize_pool_namespace(self.namespace)
+        if req_ns:
+            owner_ns = getattr(eng_view, "pool_namespace", "") or _engine_primary_pool_namespace(engine)
+            if owner_ns is not None and owner_ns != req_ns:
+                return own
+        if own is not None and own is not eng_view and any(
+            not eng_view.has_die(int(die.rank)) for die in self.case.machine.dies
+        ):
+            return own
+        return eng_view
 
     def _build_admission_view(self) -> AdmissionMemoryView:
         from mindie_sim.primitives.loader import is_sku_compatible_with_table
@@ -1196,11 +1231,17 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             if sweep:
                 sweeps.update((int(die.rank), sweep) for die in profile.dies
                               if is_sku_compatible_with_table(profile.primitive_table, die.sku))
-        first_rank = int(dies[0].rank)
-        capacities.setdefault(0, capacities[first_rank])
-        access.setdefault(0, access[first_rank])
-        sweeps.setdefault(0, sweeps.get(first_rank, {}))
-        return AdmissionMemoryView(capacities, memory_access_by_die=access, ws_sweep_by_die=sweeps)
+        if dies:
+            first_rank = int(dies[0].rank)
+            capacities.setdefault(0, capacities[first_rank])
+            access.setdefault(0, access[first_rank])
+            sweeps.setdefault(0, sweeps.get(first_rank, {}))
+        return AdmissionMemoryView(
+            capacities,
+            memory_access_by_die=access,
+            ws_sweep_by_die=sweeps,
+            pool_namespace=self.namespace,
+        )
 
     def reset_engine(self) -> None:
         """Start the next isolated price with cold memory and fresh bindings."""
@@ -1484,7 +1525,17 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         host_submits: list[tuple[int, int, Event]] = []
         scope = work.replay_scope or ("full" if work.graph_bucket is not None else "none")
         if self.include_submission and self.case.runtime.async_scheduling and replica in self.prepared:
-            schedule = self.prepared.pop(replica)
+            prepared_schedule = self.prepared.pop(replica)
+            if (prepared_schedule.done and prepared_schedule.time is not None
+                    and float(prepared_schedule.time) >= float(release_ms)):
+                schedule = prepared_schedule
+            else:
+                schedule = engine.submit(
+                    prefix + ":schedule_release",
+                    after=(prepared_schedule,),
+                    release=release_ms,
+                    owner=f"replica:{replica}",
+                )
         else:
             scheduler_ms = self.submission.scheduler_ms if self.include_submission else 0
             schedule = engine.submit(prefix + ":schedule", {f"{self.namespace}scheduler@r{replica}": scheduler_ms},

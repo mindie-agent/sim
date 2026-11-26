@@ -170,18 +170,60 @@ def physical_id(op):
     return _identifier(op)
 
 
-def requires_collective_cohort(case, op, recipe):
+def _collective_participant_replicas(topology, op, replica: int) -> tuple[int, ...]:
+    """Return sorted DP replicas owning the physical ranks of ``op``'s collective group."""
+    from mindie_sim.prediction.sharding.local_tp import (
+        LOCAL_TP_AXIS, expert_tp_groups, local_tp_replica_cohorts, local_tp_spans_dp,
+    )
+
+    meta = dict(getattr(op, "metadata", ()) or ())
+    axis = str(meta.get("group_axis") or "")
+    if axis not in {
+        "cp", "dcp", "dcp_tp", "dcp_pcp", "dcp_dp", "dcp_a2a",
+        "etp", "pcp", "ep", "tp", "dp", LOCAL_TP_AXIS,
+    }:
+        return (int(replica),)
+    stage = int(meta.get("source_stage", getattr(op, "stage", 0)))
+    parallel = topology.parallel
+    ext_dp = max(1, int(getattr(parallel, "external_dp", 1) or 1))
+    replicas = max(1, ext_dp * int(parallel.dp))
+    owner: dict[int, int] = {}
+    for rep_i in range(replicas):
+        for rk in topology.ranks(rep_i, stage):
+            owner[int(rk)] = rep_i
+    declared = meta.get("group_ranks")
+    if declared:
+        groups = (tuple(declared),)
+    elif axis == "etp":
+        groups = expert_tp_groups(topology, replica=int(replica), stage=stage)
+    elif axis == LOCAL_TP_AXIS and int(meta.get("local_tp_width", 0) or 0) <= 0:
+        if not local_tp_spans_dp(parallel):
+            return (int(replica),)
+        for cohort in local_tp_replica_cohorts(topology.machine, parallel):
+            if int(replica) in cohort:
+                return tuple(sorted(int(r) for r in cohort))
+        return (int(replica),)
+    else:
+        groups = tuple(topology.groups(axis, int(replica), stage, metadata=meta))
+    members = {
+        owner[int(rk)]
+        for grp in groups
+        for rk in grp
+        if int(rk) in owner
+    }
+    return tuple(sorted(members)) if len(members) > 1 else (int(replica),)
+
+
+def requires_collective_cohort(case, op, recipe, *, topology=None, replica=None):
     from mindie_sim.prediction.collectives.waves import startup_waves_recipe
-    from mindie_sim.prediction.sharding.local_tp import local_tp_spans_dp
+    from mindie_sim.prediction.topology import Topology
 
     recipe = startup_waves_recipe(op, recipe, case.runtime.collective_startup_mode)
-    axis = dict(op.metadata).get("group_axis")
-    return bool(
-        getattr(recipe, "algorithm", None)
-        and ((case.runtime.parallel.ep_spans_dp and axis == "ep")
-             or (local_tp_spans_dp(case.runtime.parallel) and axis == "local_tp")
-             or (case.runtime.parallel.cp_spans_dp
-                 and axis in {"cp", "dcp_dp", "dcp_a2a"})))
+    if not getattr(recipe, "algorithm", None):
+        return False
+    topo = topology if topology is not None else Topology(case.machine, case.runtime.parallel)
+    rep = int(dict(getattr(op, "metadata", ()) or ()).get("replica", 0) if replica is None else replica)
+    return len(_collective_participant_replicas(topo, op, rep)) > 1
 
 
 def _service_regime_row(context, duration):
@@ -401,6 +443,9 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
         for group in cohorts(case.runtime.parallel, case.machine)
         for rank in group
     }
+    from mindie_sim.prediction.topology import Topology
+
+    topology = Topology(case.machine, case.runtime.parallel)
     expanded = {rank: tuple(recipes.expand(items)) for rank, items in graphs.items()}
     expanded = bind_cohort_traffic(case, expanded)
     scopes, joins, joint_nodes, isolation = {}, {}, set(), []
@@ -409,14 +454,18 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
             raise ValueError("operator_replica_outside_declared_placement")
         scopes[rank] = _replay_scope(items, replay_scope)
         for op in items:
-            joint = requires_collective_cohort(case, op, recipes.select(op))
-            if (case.runtime.parallel.ep_spans_dp
+            joint = requires_collective_cohort(
+                case, op, recipes.select(op), topology=topology, replica=rank,
+            )
+            if ((joint or case.runtime.parallel.ep_spans_dp)
                     and dict(op.metadata).get("group_axis") == "ep"):
                 isolation.append((rank, op.stage, op.op_id,
                                   "complete_cohort" if joint else "per_replica"))
             if not joint:
                 continue
-            group = group_for[rank]
+            group = _collective_participant_replicas(topology, op, rank)
+            if len(group) <= 1:
+                group = group_for[rank]
             if set(group) - expanded.keys():
                 raise ValueError("operator_collective_requires_complete_cohort")
             members = joins.setdefault((group, op.op_id), {})
@@ -529,7 +578,9 @@ def _evaluate_isolated_group(
     from mindie_sim.prediction.program import NativeProgram
 
     op, recipe = execution.prepare(op, replica)
-    if requires_collective_cohort(execution.case, op, recipe):
+    if requires_collective_cohort(
+        execution.case, op, recipe, topology=execution.topology, replica=replica,
+    ):
         raise ValueError("operator_collective_requires_complete_cohort:use_graph_costs")
     context = execution._context(op, replica, replay_scope, recipe=recipe)
     engine = execution.engine

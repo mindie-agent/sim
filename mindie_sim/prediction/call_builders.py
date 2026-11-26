@@ -252,16 +252,20 @@ ACLNN_ATTENTION_KV_DTYPES = ACLNN_ATTENTION_QUERY_DTYPES | frozenset({
     "int4", "mxfp4",
 })
 MATRIX_MIN_RANK = 2
+NZ_WEIGHT_MIN_RANK = 4
 MATMUL_SHAPE_DIMS = 3
 ATTN_UNBATCHED_RANK = 3
 ATTN_BATCHED_RANK = 4
 FLOPS_PER_FMA = 2
 ATTENTION_SOFTMAX_OPS_PER_PAIR = 5
+FLASH_ATTN_SOFTMAX_STATS_LAST_DIM = 8
+FLASH_ATTN_SOFTMAX_STATS_TENSORS = 2
 RMSNORM_OPS_PER_ELEM = 5
 ADD_RMSNORM_OPS_PER_ELEM = 6
 SWIGLU_OPS_PER_ELEM = 5
 SWIGLU_SPLIT_PARTS = 2
 DYNAMIC_QUANT_OPS_PER_ELEM = 4
+DYNAMIC_QUANT_SMOOTH_OPS_PER_ELEM = 1
 CAST_OPS_PER_ELEM = 1.0
 GROUP_LIST_TYPE_CUMULATIVE = 0
 GROUP_LIST_TYPE_COUNTS = 1
@@ -273,8 +277,14 @@ SPARSE_MODE_DEFAULT_MASK = 0
 SPARSE_MODE_ALL_MASK = 1
 SPARSE_MODE_LEFT_UP_CAUSAL = 2
 SPARSE_MODE_RIGHT_DOWN_CAUSAL = 3
+SPARSE_MODE_BAND = 4
+CANN_DEFAULT_BAND_TOKENS = 2147483647
 ATTN_PAGED_CACHE_RANK = 3
 ATTN_PAGED_4D_CACHE_RANK = 4
+ACLNN_QUANT_OUTPUT_DTYPES = frozenset({"int8", "int4", "fp8", "fp8_e4m3", "fp8_e5m2"})
+ACLNN_SMOOTH_SCALE_KEYS = (
+    "smoothScalesOptional", "smooth_scales_optional", "smooth_scales", "smoothScales",
+)
 ACLNN_ATTENTION_LAYOUTS = frozenset({"BNSD", "BSND", "BNSD_NBSD", "BSH", "SBH", "TND"})
 ACLNN_ATTN_MASK_KEYS = ("atten_mask", "attenMaskOptional", "attn_mask", "mask")
 ACLNN_ATTN_BLOCK_TABLE_KEYS = ("block_table", "block_tables")
@@ -311,6 +321,12 @@ def _positive_integer(value, reason):
 
 def _nonnegative_integer(value, reason):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ModelingError(reason)
+    return value
+
+
+def _signed_integer(value, reason):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ModelingError(reason)
     return value
 
@@ -472,12 +488,37 @@ def _grouped_matmul_axis(arguments) -> int:
     return raw
 
 
-def _matrix_geometry(arguments, kind):
-    """Return ``(m, n, k, groups, group_type)`` for one standalone matrix ABI."""
+def _tensor_layout(arguments, *names) -> str:
+    tensors = arguments.get("tensors")
+    if isinstance(tensors, Mapping):
+        for name in names:
+            raw = tensors.get(name)
+            if isinstance(raw, Mapping) and raw.get("layout") is not None:
+                return str(raw["layout"]).strip().upper()
+    return ""
+
+
+def _optional_tensor_shape(arguments, *names):
+    tensors = arguments.get("tensors")
+    if not isinstance(tensors, Mapping):
+        return None, None
+    for name in names:
+        raw = tensors.get(name)
+        if raw is None:
+            continue
+        if isinstance(raw, Mapping) and raw.get("shape") is None:
+            continue
+        return name, _shape(raw, name)
+    return None, None
+
+
+def _matrix_geometry(arguments, kind, symbol=""):
+    """Return ``(m, n, k, groups, group_type, weight_layout)`` for one standalone matrix ABI."""
     attrs = arguments.get("attrs")
     attrs = attrs if isinstance(attrs, Mapping) else {}
     _, x_shape = _tensor(arguments, "x", "input", "activation", "a")
     _, w_shape = _tensor(arguments, "weight", "w", "b")
+    _, out_shape = _optional_tensor_shape(arguments, "out", "output", "y")
     if x_shape is None and arguments.get("x_shape") is not None:
         x_shape = _shape(arguments["x_shape"], "x_shape")
     if w_shape is None and arguments.get("weight_shape") is not None:
@@ -501,17 +542,44 @@ def _matrix_geometry(arguments, kind):
         m, k = (x_shape[-1], x_shape[-2]) if transpose_a else x_shape[-2:]
     w_batch = ()
     weight_count = 1
+    w_layout = _tensor_layout(arguments, "weight", "w", "b")
+    is_nz_weight = w_layout == "FRACTAL_NZ" or (
+        str(symbol).endswith("WeightNz")
+        and w_shape is not None
+        and len(w_shape) >= NZ_WEIGHT_MIN_RANK
+    )
     if w_shape is not None:
-        if len(w_shape) < MATRIX_MIN_RANK:
-            raise ModelingError("aclnn_matmul_requires_rank_at_least_two_weight")
-        w_batch = _leading_batch_shape(w_shape)
-        weight_count = math.prod(w_batch) if w_batch else 1
-        first, second = w_shape[-2:]
-        n = first if transpose_b else second
-        weight_k = second if transpose_b else first
-        if k is not None and weight_k != k:
-            raise ModelingError("aclnn_matmul_weight_k_dimension_mismatch")
-        k = weight_k if k is None else k
+        if is_nz_weight:
+            if len(w_shape) < NZ_WEIGHT_MIN_RANK:
+                raise ModelingError("aclnn_matmul_nz_weight_requires_rank_at_least_four")
+            w_batch = w_shape[:-NZ_WEIGHT_MIN_RANK]
+            weight_count = math.prod(w_batch) if w_batch else 1
+            c1, r1, r0, c0 = w_shape[-NZ_WEIGHT_MIN_RANK:]
+            padded_r, padded_c = r1 * r0, c1 * c0
+            padded_n, padded_k = (padded_r, padded_c) if transpose_b else (padded_c, padded_r)
+            if k is not None and k > padded_k:
+                raise ModelingError("aclnn_matmul_weight_k_dimension_mismatch")
+            k = padded_k if k is None else k
+            if out_shape is not None:
+                if len(out_shape) < MATRIX_MIN_RANK:
+                    raise ModelingError("aclnn_matmul_requires_rank_at_least_two_output")
+                out_n = out_shape[-1]
+                if out_n > padded_n:
+                    raise ModelingError("aclnn_matmul_weight_n_dimension_mismatch")
+                n = out_n
+            else:
+                n = padded_n
+        else:
+            if len(w_shape) < MATRIX_MIN_RANK:
+                raise ModelingError("aclnn_matmul_requires_rank_at_least_two_weight")
+            w_batch = _leading_batch_shape(w_shape)
+            weight_count = math.prod(w_batch) if w_batch else 1
+            first, second = w_shape[-2:]
+            n = first if transpose_b else second
+            weight_k = second if transpose_b else first
+            if k is not None and weight_k != k:
+                raise ModelingError("aclnn_matmul_weight_k_dimension_mismatch")
+            k = weight_k if k is None else k
     group_type = _grouped_matmul_axis(arguments) if kind == ACLNN_GROUPED_KIND else GROUP_TYPE_M
     rows = _expert_rows(arguments) if kind == ACLNN_GROUPED_KIND else None
     if rows is not None and group_type == GROUP_TYPE_K:
@@ -541,7 +609,8 @@ def _matrix_geometry(arguments, kind):
                           "aclnn_matmul_requires_positive_n")
     k = _positive_integer(arguments.get("k", k),
                           "aclnn_matmul_requires_positive_k")
-    return m, n, k, groups, group_type
+    weight_layout = "FRACTAL_NZ" if is_nz_weight else (w_layout or "ND")
+    return m, n, k, groups, group_type, weight_layout
 
 
 def _default_matrix_output_dtype(activation: str, weight: str) -> str:
@@ -588,7 +657,7 @@ def _quant_spec(symbol, kind, arguments):
         output_format=output), activation
 
 
-def _matrix_metadata(symbol, kind, arguments, m, n, k, groups, group_type):
+def _matrix_metadata(symbol, kind, arguments, m, n, k, groups, group_type, weight_layout="ND"):
     metadata = [("api", symbol), ("aclnn_symbol", symbol),
                 ("aclnn_abi_schema", ACLNN_ABI_SCHEMA),
                 ("aclnn_call_kind", kind),
@@ -596,6 +665,8 @@ def _matrix_metadata(symbol, kind, arguments, m, n, k, groups, group_type):
                                     "matrix_groups": groups,
                                     "group_type": group_type}),
                 ("program_kind", "matmul")]
+    if weight_layout and weight_layout != "ND":
+        metadata.append(("weight_layout", weight_layout))
     if kind == ACLNN_GROUPED_KIND:
         metadata.extend((
             ("matrix_mapping_domain", "aggregate_experts"),
@@ -615,9 +686,13 @@ def _matrix_metadata(symbol, kind, arguments, m, n, k, groups, group_type):
 def _build_matrix(arguments, symbol, kind, recipe, family):
     from dataclasses import replace
     from mindie_sim.catalog.ops import gemm_op
-    m, n, k, groups, group_type = _matrix_geometry(arguments, kind)
+    m, n, k, groups, group_type, weight_layout = _matrix_geometry(
+        arguments, kind, symbol=symbol,
+    )
     quant, activation = _quant_spec(symbol, kind, arguments)
-    metadata = _matrix_metadata(symbol, kind, arguments, m, n, k, groups, group_type)
+    metadata = _matrix_metadata(
+        symbol, kind, arguments, m, n, k, groups, group_type, weight_layout=weight_layout,
+    )
     # K-axis grouped matmul reads X[M, K_total] and W[K_total, N] once while
     # emitting one [M, N] output matrix per active group.
     weight_banks = 1 if group_type == GROUP_TYPE_K else groups
@@ -812,14 +887,44 @@ def _vector_work(kind, arguments):
             "norm_has_residual": True, "norm_gamma_dtype": gamma_dtype}
     if kind == "quantize":
         dtype = _tensor_dtype(arguments, ("x", "input"), ACLNN_DEFAULT_DTYPE)
-        output = _dtype(arguments.get("output_dtype", "int8"),
-                        frozenset({"int8", "fp8", "fp8_e4m3", "fp8_e5m2"}),
-                        "aclnn_dynamic_quant_output_dtype_unsupported")
-        read = elements * dtype_bytes(dtype)
-        write = elements * dtype_bytes(output) + rows * dtype_bytes("fp32")
-        return dtype, elements, DYNAMIC_QUANT_OPS_PER_ELEM, read, write, (rows, columns), {
+        output = _dtype(
+            arguments.get("output_dtype")
+            or _optional_tensor_dtype(
+                arguments, ("y", "out", "output"), ACLNN_QUANT_OUTPUT_DTYPES,
+                "aclnn_dynamic_quant_output_dtype_unsupported")
+            or "int8",
+            ACLNN_QUANT_OUTPUT_DTYPES,
+            "aclnn_dynamic_quant_output_dtype_unsupported")
+        _, smooth_shape = _tensor(arguments, *ACLNN_SMOOTH_SCALE_KEYS)
+        if smooth_shape is None:
+            for key in ACLNN_SMOOTH_SCALE_KEYS:
+                if arguments.get(key) is not None:
+                    smooth_shape = _shape(arguments[key], key)
+                    break
+        smooth_read = 0.0
+        smooth_dtype = None
+        if smooth_shape is not None:
+            if smooth_shape[-1] != columns:
+                raise ModelingError("aclnn_dynamic_quant_smooth_scales_shape_mismatch")
+            smooth_dtype = _optional_tensor_dtype(
+                arguments, ACLNN_SMOOTH_SCALE_KEYS, ACLNN_VECTOR_DTYPES,
+                "aclnn_call_tensor_dtype_unsupported") or dtype
+            smooth_read = math.prod(smooth_shape) * dtype_bytes(smooth_dtype)
+        read = elements * dtype_bytes(dtype) + smooth_read
+        scale_bytes = float(rows * dtype_bytes("fp32"))
+        write = elements * dtype_bytes(output) + scale_bytes
+        ops_per_elem = DYNAMIC_QUANT_OPS_PER_ELEM + (
+            DYNAMIC_QUANT_SMOOTH_OPS_PER_ELEM if smooth_shape is not None else 0
+        )
+        extra = {
             "input_format": dtype, "output_format": output,
-            "activation_scale_format": "fp32", "activation_scale_shape": (rows,)}
+            "primary_output": "payload",
+            "activation_scale_format": "fp32", "activation_scale_shape": (rows,),
+            "activation_scale_bytes": scale_bytes,
+        }
+        if smooth_dtype is not None:
+            extra["smooth_scales_dtype"] = smooth_dtype
+        return dtype, elements, ops_per_elem, read, write, (rows, columns), extra
     raise ModelingError(f"aclnn_vector_kind_unsupported:{kind}")
 
 
@@ -833,12 +938,13 @@ def _build_vector(arguments, symbol, vector_kind, recipe, family):
         ("aclnn_call_kind", ACLNN_VECTOR_KIND),
         *tuple(sorted(extra.items())),
     )
+    returns = ("activation_scales",) if vector_kind == "quantize" else ()
     op = vector_op(
         op_id="aclnn_call", deps=(), stage=0, layer=0, requests=(),
         elements=elements, ops_per_element=ops_per_element, dtype=dtype,
         family=family, phase=_phase(arguments.get("phase")), recipe=recipe,
         shape=shape, read_bytes_override=float(read),
-        write_bytes_override=float(write), metadata=metadata)
+        write_bytes_override=float(write), returns=returns, metadata=metadata)
     return op
 
 
@@ -972,31 +1078,112 @@ def _difference_cumulative(values, reason):
 
 def _attention_request_pairs(arguments, attrs, *, layout, paged, batch, query_tokens, key_tokens):
     """Resolve per-request ``((q_len, kv_len), ...)`` pairs for packed TND or batched calls."""
-    if layout != "TND":
-        return None
     raw_q = _extract_int_sequence(arguments, attrs, ACLNN_ATTN_SEQLEN_Q_KEYS)
     raw_kv = _extract_int_sequence(arguments, attrs, ACLNN_ATTN_SEQLEN_KV_KEYS)
     if raw_q is None and raw_kv is None:
         return None
+    if layout == "TND":
+        if raw_q is None:
+            raw_q = raw_kv
+        if raw_kv is None:
+            raw_kv = raw_q
+        if len(raw_q) != len(raw_kv):
+            raise ModelingError("aclnn_attention_seqlen_count_mismatch")
+        q_lens = _difference_cumulative(raw_q, "aclnn_attention_seqlen_q_non_monotonic")
+        if sum(q_lens) != query_tokens:
+            raise ModelingError("aclnn_attention_seqlen_q_total_mismatch")
+        if paged:
+            kv_lens = raw_kv
+        else:
+            kv_lens = _difference_cumulative(raw_kv, "aclnn_attention_seqlen_kv_non_monotonic")
+            if sum(kv_lens) != key_tokens:
+                raise ModelingError("aclnn_attention_seqlen_kv_total_mismatch")
+        return tuple(zip(q_lens, kv_lens))
     if raw_q is None:
-        raw_q = raw_kv
-    if raw_kv is None:
-        raw_kv = raw_q
-    if len(raw_q) != len(raw_kv):
-        raise ModelingError("aclnn_attention_seqlen_count_mismatch")
-    q_lens = _difference_cumulative(raw_q, "aclnn_attention_seqlen_q_non_monotonic")
-    if sum(q_lens) != query_tokens:
-        raise ModelingError("aclnn_attention_seqlen_q_total_mismatch")
-    if paged:
-        kv_lens = raw_kv
+        q_lens = (query_tokens,) * batch
     else:
-        kv_lens = _difference_cumulative(raw_kv, "aclnn_attention_seqlen_kv_non_monotonic")
-        if sum(kv_lens) != key_tokens:
-            raise ModelingError("aclnn_attention_seqlen_kv_total_mismatch")
+        q_lens = raw_q * batch if len(raw_q) == 1 and batch > 1 else raw_q
+        if len(q_lens) != batch:
+            raise ModelingError("aclnn_attention_seqlen_count_mismatch")
+        if any(value > query_tokens for value in q_lens):
+            raise ModelingError("aclnn_attention_seqlen_q_exceeds_tensor")
+    if raw_kv is None:
+        kv_lens = (key_tokens,) * batch
+    else:
+        kv_lens = raw_kv * batch if len(raw_kv) == 1 and batch > 1 else raw_kv
+        if len(kv_lens) != batch:
+            raise ModelingError("aclnn_attention_seqlen_count_mismatch")
+        if not paged and any(value > key_tokens for value in kv_lens):
+            raise ModelingError("aclnn_attention_seqlen_kv_exceeds_tensor")
     return tuple(zip(q_lens, kv_lens))
 
 
-def _visible_pairs(query_tokens: int, key_tokens: int, *, causal: bool, top_left_causal: bool) -> int:
+def _sum_ints(lo: int, hi: int) -> int:
+    return (hi - lo + 1) * (lo + hi) // 2 if lo <= hi else 0
+
+
+def _band_visible_pairs(
+    query_tokens: int, key_tokens: int, *,
+    pre_tokens: int, next_tokens: int, top_left: bool = False,
+) -> int:
+    """Exact O(1) visible query-key pair count for CANN band sparse attention."""
+    if query_tokens <= 0 or key_tokens <= 0:
+        return 0
+    shift = 0 if top_left else (key_tokens - query_tokens)
+    lo_off = shift - pre_tokens
+    hi_off = shift + next_tokens
+    if hi_off < lo_off:
+        return 0
+    q_lo = max(0, -hi_off)
+    q_hi = min(query_tokens - 1, key_tokens - 1 - lo_off)
+    if q_lo > q_hi:
+        return 0
+    uncapped_end = min(q_hi, key_tokens - 1 - hi_off)
+    hi_sum = (
+        _sum_ints(q_lo, uncapped_end) + (uncapped_end - q_lo + 1) * hi_off
+        if q_lo <= uncapped_end else 0
+    )
+    capped_start = max(q_lo, key_tokens - hi_off)
+    if capped_start <= q_hi:
+        hi_sum += (q_hi - capped_start + 1) * (key_tokens - 1)
+    pos_start = max(q_lo, -lo_off)
+    lo_sum = (
+        _sum_ints(pos_start, q_hi) + (q_hi - pos_start + 1) * lo_off
+        if pos_start <= q_hi else 0
+    )
+    return hi_sum - lo_sum + (q_hi - q_lo + 1)
+
+
+def _band_touched_kv_tokens(
+    query_tokens: int, key_tokens: int, *,
+    pre_tokens: int, next_tokens: int, top_left: bool = False,
+) -> int:
+    """Exact count of distinct KV positions touched by CANN band sparse attention."""
+    if query_tokens <= 0 or key_tokens <= 0:
+        return 0
+    shift = 0 if top_left else (key_tokens - query_tokens)
+    lo_off = shift - pre_tokens
+    hi_off = shift + next_tokens
+    if hi_off < lo_off:
+        return 0
+    q_lo = max(0, -hi_off)
+    q_hi = min(query_tokens - 1, key_tokens - 1 - lo_off)
+    if q_lo > q_hi:
+        return 0
+    k_lo = max(0, q_lo + lo_off)
+    k_hi = min(key_tokens - 1, q_hi + hi_off)
+    return max(0, k_hi - k_lo + 1)
+
+
+def _visible_pairs(
+    query_tokens: int, key_tokens: int, *, causal: bool, top_left_causal: bool,
+    band_window: tuple[int, int] | None = None,
+) -> int:
+    if band_window is not None:
+        return _band_visible_pairs(
+            query_tokens, key_tokens,
+            pre_tokens=band_window[0], next_tokens=band_window[1], top_left=False,
+        )
     if not causal:
         return query_tokens * key_tokens
     visible = min(query_tokens, key_tokens)
@@ -1217,7 +1404,7 @@ def _mask_is_all_unmasked(arguments, attrs) -> bool:
     return False
 
 
-def _attention_op(arguments, symbol, recipe):
+def _attention_op(arguments, symbol, recipe, *, entry=None):
     from mindie_sim.schema.operators import OpSpec
     attrs = arguments.get("attrs")
     attrs = (_mapping(attrs, "aclnn_attention_attrs_requires_mapping")
@@ -1228,11 +1415,32 @@ def _attention_op(arguments, symbol, recipe):
     sparse_mode = (_nonnegative_integer(sparse_mode,
                                         "aclnn_attention_sparse_mode_invalid")
                    if sparse_mode is not None else None)
+    raw_pre = _first_integer(attrs, "pre_tokens", "preTokens")
+    if raw_pre is None:
+        raw_pre = _first_integer(arguments, "pre_tokens", "preTokens")
+    pre_tokens = (
+        _signed_integer(raw_pre, "aclnn_attention_pre_tokens_invalid")
+        if raw_pre is not None else None
+    )
+    raw_next = _first_integer(attrs, "next_tokens", "nextTokens")
+    if raw_next is None:
+        raw_next = _first_integer(arguments, "next_tokens", "nextTokens")
+    next_tokens = (
+        _signed_integer(raw_next, "aclnn_attention_next_tokens_invalid")
+        if raw_next is not None else None
+    )
     has_mask = _attention_has_mask(arguments, attrs)
+    band_window = None
+    if sparse_mode == SPARSE_MODE_BAND:
+        eff_pre = CANN_DEFAULT_BAND_TOKENS if pre_tokens is None else pre_tokens
+        eff_next = CANN_DEFAULT_BAND_TOKENS if next_tokens is None else next_tokens
+        band_window = (eff_pre, eff_next)
     if "causal" in attrs:
         causal = _boolean(attrs["causal"], "aclnn_attention_causal_requires_boolean")
     elif "causal" in arguments:
         causal = _boolean(arguments["causal"], "aclnn_attention_causal_requires_boolean")
+    elif band_window is not None:
+        causal = band_window[1] <= 0
     elif sparse_mode in (SPARSE_MODE_LEFT_UP_CAUSAL, SPARSE_MODE_RIGHT_DOWN_CAUSAL):
         causal = True
     elif sparse_mode == SPARSE_MODE_ALL_MASK:
@@ -1247,16 +1455,36 @@ def _attention_op(arguments, symbol, recipe):
         query_tokens=query_tokens, key_tokens=key_tokens)
     if req_pairs is not None:
         total_pairs = sum(
-            _visible_pairs(q_i, k_i, causal=causal, top_left_causal=top_left_causal)
+            _visible_pairs(
+                q_i, k_i, causal=causal, top_left_causal=top_left_causal,
+                band_window=band_window,
+            )
             for q_i, k_i in req_pairs
         )
         effective_batch = len(req_pairs)
-        total_kv_tokens = sum(k_i for _, k_i in req_pairs)
+        total_q_tokens = sum(q_i for q_i, _ in req_pairs)
+        total_kv_tokens = sum(
+            _band_touched_kv_tokens(
+                q_i, k_i, pre_tokens=band_window[0], next_tokens=band_window[1],
+            )
+            if band_window is not None else k_i
+            for q_i, k_i in req_pairs
+        )
     else:
         total_pairs = batch * _visible_pairs(
-            query_tokens, key_tokens, causal=causal, top_left_causal=top_left_causal)
+            query_tokens, key_tokens, causal=causal, top_left_causal=top_left_causal,
+            band_window=band_window,
+        )
         effective_batch = batch
-        total_kv_tokens = batch * key_tokens
+        total_q_tokens = batch * query_tokens
+        touched_kv = (
+            _band_touched_kv_tokens(
+                query_tokens, key_tokens,
+                pre_tokens=band_window[0], next_tokens=band_window[1],
+            )
+            if band_window is not None else key_tokens
+        )
+        total_kv_tokens = batch * touched_kv
     query_dtype = _dtype(
         arguments.get("query_dtype")
         or _optional_tensor_dtype(
@@ -1285,11 +1513,20 @@ def _attention_op(arguments, symbol, recipe):
             "aclnn_attention_output_dtype_unsupported")
         or query_dtype,
         ACLNN_ATTENTION_QUERY_DTYPES, "aclnn_attention_output_dtype_unsupported")
-    query_bytes = batch * heads * query_tokens * head_dim * dtype_bytes(query_dtype)
+    query_bytes = total_q_tokens * heads * head_dim * dtype_bytes(query_dtype)
     key_bytes = total_kv_tokens * kv_heads * head_dim * dtype_bytes(key_dtype)
     value_bytes = total_kv_tokens * kv_heads * v_head_dim * dtype_bytes(value_dtype)
     kv_bytes = key_bytes + value_bytes
-    output_bytes = batch * heads * query_tokens * v_head_dim * dtype_bytes(output_dtype)
+    is_flash_score = (entry or symbol) == "aclnnFlashAttentionScore"
+    softmax_stats_bytes = (
+        FLASH_ATTN_SOFTMAX_STATS_TENSORS * total_q_tokens * heads
+        * FLASH_ATTN_SOFTMAX_STATS_LAST_DIM * dtype_bytes("fp32")
+        if is_flash_score else 0
+    )
+    output_bytes = (
+        total_q_tokens * heads * v_head_dim * dtype_bytes(output_dtype)
+        + softmax_stats_bytes
+    )
     flops = float(FLOPS_PER_FMA * heads * total_pairs * (head_dim + v_head_dim))
     vector_ops = float(ATTENTION_SOFTMAX_OPS_PER_PAIR * heads * total_pairs)
     if layout == "TND":
@@ -1323,6 +1560,26 @@ def _attention_op(arguments, symbol, recipe):
     }
     if paged:
         view["page_size"] = block_size
+    extra_returns = ()
+    extra_meta = ()
+    if is_flash_score:
+        stats_shape = (
+            (query_tokens, heads, FLASH_ATTN_SOFTMAX_STATS_LAST_DIM)
+            if layout == "TND"
+            else (batch, heads, query_tokens, FLASH_ATTN_SOFTMAX_STATS_LAST_DIM)
+        )
+        single_stats_bytes = float(softmax_stats_bytes / FLASH_ATTN_SOFTMAX_STATS_TENSORS)
+        extra_returns = ("softmax_max", "softmax_sum")
+        extra_meta = (
+            ("softmax_max_dtype", "fp32"),
+            ("softmax_max_shape", stats_shape),
+            ("softmax_max_bytes", single_stats_bytes),
+            ("softmax_max_role", "auxiliary"),
+            ("softmax_sum_dtype", "fp32"),
+            ("softmax_sum_shape", stats_shape),
+            ("softmax_sum_bytes", single_stats_bytes),
+            ("softmax_sum_role", "auxiliary"),
+        )
     metadata = (
         ("api", symbol), ("aclnn_symbol", symbol),
         ("aclnn_abi_schema", ACLNN_ABI_SCHEMA),
@@ -1337,6 +1594,7 @@ def _attention_op(arguments, symbol, recipe):
             "input_layout": layout,
             "query_dtype": query_dtype, "key_dtype": key_dtype,
             "value_dtype": value_dtype, "output_dtype": output_dtype}),
+        *extra_meta,
     )
     return OpSpec(
         op_id="aclnn_call", family="attention", phase=_phase(arguments.get("phase")),
@@ -1348,7 +1606,7 @@ def _attention_op(arguments, symbol, recipe):
         flops=flops, vector_ops=vector_ops,
         hbm_bytes=query_bytes + kv_bytes + output_bytes,
         mte2_bytes=query_bytes + kv_bytes, mte3_bytes=output_bytes,
-        dtype=query_dtype, recipe=recipe, metadata=metadata)
+        dtype=query_dtype, recipe=recipe, returns=extra_returns, metadata=metadata)
 
 
 from collections.abc import Mapping, Sequence
@@ -1536,7 +1794,7 @@ def build_aclnn_call(arguments):
     symbol = _symbol(arguments)
     entry, (kind, recipe, family, mechanism) = resolve_aclnn_abi(symbol)
     if kind == ACLNN_ATTENTION_KIND:
-        op = _attention_op(arguments, symbol, recipe)
+        op = _attention_op(arguments, symbol, recipe, entry=entry)
     elif kind == ACLNN_VECTOR_KIND:
         op = _build_vector(arguments, symbol, family, recipe, family)
     else:

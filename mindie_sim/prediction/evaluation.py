@@ -653,10 +653,22 @@ def _rebind_primitive_table(table: Any, die: Any, registered: Mapping[str, Any])
 
 
 def _resolve_default_primitive_table(case: CaseSpec) -> Any:
-    """Auto-bind the calibrated bundled SKU primitive table to the declared dies."""
-    if not case.machine.dies or not case.machine.homogeneous:
+    """Auto-bind the calibrated bundled SKU primitive table to the active declared dies."""
+    if not case.machine.dies:
         return None
-    sku = str(case.machine.sku or "")
+    active_dies = case.machine.dies
+    if hasattr(case.machine, "validate_placement"):
+        try:
+            placement = case.machine.validate_placement(case.runtime.parallel)
+        except ModelingError:
+            placement = None
+        if placement is not None and placement.active_ranks:
+            active_dies = tuple(
+                die for die in case.machine.dies if die.rank in placement.active_ranks
+            )
+    if not active_dies or len({die.resource_signature for die in active_dies}) > 1:
+        return None
+    sku = str(active_dies[0].sku or case.machine.sku or "")
     table = _bundled_calibrated_primitive_table(sku)
     if table is None and sku:
         from mindie_sim.backends.ascend import DERIVED_ASCEND_SKUS
@@ -676,7 +688,7 @@ def _resolve_default_primitive_table(case: CaseSpec) -> Any:
     registered = entry.get("device") if isinstance(entry, Mapping) else None
     if not isinstance(registered, Mapping):
         return None
-    return _rebind_primitive_table(table, case.machine.dies[0], registered)
+    return _rebind_primitive_table(table, active_dies[0], registered)
 
 
 @dataclass

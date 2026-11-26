@@ -202,8 +202,11 @@ class ServingIO:
             after=(schedule,), owner=f"replica:{replica}")
         policy = self.transfers.get("h2d")
         tokens = work.padded_tokens if policy and policy.token_basis == "padded" else work.valid_tokens
+        client_requests = sum(
+            1 for view in work.plan.requests if not getattr(view, "padding", False)
+        )
         copied = self.transfer(execution, "h2d", prefix, replica, prepared,
-                               tokens, len(work.plan.requests))
+                               tokens, client_requests)
         if not self.record_events:
             return prepared, copied
         self.batch_events[prefix] = {
@@ -213,7 +216,7 @@ class ServingIO:
             "schedule": schedule,
             "host_prepare": prepared,
             "input_ready": copied,
-            "input_bytes": (policy.volume(tokens, len(work.plan.requests))
+            "input_bytes": (policy.volume(tokens, client_requests)
                             if policy is not None else 0.0),
         }
         return prepared, copied

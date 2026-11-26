@@ -743,6 +743,38 @@ ROLE_COMMUNICATION = "communication"
 ROLE_CONTROL = "control"
 
 
+_DTYPE_PEAK_ALIASES = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}
+
+
+def _cube_service_seconds(
+    op, flops: float, metadata: Mapping[str, Any], peaks: Mapping[str, float],
+) -> float:
+    dtype = str(getattr(op, "dtype", "") or "bf16").strip().lower()
+    dtype = _DTYPE_PEAK_ALIASES.get(dtype, dtype)
+    fallback_rate = float(peaks.get(dtype) or peaks.get("bf16") or peaks.get("fp16") or 0.0)
+    raw_phases = getattr(op, "matrix_flops", None) or metadata.get("matrix_flops") or ()
+    phases = raw_phases.items() if isinstance(raw_phases, Mapping) else raw_phases
+    total_sec = 0.0
+    accounted_flops = 0.0
+    for pair in phases:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            continue
+        fmt_raw, amount_raw = pair
+        amount = float(amount_raw or 0.0)
+        if amount <= 0.0:
+            continue
+        fmt = str(fmt_raw or "").strip().lower()
+        fmt = _DTYPE_PEAK_ALIASES.get(fmt, fmt)
+        rate = float(peaks.get(fmt) or fallback_rate)
+        if rate > 0.0:
+            total_sec += amount / rate
+            accounted_flops += amount
+    residual = max(0.0, flops - accounted_flops)
+    if residual > 0.0 and fallback_rate > 0.0:
+        total_sec += residual / fallback_rate
+    return total_sec
+
+
 def _dominant_role(op, *, stage_rates: Mapping[str, Any] | None = None) -> str:
     """Dominant physical service role of one executed occurrence by roofline argmax."""
     link = float(getattr(op, "link_bytes", 0) or 0)
@@ -756,14 +788,13 @@ def _dominant_role(op, *, stage_rates: Mapping[str, Any] | None = None) -> str:
         hbm += float(metadata.get("fixpipe_bytes", 0) or 0)
     if stage_rates:
         peaks = stage_rates.get("compute_peaks") or {}
-        dtype = str(getattr(op, "dtype", "") or "bf16").strip().lower()
-        cube_rate = float(peaks.get(dtype) or peaks.get("bf16") or peaks.get("fp16") or 0.0)
+        cube_time = _cube_service_seconds(op, flops, metadata, peaks)
         vec_rate = float(stage_rates.get("vector") or 0.0)
         hbm_rate = float(stage_rates.get("hbm") or 0.0)
         link_rate = float(stage_rates.get("link") or 0.0)
         times = (
             (ROLE_COMMUNICATION, (link / link_rate) if (link > 0.0 and link_rate > 0.0) else (float("inf") if link > 0.0 else 0.0)),
-            (ROLE_CUBE, (flops / cube_rate) if (flops > 0.0 and cube_rate > 0.0) else 0.0),
+            (ROLE_CUBE, cube_time),
             (ROLE_VECTOR, (vec / vec_rate) if (vec > 0.0 and vec_rate > 0.0) else 0.0),
             (ROLE_MEMORY, (hbm / hbm_rate) if (hbm > 0.0 and hbm_rate > 0.0) else 0.0),
         )
@@ -772,7 +803,7 @@ def _dominant_role(op, *, stage_rates: Mapping[str, Any] | None = None) -> str:
             return best_role
     if link > 0:
         return ROLE_COMMUNICATION
-    if flops > 0:
+    if flops > 0 or bool(getattr(op, "matrix_flops", None) or metadata.get("matrix_flops")):
         return ROLE_CUBE
     if vec > 0:
         return ROLE_VECTOR
@@ -995,13 +1026,48 @@ def _precedence_bound(rows, external, start):
     }
 
 
+def _merge_replica_groups(
+    groups: Sequence[tuple[int, ...]],
+    extra_groups: Sequence[tuple[int, ...]],
+) -> list[tuple[int, ...]]:
+    """Merge replica groups into connected components closed under ``extra_groups``."""
+    parent: dict[int, int] = {}
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> None:
+        ra, rb = find(left), find(right)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for grp in (*groups, *extra_groups):
+        if not grp:
+            continue
+        first = int(grp[0])
+        parent.setdefault(first, first)
+        for member in grp[1:]:
+            node = int(member)
+            parent.setdefault(node, node)
+            union(first, node)
+    buckets: dict[int, list[int]] = {}
+    for node in sorted(parent):
+        buckets.setdefault(find(node), []).append(node)
+    return [tuple(members) for members in buckets.values()]
+
+
 def _prepare_graphs(case, ops, book, replay_scope, external):
+    from .execution.operator_replay import _collective_participant_replicas
     from .operator_analysis import _replay_scope
+    from .topology import Topology
+
     graphs = {r: tuple(book.expand(items)) for r, items in
               (ops.items() if isinstance(ops, Mapping) else ((0, ops),))}
     graphs = bind_cohort_traffic(case, graphs)
     from .sharding.local_tp import lower_local_projection_tp_cohort
-    from .sharding.local_tp import local_tp_spans_dp
     if len(graphs) > 1:
         graphs = lower_local_projection_tp_cohort(
             graphs, model=case.model, runtime=case.runtime, machine=case.machine)
@@ -1018,20 +1084,30 @@ def _prepare_graphs(case, ops, book, replay_scope, external):
     for items in graphs.values():
         _validate_graph(items, external)
     groups = cohorts(case.runtime.parallel, case.machine)
-    group_for = {r: group for group in groups for r in group}
+    topology = Topology(case.machine, case.runtime.parallel)
+    cross_dp_links: list[tuple[int, ...]] = []
     for r, items in graphs.items():
-        if case.runtime.parallel.ep_spans_dp and any(
-            dict(op.metadata).get("group_axis") == "ep" for op in items
-        ) and set(group_for[r]) - graphs.keys():
-            raise ValueError("graph_expert_collective_requires_complete_cohort")
-        if local_tp_spans_dp(case.runtime.parallel) and any(
-            dict(op.metadata).get("group_axis") == "local_tp" for op in items
-        ) and set(group_for[r]) - graphs.keys():
-            raise ValueError("graph_local_tp_collective_requires_complete_cohort")
-        if case.runtime.parallel.cp_spans_dp and any(
-            dict(op.metadata).get("group_axis") in {"cp", "dcp_dp", "dcp_a2a"} for op in items
-        ) and set(group_for[r]) - graphs.keys():
-            raise ValueError("graph_cp_collective_requires_complete_cohort")
+        for op in items:
+            if not op.metadata:
+                continue
+            axis = dict(op.metadata).get("group_axis")
+            if not axis:
+                continue
+            participants = _collective_participant_replicas(topology, op, r)
+            if len(participants) <= 1:
+                continue
+            if set(participants) - graphs.keys():
+                if axis == "ep":
+                    raise ValueError("graph_expert_collective_requires_complete_cohort")
+                if axis == "local_tp":
+                    raise ValueError("graph_local_tp_collective_requires_complete_cohort")
+                if axis in {"cp", "dcp_dp", "dcp_a2a"}:
+                    raise ValueError("graph_cp_collective_requires_complete_cohort")
+                raise ValueError("graph_collective_requires_complete_cohort")
+            cross_dp_links.append(participants)
+    if cross_dp_links:
+        groups = _merge_replica_groups(groups, cross_dp_links)
+    group_for = {r: group for group in groups for r in group}
     return graphs, scopes, replay_scope, groups, group_for
 
 
@@ -1361,13 +1437,12 @@ def _build_cohort_probe_observer(
 
 
 def _finalize_run_graph_artifacts(
-    case, execution, engine, records, graphs, *, fast_span_only, timeline_replicas,
-    cp_spans, non_observed_peer_events, group_for, replica_observer,
+    execution, engine, records, graphs, *, fast_span_only, timeline_replicas,
     layer_events_by_replica, non_body_by_replica, tracked_by_replica,
     cohort_probe_order, replica_snaps, global_snaps, initial_snap,
-    cohort_layer_deltas_out, filtered_non_barrier, layer_ops_seen=None,
+    cohort_layer_deltas_out, layer_ops_seen=None,
 ):
-    skipped_occurrences = filtered_non_barrier
+    skipped_occurrences = 0
     dedup_cohorts = getattr(execution, "_dedup_cohorts", None)
     if not fast_span_only and dedup_cohorts:
         from .runtime.dp_cohort_dedup import expand_dedup_graph_artifacts
@@ -1399,18 +1474,6 @@ def _finalize_run_graph_artifacts(
             initial_snap, obs_reps, fast_span_only=fast_span_only,
             layer_ops_seen=layer_ops_seen,
         ))
-    if non_observed_peer_events and group_for is not None:
-        from .topology import Topology
-        topology = Topology(case.machine, case.runtime.parallel) if cp_spans else None
-        for op, replica, ready, axis in non_observed_peer_events:
-            meta = dict(op.metadata) if op.metadata else {}
-            if axis == "ep":
-                grp = group_for[replica]
-            elif axis == "local_tp":
-                grp = tuple(meta.get("group_ranks") or group_for[replica])
-            else:
-                grp = _dcp_replica_subgroup(topology, axis, replica, op.stage, meta, group_for[replica])
-            replica_observer.record_peer_readiness((grp, op.op_id), replica, ready.time)
     return skipped_occurrences
 
 
@@ -1448,46 +1511,12 @@ def _run_graph(
     from .runtime.exposed_observer import ExposedObserver
 
     records, streams = [], {}
-    filter_at_observe = timeline_replicas is not None and not compact
-    observe_replicas = (
-        (frozenset(timeline_replicas) | {group[0] for group in groups if group[0] in graphs})
-        if (filter_at_observe and len(graphs) > 1)
-        else (timeline_replicas if filter_at_observe else None)
-    )
-    replica_observer = ExposedObserver(observed_replicas=observe_replicas)
-    filtered_non_barrier = 0
-    ep_spans = bool(case.runtime.parallel.ep_spans_dp)
-    from .sharding.local_tp import local_tp_spans_dp
-    ltp_spans = bool(local_tp_spans_dp(case.runtime.parallel))
-    cp_spans = bool(case.runtime.parallel.cp_spans_dp)
-    cross_dp_axes = (
-        ({"ep"} if ep_spans else set())
-        | ({"local_tp"} if ltp_spans else set())
-        | ({"cp", "dcp_dp", "dcp_a2a"} if cp_spans else set())
-    )
-    non_observed_peer_events: list[tuple[Any, int, Any, str]] = []
+    # Retain all executed replicas in internal records so asymmetric critical-path
+    # attribution stays independent of display timeline_replicas; symmetric DP
+    # cohorts still skip peer expansion in expand_dedup_graph_artifacts.
+    replica_observer = ExposedObserver(observed_replicas=None)
 
     def observe(op, replica, program, ready, complete):
-        nonlocal filtered_non_barrier
-        if filter_at_observe and not replica_observer.should_retain_replica(replica):
-            if op.family != "barrier":
-                filtered_non_barrier += 1
-            if cross_dp_axes:
-                meta = dict(op.metadata) if op.metadata else {}
-                axis = meta.get("group_axis")
-                if axis in cross_dp_axes:
-                    if isolated:
-                        key = _name(replica, op.op_id)
-                        records.append({
-                            "id": key, "op": op, "replica": replica, "program": program,
-                            "predecessors": tuple(_name(replica, dep) for dep in op.deps),
-                            "ready": ready, "complete": complete,
-                            "collective_algorithm": getattr(book.select(op), "algorithm", None),
-                            "_peer_only": True,
-                        })
-                    else:
-                        non_observed_peer_events.append((op, replica, ready, str(axis)))
-            return
         key = _name(replica, op.op_id)
         stream = replica, op.stage, op.stream or "main"
         predecessors = [_name(replica, dep) for dep in op.deps]
@@ -1565,59 +1594,46 @@ def _run_graph(
     if l2_fingerprints is not None:
         l2_fingerprints["after"] = _l2_residency_digest(engine)
     skipped_occurrences = _finalize_run_graph_artifacts(
-        case, execution, engine, records, graphs, fast_span_only=fast_span_only,
-        timeline_replicas=timeline_replicas, cp_spans=cp_spans,
-        non_observed_peer_events=non_observed_peer_events, group_for=group_for,
-        replica_observer=replica_observer,
+        execution, engine, records, graphs, fast_span_only=fast_span_only,
+        timeline_replicas=(None if isolated else timeline_replicas),
         layer_events_by_replica=layer_events_by_replica,
         non_body_by_replica=non_body_by_replica,
         tracked_by_replica=tracked_by_replica,
         cohort_probe_order=cohort_probe_order, replica_snaps=replica_snaps,
         global_snaps=global_snaps, initial_snap=initial_snap,
         cohort_layer_deltas_out=cohort_layer_deltas_out,
-        filtered_non_barrier=filtered_non_barrier,
         layer_ops_seen=layer_ops_seen,
     )
     return execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer
 
 
-def _dcp_replica_subgroup(topology, axis, replica, stage, meta, fallback):
-    """Map one op's physical DCP collective group to its participating DP replicas."""
-    groups = topology.groups(axis, replica, stage, metadata=meta)
-    ranks = {int(rk) for group in groups for rk in group}
-    if not ranks:
-        return fallback
-    matched = tuple(
-        r for r in fallback
-        if any(int(rk) in ranks for rk in topology.ranks(r, stage))
-    )
-    return matched or fallback
-
-
 def _bind_collective_readiness(case, records, group_for, execution, replica_observer=None):
-    from .sharding.local_tp import local_tp_spans_dp
+    from .execution.operator_replay import _collective_participant_replicas
     from .topology import Topology
 
     # Aggregate recipes retain their rendezvous. Causal transport plans retain
     # rank entry and round dependencies instead of one all-cohort ready gate.
     joins = {}
-    has_ltp = local_tp_spans_dp(case.runtime.parallel)
-    has_cp_dp = bool(case.runtime.parallel.cp_spans_dp)
-    topology = Topology(case.machine, case.runtime.parallel) if has_cp_dp else None
-    if case.runtime.parallel.ep_spans_dp or has_ltp or has_cp_dp:
-        for record in records:
-            op, r = record["op"], record["replica"]
-            meta = dict(op.metadata)
-            axis = meta.get("group_axis")
-            if case.runtime.parallel.ep_spans_dp and axis == "ep":
-                joins.setdefault((group_for[r], op.op_id), []).append(record)
-            elif has_ltp and axis == "local_tp":
-                grp = tuple(meta.get("group_ranks") or group_for[r])
-                joins.setdefault((grp, op.op_id), []).append(record)
-            elif has_cp_dp and axis in {"cp", "dcp_dp", "dcp_a2a"}:
-                grp = _dcp_replica_subgroup(
-                    topology, axis, r, op.stage, meta, group_for[r])
-                joins.setdefault((grp, op.op_id), []).append(record)
+    topology = getattr(execution, "topology", None)
+    for record in records:
+        op, r = record["op"], record["replica"]
+        if not op.metadata:
+            continue
+        meta = dict(op.metadata)
+        axis = meta.get("group_axis")
+        if not axis:
+            continue
+        if topology is None:
+            topology = Topology(case.machine, case.runtime.parallel)
+        participants = _collective_participant_replicas(topology, op, r)
+        if len(participants) <= 1:
+            continue
+        grp = (
+            tuple(meta["group_ranks"])
+            if axis == "local_tp" and meta.get("group_ranks")
+            else participants
+        )
+        joins.setdefault((grp, op.op_id), []).append(record)
     for join_key, participants in joins.items():
         if all(item["collective_algorithm"] for item in participants):
             for item in participants:
@@ -1828,9 +1844,35 @@ def _accumulate_compact_record(profile, record, ready_ms, complete_ms, elapsed,
     family_rank["complete_ms"] = max(family_rank["complete_ms"], complete_ms)
 
 
-def _graph_operator_rows(records, duration, compact, isolated, durations, warm_durations, stream_plans):
+def _annotate_isolated_precedence(records, durations, warm_durations, stream_plans):
+    """Populate isolated and warm-admissible precedence times on every DAG record."""
     from .operator_analysis import physical_id
-    cold_roots = _compulsory_cold_roots(records) if isolated else frozenset()
+
+    cold_roots = _compulsory_cold_roots(records)
+    for record in records:
+        op, r = record["op"], record["replica"]
+        if record.get("joint_collective"):
+            record["isolated_ms"] = record["joint_isolated_ms"]
+            record["precedence_ms"] = 0
+            continue
+        op_stream = (op.stream or "main") if stream_plans else ""
+        key = (r, op.stage, physical_id(op), op_stream)
+        cold_ms = 0 if op.family == "barrier" else durations[key]
+        record["isolated_ms"] = cold_ms
+        if op.family != "barrier" and record["id"] not in cold_roots:
+            warm_ms = warm_durations.get(key, cold_ms)
+            if warm_ms + 1e-12 < cold_ms:
+                record["precedence_ms"] = warm_ms
+    return cold_roots
+
+
+def _graph_operator_rows(
+    records, duration, compact, isolated, durations, warm_durations, stream_plans,
+    *, cold_roots=None,
+):
+    from .operator_analysis import physical_id
+    if cold_roots is None:
+        cold_roots = _compulsory_cold_roots(records) if isolated else frozenset()
     profile = None
     if compact:
         profile = {
@@ -2011,6 +2053,32 @@ def _record_native_bridge(case, records, execution_summary, profile):
         }
 
 
+def _critical_exposed_replica(graphs, records, steps) -> int:
+    """Select the latest-completing observed replica (lowest ID on ties)."""
+    observed_end: dict[int, float] = {}
+    non_barrier: set[int] = set()
+    for record in records:
+        if record.get("_peer_only"):
+            continue
+        rep = int(record["replica"])
+        end_ms = float(record["complete"].time)
+        prev = observed_end.get(rep)
+        if prev is None or end_ms > prev:
+            observed_end[rep] = end_ms
+        if record["op"].family != "barrier":
+            non_barrier.add(rep)
+    candidates = non_barrier or set(observed_end)
+    if not candidates:
+        return min(graphs)
+
+    def _rank_key(rep: int) -> tuple[float, int]:
+        step = steps.get(rep) if steps else None
+        end_ms = float(step.completion.time) if step is not None else observed_end[rep]
+        return (end_ms, -rep)
+
+    return max(candidates, key=_rank_key)
+
+
 def _assemble_graph_result(
     case, graphs, records, steps, execution, engine, rows, profile,
     resources, head, *, compact, isolated, costs, isolated_sum,
@@ -2051,8 +2119,7 @@ def _assemble_graph_result(
                 key: tuple(spans) for key, spans in evicted_spans.items()
             }
     if graphs:
-        observed_reps = {record["replica"] for record in records if not record.get("_peer_only")}
-        exposed_rep = min(graphs) if (not observed_reps or min(graphs) in observed_reps) else min(observed_reps)
+        exposed_rep = _critical_exposed_replica(graphs, records, steps)
         result.update(_exposed_breakdown(
             records, duration, input_ready_ms, exposed_rep,
             stage_rates_by_key=_stage_role_rates(execution)))
@@ -2060,8 +2127,7 @@ def _assemble_graph_result(
         result.update(unavailable_breakdown(
             "exposed_operator_intervals_missing", boundary="device_step"))
     if isolated:
-        path = _precedence_bound(records if compact else rows,
-                                 external_times, input_ready_ms)
+        path = _precedence_bound(records, external_times, input_ready_ms)
         capacity_bound = max((row["capacity_bound_ms"] for row in resources), default=0)
         result["isolated"] = {
             "boundary": "sum_of_isolated_device_programs",
@@ -2192,8 +2258,7 @@ def _attach_cohort_graph_metadata(
         }
     if not cohort_layer_deltas:
         return assembled
-    observed_reps = {record["replica"] for record in records if not record.get("_peer_only")}
-    exposed_rep = min(graphs) if (not observed_reps or min(graphs) in observed_reps) else min(observed_reps)
+    exposed_rep = _critical_exposed_replica(graphs, records, steps)
     stage_rates = _stage_role_rates(execution)
     for rep_key, delta_info in cohort_layer_deltas.items():
         rep_recs = [
@@ -2303,12 +2368,17 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     if isolated:
         costs, durations, warm_durations, isolated_sum, cohort_cache = _price_isolated_graph(
             case, graphs, joins, scopes, book, primitives, ctx, stream_plans)
+    cold_roots = (
+        _annotate_isolated_precedence(records, durations, warm_durations, stream_plans)
+        if isolated else frozenset()
+    )
     row_records = (
         [record for record in records if not record.get("_peer_only") and record["replica"] in keep_replicas]
         if (keep_replicas is not None and not compact) else records
     )
     rows, profile = _graph_operator_rows(
         row_records, duration, compact, isolated, durations, warm_durations, stream_plans,
+        cold_roots=cold_roots,
     )
     isolated_profile = None
     if compact and isolated:

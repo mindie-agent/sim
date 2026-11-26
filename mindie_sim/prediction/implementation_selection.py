@@ -249,18 +249,26 @@ def resolve(runtime, views, *, padded_tokens, replay_scope, global_views=None,
     bindings = runtime.kernels.get("lowerings", {})
     if not any(is_policy(raw) for raw in bindings.values()):
         return runtime, ()
+    valid_views = tuple(view for view in views if not getattr(view, "padding", False))
+    phase_views = (
+        valid_views
+        or tuple(view for view in (global_views or ()) if not getattr(view, "padding", False))
+        or views
+        or global_views
+        or ()
+    )
     geometry = {
-        "phases": sorted({view.phase for view in (views or global_views or ())}),
-        "valid_tokens": sum(view.q_len for view in views),
+        "phases": sorted({view.phase for view in phase_views}),
+        "valid_tokens": sum(view.q_len for view in valid_views),
         "padded_tokens": padded_tokens,
-        "sequences": len(views),
-        "min_query_tokens": min((view.q_len for view in views), default=0),
-        "max_query_tokens": max((view.q_len for view in views), default=0),
-        "max_context_tokens": max((view.context for view in views), default=0),
+        "sequences": len(valid_views),
+        "min_query_tokens": min((view.q_len for view in valid_views), default=0),
+        "max_query_tokens": max((view.q_len for view in valid_views), default=0),
+        "max_context_tokens": max((view.context for view in valid_views), default=0),
         # Dense paged-MLA source kernels apply their split-core tile only from a
         # declared page-aligned context; the minimum keeps that a domain match
         # instead of a planner exception on short contexts.
-        "min_context_tokens": min((view.context for view in views), default=0),
+        "min_context_tokens": min((view.context for view in valid_views), default=0),
         "replay_scope": replay_scope,
         "model_scope": model_scope,
     }

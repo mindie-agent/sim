@@ -380,7 +380,9 @@ def _gqa_tiles(case, layers, tokens=1):
     a capacity policy, not a prediction of the vendor's tiling dispatch.
     """
     qb = dtype_bytes(case.model.activation_dtype)
-    kb = _kv_cache_element_bytes(case.model.quant.kv_dtype)
+    kv_dtype_norm = str(case.model.quant.kv_dtype or "").strip().lower()
+    kb = _kv_cache_element_bytes(kv_dtype_norm)
+    kv_needs_conv = kv_dtype_norm in _QUANTIZED_GQA_KV_DTYPES or kb != qb
     tp = max(case.runtime.parallel.tp, 1)
     cores = min((d.compute_units for d in case.machine.dies), default=0)
     is_a5 = case.machine.arch_family == "A5"
@@ -392,14 +394,22 @@ def _gqa_tiles(case, layers, tokens=1):
             fits = True
             for layer in layers:
                 dim = layer.head_dim
+                v_dim = int(getattr(layer, "v_head_dim", 0) or 0) or dim
+                max_dim = max(dim, v_dim)
+                kv_operand_bytes = max(kb, qb)
+                ub_conv_bytes = (
+                    2 * (key * max_dim * (kb + qb) + key * GQA_SCORE_ACCUM_BYTES)
+                    if kv_needs_conv else 0
+                )
                 sizes = {
-                    "l1": query * dim * qb + 2 * key * dim * kb,
+                    "l1": query * dim * qb + 2 * key * max_dim * kv_operand_bytes,
                     "l0a": query * dim * qb + 2 * query * key * qb,
-                    "l0b": 2 * key * dim * kb,
-                    "l0c": 2 * query * max(key, dim) * GQA_SCORE_ACCUM_BYTES,
+                    "l0b": 2 * key * max_dim * kv_operand_bytes,
+                    "l0c": 2 * query * max(key, v_dim) * GQA_SCORE_ACCUM_BYTES,
                     "ub": (
-                        query * (dim * GQA_SCORE_ACCUM_BYTES + GQA_ONLINE_STATS_BYTES)
+                        query * (v_dim * GQA_SCORE_ACCUM_BYTES + GQA_ONLINE_STATS_BYTES)
                         + 2 * query * key * GQA_SCORE_ACCUM_BYTES
+                        + ub_conv_bytes
                     ),
                 }
                 for die in case.machine.dies:

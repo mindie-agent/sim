@@ -314,3 +314,186 @@ def test_exact_mindie_sd_recipe_name_and_workspace_pool_fallbacks():
     hbm_stages = {s.name: s for s in plan.program(_context(prepared, CORE_NAMES, pool_names={"hbm": "hbm"}, pool_units={"hbm": 1})).stages}
     no_pool_stages = {s.name: s for s in plan.program(_context(prepared, CORE_NAMES, pool_names={}, pool_units={})).stages}
     assert hbm_stages["write_hidden_store"].acquire and not no_pool_stages["write_hidden_store"].acquire
+
+
+def test_aclnn_call_builders_honor_batched_seqlens_band_nz_stats_and_quant():
+    from mindie_sim.prediction.implementations import produced_values
+
+    # Padded BNSD decode honors actual_seq_lengths_kv rather than full KV tensor length.
+    padded_decode = build_aclnn_call({
+        "api": "aclnnFusedInferAttentionScore",
+        "tensors": {"query": [2, 1, 1, 64], "key": [2, 1, 128, 64], "value": [2, 1, 128, 64]},
+        "attrs": {"input_layout": "BNSD", "num_heads": 1, "actual_seq_lengths_kv": [1, 3]},
+    }).ops[0]
+    assert int(padded_decode.flops) == 2 * (64 + 64) * (1 + 3)
+
+    # Sparse band mode (sparse_mode=4) prices exact pre_tokens/next_tokens window and touched KV rows.
+    band_tensors = {k: [1, 1, 128, 64] for k in ("query", "key", "value")}
+    band_tensors["atten_mask"] = {"shape": [2048, 2048], "dtype": "bool"}
+    band_op = build_aclnn_call({
+        "api": "aclnnFusedInferAttentionScore",
+        "tensors": band_tensors,
+        "attrs": {"input_layout": "BNSD", "num_heads": 1, "sparse_mode": 4,
+                  "pre_tokens": 1, "next_tokens": 0},
+    }).ops[0]
+    assert int(band_op.flops) == (1 + 127 * 2) * 2 * (64 + 64)
+    wide_band = build_aclnn_call({
+        "api": "aclnnFusedInferAttentionScore",
+        "tensors": {"query": [1, 1, 128, 64], "key": [1, 1, 4096, 64], "value": [1, 1, 4096, 64]},
+        "attrs": {"input_layout": "BNSD", "num_heads": 1, "sparse_mode": 4,
+                  "pre_tokens": 127, "next_tokens": 0},
+    }).ops[0]
+    assert int(wide_band.mte2_bytes) == (128 + 2 * 255) * 64 * 2
+
+    # FRACTAL_NZ weight layout decodes 4D fractal tiles, propagates layout, and dtype-only out still works.
+    nz_op = build_aclnn_call({
+        "api": "aclnnMatmulWeightNz",
+        "tensors": {
+            "x": {"shape": [16, 16], "dtype": "bf16"},
+            "weight": {"shape": [2, 1, 16, 16], "dtype": "bf16", "layout": "FRACTAL_NZ"},
+            "out": {"shape": [16, 17], "dtype": "bf16"},
+        },
+    }).ops[0]
+    assert nz_op.local_shape == (16, 17, 16)
+    assert dict(nz_op.metadata).get("weight_layout") == "FRACTAL_NZ"
+    assert int(nz_op.flops) == 2 * 16 * 17 * 16
+    assert int(nz_op.mte3_bytes) == 16 * 17 * 2
+    dtype_only_out = build_aclnn_call({
+        "api": "aclnnMatmul", "m": 16, "n": 16, "k": 16,
+        "tensors": {"out": {"dtype": "bf16"}},
+    }).ops[0]
+    assert dtype_only_out.local_shape == (16, 16, 16) and dtype_only_out.dtype == "bf16"
+
+    # FlashAttentionScore includes and publishes mandatory FP32 softmaxMaxOut and softmaxSumOut.
+    fa_op = build_aclnn_call({
+        "api": "aclnnFlashAttentionScore",
+        "tensors": {"query": [1, 1, 16, 64], "key": [1, 1, 16, 64], "value": [1, 1, 16, 64]},
+        "attrs": {"input_layout": "BNSD", "num_heads": 1},
+    }).ops[0]
+    assert int(fa_op.mte3_bytes) == 16 * 64 * 2 + 2 * 16 * 8 * 4
+    assert fa_op.returns == ("softmax_max", "softmax_sum")
+    assert [v["output"] for v in produced_values(fa_op)] == ["output", "softmax_max", "softmax_sum"]
+
+    # DynamicQuant accounts for smoothScalesOptional reads/ops, INT4 width, and published row scale.
+    dq_unsmoothed = build_aclnn_call({
+        "api": "aclnnDynamicQuant",
+        "tensors": {"x": {"shape": [1, 128], "dtype": "bf16"}, "y": {"shape": [1, 128], "dtype": "int4"}},
+    }).ops[0]
+    dq_op = build_aclnn_call({
+        "api": "aclnnDynamicQuant",
+        "tensors": {
+            "x": {"shape": [1, 128], "dtype": "bf16"},
+            "smoothScalesOptional": {"shape": [128], "dtype": "bf16"},
+            "y": {"shape": [1, 128], "dtype": "int4"},
+        },
+    }).ops[0]
+    assert (int(dq_op.mte2_bytes), int(dq_op.mte3_bytes)) == ((128 + 128) * 2, 128 // 2 + 4)
+    assert dq_op.vector_ops - dq_unsmoothed.vector_ops == pytest.approx(128.0)
+    assert dq_op.returns == ("activation_scales",)
+    assert [(v["output"], v["dtype"]) for v in produced_values(dq_op)] == [("payload", "int4"), ("activation_scales", "fp32")]
+
+
+def test_feedforward_shared_overlap_tp_pack_situ_quant_and_padding_selection():
+    from _support.axes import REPRESENTATIVE_SKUS
+    from _support.hardware import sku_case
+    from _support.operator_cases import declared_case
+    from mindie_sim import graph_costs, target_operators
+    from mindie_sim.catalog.quant import quant_preset
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.prediction.implementations import produced_values
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    # Single-device shared-expert overlap keeps producer before join consumer.
+    single = declared_case()
+    single["model"].update(
+        layers=1, ffn="moe", num_experts=4, top_k=2,
+        num_shared_experts=1, moe_intermediate_size=32,
+    )
+    single["runtime"]["multistream_overlap_shared_expert"] = True
+    overlap_ops = target_operators(
+        single, scope="body", phase="decode", tokens=1, context=8, resource_fusion=False,
+    )
+    ids = {op.op_id for op in overlap_ops}
+    ext = {dep: 0 for op in overlap_ops for dep in op.deps if dep not in ids}
+    order = {op.op_id: i for i, op in enumerate(overlap_ops)}
+    assert not [(order[d], order[o.op_id]) for o in overlap_ops for d in o.deps if d in order and order[d] > order[o.op_id]]
+    assert graph_costs(single, overlap_ops, external_inputs=ext, isolated=False)["duration_ms"] > 0.0
+
+    # TP route packing bills each physical rank by TP lane even under permuted EP rank_table.
+    tp_moe = declared_case(tp=2, ep=2)
+    tp_moe["model"].update(layers=1, ffn="moe", num_experts=4, top_k=2, moe_intermediate_size=32)
+    tp_moe["runtime"]["kernels"] = {
+        "moe_token_partition": {"kind": "vllm_ascend_mc2_tp_slice", "padding": "right_to_tp"},
+    }
+    for rank in (0, 1):
+        ops = target_operators(
+            tp_moe, scope="model", phase="prefill", tokens=3,
+            physical_rank=rank, apply_body_defaults=False,
+        )
+        pack = next(op for op in ops if op.recipe == "route_pack")
+        rows = dict(pack.metadata)["moe_token_partition"]["valid_rows_per_rank"][rank]
+        assert (int(pack.vector_ops), int(pack.mte2_bytes)) == (2 * rows, 72 * rows)
+    tp_moe_perm = {**tp_moe, "runtime": {**tp_moe["runtime"], "rank_table": [[1, 0]]}}
+    perm_ops = target_operators(
+        tp_moe_perm, scope="model", phase="prefill", tokens=3,
+        physical_rank=0, apply_body_defaults=False,
+    )
+    perm_pack = next(op for op in perm_ops if op.recipe == "route_pack")
+    assert (int(perm_pack.vector_ops), int(perm_pack.mte2_bytes)) == (4, 144)
+
+    # Shipping quantized SiTU binds fused INT8+FP32 only when fused and scale geometry matches.
+    situ_case = parse_case(sku_case(REPRESENTATIVE_SKUS["a3"]))
+    layer_plan = replace(situ_case.model.layer_plans[0], ffn_activation="situ", intermediate_size=128)
+    situ_model = replace(
+        situ_case.model, intermediate_size=128, layers=1,
+        layer_plans=(layer_plan,), quant=quant_preset("w8a8_int8"),
+    )
+    situ_case = replace(
+        situ_case, model=situ_model,
+        runtime=replace(situ_case.runtime, metadata=(("arch_family", "A3"),)),
+    )
+    situ_ops = target_operators(
+        situ_case, phase="decode", tokens=1, context=4, scope="body", apply_body_defaults=False,
+    )
+    situ_op = next(op for op in situ_ops if op.family == "situ")
+    assert tuple(v["dtype"] for v in produced_values(situ_op)) == ("int8", "fp32")
+    assert situ_op.mte3_bytes == pytest.approx(132.0)
+    assert [op.op_id for op in situ_ops if situ_op.op_id in op.deps] == ["s0.l0.down"]
+
+    eager_situ = replace(
+        situ_case,
+        runtime=replace(situ_case.runtime, metadata=(("arch_family", "A3"), ("raw_eager", True))),
+    )
+    eager_ops = target_operators(
+        eager_situ, phase="decode", tokens=1, context=4, scope="body", apply_body_defaults=False,
+    )
+    eager_cast = next(op for op in eager_ops if op.op_id == "s0.l0.situ")
+    assert eager_cast.mte3_bytes == pytest.approx(256.0)
+    assert dict(eager_cast.metadata).get("activation_abi_shipping") is False
+    assert any(op.op_id == "s0.l0.down.quantize" and op.family == "quantize" for op in eager_ops)
+
+    grouped_quant = replace(quant_preset("w8a8_int8"), activation_group_size=128)
+    grouped_layer = replace(situ_case.model.layer_plans[0], ffn_activation="situ", intermediate_size=512)
+    grouped_case = replace(
+        situ_case,
+        model=replace(situ_case.model, intermediate_size=512, layers=1, layer_plans=(grouped_layer,), quant=grouped_quant),
+    )
+    grouped_ops = target_operators(
+        grouped_case, phase="decode", tokens=1, context=4, scope="body", apply_body_defaults=False,
+    )
+    assert any(op.op_id == "s0.l0.down.quantize" and "s0.l0.situ" in op.deps for op in grouped_ops)
+
+    # Padding RequestViews do not inflate valid_tokens during implementation policy selection.
+    rule = {"cases": [{"domain": {"valid_tokens": {"max": 1}}, "binding": "vllm_ascend_native_norm"}], "otherwise": "error"}
+    sel_raw = declared_case()
+    sel_raw["model"]["layers"] = 1
+    sel_raw["runtime"].update(lowering_passes=["residual_norm"], kernels={"lowerings": {"add_rmsnorm": rule}})
+    sel_case = parse_case(sel_raw)
+    active_view = RequestView("a", 1, 32, True, "decode")
+    pad_view = RequestView("pad", 1, 0, False, "decode", padding=True)
+    for views in ((active_view,), (active_view, pad_view)):
+        plan = IterationPlan(views)
+        work = Frontend()(plan, sel_case.model, sel_case.runtime, sel_case.machine)
+        assert plan.valid_tokens == 1
+        assert any(op.family == "add_rmsnorm" for op in work.ops)
