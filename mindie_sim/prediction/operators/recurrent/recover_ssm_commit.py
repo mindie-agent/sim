@@ -790,6 +790,22 @@ def _kda_split_work(
     return ord_work, bnd_work
 
 
+def _resolve_conv_history_len(metadata: Mapping[str, Any]) -> int:
+    """Resolve KDA short-conv history length (``conv_kernel - 1``) from intent metadata."""
+    geometry = _geometry(metadata)
+    raw_hist = metadata.get("conv_history_len")
+    if raw_hist is None:
+        raw_hist = geometry.get("conv_history_len")
+    if raw_hist is not None:
+        return max(0, int(raw_hist))
+    raw_kernel = metadata.get("conv_kernel")
+    if raw_kernel is None:
+        raw_kernel = geometry.get("conv_kernel")
+    if raw_kernel is not None and int(raw_kernel) > 0:
+        return max(0, int(raw_kernel) - 1)
+    return KDA_CONV_DEFAULT_HISTORY_LEN
+
+
 def _build_shared_kda_plan_and_conv(
     *,
     stage: int,
@@ -807,6 +823,7 @@ def _build_shared_kda_plan_and_conv(
     readiness: str,
     metadata: Mapping[str, Any],
     group_suffix: str = "",
+    boundary_count: int = 0,
 ) -> tuple[OpSpec, OpSpec]:
     """Emit stage-shared ``_prepare_commit_plan_kernel`` and ``_compact_conv_state_kernel``."""
     batch = max(1, len(requests))
@@ -834,9 +851,12 @@ def _build_shared_kda_plan_and_conv(
             ("recover_ssm_stage", "commit_plan"),
         ),
     )
-    conv_dim = int(metadata.get("conv_dim") or (heads * (dk * 2 + dv)))
-    conv_hist = int(metadata.get("conv_history_len") or KDA_CONV_DEFAULT_HISTORY_LEN)
-    conv_elems = active_count * num_layers * conv_dim * conv_hist
+    geometry = _geometry(metadata)
+    conv_dim = int(metadata.get("conv_dim") or geometry.get("conv_dim") or (heads * (dk * 2 + dv)))
+    conv_hist = _resolve_conv_history_len(metadata)
+    eff_boundary_count = max(0, int(boundary_count)) if align_mode else 0
+    conv_copies = active_count + eff_boundary_count
+    conv_elems = conv_copies * num_layers * conv_dim * conv_hist
     conv_bytes = float(conv_elems * KDA_CONV_ELEMENT_BYTES)
     conv_kb = KernelBinding(
         kernel_id=KDA_CONV_COMPACT_KERNEL_NAME, backend=COMMIT_KERNEL_BACKEND,
@@ -856,6 +876,7 @@ def _build_shared_kda_plan_and_conv(
         recipe="kda_compact_conv_state", dtype="bf16",
         source_boundary="", kernel_binding=conv_kb,
         metadata=(
+            ("align_boundary_triggered", eff_boundary_count),
             ("align_mode", align_mode),
             ("conv_dim", conv_dim),
             ("conv_history_len", conv_hist),
@@ -1125,6 +1146,7 @@ def _materialize_shared_kda_group(
         verify_deps=verify_deps, num_layers=num_layers, active_count=total_active,
         heads=heads, dk=dk, dv=dv, align_mode=align_mode, arch_family=arch_family,
         readiness=readiness, metadata=first_meta, group_suffix=group_suffix,
+        boundary_count=bnd_count,
     )
     out_ops: list[OpSpec] = [plan_op, conv_op]
     commit_deps = tuple(dict.fromkeys((plan_op.op_id, conv_op.op_id, *verify_deps)))
@@ -1574,8 +1596,10 @@ def bind_recover_ssm_commits(
             g_dv = int(geometry.get("dv", metadata.get("dv", 1)))
             g_sdtype = str(geometry.get("state_dtype", metadata.get("state_dtype", "fp32")))
             g_kg = str(geometry.get("kg_dtype", metadata.get("record_kg_dtype", "bf16")))
+            g_conv_hist = _resolve_conv_history_len(metadata) if fam == "kda" else 0
+            g_conv_dim = int(metadata.get("conv_dim") or geometry.get("conv_dim") or (g_heads * (g_dk * 2 + g_dv))) if fam == "kda" else 0
             kda_groups.setdefault(
-                (int(op.stage), _scope(metadata), fam, g_heads, g_dk, g_dv, g_sdtype, g_kg), []
+                (int(op.stage), _scope(metadata), fam, g_heads, g_dk, g_dv, g_sdtype, g_kg, g_conv_hist, g_conv_dim), []
             ).append(idx)
 
     stage_group_counts: dict[tuple[int, str], int] = {}

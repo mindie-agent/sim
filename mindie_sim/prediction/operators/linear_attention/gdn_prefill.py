@@ -90,6 +90,27 @@ PCP_HUPDATE_DIAG_HALVES = 2
 STATE_BLOCK_ELEMENTS = 1024
 
 
+def resolve_pcp_rank(parallel, physical_rank, *, machine=None, stage=None) -> int | None:
+    """Resolve the logical PCP lane of ``physical_rank`` via ``RankCoord.pcp_lane``."""
+    del stage
+    if physical_rank is None or int(parallel.pcp) <= 1:
+        return None
+    rank = int(physical_rank)
+    if machine is not None:
+        from mindie_sim.schema.common import ModelingError
+        from mindie_sim.schema.parallel import GlobalRank
+
+        try:
+            return machine.validate_placement(parallel).coord_for_physical_rank(
+                GlobalRank(rank)
+            ).pcp_lane
+        except ModelingError:
+            pass
+    tp = max(1, int(parallel.tp))
+    pcp = int(parallel.pcp)
+    return (rank % (tp * pcp)) // tp
+
+
 def pcp_gdn_prefix_work(
     *, n_pf: int, tokens: int, chunks: int, chunk: int, heads: int,
     dk: int, dv: int, pcp: int, act_dtype: str = "bf16",
@@ -328,13 +349,14 @@ def _lower_gdn_pcp_prefix_sync(
         n_pf=n_pf, tokens=scan_tok, chunks=scan_chunks, chunk=scan_chunk,
         heads=scan_heads, dk=dk, dv=dv, pcp=pcp, act_dtype=b.model.activation_dtype,
     )
+    hupdate_family = "recurrent_scan" if scan_chunks > 0 else "tensor_fill"
     hupdate = b.work(
         "pcp_gdn_hupdate", tuple(composite.states), (n_pf, scan_heads, dk, dk),
         flops=pw["hupdate_flops"],
         matrix_flops=pw["hupdate_matrix_flops"],
         vector=pw["hupdate_vector"],
         read=pw["hupdate_read"], write=pw["hupdate_write"],
-        family="recurrent_scan", dtype="fp32",
+        family=hupdate_family, dtype="fp32",
         metadata=(
             ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
             ("tokens", scan_tok), ("heads", scan_heads),
@@ -364,17 +386,39 @@ def _lower_gdn_pcp_prefix_sync(
     )
     needs_rerun = pcp_rank is None or int(pcp_rank) > 0
     if needs_rerun:
-        final_state_op = b.work(
-            "pcp_gdn_fwd_h_rerun", (prefix_scan,), (scan_tok, scan_heads, dk, dv),
-            flops=float(2 * 2 * scan_tok * scan_heads * dk * dv),
-            vector=float(scan_chunks * 2 * scan_heads * dk * dv),
-            read=pw["st_bytes"], write=pw["st_bytes"], family="recurrent_scan", dtype="fp32",
-            metadata=(
-                ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
-                ("tokens", scan_tok), ("heads", scan_heads),
-                ("pcp_rank_gt_zero_rerun", True),
-            ) + scan_seq_meta,
-        )
+        if scan_chunks > 0:
+            act_bytes = int(dtype_bytes(b.model.activation_dtype))
+            rerun_read = (
+                pw["st_bytes"]
+                + float(scan_tok * scan_heads * ((2 * dk + dv) * act_bytes + FP32_BYTES))
+            )
+            rerun_write = (
+                pw["st_bytes"]
+                + float(scan_chunks * scan_heads * dk * dv * act_bytes)
+                + float(scan_tok * scan_heads * dv * act_bytes)
+            )
+            final_state_op = b.work(
+                "pcp_gdn_fwd_h_rerun", (prefix_scan,), (scan_tok, scan_heads, dk, dv),
+                flops=float(2 * 2 * scan_tok * scan_heads * dk * dv),
+                vector=float(scan_chunks * 2 * scan_heads * dk * dv),
+                read=rerun_read, write=rerun_write, family="recurrent_scan", dtype="fp32",
+                metadata=(
+                    ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
+                    ("tokens", scan_tok), ("heads", scan_heads),
+                    ("pcp_rank_gt_zero_rerun", True),
+                ) + scan_seq_meta,
+            )
+        else:
+            final_state_op = b.work(
+                "pcp_gdn_fwd_h_rerun", (prefix_scan,), (n_pf, scan_heads, dk, dv),
+                flops=0.0, vector=0.0,
+                read=pw["st_bytes"], write=pw["st_bytes"], family="tensor_copy", dtype="fp32",
+                metadata=(
+                    ("pcp", int(pcp)), ("chunks", 0), ("chunk", scan_chunk),
+                    ("tokens", 0), ("heads", scan_heads),
+                    ("pcp_rank_gt_zero_rerun", True),
+                ),
+            )
         for def_op in deferred_ops:
             if any(d in state_set for d in def_op.deps):
                 new_deps = tuple(dict.fromkeys(
@@ -774,7 +818,7 @@ def _lower_prefill_convolution(b, tensors, *, parallel, ordered, prefill, decode
 
 def _lower_idle_prefill_pcp_collectives(
     b, *, root_dep, prefill, model, plan, parallel, heads, dk, dv, width,
-    emit_conv_tail: bool,
+    emit_conv_tail: bool, pcp_rank=None,
 ) -> str | None:
     """Join PCP prefill collectives for live prefill slots that own 0 local tokens."""
     pcp = int(parallel.pcp)
@@ -831,7 +875,7 @@ def _lower_idle_prefill_pcp_collectives(
         "pcp_gdn_hupdate", (kv_transpose,), (n_pf, heads, dk, dk),
         flops=pw["hupdate_flops"], matrix_flops=pw["hupdate_matrix_flops"],
         vector=pw["hupdate_vector"], read=pw["hupdate_read"], write=pw["hupdate_write"],
-        family="recurrent_scan", dtype="fp32",
+        family="tensor_fill", dtype="fp32",
         metadata=(("pcp", pcp), ("chunks", 0), ("chunk", GDN_CHUNK64_TOKENS),
                   ("tokens", 0), ("heads", heads),
                   ("source", "ops/triton/fla/chunk.py:fwd_hupdate")),
@@ -854,18 +898,29 @@ def _lower_idle_prefill_pcp_collectives(
                   ("tokens", prefix_steps), ("heads", heads),
                   ("source", "ops/triton/fla/chunk.py:prefix_scan")),
     )
+    state_out = prefix_scan
+    if pcp_rank is None or int(pcp_rank) > 0:
+        state_out = b.work(
+            "pcp_gdn_fwd_h_rerun", (prefix_scan,), (n_pf, heads, dk, dv),
+            flops=0.0, vector=0.0,
+            read=pw["st_bytes"], write=pw["st_bytes"],
+            family="tensor_copy", dtype="fp32",
+            metadata=(("pcp", pcp), ("chunks", 0), ("chunk", GDN_CHUNK64_TOKENS),
+                      ("tokens", 0), ("heads", heads),
+                      ("pcp_rank_gt_zero_rerun", True)),
+        )
     vk_transpose = b.work(
-        "final_state_vk_transpose", (prefix_scan,), (n_pf, heads, dv, dk),
+        "final_state_vk_transpose", (state_out,), (n_pf, heads, dv, dk),
         read=active_elements * state_byte, write=active_elements * state_byte,
         family="tensor_copy", dtype=state_dtype,
         metadata=(("state_layout", "V,K"), ("source", "vllm_ascend/ops/gdn.py:942")),
     )
     scatter = b.work(
-        "scatter_recurrent_state", (prefix_scan, vk_transpose), (n_pf, heads, dv, dk),
+        "scatter_recurrent_state", (state_out, vk_transpose), (n_pf, heads, dv, dk),
         read=active_elements * state_byte + n_pf * state_blocks * STATE_INDEX_BYTES,
         write=active_elements * state_byte, family="state_scatter", dtype=state_dtype,
         metadata=(("state_layout", "V,K"), ("effect_role", "scatter_publish"),
-                  ("state_value_input", (prefix_scan,)),
+                  ("state_value_input", (state_out,)),
                   ("state_value_output", "persistent_cache")),
     )
     idle_ops = b.ops[idle_start:]
@@ -888,18 +943,18 @@ def _lower_idle_prefill_pcp_collectives(
         fusion_reason="arch35_gdn_idle_pcp_peer_sync",
         native_fusion_eligible=False,
     )
-    return prefix_scan
+    return state_out
 
 
 def _lower_idle_pcp_peer(
     b, tensors, *, projection, zero, prefill, model, plan, parallel,
-    tokens, tp, heads, dk, dv, width, value_width,
+    tokens, tp, heads, dk, dv, width, value_width, pcp_rank=None,
 ):
     """Idle PCP peer owns 0 local tokens of a batch: join live prefill collectives only."""
     prefix_scan = _lower_idle_prefill_pcp_collectives(
         b, root_dep=zero, prefill=prefill, model=model, plan=plan,
         parallel=parallel, heads=heads, dk=dk, dv=dv, width=width,
-        emit_conv_tail=True,
+        emit_conv_tail=True, pcp_rank=pcp_rank,
     )
     gate = tensors.reshape(projection, (tokens * heads, dv),
                            name="output_gate_reshape")
@@ -1012,7 +1067,7 @@ def _lower_mixed_decode_branch(
 
 
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
-          padded_tokens, policy, runtime, physical_rank=None):
+          padded_tokens, policy, runtime, physical_rank=None, machine=None):
     """[Cohesive-Pipeline] Lower one chunked GDN prefill operator into engine phases."""
     if plan.recurrent_state_dtype != "fp32":
         raise ValueError("gdn_prefill_arch35_state_precision_branch_not_implemented:"
@@ -1067,6 +1122,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         conv_view = tensors.result(rep_id, (tokens, width))
     gate_inputs = [tensors.contiguous(view, name + "_contiguous", reason="gdn_split_ba.contiguous")
                    for view, name in ((beta_view, "beta"), (alpha_view, "alpha"))]
+    pcp_rank = resolve_pcp_rank(parallel, physical_rank, machine=machine, stage=stage)
     zero = b.work("core_output_zero", (deps,), (tokens, heads, dv),
                   vector=tokens * value_width, write=tokens * value_width * 2,
                   family="tensor_fill", dtype=model.activation_dtype)
@@ -1075,6 +1131,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
             b, tensors, projection=z_view, zero=zero, prefill=prefill,
             model=model, plan=plan, parallel=parallel, tokens=tokens, tp=tp,
             heads=heads, dk=dk, dv=dv, width=width, value_width=value_width,
+            pcp_rank=pcp_rank,
         )
     conv_input = tensors.contiguous(conv_view.narrow(0, 0, actual),
                                     "convolution_input_contiguous",
@@ -1083,10 +1140,6 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     cache_indices, state_rows, index_source, null_block_id = _state_slot_inputs(
         runtime, ordered)
     chunk = policy.recurrent_chunk if policy else GDN_CHUNK64_TOKENS
-    pcp_rank = (
-        (int(physical_rank) % max(1, int(parallel.tp) * int(parallel.pcp))) // max(1, int(parallel.tp))
-        if physical_rank is not None and int(parallel.pcp) > 1 else None
-    )
     global_lengths = tuple(view.global_q_len or view.q_len for view in ordered)
     initial_flags = tuple(view.context > 0 and not view.padding for view in ordered)
     conv = _lower_prefill_convolution(
@@ -1118,7 +1171,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         idle_prefix_sync = _lower_idle_prefill_pcp_collectives(
             b, root_dep=conv, prefill=prefill, model=model, plan=plan,
             parallel=parallel, heads=heads, dk=dk, dv=dv, width=width,
-            emit_conv_tail=False,
+            emit_conv_tail=False, pcp_rank=pcp_rank,
         )
     else:
         prefill_slots = (None if cache_indices is None else

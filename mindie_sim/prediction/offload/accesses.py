@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 import math
@@ -19,6 +20,8 @@ _INDEX_POOL_TAIL_COMPONENT_BYTES = 4
 _STRIDED_SPAN_ARITY = 4
 _RECURRENT_STATE_3D_RANK = 3
 _RECURRENT_STATE_4D_RANK = 4
+_CANONICAL_SPAN_EXPAND_LIMIT = 65536
+_PERIODIC_MIN_FULL_PERIODS = 3
 _SPAN_FORMATS = frozenset({"half_open", "start_count", "start_width_stride_count"})
 _PERSISTENT_STATE_POSITIONS = frozenset({"cache", "state", "tail", "layout"})
 _TRANSIENT_STORAGE_PREFIXES = (
@@ -109,6 +112,272 @@ def _normalize_span(
     return tuple(normalized)
 
 
+def _run_end(run: tuple[int, int, int, int]) -> int:
+    start, width, stride, count = run
+    return start + (count - 1) * stride + width
+
+
+def _pop_first_interval(
+    run: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
+    start, width, stride, count = run
+    if count <= 1:
+        return None
+    rem_count = count - 1
+    return (start + stride, width, width if rem_count == 1 else stride, rem_count)
+
+
+def _merge_boundary_touching(
+    cluster: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    merged: list[tuple[int, int, int, int]] = []
+    for run in cluster:
+        start, width, stride, count = run
+        if merged and _run_end(merged[-1]) == start:
+            ps, pw, pd, pc = merged.pop()
+            if pc > 1:
+                prefix_count = pc - 1
+                merged.append((ps, pw, pw if prefix_count == 1 else pd, prefix_count))
+                tail_start = ps + prefix_count * pd
+            else:
+                tail_start = ps
+            combined_width = pw + width
+            merged.append((tail_start, combined_width, combined_width, 1))
+            rest = _pop_first_interval((start, width, stride, count))
+            if rest is not None:
+                merged.append(rest)
+        else:
+            merged.append(run)
+    return merged
+
+
+def _coalesce_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    intervals.sort()
+    coalesced: list[tuple[int, int]] = []
+    cur_start, cur_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            coalesced.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+    coalesced.append((cur_start, cur_end))
+    return coalesced
+
+
+def _intervals_to_runs(
+    intervals: list[tuple[int, int]],
+) -> list[tuple[int, int, int, int]]:
+    return [(start, end - start, end - start, 1) for start, end in intervals]
+
+
+def _zone_intervals(
+    runs: list[tuple[int, int, int, int]], lo: int, hi: int,
+) -> list[tuple[int, int]]:
+    raw: list[tuple[int, int]] = []
+    for start, width, stride, count in runs:
+        if start >= hi or _run_end((start, width, stride, count)) <= lo:
+            continue
+        if count == 1:
+            raw.append((max(start, lo), min(start + width, hi)))
+            continue
+        k_lo = max(0, (lo - start - width) // stride + 1)
+        k_hi = min(count - 1, (hi - 1 - start) // stride)
+        for idx in range(k_lo, k_hi + 1):
+            a = start + idx * stride
+            raw.append((max(a, lo), min(a + width, hi)))
+    return _coalesce_intervals(raw)
+
+
+def _uniform_periodic_runs(
+    tile: list[tuple[int, int]], period: int, repeat_count: int,
+) -> list[tuple[int, int, int, int]]:
+    if not tile or repeat_count <= 0:
+        return []
+    if len(tile) == 1:
+        a, b = tile[0]
+        width = b - a
+        return [(a, width, period if repeat_count > 1 else width, repeat_count)]
+    first_width = tile[0][1] - tile[0][0]
+    sub_stride = tile[1][0] - tile[0][0]
+    uniform = (
+        len(tile) * sub_stride == period
+        and all(end - start == first_width for start, end in tile)
+        and all(
+            tile[i + 1][0] - tile[i][0] == sub_stride
+            for i in range(len(tile) - 1)
+        )
+    )
+    if uniform:
+        return [(tile[0][0], first_width, sub_stride, len(tile) * repeat_count)]
+    return [
+        (start, end - start, period if repeat_count > 1 else end - start, repeat_count)
+        for start, end in tile
+    ]
+
+
+def _merge_periodic_zone_runs(
+    runs: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Merge same-track continuations and adjacent touching runs after periodic zoning."""
+    merged: list[tuple[int, int, int, int]] = []
+    track_index: dict[tuple[int, int, int], int] = {}
+    for run in _merge_boundary_touching(runs):
+        start, width, stride, count = run
+        if count >= 2:
+            track = (width, stride, start % stride)
+            prev_idx = track_index.get(track)
+            if prev_idx is not None:
+                ps, pw, pd, pc = merged[prev_idx]
+                if start == ps + pc * pd:
+                    merged[prev_idx] = (ps, pw, pd, pc + count)
+                    continue
+            track_index[track] = len(merged)
+        merged.append(run)
+    return merged
+
+
+def _coalesce_periodic_cluster(
+    cluster: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]] | None:
+    """Coalesce arbitrarily large periodic/interleaved strided clusters in O(zones * period_work)."""
+    strides = sorted({stride for _, width, stride, count in cluster if count >= 2 and stride > width})
+    if not strides:
+        return None
+    period = math.lcm(*strides)
+    work_per_period = sum(
+        period // stride for _, width, stride, count in cluster if count >= 2 and stride > width
+    )
+    if period <= 0 or work_per_period > _CANONICAL_SPAN_EXPAND_LIMIT:
+        return None
+    points = sorted({pt for run in cluster for pt in (run[0], _run_end(run))})
+    emitted: list[tuple[int, int, int, int]] = []
+    for lo, hi in zip(points, points[1:]):
+        active = [run for run in cluster if run[0] < hi and _run_end(run) > lo]
+        if not active:
+            continue
+        if any(run[3] == 1 for run in active):
+            emitted.append((lo, hi - lo, hi - lo, 1))
+            continue
+        full_periods = (hi - lo) // period
+        if full_periods < _PERIODIC_MIN_FULL_PERIODS:
+            emitted.extend(_intervals_to_runs(_zone_intervals(active, lo, hi)))
+            continue
+        mid_lo = lo + period
+        two_p = _zone_intervals(active, mid_lo, mid_lo + 2 * period)
+        if not two_p:
+            emitted.extend(_intervals_to_runs(_zone_intervals(active, lo, mid_lo)))
+            emitted.extend(_intervals_to_runs(_zone_intervals(active, lo + (full_periods - 1) * period, hi)))
+            continue
+        if len(two_p) == 1 and two_p[0] == (mid_lo, mid_lo + 2 * period):
+            mid_hi = lo + (full_periods - 1) * period
+            emitted.extend(_intervals_to_runs(_zone_intervals(active, lo, mid_lo)))
+            emitted.append((mid_lo, mid_hi - mid_lo, mid_hi - mid_lo, 1))
+            emitted.extend(_intervals_to_runs(_zone_intervals(active, mid_hi, hi)))
+            continue
+        gap = mid_lo if two_p[0][0] > mid_lo else two_p[0][1]
+        mid_periods = (hi - gap) // period - 1
+        if mid_periods <= 0:
+            emitted.extend(_intervals_to_runs(_zone_intervals(active, lo, hi)))
+            continue
+        mid_hi = gap + mid_periods * period
+        emitted.extend(_intervals_to_runs(_zone_intervals(active, lo, gap)))
+        emitted.extend(_uniform_periodic_runs(_zone_intervals(active, gap, gap + period), period, mid_periods))
+        emitted.extend(_intervals_to_runs(_zone_intervals(active, mid_hi, hi)))
+    return _merge_periodic_zone_runs(emitted)
+
+
+def _coalesce_run_cluster(
+    cluster: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    if len(cluster) <= 1:
+        return cluster
+    if sum(run[3] for run in cluster) <= _CANONICAL_SPAN_EXPAND_LIMIT:
+        intervals = [
+            (start + idx * stride, start + idx * stride + width)
+            for start, width, stride, count in cluster
+            for idx in range(count)
+        ]
+        return _intervals_to_runs(_coalesce_intervals(intervals))
+    if all(_run_end(left) == right[0] for left, right in zip(cluster, cluster[1:])):
+        return _merge_boundary_touching(cluster)
+    periodic = _coalesce_periodic_cluster(cluster)
+    if periodic is not None:
+        return periodic
+    return sorted(set(cluster))
+
+
+def _canonical_span_key(
+    descriptors: tuple[tuple[int, ...], ...],
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Canonical representation invariant to half_open vs strided descriptor encoding."""
+    if not descriptors:
+        return ()
+    runs: list[tuple[int, int, int, int]] = []
+    for item in descriptors:
+        if len(item) == 2:
+            start, end = int(item[0]), int(item[1])
+            if end > start:
+                width = end - start
+                runs.append((start, width, width, 1))
+        else:
+            start, width, stride, count = (
+                int(item[0]), int(item[1]), int(item[2]), int(item[3]),
+            )
+            if count == 1 or stride == width:
+                span_width = width * count
+                runs.append((start, span_width, span_width, 1))
+            else:
+                runs.append((start, width, stride, count))
+    if not runs:
+        return ()
+    runs.sort()
+    separated: list[tuple[int, int, int, int]] = []
+    cluster = [runs[0]]
+    cluster_end = _run_end(runs[0])
+    for run in runs[1:]:
+        if run[0] <= cluster_end:
+            cluster.append(run)
+            cluster_end = max(cluster_end, _run_end(run))
+        else:
+            separated.extend(_coalesce_run_cluster(cluster))
+            cluster = [run]
+            cluster_end = _run_end(run)
+    separated.extend(_coalesce_run_cluster(cluster))
+    queue = deque(separated)
+    canonical: list[tuple[int, int, int, int]] = []
+    while queue:
+        start, width, stride, count = queue.popleft()
+        while queue:
+            ns, nw, nd, nc = queue[0]
+            if nw != width:
+                break
+            if count == 1:
+                new_stride = ns - start
+                if nc >= 2 and nd == new_stride:
+                    queue.popleft()
+                    stride, count = new_stride, 1 + nc
+                else:
+                    rest = _pop_first_interval(queue.popleft())
+                    if rest is not None:
+                        queue.appendleft(rest)
+                    stride, count = new_stride, 2
+            elif ns != start + count * stride:
+                break
+            elif nc >= 2 and nd == stride:
+                queue.popleft()
+                count += nc
+            else:
+                rest = _pop_first_interval(queue.popleft())
+                if rest is not None:
+                    queue.appendleft(rest)
+                count += 1
+        canonical.append((start, width, stride, count))
+    return tuple(canonical)
+
+
 @dataclass(frozen=True)
 class StateAccess:
     """Instance binding of one real state read/write/alias to an occurrence.
@@ -172,7 +441,9 @@ class StateAccess:
         # access identity so disjoint slices within one cache line are never
         # collapsed while equivalent span encodings deduplicate identically.
         return (self.occurrence, self.producer, self.stage, self.output,
-                self.storage, self.state_version, self.span, self.byte_span,
+                self.storage, self.state_version,
+                _canonical_span_key(self.span),
+                _canonical_span_key(self.byte_span),
                 self.span_unit, self.direction, self.rank, self.request,
                 self.scope)
 

@@ -627,3 +627,63 @@ def test_superpod_optical_switched_startup_and_ub_mesh_pod_limit():
     srv_machine = _make_machine(DIRECT_MESH_SKU, num_devices=16, ranks_per_node=8, topology_preset="a5_server")
     srv_topo = Topology(srv_machine, ParallelSpec(tp=1, dp=16, ep=16))
     assert srv_topo.link_scope(srv_topo.route(0, 8)[0][0]) == "cross_node"
+
+
+def test_explicit_multinode_placement_and_subgroup_channel_utilization():
+    # 1. Explicit two-node placement retains inter-node link even when count <= ranks_per_node.
+    for width in (1, 8):
+        hw = Hardware.from_mapping(dict(
+            backend="ascend", sku=SINGLE_DIE_SKU, num_devices=2,
+            ranks_per_node=width, devices=[{"node": 0}, {"node": 1}],
+        ))
+        topo = Topology(hw, ParallelSpec(tp=2))
+        route = topo.route(0, 1)
+        assert len(hw.links) == 1 and len(route) == 1 and hw.links[0].channel == "d2d_inter_node"
+
+    # Sparse multi-node placement crossing a 1-node-per-pod boundary routes over d2d_inter_pod
+    # both when ranks_per_node is omitted (defaulting physical node width to SKU width) and explicit,
+    # whereas same-node placement emits intra-node connectivity only.
+    for override in ({}, {"ranks_per_node": 8}):
+        pod_cross = Hardware.from_mapping(dict(
+            backend="ascend", sku=SINGLE_DIE_SKU, num_devices=2,
+            superpod_size=8, devices=[{"node": 0}, {"node": 1}], **override,
+        ))
+        pod_topo = Topology(pod_cross, ParallelSpec(tp=2))
+        assert [link.channel for link in pod_cross.links] == ["d2d_inter_pod"]
+        assert pod_topo.links[pod_topo.route(0, 1)[0][0]].channel == "d2d_inter_pod"
+    same_node = Hardware.from_mapping(dict(
+        backend="ascend", sku=SINGLE_DIE_SKU, num_devices=2,
+        ranks_per_node=1, devices=[{"node": 0}, {"node": 0}],
+    ))
+    assert len(same_node.links) == 1 and same_node.links[0].channel == "d2d_intra_node"
+
+    # 2. Subgroup routing honors explicit transfer_channels utilization for both caller and preset peaks.
+    for util in (0.25, 1.0):
+        hw = Hardware.from_mapping(dict(
+            backend="ascend", sku=DUAL_DIE_LARGE_SKU,
+            topology_preset="a3_16p", num_devices=16, intra_bw_4p_gbps=100,
+            transfer_channels={"d2d_intra_4p": {"bw_utilization": util}},
+        ))
+        topo = Topology(hw, ParallelSpec(tp=16))
+        name = topo.route(0, 2)[0][0]
+        assert name.startswith("d2d_intra_4p:")
+        assert topo.links[name].capacity_bytes_per_ms == pytest.approx(100e6 * util)
+
+    hw_preset = Hardware.from_mapping(dict(
+        backend="ascend", sku=DUAL_DIE_LARGE_SKU,
+        topology_preset="a3_16p", num_devices=16,
+        transfer_channels={"d2d_intra_4p": {"bw_utilization": 0.5}},
+    ))
+    topo_preset = Topology(hw_preset, ParallelSpec(tp=16))
+    name_preset = topo_preset.route(0, 2)[0][0]
+    assert topo_preset.links[name_preset].capacity_bytes_per_ms == pytest.approx(196e6 * 0.5)
+
+    hw_inter_pod = Hardware.from_mapping(dict(
+        backend="ascend", sku=DUAL_DIE_LARGE_SKU,
+        topology_preset="a3_superpod", num_devices=32, ranks_per_node=16, superpod_size=16,
+        inter_pod_bw_gbps=100, transfer_channels={"d2d_inter_pod": {"bw_utilization": 0.25}},
+    ))
+    topo_inter_pod = Topology(hw_inter_pod, ParallelSpec(tp=32))
+    name_pod = topo_inter_pod.route(0, 16)[0][0]
+    assert name_pod.startswith("d2d_inter_pod:")
+    assert topo_inter_pod.links[name_pod].capacity_bytes_per_ms == pytest.approx(25e6)

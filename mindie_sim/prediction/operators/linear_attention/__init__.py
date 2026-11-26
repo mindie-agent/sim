@@ -91,6 +91,29 @@ def chunk32_plan_timing(context: RecipeContext, *, recurrence_sync: bool) -> tup
     return _arch35_chunk32_setup_ms(context), 0.0
 
 
+def _segment_bound_lengths(meta: dict, bound_requests: tuple) -> tuple[int, ...] | None:
+    """Resolve per-segment lengths for PCP-partitioned Chunk32 prepare/state/output ops."""
+    seg_index = meta.get("state_segment_index")
+    if seg_index is None:
+        return None
+    seg_lengths = meta.get("state_segment_lengths")
+    if seg_lengths is None:
+        all_seg_lengths = meta.get("segment_lengths")
+        if (isinstance(all_seg_lengths, (tuple, list))
+                and 0 <= int(seg_index) < len(all_seg_lengths)):
+            seg_lengths = all_seg_lengths[int(seg_index)]
+    if seg_lengths is None:
+        seg_lengths = meta.get("lengths")
+    if not seg_lengths:
+        return None
+    if len(seg_lengths) == len(bound_requests):
+        return tuple(
+            int(q) for q, view in zip(seg_lengths, bound_requests)
+            if not view.padding and int(q) > 0
+        )
+    return tuple(int(q) for q in seg_lengths if int(q) > 0)
+
+
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:
     """Bind a governed operation to its executable plan and source descriptor."""
     if ctx.requests and not ctx.layout:
@@ -114,15 +137,30 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedO
 
         if uses_retained_source_plan(op):
             source_op = op
-            if ctx.requests:
-                lengths = tuple(length for length in request_lengths(ctx.requests) if length)
+            bound_ctx = ctx
+            bound_requests = (
+                tuple(view for view in ctx.requests if view.request_id in frozenset(op.requests))
+                if ctx.requests and op.requests else ctx.requests
+            )
+            if bound_requests:
+                bound_ctx = replace(ctx, requests=bound_requests)
+                lengths = tuple(length for length in request_lengths(bound_requests) if length)
                 if not lengths:
-                    plan = make_plan(ctx, op.recipe, (), metadata={"total_chunks": 0})
+                    plan = make_plan(bound_ctx, op.recipe, (), metadata={"total_chunks": 0})
                     return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
-                source_op = replace(op, metadata=tuple({**dict(op.metadata), "lengths": lengths}.items()))
-            plan = gdn_chunk32.build(source_op, ctx.geometry, ctx=ctx)
-            if ctx.requests:
-                plan = replace(plan, metadata={**plan.metadata, **request_layout_metadata(ctx)})
+                meta = dict(op.metadata)
+                seg_lengths = _segment_bound_lengths(meta, bound_requests)
+                if seg_lengths is not None:
+                    lengths = seg_lengths
+                    if not lengths:
+                        plan = make_plan(bound_ctx, op.recipe, (), metadata={"total_chunks": 0})
+                        return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
+                source_op = replace(op, metadata=tuple({**meta, "lengths": lengths}.items()))
+            elif ctx.requests and op.requests:
+                bound_ctx = replace(ctx, requests=())
+            plan = gdn_chunk32.build(source_op, ctx.geometry, ctx=bound_ctx)
+            if bound_ctx.requests:
+                plan = replace(plan, metadata={**plan.metadata, **request_layout_metadata(bound_ctx)})
             return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
     contract = validate_contract(op, ctx)
     abi = ctx.requested_abi or dict(op.metadata).get("abi") or op.recipe or op.family

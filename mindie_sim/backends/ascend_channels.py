@@ -278,6 +278,12 @@ def _finalize_channel_utilization(channels, explicit=(), declared=None):
             continue
         util = _channel_util(declaration)
         if math.isclose(util, 1.0):
+            if (util_declared and channel not in explicit
+                    and not _is_measured_effective(declaration)):
+                peak_val = declaration.get("uni_peak_bw_gbps")
+                if peak_val is not None:
+                    declaration["effective_uni_bw_gbps"] = _positive_float(
+                        peak_val, f"transfer_channel_requires_positive_gbps:{channel}")
             _clear_utilization(declaration)
             continue
         if _is_measured_effective(declaration):
@@ -437,24 +443,41 @@ def _group_links(channels, channel, groups, peak=None, util=None, latency=None,
     return links
 
 
+def _sync_tier_channel(declaration, peak, util, effective, latency):
+    declaration["uni_peak_bw_gbps"] = float(peak)
+    declaration["effective_uni_bw_gbps"] = float(effective)
+    declaration["latency_us"] = float(latency)
+    if math.isclose(util, 1.0):
+        _clear_utilization(declaration)
+    else:
+        declaration["bw_utilization"] = float(util)
+        declaration["peak_capacity_bytes_per_ms"] = float(peak) * GBPS_TO_BYTES_PER_MS
+
+
 def _subgroup_tier(channels, raw, preset, declared, explicit, name, key,
                    node_tier, node_latency, node_caller):
     node_peak, node_util, node_effective = node_tier
+    fields = declared.get(name, set())
     latency = (_declaration_latency(channels[name], node_latency)
                if name in declared else node_latency)
     if name in explicit:
         peak, util, effective = _tier_bandwidth(channels, name)
         return peak, util, effective, latency
+    util_declared = bool(set(_UTIL_FIELDS) & fields)
+    tier_util = _channel_util(channels[name]) if util_declared else node_util
     if raw.get(key) is not None:
         peak = _number(key, raw[key])
-        return peak, node_util, peak * node_util, latency
+        return peak, tier_util, peak * tier_util, latency
     if node_caller:
-        return node_peak, node_util, node_effective, latency
+        effective = node_peak * tier_util if util_declared else node_effective
+        return node_peak, tier_util, effective, latency
     peak = preset.get(key)
-    if peak is None:
-        return None
-    peak = _number(key, peak)
-    return peak, node_util, peak * node_util, latency
+    if peak is not None:
+        peak = _number(key, peak)
+        return peak, tier_util, peak * tier_util, latency
+    if name in declared:
+        return node_peak, tier_util, node_peak * tier_util, latency
+    return None
 
 
 OPTICAL_SMALL_FRAME_BYTES = 4096
@@ -600,7 +623,38 @@ def _apply_superpod_inter_node_protocol(combined, raw, channels, declared, super
         )
 
 
+def _pod_node_width(combined, raw, preset, per_node: int) -> int:
+    """Resolve physical node die capacity for SuperPoD node-count grouping."""
+    if raw.get("ranks_per_node") is not None:
+        return int(per_node)
+    phys_rpn = int(
+        raw.get("physical_ranks_per_node")
+        or preset.get("ranks_per_node")
+        or combined.get("physical_ranks_per_node")
+        or default_ranks_per_node(str(combined.get("sku", "")))
+    )
+    return max(phys_rpn, int(per_node))
+
+
+def _superpod_groups(placements, node_width: int, superpod_size: int):
+    """Group nodes into SuperPoD domains while preserving sparse multi-node boundaries."""
+    if node_width > 0 and superpod_size >= node_width and superpod_size % node_width == 0:
+        nodes_per_pod = max(1, superpod_size // node_width)
+        node_groups = placement_node_groups(placements)
+        if all(len(members) <= node_width for _, members in node_groups):
+            return [
+                (
+                    node_groups[start][0],
+                    [rank for _, members in node_groups[start:start + nodes_per_pod]
+                     for rank in members],
+                )
+                for start in range(0, len(node_groups), nodes_per_pod)
+            ]
+    return placement_node_order_groups(placements, superpod_size)
+
+
 def _inter_node_links(combined, raw, preset, channels, placements, count, per_node, explicit, bw_caller, declared):
+    del count
     superpod_size = combined.get("superpod_size", combined.get("max_dies"))
     if superpod_size is not None:
         if isinstance(superpod_size, bool):
@@ -624,34 +678,45 @@ def _inter_node_links(combined, raw, preset, channels, placements, count, per_no
             peak_capacity_bytes_per_ms=same_peak * GBPS_TO_BYTES_PER_MS,
             latency_us=same_latency)
         _apply_superpod_inter_node_protocol(combined, raw, channels, declared, superpod_size, same_latency)
-    if not (per_node > 0 and count > per_node and inter_tier is not None):
+    spans_nodes = len({node for _, node, _ in placements}) > 1
+    if not (per_node > 0 and spans_nodes and inter_tier is not None):
         return []
     links = []
     inter_peak, inter_util, inter_effective = inter_tier
     inter_decl = orig_inter_decl or channels["d2d_inter_node"]
     inter_latency = _declaration_latency(inter_decl)
     if superpod_size is not None:
+        pod_groups = _superpod_groups(
+            placements, _pod_node_width(combined, raw, preset, per_node), superpod_size,
+        )
         links.extend(_group_links(
-            channels, "d2d_inter_node", placement_node_order_groups(placements, superpod_size),
+            channels, "d2d_inter_node", pod_groups,
             peak=same_peak, util=same_util, latency=same_latency, capacity=same_capacity))
-        if superpod_size < count:
-            if "d2d_inter_pod" in declared:
+        if len(pod_groups) > 1:
+            pod_fields = declared.get("d2d_inter_pod", set())
+            if "d2d_inter_pod" in explicit:
                 pod_peak, pod_util, pod_effective = _tier_bandwidth(channels, "d2d_inter_pod")
-                pod_latency = _declaration_latency(channels["d2d_inter_pod"], inter_latency)
             else:
                 pod_peak = _number("inter_pod_bw_gbps", raw.get(
                     "inter_pod_bw_gbps", preset.get("inter_pod_bw_gbps", inter_peak)))
-                pod_util = _positive_float(
-                    raw.get("inter_node_bw_util", preset.get("inter_node_bw_util", 1.0)),
-                    "inter_node_bw_util_invalid", allow_zero=False)
+                if set(_UTIL_FIELDS) & pod_fields:
+                    pod_util = _channel_util(channels["d2d_inter_pod"])
+                else:
+                    pod_util = _positive_float(
+                        raw.get("inter_node_bw_util", preset.get("inter_node_bw_util", 1.0)),
+                        "inter_node_bw_util_invalid", allow_zero=False)
+                pod_effective = pod_peak * pod_util
+            if {"latency_us", "alpha_us"} & pod_fields:
+                pod_latency = _declaration_latency(channels["d2d_inter_pod"], inter_latency)
+            else:
                 pod_latency = _positive_float(
                     raw.get("inter_pod_latency_us", preset.get("inter_pod_latency_us", inter_latency)),
                     "inter_pod_latency_us_invalid", allow_zero=True)
-                pod_effective = pod_peak * pod_util
             pod_decl = {**inter_decl, "channel": "d2d_inter_pod"}
             if pod_decl.get("rail_id"):
                 pod_decl["rail_id"] = f"{pod_decl['rail_id']}_pod"
             channels.setdefault("d2d_inter_pod", pod_decl)
+            _sync_tier_channel(channels["d2d_inter_pod"], pod_peak, pod_util, pod_effective, pod_latency)
             links.extend(_group_links(
                 channels, "d2d_inter_pod", placement_node_order_groups(placements),
                 peak=pod_peak, util=pod_util, latency=pod_latency, capacity=pod_effective))
@@ -674,7 +739,9 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
 
     node_tier = (_tier_bandwidth(channels, "d2d_intra_node")
                  if "d2d_intra_node" in channels else None)
-    if per_node > 1 and node_tier is not None:
+    node_groups = placement_node_groups(placements)
+    has_shared_node = any(len(members) > 1 for _, members in node_groups)
+    if (per_node > 1 or has_shared_node) and node_tier is not None:
         node_peak, node_util, node_effective = node_tier
         node_decl = channels["d2d_intra_node"]
         node_latency = _declaration_latency(node_decl)
@@ -698,6 +765,7 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
                 quad_decl["rail_id"] = f"{quad_decl['rail_id']}_4p"
             channels.setdefault("d2d_intra_4p", quad_decl)
             peak, util, effective, latency = quad
+            _sync_tier_channel(channels["d2d_intra_4p"], peak, util, effective, latency)
             links.extend(_group_links(
                 channels, "d2d_intra_4p",
                 placement_node_groups(placements, SUBGROUP_QUAD_DIE_RANKS),
@@ -708,6 +776,7 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
                 octa_decl["rail_id"] = f"{octa_decl['rail_id']}_8p"
             channels.setdefault("d2d_intra_8p", octa_decl)
             peak, util, effective, latency = octa
+            _sync_tier_channel(channels["d2d_intra_8p"], peak, util, effective, latency)
             links.extend(_group_links(
                 channels, "d2d_intra_8p",
                 placement_node_groups(placements, SUBGROUP_OCTA_DIE_RANKS),
@@ -718,7 +787,7 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
         elif per_node <= SUBGROUP_OCTA_DIE_RANKS and octa is not None:
             node_peak_eff, node_util_eff, node_capacity, node_latency = octa
         links.extend(_group_links(
-            channels, "d2d_intra_node", placement_node_groups(placements),
+            channels, "d2d_intra_node", node_groups,
             peak=node_peak_eff, util=node_util_eff, latency=node_latency,
             capacity=node_capacity))
 

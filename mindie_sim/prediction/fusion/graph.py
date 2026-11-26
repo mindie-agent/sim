@@ -91,13 +91,16 @@ class TensorValue:
             raise FeasibilityError(f"tensor_storage_or_version_invalid:{self.value_id}")
         if self.layout not in LAYOUTS:
             raise FeasibilityError(f"tensor_layout_unknown:{self.value_id}:{self.layout}")
-        if self.storage_shape is not None and any(d < 0 for d in self.storage_shape):
+        if self.storage_shape is not None and (
+                not self.storage_shape or any(d < 0 for d in self.storage_shape)):
             raise FeasibilityError(f"tensor_storage_shape_invalid:{self.value_id}")
 
     @property
     def nbytes(self) -> int:
-        return (int(self.storage_bytes) if self.storage_bytes is not None
-                else int(math.ceil(_numel(self.shape) * dtype_bytes(self.dtype))))
+        if self.storage_bytes is not None:
+            return int(self.storage_bytes)
+        physical_shape = self.storage_shape if self.storage_shape is not None else self.shape
+        return int(math.ceil(_numel(physical_shape) * dtype_bytes(self.dtype)))
 
     @property
     def materialized(self) -> bool:

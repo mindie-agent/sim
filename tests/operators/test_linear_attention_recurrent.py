@@ -1157,3 +1157,78 @@ def test_recurrent_padding_slot_skips_state_writes_and_pcp_sync_batches_by_rank_
     ops_null = Frontend()(IterationPlan((RequestView("r", 1, 0, False, "decode", padding=False, state_slot=0),)), c_null.model, c_null.runtime, c_null.machine).ops
     conv_null = next(o for o in ops_null if o.op_id.endswith(".short_convolution"))
     assert conv_null.mte2_bytes == 0 and conv_null.mte3_bytes == 0
+
+
+def test_kda_recover_ssm_record_offsets_stride_and_conv_compaction():
+    from mindie_sim import compose_case
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.tensors import TensorLayout, TensorValue
+    from mindie_sim.schema.workload import IterationPlan
+
+    gen5_sku = REPRESENTATIVE_SKUS["a5"]
+    # 1. Multi-request KDA recovery records occupy distinct addresses in a shared backing store,
+    #    and explicit record_stride keeps peer offsets invariant to another request's query length.
+    pool = TensorValue("external", "fp32", TensorLayout.contiguous((3, 1, 128, 128)),
+                       storage="pool", binding="external", binding_name="states")
+    op_eq = kda_recurrent.make_op(
+        dict(lengths=(2, 2), heads=1, key_heads=1, recover_ssm=True),
+        requests=("a", "b"), state_values=pool, state_slots=(1, 2),
+    )
+    writes_eq = dict(op_eq.metadata)["kda_state_contract"]["write_bindings"]
+    addrs_eq = [(w["storage"], w["offset"]) for w in writes_eq]
+    assert len(set(addrs_eq)) == len(writes_eq) == 4
+    assert [off for _, off in addrs_eq] == [0, 512, 1024, 1536]
+    op_var = kda_recurrent.make_op(
+        dict(lengths=(2, 3), heads=1, key_heads=1, recover_ssm=True),
+        requests=("a", "b"), state_values=pool, state_slots=(1, 2),
+    )
+    writes_var = dict(op_var.metadata)["kda_state_contract"]["write_bindings"]
+    assert len({(w["storage"], w["offset"]) for w in writes_var}) == len(writes_var) == 5
+
+    peer_b_offsets = []
+    for q0 in (2, 3):
+        op_stride = kda_recurrent.make_op(
+            dict(lengths=(q0, 2), heads=1, key_heads=1, recover_ssm=True, record_stride=4),
+            requests=("a", "b"), state_values=pool, state_slots=(1, 2),
+        )
+        assert dict(op_stride.metadata)["kda_recurrent_params"]["record_stride"] == 4
+        peer_b_offsets.append([
+            w["offset"] for w in dict(op_stride.metadata)["kda_state_contract"]["write_bindings"]
+            if w["target"].endswith("[b]")
+        ])
+    assert peer_b_offsets[0] == peer_b_offsets[1] == [2048, 2560]
+    for bad_stride in (1, True):
+        with pytest.raises(ModelingError, match="recurrent_kda_record_stride_invalid"):
+            kda_recurrent.make_op(
+                dict(lengths=(2, 2), heads=1, key_heads=1, recover_ssm=True, record_stride=bad_stride),
+                requests=("a", "b"), state_values=pool, state_slots=(1, 2),
+            )
+
+    # 2. KDA conv compaction propagates configured conv_kernel - 1 history length.
+    v_act = RequestView("a", 2, 128, True, "decode", draft_proposal_tokens=1, draft_accepted_tokens=1,
+                        draft_advanced_tokens=2, state_slot=1)
+    cfg = json.loads((ROOT / "mindie_sim/model_configs/glm-5.3-flash.json").read_text())
+    cfg["text_config"]["linear_attn_config"]["short_conv_kernel_size"] = 3
+    c_k3 = parse_case(compose_case(cfg, gen5_sku, layers=2, tp=1, ep=1, mtp_proposal_tokens=1, recover_ssm=True))
+    ops_k3 = Frontend()(IterationPlan((v_act,)), c_k3.model, c_k3.runtime, c_k3.machine).ops
+    conv_k3 = next(o for o in ops_k3 if o.recipe == "kda_compact_conv_state")
+    n_seq, n_layers, width, hist = conv_k3.local_shape
+    assert hist == c_k3.model.layer_plans[0].conv_kernel - 1 == 2
+    assert conv_k3.hbm_bytes == pytest.approx(2 * n_seq * n_layers * width * hist * 2)
+
+    # 3. Align-mode KDA conv compaction charges both boundary and final stores on block crossing.
+    raw_al = compose_case("glm-5.3-flash", gen5_sku, layers=1, tp=1, ep=1, mtp_proposal_tokens=1, recover_ssm=True)
+    raw_al["runtime"].setdefault("metadata", {})["mamba_cache_mode"] = "align"
+    c_al = parse_case(raw_al)
+    for pos, expect_cross in ((125, 0), (127, 1)):
+        v_al = RequestView("a", 2, pos, True, "decode", draft_proposal_tokens=1, draft_accepted_tokens=1,
+                           draft_advanced_tokens=2, state_slot=11, mamba_block_table=(11, 12))
+        ops_al = Frontend()(IterationPlan((v_al,)), c_al.model, c_al.runtime, c_al.machine).ops
+        conv_al = next(o for o in ops_al if o.recipe == "kda_compact_conv_state")
+        crossing = max(dict(o.metadata).get("align_boundary_triggered", 0) for o in ops_al)
+        n_a, l_a, w_a, h_a = conv_al.local_shape
+        assert crossing == expect_cross
+        assert conv_al.mte3_bytes == pytest.approx((1 + crossing) * n_a * l_a * w_a * h_a * 2)
+        assert conv_al.mte2_bytes == pytest.approx(conv_al.mte3_bytes)
+        assert conv_al.hbm_bytes == pytest.approx(2.0 * conv_al.mte3_bytes)

@@ -238,6 +238,23 @@ def make_op(params: dict) -> OpSpec:
     chunk_tokens = sum(count * parsed.chunk
                        for count in parsed.chunks_per_sequence)
     semantic = (1, parsed.heads, packed_tokens, parsed.dv)
+    # Compulsory per-sequence lower bound across all core counts: each key head
+    # is read once per sequence rather than split across hypothetical 1-core units.
+    unit_works = tuple(
+        _unit_work(
+            HeadUnit(
+                core=0, sequence=seq, hv_begin=0, heads=parsed.heads,
+                length=length, chunks=chunks,
+            ),
+            parsed,
+        )
+        for seq, (length, chunks) in enumerate(zip(parsed.lengths, parsed.chunks_per_sequence))
+    )
+    matrix = math.fsum(w.matrix_flops for w in unit_works)
+    mte2 = math.fsum(w.mte2_bytes for w in unit_works)
+    mte3 = math.fsum(w.mte3_bytes for w in unit_works)
+    vector = math.fsum(w.vector_ops for w in unit_works)
+    hbm = math.fsum(w.hbm_bytes for w in unit_works)
     return OpSpec(
         op_id="gdn_state",
         family="gdn_state",
@@ -249,6 +266,12 @@ def make_op(params: dict) -> OpSpec:
         local_shape=semantic,
         padded_shape=(1, parsed.heads, chunk_tokens, parsed.dv),
         launch_shape=semantic,
+        flops=matrix,
+        matrix_flops=(("bf16", matrix),) if matrix else (),
+        vector_ops=vector,
+        hbm_bytes=hbm,
+        mte2_bytes=mte2,
+        mte3_bytes=mte3,
         dtype="bf16",
         layout="BNSD",
         recipe="chunk_fwd_h", source_boundary="kernel",

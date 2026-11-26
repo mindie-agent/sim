@@ -602,3 +602,79 @@ def test_replay_lowers_mixed_gdn_and_preserves_ragged_attention_per_replica(monk
     result = spine.run_step(prepared)
     assert result.span_ms > 0 and any(row.family == "gdn_prepare" for row in result.operators)
     assert seen == {0: (small, 1), 1: (mixed, 5)}
+
+
+def test_gdn_chunk64_specs_declare_nonzero_work_and_chunk32_honors_bound_requests():
+    from mindie_sim.optimization.framework_solver import _op_service_us
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.prediction.operators.linear_attention import gdn_output, gdn_prepare, gdn_state
+
+    # 1. Chunk64 prepare/state/output OpSpecs carry compulsory work for stream scheduling,
+    #    and gdn_state compulsory HBM never exceeds its multi-core executable plan.
+    c64 = parse_case(compose_case("qwen3.8-flash-next", NEWEST_SKU, layers=1, tp=1, ep=1))
+    ops64 = target_graphs(c64, phase="prefill", tokens=128, scope="body")[0]
+    geom64 = Geometry.from_devices(c64.machine.dies)
+    for mod in (gdn_prepare, gdn_state, gdn_output):
+        fam = mod.__name__.split(".")[-1]
+        op = next(x for x in ops64 if x.family == fam)
+        plan_work = mod.build(op, geom64).work
+        expected_flops = sum(plan_work.matrix.values())
+        floor_us = max(n * 1e6 / c64.machine.dies[0].peak(dt) for dt, n in plan_work.matrix.items())
+        assert op.flops == pytest.approx(expected_flops) and op.flops > 0
+        assert dict(op.matrix_flops) == pytest.approx(dict(plan_work.matrix))
+        assert op.hbm_bytes > 0 and op.mte2_bytes > 0 and op.mte3_bytes > 0 and op.vector_ops > 0
+        assert op.hbm_bytes <= plan_work.resources["hbm"] + 1e-6
+        assert _op_service_us(op, c64.machine.dies) >= floor_us > 0
+    long_state = gdn_state.make_op(dict(lengths=(4096, 4096), heads=48, key_heads=16, dk=128, dv=128, chunk=64))
+    assert long_state.hbm_bytes == pytest.approx(gdn_state.build(long_state, geom64).work.resources["hbm"])
+
+    # 2. Chunk32 retained planner resolves only the operator's own bound active requests.
+    c32 = parse_case(compose_case(
+        "qwen3.8-flash-next", NEWEST_SKU, layers=1, tp=1, ep=1,
+        feature_track="proposed", optimizations=("gdn_chunk32_prefill",),
+    ))
+    mixed = (RequestView("p", 32, 0, False, "prefill"), RequestView("d", 1, 128, True, "decode"))
+    fe = Frontend(attention_policy=AttentionPolicy(**c32.runtime.attention_policy))
+    prep = next(o for o in fe(IterationPlan(mixed), c32.model, c32.runtime, c32.machine).ops if o.family == "gdn_prepare")
+    serviced = []
+    for batch in (mixed, mixed[:1]):
+        ex = Execution(c32, CostModel(c32), include_submission=False)
+        work = IterationWork((replace(prep, deps=()),), IterationPlan(batch), 1, 0, 0, None, "body", "audit")
+        ex.engine.advance(until=(ex.add(work, 0, 0).completion,))
+        serviced.append(ex.engine.serviced["mte1@r0:s0"])
+    assert serviced[0] == pytest.approx(serviced[1]) and serviced[0] > 0
+    pad_only = (RequestView("p", 32, 0, False, "prefill", padding=True), mixed[1])
+    ex_pad = Execution(c32, CostModel(c32), include_submission=False)
+    ex_pad.engine.advance(until=(ex_pad.add(
+        IterationWork((replace(prep, deps=()),), IterationPlan(pad_only), 1, 0, 0, None, "body", "audit"), 0, 0,
+    ).completion,))
+    assert ex_pad.engine.serviced.get("mte1@r0:s0", 0.0) == 0.0
+    pad_mixed = (mixed[0], RequestView("pad", 32, 0, False, "prefill", padding=True))
+    state_flops = []
+    for batch in (mixed[:1], pad_mixed):
+        st_op = next(o for o in fe(IterationPlan(batch), c32.model, c32.runtime, c32.machine).ops if o.family == "gdn_state")
+        ev = EvaluationContext.create(c32)
+        ex_st = Execution(c32, ev.cost, ledger=ev.cost.ledger, evaluation=ev, bindings=ev.bindings, include_submission=False)
+        ex_st.engine.advance(until=(ex_st.add(
+            IterationWork((replace(st_op, deps=()),), IterationPlan(batch), 1, 0, 0, None, "body", "audit"), 0, 0,
+        ).completion,))
+        state_flops.append(ex_st.work["flops"])
+    assert state_flops[0] == pytest.approx(state_flops[1]) and state_flops[0] > 0
+
+    # 3. Segmented Chunk32 prepare/state/output each preserve their own segment_lengths.
+    from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
+    from mindie_sim.prediction.operators.linear_attention import gdn_chunk32, resolve_operator_plan
+    from mindie_sim.prediction.results import OpOccurrence
+
+    v_seg = RequestView("r", 64, 0, False, "prefill", global_q_len=96, query_ranges=((0, 32), (64, 96)))
+    seg_ops = fe(IterationPlan((v_seg,)), c32.model, c32.runtime, c32.machine).ops
+    checked_fams = set()
+    for seg_op in seg_ops:
+        if seg_op.family in {"gdn_prepare", "gdn_state", "gdn_output"}:
+            ctx_seg = OperatorPlanningContext(OpOccurrence(0, 0, 0, seg_op.op_id), geom64, geom64.datapath, requests=(v_seg,))
+            expected_m = sum(gdn_chunk32.build(seg_op, geom64, ctx=ctx_seg).work.matrix.values())
+            resolved_m = sum(resolve_operator_plan(seg_op, ctx_seg).recipe.work.matrix.values())
+            assert resolved_m == pytest.approx(expected_m) and expected_m > 0
+            checked_fams.add(seg_op.family)
+    assert checked_fams == {"gdn_prepare", "gdn_state", "gdn_output"}

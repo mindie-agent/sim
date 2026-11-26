@@ -598,3 +598,88 @@ def test_cann_gdn_reuses_final_state_slot_while_fla_stores_each_chunk(length):
         for chunk in {0, chunks.count - 1}:
             store = next(stage for stage in chunks.tile(chunk) if stage.name == "write_rolling_state")
             assert store.metadata["base_byte"] == 0 and store.metadata["head_stride_bytes"] == store.work["fixpipe"] == 32 * 1024
+
+
+def test_gdn_pcp_prefix_sync_guards_rank0_idle_chunks_batches_gathers_and_rerun_stores():
+    from dataclasses import replace as dc_replace
+    from mindie_sim import compose_case, target_graphs
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.prediction.operators.linear_attention.gdn_prefill import resolve_pcp_rank
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import IterationWork
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    gen2_sku, gen3_sku, gen5_sku = (REPRESENTATIVE_SKUS[k] for k in ("a2", "a3", "a5"))
+    # 1. Rank-0 skips PCP rerun while rank-1 executes it on analytical A2/A3 paths,
+    #    and permuted stage ranks resolve PCP lane from RankCoord placement.
+    for sku in (gen2_sku, gen3_sku):
+        c2 = compose_case("qwen3.8-flash-next", sku, layers=1, tp=1, ep=1, pcp=2)
+        for rank in (0, 1):
+            ops = target_graphs(c2, phase="prefill", tokens=128, scope="body",
+                                physical_rank=rank, apply_body_defaults=True)[0]
+            rerun_flops = sum(o.flops for o in ops if "pcp_gdn_fwd_h_rerun" in o.op_id)
+            assert rerun_flops == pytest.approx(rank * 4 * 64 * 48 * 128**2)
+    c2_perm = parse_case(compose_case("qwen3.8-flash-next", gen2_sku, layers=1, tp=1, ep=1, pcp=2))
+    c2_perm = dc_replace(c2_perm, machine=dc_replace(c2_perm.machine, dies=(c2_perm.machine.dies[1], c2_perm.machine.dies[0])))
+    assert resolve_pcp_rank(c2_perm.runtime.parallel, 1, machine=c2_perm.machine) == 0
+    assert resolve_pcp_rank(c2_perm.runtime.parallel, 0, machine=c2_perm.machine) == 1
+    lane0_ops = target_graphs(c2_perm, phase="prefill", tokens=128, scope="body", physical_rank=1, apply_body_defaults=True)[0]
+    lane1_ops = target_graphs(c2_perm, phase="prefill", tokens=128, scope="body", physical_rank=0, apply_body_defaults=True)[0]
+    assert sum(o.flops for o in lane0_ops if "pcp_gdn_fwd_h_rerun" in o.op_id) == 0.0
+    assert sum(o.flops for o in lane1_ops if "pcp_gdn_fwd_h_rerun" in o.op_id) == pytest.approx(4 * 64 * 48 * 128**2)
+
+    # 2. Idle PCP rank with 0 local tokens incurs 0 hupdate/rerun FLOPs while executing
+    #    mandatory FP32 eye(K) identity fill, both collectives, and positive-rank h0->ht state copy.
+    for sku in (gen2_sku, gen3_sku, gen5_sku):
+        c4 = parse_case(compose_case("qwen3.8-flash-next", sku, layers=1, tp=1, ep=1, pcp=4))
+        ops = target_graphs(c4, phase="prefill", tokens=1, scope="body",
+                            physical_rank=3, apply_body_defaults=True)[0]
+        update = next(o for o in ops if o.recipe == "pcp_gdn_hupdate")
+        rerun = next(o for o in ops if o.recipe == "pcp_gdn_fwd_h_rerun")
+        gathers = [o for o in ops if o.recipe in {"pcp_gdn_state_gather", "pcp_gdn_hupdate_gather"}]
+        expected_state_bytes = 48 * 128 * 128 * 4
+        assert update.family == "tensor_fill" and update.flops == 0.0
+        assert update.mte3_bytes == pytest.approx(expected_state_bytes)
+        assert rerun.family == "tensor_copy" and rerun.flops == 0.0
+        assert rerun.mte2_bytes == pytest.approx(expected_state_bytes)
+        assert rerun.mte3_bytes == pytest.approx(expected_state_bytes)
+        assert len(gathers) == 2 and sum(o.link_bytes for o in gathers) > 0
+        if sku != gen5_sku:
+            assert next(o.local_shape[0] for o in ops if o.family == "recurrent_output") == 0
+
+    # 3. Multi-request PCP all-gathers are batched into 2 launches per layer across all generations,
+    #    and batched analytical PCP executes with per-sequence chunk metadata.
+    link_totals = []
+    for sku in (gen2_sku, gen3_sku, gen5_sku):
+        c_bat = parse_case(compose_case("qwen3.8-flash-next", sku, layers=1, tp=1, ep=1, pcp=2))
+        views = tuple(RequestView(str(i), 128, 0, False, "prefill") for i in range(8))
+        ops = Frontend()(IterationPlan(views), c_bat.model, c_bat.runtime, c_bat.machine, physical_rank=1).ops
+        gathers = [o for o in ops if "pcp_gdn_" in o.op_id and "gather" in o.op_id]
+        assert len(gathers) == 2
+        link_totals.append(int(sum(o.link_bytes for o in gathers)))
+    assert len(set(link_totals)) == 1 and link_totals[0] > 0
+    c_multi = parse_case(compose_case("qwen3.8-flash-next", gen2_sku, layers=1, tp=1, ep=1, pcp=2))
+    v_multi = (
+        RequestView("r0", 16, 0, False, "prefill", global_q_len=32, query_ranges=((16, 32),)),
+        RequestView("r1", 16, 0, False, "prefill", global_q_len=32, query_ranges=((16, 32),)),
+    )
+    ops_multi = Frontend()(IterationPlan(v_multi), c_multi.model, c_multi.runtime, c_multi.machine, physical_rank=1).ops
+    ex_multi = Execution(c_multi, CostModel(c_multi), include_submission=False)
+    ex_multi.engine.advance(until=(ex_multi.add(
+        IterationWork(tuple(ops_multi), IterationPlan(v_multi), 1, 0, 0, None, "body", "audit"), 0, 0,
+    ).completion,))
+
+    # 4. Positive-rank PCP rerun stores cover final_state + BF16 h snapshots + BF16 v_new.
+    c_a5 = compose_case("qwen3.8-flash-next", gen5_sku, layers=1, tp=1, ep=1, pcp=2)
+    for tokens in (1024, 2048):
+        ops = target_graphs(c_a5, phase="prefill", tokens=tokens, scope="body",
+                            physical_rank=1, apply_body_defaults=True)[0]
+        rerun = next(o for o in ops if o.recipe == "pcp_gdn_fwd_h_rerun")
+        local_t, heads, dk, dv = rerun.local_shape
+        chunks = (local_t + 63) // 64
+        v_new_bytes = local_t * heads * dv * 2
+        expected_stores = heads * dk * dv * 4 + chunks * heads * dk * dv * 2 + v_new_bytes
+        assert rerun.mte3_bytes == pytest.approx(expected_stores)
+        assert rerun.mte3_bytes > v_new_bytes

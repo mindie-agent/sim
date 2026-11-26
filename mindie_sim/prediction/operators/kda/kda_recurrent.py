@@ -156,6 +156,7 @@ class Params:
     #: identity in the lowerer; an occurrence name is never the state key.
     state_targets: tuple | None = None
     recover_ssm: bool = False
+    record_stride: int | None = None
 
     @classmethod
     def parse(cls, raw):
@@ -164,6 +165,11 @@ class Params:
             raise ModelingError("recurrent_kda_recover_ssm_invalid")
         if not p.lengths or any(not isinstance(q, int) or not 1 <= q <= KDA_MAX_QUERY_ROWS for q in p.lengths):
             raise ModelingError("recurrent_kda_requires_nonempty_q1_to_q8_sequences")
+        if p.record_stride is not None:
+            if (isinstance(p.record_stride, bool)
+                    or not isinstance(p.record_stride, int)
+                    or p.record_stride < max(p.lengths)):
+                raise ModelingError("recurrent_kda_record_stride_invalid")
         if (not 1 <= p.key_heads <= p.heads <= KDA_MAX_VALUE_HEADS or p.heads % p.key_heads
                 or p.dk != KDA_KEY_HEAD_DIM or p.dv not in KDA_VALUE_HEAD_DIMS):
             raise ModelingError("recurrent_kda_source_head_geometry_unsupported")
@@ -577,7 +583,8 @@ def make_op(params, *, op_id="kda_recurrent", deps=(), requests=(), stage=0,
         acceptance=p.state_acceptance, bindings=bindings, owner=owner,
         state_dtype=p.state_dtype, record_dtype=p.dtype, decisions=state_decisions,
         ready=state_ready, grants=state_grants, op_id=op_id,
-        recover_ssm=p.recover_ssm, state_values=state_values)
+        recover_ssm=p.recover_ssm, state_values=state_values,
+        record_stride=p.record_stride)
     metadata.update(
         kda_state_contract=contract, kda_state_effects=effects,
         state_targets=targets, state_bindings=tuple(

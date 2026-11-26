@@ -78,10 +78,19 @@ def make_op(params):
         + (2 * BT * BT * K + 2 * BT * V * K + 2 * (length % BT) ** 2 * V
            if length % BT else 0)
         for length in lengths)
+    spec_work, _ = _aggregate_work(config)
+    matrix_items = tuple(sorted((k, float(v)) for k, v in spec_work.matrix.items() if k and v))
+    total_flops = float(sum(v for _, v in matrix_items))
     return OpSpec(
         op_id="gdn_output", family="gdn_output", phase="prefill", stage=0, layer=0,
         requests=(), dtype="bf16", layout="BSND", recipe=IMPLEMENTATION, source_boundary="kernel",
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        flops=total_flops,
+        matrix_flops=matrix_items,
+        vector_ops=float(spec_work.resources.get("vector", 0.0)),
+        hbm_bytes=float(spec_work.resources.get("hbm", 0.0)),
+        mte2_bytes=float(spec_work.resources.get("mte2", 0.0)),
+        mte3_bytes=float(spec_work.resources.get("mte3", 0.0)),
         metadata=tuple(sorted({
             **config.__dict__, "dispatch": dispatch, "a_prime_transfer": "ub_to_l1",
             "h_semantic_strides": (1, K) if config.state_v_first else (V, 1),
@@ -142,13 +151,9 @@ def _group_work(cfg, group, rows):
     return result
 
 
-def build(op, geometry):
-    require_pair(geometry)
-    meta = dict(op.metadata)
-    cfg = OutputGeometry(**{name: meta[name] for name in OutputGeometry.__dataclass_fields__})
-    chunks = PackedChunks.from_lengths(cfg.lengths)
+def _aggregate_work(cfg: OutputGeometry) -> tuple[Work, float]:
     groups = math.ceil(cfg.heads / cfg.task_group_size)
-    work, aic_reads = Work(), 0
+    work, aic_reads = Work(), 0.0
     for length in cfg.lengths:
         full, tail = divmod(length, BT)
         for rows, count in ((BT, full), (tail, bool(tail))):
@@ -158,6 +163,16 @@ def build(op, geometry):
                         aic_reads += count * (head[1].resources["mte2"] + head[3].resources["mte2"])
                         for stage in head:
                             work = work + stage.scaled(count)
+    return work, aic_reads
+
+
+def build(op, geometry):
+    require_pair(geometry)
+    meta = dict(op.metadata)
+    cfg = OutputGeometry(**{name: meta[name] for name in OutputGeometry.__dataclass_fields__})
+    chunks = PackedChunks.from_lengths(cfg.lengths)
+    groups = math.ceil(cfg.heads / cfg.task_group_size)
+    work, aic_reads = _aggregate_work(cfg)
     work = split_reads(work, aic_reads, geometry.resource_units)
 
     def program(context):

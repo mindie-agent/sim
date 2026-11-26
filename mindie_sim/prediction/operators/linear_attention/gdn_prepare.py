@@ -279,9 +279,36 @@ def make_op(params: dict) -> OpSpec:
     if allow_neg and not use_beta:
         raise ValueError("allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True.")
 
+    output_beta = _bool_param(params, "output_beta", True)
     chunks = PackedChunks.from_lengths(lengths, chunk)
     total_tokens = sum(lengths)
     tasks_per_pack = COMPACT_HEAD_PACK if gqa == COMPACT_HEAD_PACK else DEFAULT_HEAD_PACK
+    cfg = _Config(
+        lengths=lengths,
+        heads=heads,
+        key_heads=key_heads,
+        head_dim_k=head_dim_k,
+        head_dim_v=head_dim_v,
+        chunk=chunk,
+        gqa=gqa,
+        tasks_per_pack=tasks_per_pack,
+        dtype=dtype,
+        gate_dtype=gate_dtype,
+        gate_bytes=_dtype_width(gate_dtype),
+        use_qk_l2norm=use_qk,
+        use_gate=use_gate,
+        use_beta_sigmoid=use_beta,
+        allow_neg_eigval=allow_neg,
+        use_exp2=use_exp2,
+        output_a=output_a,
+        has_dt_bias=has_dt_bias,
+        has_a_log=has_a_log,
+        output_beta=output_beta,
+        fp32_mmad_mode=mm_mode,
+    )
+    spec_work = _total_work(cfg, chunks, 0) if chunks.total * heads > 0 else Work()
+    matrix_items = tuple(sorted((k, float(v)) for k, v in spec_work.matrix.items() if k and v))
+    total_flops = float(sum(v for _, v in matrix_items))
     metadata = tuple(sorted({
         "implementation": _IMPLEMENTATION,
         "lengths": lengths,
@@ -305,7 +332,7 @@ def make_op(params: dict) -> OpSpec:
         "output_a": output_a,
         "has_dt_bias": has_dt_bias,
         "has_a_log": has_a_log,
-        "output_beta": _bool_param(params, "output_beta", True),
+        "output_beta": output_beta,
         "dispatch": {"implementation": _IMPLEMENTATION, "gate_dtype": gate_dtype,
                      "use_exp2": use_exp2, "use_qk_l2norm_in_kernel": use_qk,
                      "use_beta_sigmoid_in_kernel": use_beta,
@@ -325,6 +352,12 @@ def make_op(params: dict) -> OpSpec:
         local_shape=semantic,
         padded_shape=padded,
         launch_shape=padded,
+        flops=total_flops,
+        matrix_flops=matrix_items,
+        vector_ops=float(spec_work.resources.get("vector", 0.0)),
+        hbm_bytes=float(spec_work.resources.get("hbm", 0.0)),
+        mte2_bytes=float(spec_work.resources.get("mte2", 0.0)),
+        mte3_bytes=float(spec_work.resources.get("mte3", 0.0)),
         dtype=dtype,
         recipe=_IMPLEMENTATION, source_boundary="kernel",
         metadata=metadata,

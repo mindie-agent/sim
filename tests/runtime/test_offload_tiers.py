@@ -676,3 +676,72 @@ def test_derived_sku_host_dma_inherits_base_channel_and_calibration():
         assert own["sku"] == derived and own["h2d_source"] != "explicit_transfer_channel"
         for key in ("h2d_bps", "d2h_bps", "host_memory_bps", "h2d_source", "d2h_source", "h2d_latency_us"):
             assert own[key] == base[key], (derived, key)
+
+
+def test_equivalent_strided_and_half_open_spans_deduplicate_offload_charge():
+    policy = OffloadPolicy(kvc_ddr_ratio=1.0, ddr_bw_gbps=16.0)
+    strided = StateAccess(
+        "step1", "append", "r", 0, 0, "write", storage="kv", rank=0,
+        state_version=1, bytes=512, byte_span=((0, 128, 256, 4),),
+        byte_span_format="start_width_stride_count",
+    )
+    explicit = replace(
+        strided,
+        byte_span=tuple((i, i + 128) for i in range(0, 1024, 256)),
+        byte_span_format="half_open",
+    )
+    split_quads = replace(
+        strided,
+        byte_span=((0, 128, 256, 2), (512, 128, 256, 2)),
+        byte_span_format="start_width_stride_count",
+    )
+    unordered_split = replace(
+        strided,
+        byte_span=((768, 896), (0, 64), (64, 128), (512, 640), (256, 384)),
+        byte_span_format="half_open",
+    )
+    assert strided.key == explicit.key == split_quads.key == unordered_split.key
+    for records in ((strided,), (explicit,), (strided, explicit), (strided, explicit, split_quads, unordered_split)):
+        assert sum(row["ddr_bytes"] for row in project_state_tiers(records, policy)) == pytest.approx(512.0)
+
+    # Disjoint slice on the same write occurrence stays distinct and additive.
+    disjoint = replace(strided, byte_span=((128, 256),), byte_span_format="half_open")
+    assert disjoint.key != strided.key
+    assert sum(row["ddr_bytes"] for row in project_state_tiers((strided, disjoint), policy)) == pytest.approx(1024.0)
+
+    # Greedy boundary equivalence: singleton + strided run vs explicit half-open intervals.
+    boundary_explicit = replace(
+        strided, byte_span=((0, 10), (20, 30), (50, 60), (80, 90)), byte_span_format="half_open",
+    )
+    boundary_mixed = replace(
+        strided, byte_span=((0, 10, 10, 1), (20, 10, 30, 3)), byte_span_format="start_width_stride_count",
+    )
+    assert boundary_explicit.key == boundary_mixed.key
+
+    # Large symbolic strided runs deduplicate in O(1) without expanding millions of intervals,
+    # including interleaved periodic runs tiling a contiguous or sub-strided byte range.
+    huge_whole = replace(strided, byte_span=((0, 128, 256, 1_000_000),), byte_span_format="start_width_stride_count")
+    huge_split = replace(
+        strided,
+        byte_span=((0, 128, 256, 400_000), (400_000 * 256, 128, 256, 600_000)),
+        byte_span_format="start_width_stride_count",
+    )
+    assert huge_whole.key == huge_split.key
+
+    n_large, w_large = 100_000, 128
+    contig_large = replace(strided, bytes=2 * n_large * w_large, byte_span=((0, 2 * n_large * w_large),), byte_span_format="half_open")
+    tiled_large = replace(
+        contig_large,
+        byte_span=((0, w_large, 2 * w_large, n_large), (w_large, w_large, 2 * w_large, n_large)),
+        byte_span_format="start_width_stride_count",
+    )
+    assert contig_large.key == tiled_large.key
+    assert sum(row["ddr_bytes"] for row in project_state_tiers((contig_large, tiled_large), policy)) == pytest.approx(2 * n_large * w_large)
+
+    sub_single = replace(strided, byte_span=((0, 64, 256, 200_000),), byte_span_format="start_width_stride_count")
+    sub_interleaved = replace(
+        strided,
+        byte_span=((0, 64, 512, 100_000), (256, 64, 512, 100_000)),
+        byte_span_format="start_width_stride_count",
+    )
+    assert sub_single.key == sub_interleaved.key

@@ -70,17 +70,21 @@ def _write_slot_value(state_values, source, value, slot):
     return value
 
 
-def _recover_ssm_record_value(*, producer, source, value, version, token_index, record_dtype):
+def _recover_ssm_record_value(
+    *, producer, source, value, version, token_index, record_dtype,
+    batch_index: int = 0, record_stride: int = 1,
+):
     shape = tuple(value.layout.shape)
     heads = shape[1] if len(shape) == STATE_POOL_DIMS and shape[0] == 1 else shape[0]
     dv, dk = int(shape[-2]), int(shape[-1])
     rec_head = record_head_bytes(dk, dv, str(record_dtype))
     elem_bytes = int(dtype_bytes(str(record_dtype)))
     rec_elems = rec_head // elem_bytes
+    stride_tokens = max(1, int(record_stride))
     layout = TensorLayout(
         shape=(heads, rec_elems),
         strides=(rec_elems, 1),
-        offset=token_index * heads * rec_elems,
+        offset=(int(batch_index) * stride_tokens + int(token_index)) * heads * rec_elems,
     )
     storage = f"{_slot_storage(source['storage'], None)}:recover_ssm_record"
     return TensorValue(
@@ -94,7 +98,8 @@ def state_contract(*, lengths, targets=(), requests=(), selection=None,
                    contexts=None, acceptance=None, bindings=None,
                    owner="self", state_dtype=None, record_dtype="bf16",
                    decisions=(), ready=(), grants=(), op_id=None,
-                   recover_ssm=False, state_values=None):
+                   recover_ssm=False, state_values=None,
+                   record_stride: int | None = None):
     """Bind per-query versions to explicit state write/commit records.
 
     ``bindings`` are the caller's actual ``TensorValue`` records.  The contract
@@ -129,8 +134,13 @@ def state_contract(*, lengths, targets=(), requests=(), selection=None,
             binding["target"], "read", binding["state_version"]))
     write_bindings = []
     by_target = {binding["target"]: binding for binding in bindings}
+    target_index = {target: index for index, target in enumerate(targets)}
     committed_pairs = set(records["commit_records"])
     query_by_target = dict(zip(targets, records["queries"]))
+    max_query = max((int(q) for q in records["queries"]), default=1)
+    effective_record_stride = (
+        max(max_query, int(record_stride)) if record_stride is not None else max_query
+    )
     token_pos_by_target: dict[str, int] = {}
     for target, version, slot in records["write_records"]:
         source = by_target[target]
@@ -144,6 +154,8 @@ def state_contract(*, lengths, targets=(), requests=(), selection=None,
                 producer=str(op_id or target), source=source, value=value,
                 version=version, token_index=token_index,
                 record_dtype=record_dtype,
+                batch_index=target_index[target],
+                record_stride=effective_record_stride,
             )
             binding = bind_state_value(
                 write_value, target=target, owner=source.get("owner", owner),

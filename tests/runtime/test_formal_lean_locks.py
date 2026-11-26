@@ -607,3 +607,26 @@ def test_aliased_contraction_bound_respects_engine_wall():
     wall_ns = eng.now * 10**6
     assert wall_ns == pytest.approx(32.8192)
     assert 0 < cert.l_star_lean_ns <= wall_ns
+
+
+def test_storage_shape_determines_physical_weight_bytes_for_prefetch():
+    from mindie_sim.prediction.execution.weight_prefetch import PrefetchPhysics, plan_prefetch
+    from mindie_sim.prediction.fusion.graph import FeasibilityError
+
+    w_nz = TensorValue("w", "bf16", (17, 17), role="weight", layout="nz", storage_shape=(2, 2, 16, 16))
+    w_explicit = replace(w_nz, storage_bytes=2 * math.prod(w_nz.storage_shape))
+    x = TensorValue("x", "bf16", (1, 17))
+    y = TensorValue("y", "bf16", (1, 17), producer="mm")
+    mm = OpNode("mm", "matmul", "cube", ("x", "w"), ("y",))
+    physics = PrefetchPhysics(1000, 4000, 4096)
+
+    for weight in (w_nz, w_explicit):
+        graph = TypedGraph(1, {"x": x, "w": weight, "y": y}, {"mm": mm}, ("y",))
+        graph.validate()
+        plan = plan_prefetch(graph, "mm", window_ms=10, foreground_hbm_bytes=0, physics=physics)
+        assert (weight.nbytes, plan.weight_bytes, plan.target_bytes) == (2048, 2048, 2048)
+
+    # Explicit storage_bytes retains precedence over storage_shape, and empty storage_shape is rejected.
+    assert replace(w_nz, storage_bytes=4096).nbytes == 4096
+    with pytest.raises(FeasibilityError, match="tensor_storage_shape_invalid"):
+        TensorValue("bad", "bf16", (17, 17), role="weight", layout="nz", storage_shape=())
