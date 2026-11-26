@@ -746,6 +746,7 @@ def _mla_kva_owner(lower, core):
 
 
 def _lower_mla(lower, p, ready):
+    """[Cohesive-Pipeline] Lower one DSL MLA kernel specification into tiled compute and memory stages."""
     spec = lower.spec
     mode = p.quant_mode
     workspace, _, scratch_rows, recompute = mla_workspaces(p, spec.aic_budget)

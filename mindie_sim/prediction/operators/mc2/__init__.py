@@ -100,6 +100,9 @@ def fused_mc2_native_binding(weight_dtype: str, *, fused_level: int = 1, arch_fa
     raise ModelingError(f"mc2_fused_native_binding_arch_unsupported:{arch_family!r}")
 
 
+_rebind_fused_mc2_op = arch22._rebind_fused_mc2_op
+
+
 def lower_native_protocol(ops, *, selected, **caller):
     """Apply the selected protocol's graph lowering."""
     return _NATIVE_PROTOCOLS[selected["kind"]].lower_native_protocol(

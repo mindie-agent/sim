@@ -1544,6 +1544,7 @@ def _lower_kda_pcp_exit(b, *, last, plan, model, parallel, views, tokens, local_
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
            padded_tokens, policy=None, runtime=None, physical_rank=None,
            explicit_physical_rank=False, machine=None, **_):
+    """[Cohesive-Pipeline] Lower one recurrent linear-attention layer (GDN/KDA) preserving state and CP dependencies."""
     from mindie_sim.catalog.paired_sfa import execution
     if execution(model).get("recurrent_context_sharded") is False:
         # Preserve the PCP plan for head-local KDA state.

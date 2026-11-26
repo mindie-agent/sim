@@ -423,6 +423,8 @@ def _check_explicit_precision_alignment(
 def produced_values(op, *, materialized=None):
     """All actual values written by ``op``, with logical and storage shapes.
 
+    [Cohesive-Pipeline] Single-pass output-value derivation across operator families and quantized layouts.
+
     Produced values are derived from the operator's real output contract:
     a matmul writes ``(M,N)`` even though its operand geometry is ``(M,N,K)``;
     quantized values carry the declared payload format, not the consumer's

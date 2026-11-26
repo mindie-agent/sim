@@ -1405,6 +1405,7 @@ def _mask_is_all_unmasked(arguments, attrs) -> bool:
 
 
 def _attention_op(arguments, symbol, recipe, *, entry=None):
+    """[Cohesive-Pipeline] Build a single aclnn attention OpSpec from declared call arguments and geometry."""
     from mindie_sim.schema.operators import OpSpec
     attrs = arguments.get("attrs")
     attrs = (_mapping(attrs, "aclnn_attention_attrs_requires_mapping")

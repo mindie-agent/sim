@@ -684,6 +684,7 @@ class _FrontendBody:
              layer_limit: int | None = None,
              topk_scope=None, reuse_index_selection: bool = False, rank_ledger=None,
              hc_collapse_before_sp_gather: bool = False):
+        """[Cohesive-Pipeline] Lower the full model layer body DAG with coupled residual, CP, and routing state."""
         _frontend._reject_unmodeled_dbo(runtime, "frontend.body")
         p = runtime.parallel
         if layer_limit is not None:

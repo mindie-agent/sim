@@ -544,6 +544,7 @@ def _sparse_active_totals(
 
 
 def _sparse_contract(op, meta, dtype, returns, resolved, options):
+    """[Cohesive-Pipeline] Validate and assemble one sparse diffusion attention physical contract."""
     ratio = _ratio(meta, options.get("sparsity_ratio"), "sparsity_ratio")
     if not (0.0 <= ratio < 1.0):
         raise ModelingError(f"mindie_sd_invalid_sparsity_ratio:{ratio}")

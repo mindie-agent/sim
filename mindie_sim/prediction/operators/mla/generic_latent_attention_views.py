@@ -981,7 +981,10 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
                           dsa_rank: int | None = None,
                           dsa_batch_tokens: int | None = None,
                           dsa_token_offset: int = 0):
-    """Per-view logical pairs, owned sweeps and batch row vectors."""
+    """Per-view logical pairs, owned sweeps and batch row vectors.
+
+    [Cohesive-Pipeline] Single-pass per-view MLA/DSA context-parallel sweep geometry assembly.
+    """
     context, query = view.context, view.q_len
     parts = (
         dsa_cp_prefill_parts(

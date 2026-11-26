@@ -737,6 +737,8 @@ class _EngineCatalogMixin:
                        owner: str = "") -> Submission:
         """Submit one immutable catalog through the unique event kernel.
 
+        [Cohesive-Pipeline] Single-pass catalog submission binding flat DAGs and finite repeated panels.
+
         Flat catalogs publish every declared stage as a relative DAG. Repeated
         catalogs publish at most ``finite.slots`` panels and issue the next
         absolute index only when a live panel retires, so their live frontier

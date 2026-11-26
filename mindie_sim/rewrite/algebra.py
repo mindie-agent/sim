@@ -1274,7 +1274,10 @@ def _build_mla_prolog_ports(
     rope_dim: int,
     include_rope: bool = True,
 ) -> tuple[str, tuple[OperandPortSig, ...], tuple[OperandPortSig, ...]] | None:
-    """Build independent per-projection MLA prolog operand and output port signatures."""
+    """Build independent per-projection MLA prolog operand and output port signatures.
+
+    [Cohesive-Pipeline] Single-pass ABI port signature construction across MLA prolog operand roles.
+    """
     entry_op = next((op for op in ordered_m if role_of[op.op_id] in {"qkv_a", "q_a"}), ordered_m[0])
     tr = traits[entry_op.op_id]
     by_role: dict[str, OpSpec] = {}

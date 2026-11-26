@@ -28,7 +28,6 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import lru_cache
-import importlib
 import json
 import math
 import os
@@ -330,7 +329,7 @@ def _lowered_op_to_profiler_node(
         impl = resolve_onboarding_builder_and_abi(arch, "attention")[3]
         return (
             {"node_id": nid, "op_id": oid, "kind": "operator", "op": "absorbed_mla", "builder": "absorbed_mla", "family": "attention", "recipe": rec, "implementation": impl, "dtype": dt, "paged": True, "layout": sh.get("query_layout", "TND"), "shape": sh},
-            {"op_id": oid, "family": "attention", "recipe": rec, "builder": "absorbed_mla", "paged": True, "heads": sh["heads"], "kv_heads": 1, "latent": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "kv_len": sh["seq_len"], "page_count": sh["page_count"], "query_layout": sh.get("query_layout", "TND")},
+            {"op_id": oid, "family": "attention", "recipe": rec, "builder": "absorbed_mla", "paged": True, "heads": sh["heads"], "kv_heads": int(sh.get("kv_heads", 1)), "latent": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "kv_len": sh["seq_len"], "page_count": sh["page_count"], "query_layout": sh.get("query_layout", "TND")},
         )
     if fam in _GEMM_FAMILIES and len(loc) >= _MIN_GEMM_RANK:
         m_d, n_d, k_d, mg = int(loc[0]), int(loc[1]), int(loc[2]), max(1, int(op_rec["matrix_groups"]))
@@ -424,6 +423,23 @@ def _structural_width_for_point(
     return _DEFAULT_HIDDEN_WIDTH if sim_fam in {"indexer", "layernorm", "rotary"} else _MLA_HIDDEN_WIDTH
 
 
+def _point_local_kv_heads(plan_doc: Mapping[str, Any], pt: Mapping[str, Any], custom_sim: Mapping[str, Any] | None, tp: int) -> int:
+    for src in (pt, plan_doc):
+        if (v := _int_from(src, "local_kv_heads", "kv_heads")) is not None and v >= 1:
+            return v
+    mdl = custom_sim.get("model") if isinstance(custom_sim, Mapping) else None
+    if isinstance(mdl, Mapping) and (raw_kv := _int_from(mdl, "num_kv_heads", "num_key_value_heads", "kv_heads")) is not None and raw_kv >= 1:
+        from mindie_sim.schema.parallel import local_kv_heads as compute_local_kv_heads
+        return int(compute_local_kv_heads(raw_kv, tp))
+    return 1
+
+
+def _bxkv_seqs(val: int, local_kv: int, pt: Mapping[str, Any]) -> int:
+    if val < 1 or val % local_kv != 0:
+        raise ModelingError(f"profiler_batch_x_kv_heads_indivisible:{pt.get('point_id') or 'pt'}:target={val}:local_kv={local_kv}")
+    return val // local_kv
+
+
 def resolve_point_binding_and_shape(
     plan_doc: Mapping[str, Any], pt: Mapping[str, Any], *, sku: str, profile_override: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, str, str, str, dict[str, Any], dict[str, Any]]:
@@ -440,6 +456,7 @@ def resolve_point_binding_and_shape(
     level = assign_plan_point_level(plan_doc, pt)
     raw_custom = pt.get("sim_case") or plan_doc.get("sim_case")
     custom_sim: Mapping[str, Any] | None = raw_custom if isinstance(raw_custom, Mapping) else None
+    local_kv = _point_local_kv_heads(plan_doc, pt, custom_sim, tp)
     probe_indexed, probe_single_layer, probe_hidden, idx_dt = False, False, None, "bf16"
     if topk_val is not None or plan_family in _SPARSE_INDEXER_FAMILIES:
         cm_q = custom_sim.get("model", {}).get("quant", {}) if isinstance(custom_sim, Mapping) and isinstance(custom_sim.get("model"), Mapping) and isinstance(custom_sim["model"].get("quant"), Mapping) else {}
@@ -460,14 +477,14 @@ def resolve_point_binding_and_shape(
         impl = resolve_onboarding_builder_and_abi(arch, "attention")[3]
         sim_fam = "attention"
         ctx_len = val if axis == "context_len" else _DEFAULT_CONTEXT_FALLBACK
-        seqs = val if axis == "batch_x_kv_heads" else batch
+        seqs = _bxkv_seqs(val, local_kv, pt) if axis == "batch_x_kv_heads" else batch
         kv_len = ctx_len + q_tok
         if dcp > 1:
             la = next((o for o in _lower_one_layer_step_ops(sku, topo, "prefill" if q_tok > 1 else "decode", q_tok, ctx_len, seqs, sim_case=custom_sim, profile_override=profile_override) if o["family"] == "attention"), None)
             if la and len(la["local_shape"]) >= _MIN_2D_RANK:
                 kv_len = int(la["local_shape"][1])
         qlay = "BNSD" if is_single_q_local else "TND"
-        shape = {"tokens": max(1, seqs * q_tok), "sequences": seqs, "batch_size": batch, "query_tokens": q_tok, "q_len": q_tok, "seq_len": kv_len, "kv_len": kv_len, "context_len": ctx_len, "page_count": _page_count(kv_len), "heads": local_heads, "kv_heads": 1, "head_dim": _MLA_LATENT_DIM, "latent": _MLA_LATENT_DIM, "kv_lora_rank": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "qk_rope_head_dim": _MLA_ROPE_DIM, "block_size": _MLA_BLOCK_SIZE, "paged": True, "query_layout": qlay, "input_layout": qlay, "cache_layout": "PA_BSND", "output_layout": "NBSD" if is_single_q_local else "TND", "parallel_topology": topo}
+        shape = {"tokens": max(1, seqs * q_tok), "sequences": seqs, "batch_size": batch, "query_tokens": q_tok, "q_len": q_tok, "seq_len": kv_len, "kv_len": kv_len, "context_len": ctx_len, "page_count": _page_count(kv_len), "heads": local_heads, "kv_heads": local_kv, "head_dim": _MLA_LATENT_DIM, "latent": _MLA_LATENT_DIM, "kv_lora_rank": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "qk_rope_head_dim": _MLA_ROPE_DIM, "block_size": _MLA_BLOCK_SIZE, "paged": True, "query_layout": qlay, "input_layout": qlay, "cache_layout": "PA_BSND", "output_layout": "NBSD" if is_single_q_local else "TND", "parallel_topology": topo}
         if axis == "batch_x_kv_heads":
             shape["batch_x_kv_heads"] = val
         probe_single_layer = level == "L3" and plan_family == "sku_suite"
@@ -480,7 +497,7 @@ def resolve_point_binding_and_shape(
         sim_fam = pfam
         width = _structural_width_for_point(plan_doc, pt, sim_fam=sim_fam, custom_sim=custom_sim)
         probe_hidden = width
-        tok_val = val if axis == "tokens" else max(1, (val if axis == "batch_x_kv_heads" else batch) * q_tok)
+        tok_val = val if axis == "tokens" else max(1, (_bxkv_seqs(val, local_kv, pt) if axis == "batch_x_kv_heads" else batch) * q_tok)
         shape, topo_opts = _resolve_family_shape(
             pbld, tok_val=tok_val, width=width, tp=tp, ep=ep,
             local_heads=local_heads, topo=topo, topo_opts=topo_opts,
@@ -528,7 +545,7 @@ def _build_case_nodes(
             {"node_id": f"{pid}:s0.l0.v_expand", "op_id": "s0.l0.v_expand", "kind": "operator", "op": "grouped_matmul", "builder": "grouped_matmul", "family": "grouped_gemm", "recipe": "grouped_matmul", "implementation": gmm_impl, "dtype": node_dt, "group_list": [total_tokens] * local_heads, "group_list_type": 1, "shape": {"m": v_m, "n": _MLA_HEAD_DIM, "k": _MLA_LATENT_DIM, "e": local_heads, "matrix_groups": local_heads, "dtype": node_dt}},
         ]
         nbs = [
-            {"op_id": attn_id, "family": "attention", "recipe": prec, "builder": pbld, "paged": True, "heads": local_heads, "kv_heads": 1, "latent": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "kv_len": int(shape["seq_len"]), "page_count": int(shape["page_count"]), "query_layout": str(shape.get("query_layout") or "TND")},
+            {"op_id": attn_id, "family": "attention", "recipe": prec, "builder": pbld, "paged": True, "heads": local_heads, "kv_heads": int(shape.get("kv_heads", 1)), "latent": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "kv_len": int(shape["seq_len"]), "page_count": int(shape["page_count"]), "query_layout": str(shape.get("query_layout") or "TND")},
             {"op_id": "s0.l0.v_expand", "family": "gemm", "recipe": "v_expand", "builder": "grouped_matmul", "dtype": node_dt, "quant_mode": "none", "m": v_m, "n": _MLA_HEAD_DIM, "k": _MLA_LATENT_DIM, "matrix_groups": local_heads},
         ]
         return nodes, [{"from": f"{pid}:{attn_id}", "to": f"{pid}:s0.l0.v_expand", "kind": "data"}], nbs, [attn_id, "s0.l0.v_expand"]
@@ -1176,7 +1193,7 @@ def resolve_profiler_builder_strict(family: str, recipe: str, impl: str, *, dtyp
     saved_path, saved_mods = list(sys.path), {k: sys.modules.pop(k) for k in list(sys.modules) if k == "mindie_profiler" or k.startswith("mindie_profiler.")}
     sys.path.insert(0, str(root_path))
     try:
-        mod = importlib.import_module(".".join(("mindie_profiler", "bench", "operators")))
+        import mindie_profiler.bench.operators as mod  # type: ignore[import-not-found]
     except Exception as exc:
         raise ModelingError(f"profiler_owner_unavailable:{exc}") from exc
     finally:

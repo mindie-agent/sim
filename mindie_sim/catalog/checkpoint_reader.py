@@ -2757,7 +2757,10 @@ def quant_spec_from_checkpoint_map(
     index_dtype_override: str = "",
     checkpoint_url: str = "",
 ) -> QuantSpec:
-    """Project a lossless ``CheckpointQuantMap`` into an effective ``QuantSpec``."""
+    """Project a lossless ``CheckpointQuantMap`` into an effective ``QuantSpec``.
+
+    [Cohesive-Pipeline] Single-pass projection over checkpoint rules, layer exceptions, and cache tags.
+    """
     native = _extract_native_float_dtype(base_config) or qmap.native_float_dtype or "bf16"
     if qmap.source_format == "unquantized_native":
         return QuantSpec(

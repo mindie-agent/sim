@@ -892,7 +892,7 @@ def test_grouped_moe_contract_abi_scales_msd_and_hifloat8():
     from mindie_sim.prediction.mechanism import Geometry, Work
     from mindie_sim.prediction.operators.grouped_moe import build as build_gmoe
     from mindie_sim.prediction.operators.grouped_moe.call_grouped_source import build_quantized_grouped_source_call
-    from mindie_sim.prediction.operators.mc2.arch22 import _rebind_fused_mc2_op
+    from mindie_sim.prediction.operators.mc2 import _rebind_fused_mc2_op
     from mindie_sim.prediction.operators.mc2.megamoe import make_op as make_mc2_op
     from mindie_sim.prediction.program import RecipeBook
     from mindie_sim.schema.common import ModelingError

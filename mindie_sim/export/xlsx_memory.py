@@ -702,7 +702,10 @@ def _populate_weight_block(
     w_opts: Sequence[str],
     lookup_ref: str,
 ) -> tuple[int, int]:
-    """Render Section 1 per-die Weight + Quant Scale table; return ``(w_start, w_tot_vit)``."""
+    """Render Section 1 per-die Weight + Quant Scale table; return ``(w_start, w_tot_vit)``.
+
+    [Cohesive-Pipeline] Linear worksheet table population keeping Excel row/column formula references coupled.
+    """
     ws.set_cell(
         2, 1,
         f"1. Per-Die Weight + Quant Scale Closed-Form Table (Side-by-Side 原生 BF16 vs 量化后; Supported: {'/'.join(w_opts)})",

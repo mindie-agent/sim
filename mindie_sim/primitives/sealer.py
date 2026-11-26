@@ -444,6 +444,7 @@ def _assemble_primitive_cells(
     band_fn: Any,
     make_cell_fn: Any,
 ) -> dict[str, Any]:
+    """[Cohesive-Pipeline] Assemble the full hardware primitive cell dictionary across P01-P20 in one pass."""
     p: dict[str, Any] = {}
     p01r, p02r, p03r, p04r, p05r, p06r = (
         raw.get(k, {})

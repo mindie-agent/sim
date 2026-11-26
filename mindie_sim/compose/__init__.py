@@ -22,7 +22,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -1950,18 +1950,29 @@ def _prepare_composed_model(
     )
 
 
+_AUTO_DEPLOYMENT_SOLVER: Callable[..., dict[str, Any]] | None = None
+
+
+def register_auto_deployment_solver(solver: Callable[..., dict[str, Any]]) -> None:
+    """Register the L5b deployment solver invoked by auto-mode ``compose_case``."""
+    global _AUTO_DEPLOYMENT_SOLVER
+    _AUTO_DEPLOYMENT_SOLVER = solver
+
+
 def _compose_auto_deployment(
     model, hardware, axes, *, num_devices, prompt_tokens, output_tokens,
     ttft_slo_ms, tpot_slo_ms, deployment, role=None, **options,
 ):
-    from mindie_sim.sweep.pd import solve_optimal_deployment
+    solver = _AUTO_DEPLOYMENT_SOLVER
+    if solver is None:
+        raise ModelingError("auto_deployment_solver_unregistered")
 
     eff_dep = deployment if deployment is not None else role
     validated_dep = validate_deployment_mode(eff_dep)
     direct_keys = set(_COMPOSE_OPTION_GROUPS["auto"])
     direct_opts = {k: v for k, v in options.items() if k in direct_keys}
     extra_opts = {k: v for k, v in options.items() if k not in direct_keys and v is not None}
-    solved = solve_optimal_deployment(
+    solved = solver(
         model=model, hardware=hardware, num_devices=int(num_devices),
         prompt_tokens=int(prompt_tokens), output_tokens=int(output_tokens),
         ttft_sla_ms=(None if ttft_slo_ms is None else float(ttft_slo_ms)),
@@ -2536,6 +2547,7 @@ __all__ = [
     "capture_keys",
     "compose_case",
     "prepare_speculation",
+    "register_auto_deployment_solver",
     "resolve_case_contracts",
     "resolve_hardware_sku",
     "va_recommended_config",

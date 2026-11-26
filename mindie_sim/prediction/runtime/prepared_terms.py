@@ -208,6 +208,8 @@ def bind_vector_groups(
 ) -> BoundVectorOp:
     """Lower AIV instruction groups onto ``vec_issue`` and declared sub-pipes.
 
+    [Cohesive-Pipeline] Single-pass vector-pipe lowering preserving latency-cycle invariance.
+
     ``target_eff`` scales issue and sub-pipe throughput while leaving hardware
     result latency cycles invariant. The legacy ``vector`` total is computed as
     a pure reporting projection and never occupies a competing resource row.

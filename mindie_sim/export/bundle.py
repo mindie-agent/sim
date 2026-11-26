@@ -3147,7 +3147,10 @@ def build_export_bundle(
     pd_pool_summary: Mapping[str, Any] | None = None,
     serve_script_supplied: bool = False,
 ) -> ExportBundle:
-    """Evaluate unique layer archetypes once on ``runtime.Engine`` into ``ExportBundle``."""
+    """Evaluate unique layer archetypes once on ``runtime.Engine`` into ``ExportBundle``.
+
+    [Cohesive-Pipeline] Single-spine archetype replay, ledger accounting, waterfall attribution, and bundle assembly.
+    """
     parsed, track_name, step_req, seq_count, cluster_conc, ext_plan, has_explicit_edits, include_draft = (
         _resolve_bundle_step_context(
             case, request=request, step_eval=step_eval,

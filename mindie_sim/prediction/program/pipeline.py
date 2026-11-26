@@ -782,7 +782,10 @@ def _build_template_scoper(template: PipelineTemplate, name: str):
 def _start_template_direct(
     engine: Engine, template: PipelineTemplate, name: str, ready: Event, owner: str,
 ) -> Event:
-    """Execute a PipelineTemplate losslessly with full binding scopes and lags."""
+    """Execute a PipelineTemplate losslessly with full binding scopes and lags.
+
+    [Cohesive-Pipeline] Single-pass template instantiation binding scopes, reusable allocations, and lag edges.
+    """
     scoped_at = _build_template_scoper(template, name)
     explicit_keys = ("identity", "physical", "physical_name", "external")
     reusable_alloc_names = frozenset(
