@@ -44,6 +44,9 @@ CHECKPOINT_FORMATS = frozenset({
 ModelScope = Literal["target", "draft", "vision", "projector"]
 MODEL_SCOPES = frozenset({"target", "draft", "vision", "projector"})
 
+CacheQuantScope = Literal["target", "draft"]
+CACHE_QUANT_SCOPES = frozenset({"target", "draft"})
+
 CacheQuantProvenance = Literal[
     "checkpoint",
     "cli_override",
@@ -131,6 +134,13 @@ def _pattern_matches(pattern: str, tensor_path: str) -> bool:
 
 
 def _ignored_module_matches(entry: str, tensor_path: str) -> bool:
+    if entry.startswith("re:"):
+        rx = re.compile(entry[len("re:"):])
+        if rx.search(tensor_path) is not None:
+            return True
+        if tensor_path.endswith(".weight"):
+            return rx.search(tensor_path[: -len(".weight")]) is not None
+        return False
     pattern = entry.split(".")
     path = tensor_path.split(".")
     return len(pattern) <= len(path) and all(
@@ -174,6 +184,7 @@ class _CompiledQuantMapIndex:
         "exc_by_key",
         "ignored_exact",
         "ignored_wildcards",
+        "ignored_regexes",
         "rules_exact",
         "rules_wc",
         "digest_hex",
@@ -200,13 +211,20 @@ class _CompiledQuantMapIndex:
 
         ign_exact: list[str] = []
         ign_wc: list[str] = []
+        ign_re: list[re.Pattern[str]] = []
         for entry in qmap.ignored_modules:
-            if "*" in entry:
+            if entry.startswith("re:"):
+                try:
+                    ign_re.append(re.compile(entry[len("re:"):]))
+                except re.error as exc:
+                    raise ModelingError(f"checkpoint_ignored_module_regex_invalid:{entry!r}") from exc
+            elif "*" in entry:
                 ign_wc.append(entry)
             else:
                 ign_exact.append(entry)
         self.ignored_exact = frozenset(ign_exact)
         self.ignored_wildcards = tuple(ign_wc)
+        self.ignored_regexes = tuple(ign_re)
 
         exact_buckets: dict[
             str,
@@ -496,14 +514,24 @@ class CacheQuantRule:
     layer_scoped_kv: tuple[tuple[int, str], ...] = ()
     layer_scoped_index: tuple[tuple[int, str], ...] = ()
     provenance: CacheQuantProvenance = "native"
+    scope: CacheQuantScope = "target"
+    draft_layer_scoped_kv: tuple[tuple[int, str], ...] = ()
+    draft_layer_scoped_index: tuple[tuple[int, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.provenance not in CACHE_QUANT_PROVENANCES:
             raise ModelingError(f"cache_quant_provenance_invalid:{self.provenance!r}")
+        if self.scope not in CACHE_QUANT_SCOPES:
+            raise ModelingError(f"cache_quant_scope_invalid:{self.scope!r}")
         for attr in ("kv_tag", "index_tag", "kv_scale_dtype", "index_scale_dtype", "kv_offset_dtype"):
             if not isinstance(getattr(self, attr), str):
                 raise ModelingError(f"cache_quant_field_invalid:{attr}")
-        for attr in ("layer_scoped_kv", "layer_scoped_index"):
+        for attr in (
+            "layer_scoped_kv",
+            "layer_scoped_index",
+            "draft_layer_scoped_kv",
+            "draft_layer_scoped_index",
+        ):
             raw = getattr(self, attr)
             normalized: list[tuple[int, str]] = []
             seen_layers: set[int] = set()
@@ -519,22 +547,54 @@ class CacheQuantRule:
                 normalized.append((layer_id, _require_nonempty_str(tag, f"cache_quant_tag_empty:{attr}")))
             object.__setattr__(self, attr, tuple(sorted(normalized)))
 
-    def kv_tag_for_layer(self, source_native_layer_id: int | None) -> str:
+    def kv_tag_for_layer(
+        self,
+        source_native_layer_id: int | None,
+        *,
+        scope: CacheQuantScope = "target",
+    ) -> str:
+        if scope not in CACHE_QUANT_SCOPES:
+            raise ModelingError(f"cache_quant_scope_invalid:{scope!r}")
         if source_native_layer_id is not None:
-            for layer_id, tag in self.layer_scoped_kv:
-                if layer_id == source_native_layer_id:
-                    return tag
+            if scope == "draft":
+                for layer_id, tag in self.draft_layer_scoped_kv:
+                    if layer_id == source_native_layer_id:
+                        return tag
+                if self.scope == "draft":
+                    for layer_id, tag in self.layer_scoped_kv:
+                        if layer_id == source_native_layer_id:
+                            return tag
+            elif self.scope == "target":
+                for layer_id, tag in self.layer_scoped_kv:
+                    if layer_id == source_native_layer_id:
+                        return tag
         return self.kv_tag
 
-    def index_tag_for_layer(self, source_native_layer_id: int | None) -> str:
+    def index_tag_for_layer(
+        self,
+        source_native_layer_id: int | None,
+        *,
+        scope: CacheQuantScope = "target",
+    ) -> str:
+        if scope not in CACHE_QUANT_SCOPES:
+            raise ModelingError(f"cache_quant_scope_invalid:{scope!r}")
         if source_native_layer_id is not None:
-            for layer_id, tag in self.layer_scoped_index:
-                if layer_id == source_native_layer_id:
-                    return tag
+            if scope == "draft":
+                for layer_id, tag in self.draft_layer_scoped_index:
+                    if layer_id == source_native_layer_id:
+                        return tag
+                if self.scope == "draft":
+                    for layer_id, tag in self.layer_scoped_index:
+                        if layer_id == source_native_layer_id:
+                            return tag
+            elif self.scope == "target":
+                for layer_id, tag in self.layer_scoped_index:
+                    if layer_id == source_native_layer_id:
+                        return tag
         return self.index_tag
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "kv_tag": self.kv_tag,
             "index_tag": self.index_tag,
             "kv_scale_dtype": self.kv_scale_dtype,
@@ -544,6 +604,13 @@ class CacheQuantRule:
             "layer_scoped_index": [list(item) for item in self.layer_scoped_index],
             "provenance": self.provenance,
         }
+        if self.scope != "target":
+            payload["scope"] = self.scope
+        if self.draft_layer_scoped_kv:
+            payload["draft_layer_scoped_kv"] = [list(item) for item in self.draft_layer_scoped_kv]
+        if self.draft_layer_scoped_index:
+            payload["draft_layer_scoped_index"] = [list(item) for item in self.draft_layer_scoped_index]
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -650,6 +717,13 @@ class CheckpointQuantMap:
         for ignored in idx.ignored_wildcards:
             if _ignored_module_matches(ignored, tensor_path):
                 return "FLOAT"
+        if idx.ignored_regexes:
+            mod_path = tensor_path[: -len(".weight")] if tensor_path.endswith(".weight") else tensor_path
+            for rx in idx.ignored_regexes:
+                if rx.search(tensor_path) is not None or (
+                    mod_path != tensor_path and rx.search(mod_path) is not None
+                ):
+                    return "FLOAT"
         return None
 
     def resolve_raw_tag(
@@ -724,12 +798,14 @@ class CheckpointQuantMap:
 
 __all__ = [
     "CACHE_QUANT_PROVENANCES",
+    "CACHE_QUANT_SCOPES",
     "CHECKPOINT_FORMATS",
     "CHECKPOINT_ORIGINS",
     "CHECKPOINT_QUANT_MAP_SCHEMA",
     "MODEL_SCOPES",
     "CacheQuantProvenance",
     "CacheQuantRule",
+    "CacheQuantScope",
     "CheckpointFormat",
     "CheckpointOrigin",
     "CheckpointProvenance",

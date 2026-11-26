@@ -757,9 +757,10 @@ def _append_dspark_decode_head(
                 ops.append(scatter)
                 cur = scatter.op_id
             if run_confidence:
+                conf_width = int(draft.confidence_input_width or (draft.hidden_size + draft.markov_rank))
                 conf = vector_op(
                     op_id=f"{prefix}confidence_{m_step}", deps=(cur,), stage=stage, layer=-1,
-                    requests=requests, elements=step_seqs * (draft.hidden_size + draft.markov_rank),
+                    requests=requests, elements=step_seqs * conf_width,
                     ops_per_element=2, dtype=model.activation_dtype, family="confidence",
                     phase=phase, recipe="draft_confidence",
                 )

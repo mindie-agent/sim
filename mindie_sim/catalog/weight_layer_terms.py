@@ -451,9 +451,9 @@ def _ffn_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     if plan.ffn == "dense":
         i = plan.intermediate_size
         terms.extend([
-            _t("dense_gate", i, h, "dense_mlp", "dense_up"),
-            _t("dense_up", i, h, "dense_mlp", "dense_up"),
-            _t("dense_down", h, i, "dense_mlp", "dense_down"),
+            _t("dense_gate", i, h, "dense_mlp.gate", "dense_up"),
+            _t("dense_up", i, h, "dense_mlp.up", "dense_up"),
+            _t("dense_down", h, i, "dense_mlp.down", "dense_down"),
         ])
         return terms
     if plan.num_experts <= 0 or plan.moe_intermediate_size <= 0:

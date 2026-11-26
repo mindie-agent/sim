@@ -356,13 +356,15 @@ _SITU_ABI_PROBE_DEFAULT_WIDTH = 256
 
 
 def _verify_dequant_situ_quant_abi(
-    reg, arch: str, *, width: int = _SITU_ABI_PROBE_DEFAULT_WIDTH,
+    reg, arch: str, *, width: int = _SITU_ABI_PROBE_DEFAULT_WIDTH, input_dtype: str = "bf16",
 ) -> bool:
     """Verify full input+output ``aclnnDequantSituQuant`` tuple via ``ProbedAbiRegistry.verify``."""
     from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
 
     sku_map = {"A2": "ascend910b2", "A3": "ascend910_9362", "A5": "ascend950dt_9582"}
     even_w = max(2, int(width) if int(width) % 2 == 0 else int(width) + 1)
+    norm_in = str(input_dtype or "bf16").strip().lower().replace("-", "_")
+    eff_in = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(norm_in, norm_in or "bf16")
     query = AbiQueryKey(
         soc_arch=arch,  # type: ignore[arg-type]
         sku_id=sku_map[arch],
@@ -372,7 +374,7 @@ def _verify_dequant_situ_quant_abi(
         draft_quant_mode="none",
         pr_track="shipping",
         operands=(OperandPortSig(
-            role="x", dtype="bf16", layout="ND", transposed=False,
+            role="x", dtype=eff_in, layout="ND", transposed=False,
             shape=(1, even_w), quant_mode="dense", group_shape=(),
             scale_dtype="none", scale_shape=(),
         ),),
@@ -442,9 +444,12 @@ def _activation_abi_lowering(
             or getattr(plan, "intermediate_size", 0)
             or _SITU_ABI_PROBE_DEFAULT_WIDTH
         )
+        in_dtype = str(activation_dtype or act_fmt or "bf16").strip().lower()
         if (not is_unquantized
                 and act_fmt == "int8"
-                and _verify_dequant_situ_quant_abi(reg, arch, width=inter_w * 2)):
+                and _verify_dequant_situ_quant_abi(
+                    reg, arch, width=inter_w * 2, input_dtype=in_dtype,
+                )):
             return False, False, (
                 ("aclnn_symbol", "aclnnDequantSituQuant"),
                 ("native_kinds", ("DequantSituQuant",)),
@@ -590,6 +595,67 @@ def _strip_shipping_situ_meta(meta_items):
     return tuple(stripped)
 
 
+def _dense_projection_quant_signature(layer_quant, category: str) -> tuple:
+    resolved = layer_quant.for_category(category)
+    return (
+        resolved.format_for(category),
+        resolved.source_format_for(category),
+        resolved.activation_format,
+        resolved.weight_block,
+        resolved.expert_block,
+        resolved.scale_format,
+        resolved.scale_bytes,
+        resolved.activation_group_size,
+        resolved.activation_scale_format,
+        resolved.activation_scale_pack,
+        resolved.output_format,
+        resolved.runtime_weight_scale_format,
+        resolved.runtime_weight_scale_bytes,
+        resolved.runtime_activation_scale_format,
+        resolved.runtime_int8_weight_metadata,
+        resolved.int8_weight_metadata,
+        resolved.weight_symmetric,
+    )
+
+
+def _resolve_dense_ffn_categories(layer_quant, category: str) -> tuple[str, str, str, bool]:
+    """Resolve ``(gate_cat, up_cat, down_cat, split_gate_up)`` preserving flat ``dense_mlp`` when uniform."""
+    if category != "dense_mlp" or layer_quant is None:
+        return category, category, category, False
+    parent_sig = _dense_projection_quant_signature(layer_quant, "dense_mlp")
+    gate_sig = _dense_projection_quant_signature(layer_quant, "dense_mlp.gate")
+    up_sig = _dense_projection_quant_signature(layer_quant, "dense_mlp.up")
+    down_sig = _dense_projection_quant_signature(layer_quant, "dense_mlp.down")
+    if gate_sig == up_sig == down_sig == parent_sig:
+        return "dense_mlp", "dense_mlp", "dense_mlp", False
+    return "dense_mlp.gate", "dense_mlp.up", "dense_mlp.down", gate_sig != up_sig
+
+
+def _cast_split_branch(
+    producer, *, suffix: str, src_dtype: str, dst_dtype: str,
+    tokens, width: int, stage: int, layer: int, requests, phase: str,
+):
+    count = tokens * width
+    return vector_op(
+        op_id=producer.op_id + suffix,
+        deps=(producer.op_id,),
+        stage=stage,
+        layer=layer,
+        requests=requests,
+        elements=math.ceil(count),
+        ops_per_element=1,
+        vector_ops_override=count,
+        dtype=dst_dtype,
+        family="cast",
+        phase=phase,
+        recipe="dense_gate_up_cast",
+        shape=(math.ceil(tokens), width),
+        read_bytes_override=count * dtype_bytes(src_dtype),
+        write_bytes_override=count * dtype_bytes(dst_dtype),
+        metadata=(("source_dtype", src_dtype), ("output_format", dst_dtype)),
+    )
+
+
 def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
           category="dense_mlp", runtime=None, reduce_output=True, **_):
     # A declared selector is configuration even when this FFN is dense. Validate
@@ -599,17 +665,61 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
     moe_transport.select(runtime)
     layer_quant = projection_quant(model.quant, plan)
     width = math.ceil(plan.intermediate_size / parallel.tp)
-    gate = gemm_op(
-        op_id=prefix + ".gate_up", deps=(deps,), stage=stage, layer=plan.index,
-        requests=requests, m=tokens, n=2 * width, k=model.hidden_size,
-        quant=layer_quant, category=category, phase=mode,
-        family="gate_up_projection", recipe="dense_gate_up",
-        metadata=(("ffn_role", "gate_up"), ("ffn_category", category)),
-    )
+    gate_cat, up_cat, down_cat, split_gate_up = _resolve_dense_ffn_categories(layer_quant, category)
+    if split_gate_up:
+        gate_proj = gemm_op(
+            op_id=prefix + ".gate", deps=(deps,), stage=stage, layer=plan.index,
+            requests=requests, m=tokens, n=width, k=model.hidden_size,
+            quant=layer_quant, category=gate_cat, phase=mode,
+            family="gate_up_projection", recipe="dense_gate_up",
+            metadata=(("ffn_role", "gate_up"), ("ffn_category", category)),
+        )
+        up_proj = gemm_op(
+            op_id=prefix + ".up", deps=(deps,), stage=stage, layer=plan.index,
+            requests=requests, m=tokens, n=width, k=model.hidden_size,
+            quant=layer_quant, category=up_cat, phase=mode,
+            family="gate_up_projection", recipe="dense_gate_up",
+            metadata=(("ffn_role", "gate_up"), ("ffn_category", category)),
+        )
+        gate_ops = [gate_proj, up_proj]
+        gate_out = str(dict(gate_proj.metadata).get("output_format") or gate_proj.dtype or model.activation_dtype)
+        up_out = str(dict(up_proj.metadata).get("output_format") or up_proj.dtype or model.activation_dtype)
+        gate_dep_id, up_dep_id = gate_proj.op_id, up_proj.op_id
+        if gate_out != up_out:
+            gate_in_dtype = model.activation_dtype
+            if gate_out != gate_in_dtype:
+                gate_cast = _cast_split_branch(
+                    gate_proj, suffix=".cast", src_dtype=gate_out, dst_dtype=gate_in_dtype,
+                    tokens=tokens, width=width, stage=stage, layer=plan.index,
+                    requests=requests, phase=mode,
+                )
+                gate_ops.append(gate_cast)
+                gate_dep_id = gate_cast.op_id
+            if up_out != gate_in_dtype:
+                up_cast = _cast_split_branch(
+                    up_proj, suffix=".cast", src_dtype=up_out, dst_dtype=gate_in_dtype,
+                    tokens=tokens, width=width, stage=stage, layer=plan.index,
+                    requests=requests, phase=mode,
+                )
+                gate_ops.append(up_cast)
+                up_dep_id = up_cast.op_id
+        else:
+            gate_in_dtype = gate_out
+        act_deps = (gate_dep_id, up_dep_id)
+    else:
+        gate = gemm_op(
+            op_id=prefix + ".gate_up", deps=(deps,), stage=stage, layer=plan.index,
+            requests=requests, m=tokens, n=2 * width, k=model.hidden_size,
+            quant=layer_quant, category=gate_cat, phase=mode,
+            family="gate_up_projection", recipe="dense_gate_up",
+            metadata=(("ffn_role", "gate_up"), ("ffn_category", category)),
+        )
+        gate_ops = [gate]
+        act_deps = (gate.op_id,)
+        gate_in_dtype = str(dict(gate.metadata).get("output_format") or gate.dtype or model.activation_dtype)
     act_id = prefix + (".situ" if plan.ffn_activation == "situ" else ".swiglu")
-    gate_in_dtype = str(dict(gate.metadata).get("output_format") or gate.dtype or model.activation_dtype)
     unfuse_situ, unfuse_clipped, abi_act_meta = _activation_abi_lowering(
-        plan, runtime, layer_quant, category,
+        plan, runtime, layer_quant, down_cat,
         activation_dtype=gate_in_dtype, output_dtype=model.activation_dtype,
     )
     act_extra_meta = (
@@ -621,7 +731,7 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
     if plan.ffn_activation == "situ" and (_is_raw_eager(runtime) or unfuse_situ):
         act_ops = list(situ_eager_chain(
             plan=plan, rows=tokens, width=width, op_id=act_id,
-            deps=(gate.op_id,), stage=stage, requests=requests,
+            deps=act_deps, stage=stage, requests=requests,
             dtype=gate_in_dtype, output_dtype=model.activation_dtype, phase=mode,
         ))
         # situ_eager_chain already emits every individual kernel op; strip collapsed native_kinds
@@ -632,7 +742,7 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
     elif unfuse_clipped:
         act_ops = list(_clipped_swiglu_eager_chain(
             plan=plan, rows=tokens, width=width, op_id=act_id,
-            deps=(gate.op_id,), stage=stage, requests=requests,
+            deps=act_deps, stage=stage, requests=requests,
             dtype=model.activation_dtype, phase=mode, recipe="swiglu",
         ))
         act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + act_extra_meta)
@@ -640,21 +750,28 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
     else:
         activation = gated_activation(
             plan=plan, rows=tokens, width=width, op_id=act_id,
-            deps=(gate.op_id,), stage=stage,
+            deps=act_deps, stage=stage,
             requests=requests, dtype=model.activation_dtype, phase=mode, recipe="swiglu",
         )
+        if dtype_bytes(gate_in_dtype) != dtype_bytes(model.activation_dtype):
+            in_read = float(2 * tokens * width * dtype_bytes(gate_in_dtype))
+            activation = replace(
+                activation,
+                mte2_bytes=in_read,
+                hbm_bytes=in_read + float(activation.mte3_bytes),
+            )
         activation = replace(activation, metadata=activation.metadata + act_extra_meta)
         activation = _bind_dequant_situ_quant_outputs(activation, rows=tokens, width=width)
         act_ops = [activation]
     down = gemm_op(
         op_id=prefix + ".down", deps=(activation.op_id,), stage=stage, layer=plan.index,
         requests=requests, m=tokens, n=model.hidden_size, k=width,
-        quant=layer_quant, category=category, phase=mode,
+        quant=layer_quant, category=down_cat, phase=mode,
         family="down_projection", recipe="dense_down",
         metadata=(("ffn_role", "down"), ("ffn_category", category)),
     )
     down = _bind_explicit_quantized_consumer(down, activation)
-    ops, last = [gate, *act_ops, down], down.op_id
+    ops, last = [*gate_ops, *act_ops, down], down.op_id
     declare_situ_quant(ops, key=prefix + ".situ_quant", activation=activation,
                        consumer=down, runtime=runtime, rows=tokens, width=width)
     if parallel.tp > 1 and reduce_output:

@@ -216,9 +216,9 @@ def _draft_ffn_terms(
     else:
         i = draft.intermediate_size
         terms.extend([
-            _t("draft_gate", i, h, "dense_mlp", "dense_up"),
-            _t("draft_up", i, h, "dense_mlp", "dense_up"),
-            _t("draft_down", h, i, "dense_mlp", "dense_down"),
+            _t("draft_gate", i, h, "dense_mlp.gate", "dense_up"),
+            _t("draft_up", i, h, "dense_mlp.up", "dense_up"),
+            _t("draft_down", h, i, "dense_mlp.down", "dense_down"),
         ])
     if draft.mhc_lowrank > ZERO:
         terms.extend(lowrank_hc_draft_terms(draft))

@@ -436,9 +436,9 @@ def _plan_tensor_category_pairs(plan: Any) -> tuple[tuple[str, str], ...]:
             ])
     else:
         pairs.extend([
-            ("model.layers.*.mlp.gate_proj.weight", "dense_mlp"),
-            ("model.layers.*.mlp.up_proj.weight", "dense_mlp"),
-            ("model.layers.*.mlp.down_proj.weight", "dense_mlp"),
+            ("model.layers.*.mlp.gate_proj.weight", "dense_mlp.gate"),
+            ("model.layers.*.mlp.up_proj.weight", "dense_mlp.up"),
+            ("model.layers.*.mlp.down_proj.weight", "dense_mlp.down"),
         ])
     return tuple(pairs)
 
@@ -552,6 +552,7 @@ def _build_override_layer_exceptions(
         return ()
     from mindie_sim.catalog.npu_checkpoints import _classify_from_quant_spec
     from mindie_sim.catalog.quant import lookup_layer_quant_override, projection_quant
+    from mindie_sim.catalog.checkpoint_reader import STANDARD_UNQUANTIZED_EXCLUSIONS
 
     preset = canonical_quant_preset_key(qspec)
     base_q = replace(
@@ -574,10 +575,21 @@ def _build_override_layer_exceptions(
     )
     dense_mismatch = actual_dense_tag.upper() != preset_dense_tag.upper()
     expert_mismatch = actual_expert_tag.upper() != preset_expert_tag.upper()
+    extra_exclusions = {
+        str(cat)
+        for cat in getattr(qspec, "exclusions", ())
+        if str(cat) not in STANDARD_UNQUANTIZED_EXCLUSIONS
+        and (
+            preset_expert_tag.upper() != "FLOAT"
+            if str(cat) in _EXPERT_OVERRIDE_CATS
+            else preset_dense_tag.upper() != "FLOAT"
+        )
+    }
     has_ov = bool(
         getattr(qspec, "category_overrides", ())
         or getattr(qspec, "layer_quant_overrides", ())
         or getattr(qspec, "expert_quant_overrides", ())
+        or extra_exclusions
         or dense_mismatch
         or expert_mismatch
     )
@@ -587,6 +599,7 @@ def _build_override_layer_exceptions(
     global_ov_cats = {
         str(k) for k, f in qspec.category_overrides if _override_mapping_affects_quant(f)
     }
+    global_ov_cats.update(extra_exclusions)
     if getattr(qspec, "expert_quant_overrides", ()):
         global_ov_cats.add("routed_expert")
     layer_ov_dict = qspec.layer_quant_overrides_dict() if qspec.layer_quant_overrides else {}
@@ -886,22 +899,43 @@ def _attach_checkpoint_quant(
     return replace(spec, metadata=tuple(sorted(meta.items())))
 
 
+def _read_standalone_quantize_config(base_dir: Path) -> dict[str, Any] | None:
+    qcfg_path = base_dir / "quantize_config.json"
+    if not qcfg_path.is_file():
+        return None
+    from mindie_sim.catalog.npu_checkpoints import _standalone_quant_config
+
+    return _standalone_quant_config(_read_config_json(qcfg_path))
+
+
 def _read_companion_quant_spec(path: Path, raw_config: Mapping[str, Any]) -> Any:
     base_dir = path if path.is_dir() else path.parent
-    desc_path = base_dir / "quant_model_description.json"
-    if not desc_path.is_file():
-        return None
     from mindie_sim.catalog.checkpoint_reader import (
         quant_spec_from_checkpoint_map,
+        read_hf_quantization_config,
         read_modelslim_description_file,
     )
 
-    qmap = read_modelslim_description_file(
-        desc_path,
-        checkpoint_id=f"local/{base_dir.name or 'checkpoint'}",
-        base_config=raw_config,
-    )
-    return quant_spec_from_checkpoint_map(qmap, base_config=raw_config)
+    ckpt_id = f"local/{base_dir.name or 'checkpoint'}"
+    desc_path = base_dir / "quant_model_description.json"
+    if desc_path.is_file():
+        qmap = read_modelslim_description_file(
+            desc_path,
+            checkpoint_id=ckpt_id,
+            base_config=raw_config,
+        )
+        return quant_spec_from_checkpoint_map(qmap, base_config=raw_config)
+    if not _mapping_declares_hf_quant(raw_config):
+        standalone_q = _read_standalone_quantize_config(base_dir)
+        if standalone_q is not None:
+            qmap = read_hf_quantization_config(
+                standalone_q,
+                checkpoint_id=ckpt_id,
+                base_config=raw_config or None,
+                descriptor_path="quantize_config.json",
+            )
+            return quant_spec_from_checkpoint_map(qmap, base_config=raw_config or None)
+    return None
 
 
 def _canonical_model_id(model_arg: Any, model_spec: ModelSpec) -> str:
@@ -943,6 +977,16 @@ def _local_checkpoint_quant_map(
     desc_path = base_dir / "quant_model_description.json"
     if desc_path.is_file():
         return read_modelslim_description_file(desc_path, checkpoint_id=ckpt_id, base_config=raw_cfg)
+    if raw_cfg and _mapping_declares_hf_quant(raw_cfg):
+        return read_hf_quantization_config(raw_cfg, checkpoint_id=ckpt_id)
+    standalone_q = _read_standalone_quantize_config(base_dir)
+    if standalone_q is not None:
+        return read_hf_quantization_config(
+            standalone_q,
+            checkpoint_id=ckpt_id,
+            base_config=raw_cfg or None,
+            descriptor_path="quantize_config.json",
+        )
     if raw_cfg:
         return read_hf_quantization_config(raw_cfg, checkpoint_id=ckpt_id)
     return None

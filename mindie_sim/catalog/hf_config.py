@@ -30,6 +30,17 @@ _NON_LINEAR_EXCLUSION_ROLES = frozenset({
     "lm_head", "embedding", "norm", "router", "indexer_weights", "mtp",
     "vision", "projector",
 })
+_DENSE_MLP_PROJECTION_ROLES = frozenset({
+    "dense_mlp.gate", "dense_mlp.up", "dense_mlp.down",
+})
+_FP8_APPLICABLE_EXCLUSION_ROLES = (
+    _NON_LINEAR_EXCLUSION_ROLES
+    | _DENSE_MLP_PROJECTION_ROLES
+    | frozenset({"dense_mlp"})
+)
+_EXCLUSION_ROLE_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "dense_mlp.gate_up": ("dense_mlp.gate", "dense_mlp.up"),
+}
 _REGEX_META_CHARS = frozenset("[]?+{}")
 _PARAM_LEAF_SEGMENTS = frozenset({"weight", "bias"})
 
@@ -103,12 +114,29 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
         }),
     ),
     (
+        "dense_mlp.gate",
+        ("mlp.gate_proj", "ffn.gate_proj", "mlp.w1", "ffn.w1", "dense_mlp.gate"),
+        frozenset({"mlp", "ffn", "gate_proj", "w1", "dense_mlp", "gate"}),
+    ),
+    (
+        "dense_mlp.up",
+        ("mlp.up_proj", "ffn.up_proj", "mlp.w3", "ffn.w3", "dense_mlp.up"),
+        frozenset({"mlp", "ffn", "up_proj", "w3", "dense_mlp", "up"}),
+    ),
+    (
+        "dense_mlp.down",
+        ("mlp.down_proj", "ffn.down_proj", "mlp.w2", "ffn.w2", "dense_mlp.down"),
+        frozenset({"mlp", "ffn", "down_proj", "w2", "dense_mlp", "down"}),
+    ),
+    (
+        "dense_mlp.gate_up",
+        ("mlp.gate_up_proj", "ffn.gate_up_proj", "dense_mlp.gate_up"),
+        frozenset({"mlp", "ffn", "gate_up_proj", "dense_mlp", "gate_up"}),
+    ),
+    (
         "dense_mlp",
-        (
-            "mlp.gate_proj", "mlp.up_proj", "mlp.gate_up_proj", "mlp.down_proj",
-            "dense_mlp",
-        ),
-        frozenset({"mlp", "gate_proj", "up_proj", "gate_up_proj", "down_proj", "dense_mlp"}),
+        ("dense_mlp",),
+        frozenset({"dense_mlp"}),
     ),
     (
         "gdn",
@@ -166,10 +194,10 @@ def _classify_plain_exclusion(lower: str) -> str | None:
     return matched[0] if len(matched) == 1 else None
 
 
-def _classify_exclusion_pattern(pattern: str) -> str | None:
+def _classify_exclusion_pattern(pattern: str) -> tuple[str, ...]:
     raw = str(pattern).strip()
     if not raw:
-        return None
+        return ()
     is_regex = raw.startswith("re:")
     cleaned = raw[3:] if is_regex else raw
     lower = (
@@ -182,14 +210,26 @@ def _classify_exclusion_pattern(pattern: str) -> str | None:
         .replace("\\d", "*")
     )
     if any(ch in lower for ch in _REGEX_META_CHARS) or "\\" in lower:
-        return None
+        return ()
     if not is_regex and any(ch in lower for ch in "()|"):
-        return None
+        return ()
     variants = _expand_simple_alternation(lower) if is_regex else (lower,)
     if not variants:
-        return None
-    roles = {_classify_plain_exclusion(variant) for variant in variants}
-    return next(iter(roles)) if len(roles) == 1 else None
+        return ()
+    expanded: list[str] = []
+    for variant in variants:
+        role = _classify_plain_exclusion(variant)
+        if role is None:
+            return ()
+        for item in _EXCLUSION_ROLE_EXPANSIONS.get(role, (role,)):
+            if item not in expanded:
+                expanded.append(item)
+    if _DENSE_MLP_PROJECTION_ROLES.issubset(expanded):
+        collapsed = [item for item in expanded if item not in _DENSE_MLP_PROJECTION_ROLES]
+        if "dense_mlp" not in collapsed:
+            collapsed.append("dense_mlp")
+        return tuple(collapsed)
+    return tuple(expanded)
 
 
 _INDEXED_LAYER_ATTN_RE = re.compile(
@@ -294,6 +334,14 @@ def resolve_indexed_layer_exclusions(
         entry = native_layers.setdefault(str(layer_idx), {"category_overrides": {}})
         for cat in cats:
             entry["category_overrides"][cat] = dict(float_fields)
+    for entry in native_layers.values():
+        cat_map = entry["category_overrides"]
+        if _DENSE_MLP_PROJECTION_ROLES.issubset(cat_map):
+            sub_vals = [cat_map[sub] for sub in ("dense_mlp.gate", "dense_mlp.up", "dense_mlp.down")]
+            if sub_vals[0] == sub_vals[1] == sub_vals[2]:
+                for sub in _DENSE_MLP_PROJECTION_ROLES:
+                    cat_map.pop(sub, None)
+                cat_map["dense_mlp"] = dict(sub_vals[0])
     for (layer_idx, cat), eids in sorted(partial_experts.items()):
         sorted_ids = sorted(eids)
         count = max(int(num_experts or 0), sorted_ids[-1] + 1)
@@ -325,11 +373,13 @@ def resolve_role_exclusions(
     unresolved: list[str] = []
     for item in patterns or ():
         pattern = str(item)
-        role = _classify_exclusion_pattern(pattern)
-        if role is None:
+        matched = _classify_exclusion_pattern(pattern)
+        if not matched:
             unresolved.append(pattern)
-        elif role not in roles:
-            roles.append(role)
+            continue
+        for role in matched:
+            if role not in roles:
+                roles.append(role)
     return tuple(roles), tuple(unresolved)
 
 
@@ -508,7 +558,9 @@ def _native_quant_gaps(c, quant):
         truly_unresolved = tuple(
             p for p in unresolved_patterns if not _is_indexed_layer_attention_exclusion(p)
         )
-        if truly_unresolved or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES):
+        if truly_unresolved or not set(resolved_roles).issubset(
+            _NON_LINEAR_EXCLUSION_ROLES | set(quant.exclusions)
+        ):
             gaps.append("quant_module_exclusions_unresolved")
     return gaps
 
@@ -788,7 +840,7 @@ def resolve_quant(c):
             resolved_roles, unresolved_patterns = resolve_role_exclusions(global_excluded)
             exclusions_unresolved = bool(global_excluded) and (
                 bool(unresolved_patterns)
-                or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES)
+                or not set(resolved_roles).issubset(_FP8_APPLICABLE_EXCLUSION_ROLES)
             )
             if exclusions_unresolved:
                 gaps.append("quant_module_exclusions_unresolved")
