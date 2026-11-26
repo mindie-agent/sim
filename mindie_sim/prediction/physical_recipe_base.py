@@ -228,7 +228,15 @@ def tiled_phased_program(context, phases: Sequence[Phase], *,
     """Run the same phase DAG as a bounded finite tile pipeline."""
     count = _tile_count(context, cap=cap)
     if count <= 1:
-        return phased_program(context, phases)
+        setup_ms = float(context.setup_ms or 0.0)
+        body = phased_program(context, phases, minimum_ms=0.0 if setup_ms > 0.0 else None)
+        if setup_ms > 0.0:
+            return KernelProgram(
+                (Stage("setup", latency=setup_ms),
+                 Stage("tiles", after=("setup",), program=body)),
+                minimum_ms=context.minimum_ms,
+            )
+        return body
     amounts = _phase_amounts(context, phases)
     eff_slots = max(1, int(slots))
     pipelined = eff_slots > 1

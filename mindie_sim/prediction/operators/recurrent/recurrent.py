@@ -783,9 +783,55 @@ def _project_kda_exact_state_selection(options: dict, views, active_indices: tup
     }
 
 
+def _configured_kda_num_spec(runtime, model, active_views) -> int:
+    """Resolve declared speculative draft length using scheduling precedence."""
+    view_spec = max(
+        (int(getattr(view, "draft_proposal_tokens", 0) or 0) for view in active_views),
+        default=0,
+    )
+    if runtime is None:
+        return view_spec
+    from mindie_sim.catalog.speculative_state import _declared_speculative_policy
+    from mindie_sim.schema.speculative import SpeculativeSpec
+
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    spec_method = str(meta.get("spec_method") or "").strip().lower()
+    mode = str(meta.get("draft_mode") or "").strip().lower()
+    if spec_method == "none" or mode == "none":
+        return view_spec
+    non_neural = spec_method in {"ngram", "ngram_gpu"} or mode in {"ngram", "ngram_gpu"}
+    dspark = getattr(runtime, "dspark", None)
+    allow_dspark = (
+        dspark is not None
+        and not non_neural
+        and (not spec_method or spec_method in {"dspark", "dflash"})
+        and (not mode or mode in {"dspark", "dflash"})
+    )
+    raw_spec = meta.get("speculative")
+    if allow_dspark:
+        declared = int(dspark.step_spec().draft_len)
+    elif raw_spec:
+        import json
+        spec_data = json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec
+        declared = int(SpeculativeSpec.from_mapping(spec_data).draft_len)
+    else:
+        pol_method, pol_k = _declared_speculative_policy(runtime)
+        if pol_method == "none":
+            return view_spec
+        mtp = getattr(getattr(model, "auxiliary", None), "mtp", None)
+        default_prop = 0 if non_neural else int(getattr(mtp, "proposal_tokens", 0) or 0)
+        raw_prop = meta.get("draft_proposal_tokens", meta.get("num_speculative_tokens"))
+        declared = (
+            int(raw_prop)
+            if raw_prop is not None and raw_prop != ""
+            else (pol_k if pol_k > 0 else default_prop)
+        )
+    return max(view_spec, max(0, declared))
+
+
 def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, beta, raw_beta,
                      use_recover_ssm, heads, key_heads, dk, dv, conv, decay, normalized, gated, outputs,
-                     null_block_id: int = 0):
+                     null_block_id: int = 0, runtime=None):
     plan, model = b.plan, b.model
     decode_core = None
     decode_binder = (getattr(decode_source.module, "bind_decode_scans", None)
@@ -822,6 +868,10 @@ def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, bet
         options.update(beta_dtype=beta_dtype, gate_dtype=model.activation_dtype)
         if use_recover_ssm and any(view.q_len > 1 for view in active_views):
             options["recover_ssm"] = True
+            if options.get("record_stride") is None:
+                num_spec = _configured_kda_num_spec(runtime, model, active_views)
+                max_q = max((int(view.q_len) for view in active_views), default=1)
+                options["record_stride"] = max(num_spec + 1, max_q)
         scans = tuple(op for op in b.ops if op.family == "recurrent_scan")
         active_requests = tuple(view.request_id for view in active_views)
         decode_core = decode_binder(
@@ -1516,6 +1566,7 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             parallel=parallel, mode=mode, padded_tokens=padded_tokens, policy=policy,
             runtime=runtime,
             physical_rank=physical_rank if explicit_physical_rank else None,
+            machine=machine,
             **selected.options)
     b = Builder(prefix, plan, stage, views, model, mode)
     tensors = TensorLowering(b, runtime.tensor_layouts if runtime else None)
@@ -1622,7 +1673,7 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         b, decode_source=decode_source, views=views, parallel=parallel, projection_group=projection_group,
         beta=beta, raw_beta=raw_beta, use_recover_ssm=use_recover_ssm, heads=heads,
         key_heads=key_heads, dk=dk, dv=dv, conv=conv, decay=decay, normalized=normalized,
-        gated=gated, outputs=outputs, null_block_id=null_block_id)
+        gated=gated, outputs=outputs, null_block_id=null_block_id, runtime=runtime)
     gated, outputs = _bind_kda_prefill(
         b, kda_source=kda_source, kda_caps=kda_caps, prefill_source=prefill_source,
         prefill_scan_ids=prefill_scan_ids, prepare_ids=prepare_ids, views=views, gated=gated,

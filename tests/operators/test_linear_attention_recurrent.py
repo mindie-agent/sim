@@ -1232,3 +1232,116 @@ def test_kda_recover_ssm_record_offsets_stride_and_conv_compaction():
         assert conv_al.mte3_bytes == pytest.approx((1 + crossing) * n_a * l_a * w_a * h_a * 2)
         assert conv_al.mte2_bytes == pytest.approx(conv_al.mte3_bytes)
         assert conv_al.hbm_bytes == pytest.approx(2.0 * conv_al.mte3_bytes)
+
+
+def test_projection_abi_and_packing_metadata_invariants():
+    from tests._support.builders import linear_model, view
+    from mindie_sim.catalog.quant import quant_preset
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.prediction.lowering import Builder
+    from mindie_sim.prediction.projections import input_projections
+
+    q_w8a16 = QuantSpec("W8A16", weight_format="int8", activation_format="bf16")
+    m_w8a16 = replace(linear_model(layers=1), quant=q_w8a16)
+    b_w8a16 = Builder("l0", m_w8a16.layer_plans[0], 0, (view(),), m_w8a16, "decode")
+    b_w8a16.matrix("reference", ("in",), 1, 64, 64, category="kda.q")
+    input_projections(
+        b_w8a16, name="q", deps="in", tokens=1, hidden=64,
+        roles=(("q", "linear_q", 64, "kda.q"),), packed=False,
+    )
+    ref_abi, proj_abi = b_w8a16.ops[0].precision_abi, b_w8a16.ops[1].precision_abi
+    assert ref_abi == proj_abi
+    assert (proj_abi.linear_method, proj_abi.weight_layout,
+            proj_abi.input_dtype, bool(proj_abi.act_scale_dtype)) == (
+        "w8a16", "int8_per_channel", "bf16", False,
+    )
+
+    q_meta = replace(quant_preset("w8a8"), category_overrides={
+        "kda.q": {"runtime_int8_weight_metadata": "scale_only"},
+        "kda.k": {"runtime_int8_weight_metadata": "scale_offset"},
+    })
+    m_meta = replace(linear_model(layers=1), quant=q_meta)
+    roles = (("q", "linear_q", 64, "kda.q"), ("k", "linear_k", 64, "kda.k"))
+    totals = []
+    for packed in (False, True):
+        b_meta = Builder("l0", m_meta.layer_plans[0], 0, (view(),), m_meta, "decode")
+        input_projections(b_meta, name="qk", deps="in", tokens=1, hidden=64, roles=roles, packed=packed)
+        totals.append((len(b_meta.ops), sum(dict(op.metadata)["packed_weight_bytes"] for op in b_meta.ops)))
+    assert totals == [(2, 8576.0), (2, 8576.0)]
+
+    q_ckpt_only = replace(quant_preset("w8a8"), category_overrides={
+        "kda.q": {"int8_weight_metadata": "scale_only", "runtime_int8_weight_metadata": "scale_only"},
+        "kda.k": {"int8_weight_metadata": "scale_offset", "runtime_int8_weight_metadata": "scale_only"},
+    })
+    m_ckpt = replace(linear_model(layers=1), quant=q_ckpt_only)
+    b_ckpt = Builder("l0", m_ckpt.layer_plans[0], 0, (view(),), m_ckpt, "decode")
+    input_projections(b_ckpt, name="qk", deps="in", tokens=1, hidden=64, roles=roles, packed=True)
+    assert len(b_ckpt.ops) == 1
+
+
+def test_recurrent_permuted_die_pcp_lane_and_kda_record_stride():
+    from mindie_sim import compose_case
+    from mindie_sim.prediction.operators.recurrent.recurrent import linear
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import IterationPlan
+
+    gen5_sku = REPRESENTATIVE_SKUS["a5"]
+    c_gdn = parse_case(compose_case("qwen3.8-flash-next", gen5_sku, layers=1, tp=1, pcp=2, ep=1))
+    gdn_plan = next(lp for lp in c_gdn.model.layer_plans if lp.attention == "gdn")
+    dies = c_gdn.machine.dies
+    perm_machine = replace(c_gdn.machine, dies=(replace(dies[0], rank=1), replace(dies[1], rank=0)))
+    pf_view = RequestView("req0", 64, 0, True, "prefill", global_q_len=128, query_ranges=((0, 32), (96, 128)))
+    res_lane0 = linear(
+        prefix="l0", plan=gdn_plan, views=(pf_view,), stage=0, deps=("in",),
+        model=c_gdn.model, parallel=c_gdn.runtime.parallel, quant=c_gdn.model.quant,
+        mode="prefill", padded_tokens=64, runtime=c_gdn.runtime,
+        physical_rank=1, explicit_physical_rank=True, machine=perm_machine,
+    )
+    res_lane1 = linear(
+        prefix="l0", plan=gdn_plan, views=(pf_view,), stage=0, deps=("in",),
+        model=c_gdn.model, parallel=c_gdn.runtime.parallel, quant=c_gdn.model.quant,
+        mode="prefill", padded_tokens=64, runtime=c_gdn.runtime,
+        physical_rank=0, explicit_physical_rank=True, machine=perm_machine,
+    )
+    assert not any(op.recipe == "pcp_gdn_fwd_h_rerun" for op in res_lane0.ops)
+    assert any(op.recipe == "pcp_gdn_fwd_h_rerun" for op in res_lane1.ops)
+
+    c_kda = parse_case(compose_case(
+        "glm-5.3-flash", gen5_sku, layers=1, tp=1, ep=1, mtp_proposal_tokens=3, recover_ssm=True,
+    ))
+    peer_b_offsets = []
+    for q0 in (2, 3):
+        views = (
+            RequestView("a", 1, 16, True, "decode", draft_verify=True, draft_proposal_tokens=q0 - 1,
+                        draft_advanced_tokens=q0, state_slot=1),
+            RequestView("b", 1, 16, True, "decode", draft_verify=True, draft_proposal_tokens=1,
+                        draft_advanced_tokens=2, state_slot=2),
+        )
+        ops = Frontend()(IterationPlan(views), c_kda.model, c_kda.runtime, c_kda.machine).ops
+        core = next(op for op in ops if "kda_recurrent_params" in dict(op.metadata))
+        meta = dict(core.metadata)
+        assert meta["kda_recurrent_params"]["record_stride"] == 4
+        peer_b_offsets.append([
+            w["offset"] for w in meta["kda_state_contract"]["write_bindings"]
+            if w["target"].endswith("[b]")
+        ])
+    assert peer_b_offsets[0] == peer_b_offsets[1] and len(peer_b_offsets[0]) == 2
+
+    spec_meta = {k: v for k, v in dict(c_kda.runtime.metadata).items()
+                 if k not in {"draft_proposal_tokens", "num_speculative_tokens", "draft_mode"}}
+    spec_meta["spec_method"] = "ngram"
+    spec_meta["speculative"] = {"num_speculative_tokens": 3, "acceptance": [1.0, 1.0, 1.0]}
+    c_spec = replace(
+        c_kda,
+        model=replace(c_kda.model, auxiliary=None),
+        runtime=replace(c_kda.runtime, metadata=tuple(spec_meta.items())),
+    )
+    views_spec = (
+        RequestView("a", 1, 16, True, "decode", draft_verify=True, draft_proposal_tokens=1,
+                    draft_advanced_tokens=2, state_slot=1),
+        RequestView("b", 1, 16, True, "decode", draft_verify=True, draft_proposal_tokens=1,
+                    draft_advanced_tokens=2, state_slot=2),
+    )
+    ops_spec = Frontend()(IterationPlan(views_spec), c_spec.model, c_spec.runtime, c_spec.machine).ops
+    core_spec = next(op for op in ops_spec if "kda_recurrent_params" in dict(op.metadata))
+    assert dict(core_spec.metadata)["kda_recurrent_params"]["record_stride"] == 4

@@ -312,6 +312,7 @@ class StarsDescriptorQueue:
         self._replay_active_counts: dict[tuple[int, int], int] = {}
         self._latest_replay_by_die: dict[int, int] = {}
         self._stream_last_kernel_done: dict[tuple[int, str], Event] = {}
+        self._stream_last_issue_start: dict[tuple[int, str], Event] = {}
         self._active_records: dict[int, StarsDescriptorRecord] = {}
         self._retired_desc_ns: list[tuple[int, int]] = []
         self._retired_comp_ns: list[tuple[int, int]] = []
@@ -401,9 +402,13 @@ class StarsDescriptorQueue:
             self._replay_active_counts.get(replay_key, 0) + 1
         )
 
+        stream_key = (die_num, desc_id.stream)
         after_events = [descriptor_ready]
+        prev_issue_start = self._stream_last_issue_start.get(stream_key)
+        if prev_issue_start is not None:
+            after_events.append(prev_issue_start)
         if self.spec.release_policy == "stream_predecessor_done":
-            prev_done = self._stream_last_kernel_done.get((die_num, desc_id.stream))
+            prev_done = self._stream_last_kernel_done.get(stream_key)
             if prev_done is not None:
                 after_events.append(prev_done)
 
@@ -422,6 +427,7 @@ class StarsDescriptorQueue:
             owner=owner,
         )
         issue_start = engine.start_boundary(issue_done, f"{prefix}:issue_start")
+        self._stream_last_issue_start[stream_key] = issue_start
         record = StarsDescriptorRecord(
             descriptor_id=desc_id,
             lane_index=lane_index,

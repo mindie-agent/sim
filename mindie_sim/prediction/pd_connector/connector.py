@@ -8,6 +8,7 @@
 [Side-Effect Policy] Submits Engine tasks and updates connector counters only after preflight.
 """
 import math
+import re
 from collections import defaultdict
 from dataclasses import replace
 
@@ -29,22 +30,42 @@ _SOURCE_PREFIXES = ("prefill:", "prefill_", "src:", "src_", "source:", "source_"
 _DEST_PREFIXES = (
     "decode:", "decode_", "dst:", "dst_", "dest:", "dest_", "destination:", "destination_",
 )
+_REPLICA_TOKEN_RE = re.compile(r"(?:^|[@:_/-])r(\d+)(?=$|[@:_/-])")
+_STAGE_TOKEN_RE = re.compile(r"(?:^|[@:_/-])s(\d+)(?=$|[@:_/-])")
+_TIER_SPLIT_RE = re.compile(r"[:@._/-]+")
+_HOST_TIER_TOKENS = frozenset({"host", "dram", "ddr", "cpu"})
+_HBM_TIER_TOKENS = frozenset({"hbm", "memory"})
 
 
-def _classify_memory_resource(name: str) -> tuple[str, int | None]:
-    """Classify a memory resource name into source/destination/shared and stage."""
+def _parse_tier_token(text: str) -> str | None:
+    tokens = set(_TIER_SPLIT_RE.split(str(text).lower()))
+    if tokens & _HOST_TIER_TOKENS:
+        return "host"
+    if tokens & _HBM_TIER_TOKENS:
+        return "hbm"
+    return None
+
+
+def _parse_replica_token(text: str) -> int | None:
+    matches = list(_REPLICA_TOKEN_RE.finditer(str(text).lower()))
+    return int(matches[-1].group(1)) if matches else None
+
+
+def _parse_stage_token(text: str) -> int | None:
+    matches = list(_STAGE_TOKEN_RE.finditer(str(text).lower()))
+    return int(matches[-1].group(1)) if matches else None
+
+
+def _classify_memory_resource(name: str) -> tuple[str, tuple[int | None, int | None, str | None]]:
+    """Classify a memory resource name into role and ``(replica, stage, tier)`` scope."""
     text = str(name)
     low = text.lower()
-    stage = None
-    if ":s" in text:
-        suffix = text.rsplit(":s", 1)[-1]
-        if suffix.isdigit():
-            stage = int(suffix)
+    scope = (_parse_replica_token(low), _parse_stage_token(low), _parse_tier_token(low))
     if low in {"src", "source", "prefill"} or low.startswith(_SOURCE_PREFIXES):
-        return "source", stage
+        return "source", scope
     if low in {"dst", "dest", "destination", "decode"} or low.startswith(_DEST_PREFIXES):
-        return "destination", stage
-    return "shared", stage
+        return "destination", scope
+    return "shared", scope
 
 
 def _partition_memory_work(memory_work) -> tuple[list, list, list]:
@@ -55,14 +76,63 @@ def _partition_memory_work(memory_work) -> tuple[list, list, list]:
         amount = float(raw_value)
         if amount <= 0.0:
             continue
-        role, stage = _classify_memory_resource(str(key))
+        role, scope = _classify_memory_resource(str(key))
         if role == "source":
-            src_items.append((str(key), amount, stage))
+            src_items.append((str(key), amount, scope))
         elif role == "destination":
-            dst_items.append((str(key), amount, stage))
+            dst_items.append((str(key), amount, scope))
         else:
             shared_items.append((str(key), amount))
     return src_items, dst_items, shared_items
+
+
+def _transfer_scope(transfer, side: str) -> tuple[int | None, int, str]:
+    if side == "source":
+        rep = _parse_replica_token(transfer.source_scope)
+        if rep is None:
+            rep = _parse_replica_token(transfer.source_storage)
+        src_scope_tier = _parse_tier_token(transfer.source_scope)
+        if src_scope_tier is not None:
+            tier = src_scope_tier
+        else:
+            src_storage_low = str(transfer.source_storage).lower()
+            tier = (
+                "host" if src_storage_low.startswith(("pd:host:", "host:", "host_"))
+                else "hbm"
+            )
+        return rep, int(transfer.source_stage), tier
+    rep = _parse_replica_token(transfer.destination_scope)
+    if rep is None:
+        rep = _parse_replica_token(transfer.destination_storage)
+    tier = str(transfer.destination_tier or "hbm").lower()
+    return rep, int(transfer.destination_stage), tier
+
+
+def _matching_transfer_indices(
+    transfers, side: str, scope: tuple[int | None, int | None, str | None],
+) -> list[int]:
+    if transfers is None:
+        return []
+    replica, stage, tier = scope
+    scopes = [_transfer_scope(t, side) for t in transfers]
+
+    def _filter(req_rep: int | None, req_stage: int | None, req_tier: str | None) -> list[int]:
+        return [
+            idx for idx, (t_rep, t_stage, t_tier) in enumerate(scopes)
+            if (req_stage is None or t_stage == req_stage)
+            and (req_tier is None or t_tier == req_tier)
+            and (req_rep is None or t_rep == req_rep)
+        ]
+
+    for req_rep, req_stage, req_tier in (
+        (replica, stage, tier),
+        (None, stage, tier),
+        (None, stage, None),
+    ):
+        matched = _filter(req_rep, req_stage, req_tier)
+        if matched:
+            return matched
+    return []
 
 
 def _plan_wire_and_transactions(plan, *, track_transactions: bool):
@@ -110,17 +180,17 @@ def _build_flow_memory_weights(plan, memory_work, transfers=None) -> list[dict[s
                 per_flow[idx].get(res_name, 0.0) + amount * (payloads[idx] / total)
             )
 
-    for res_name, amount, stage in src_items:
+    for res_name, amount, scope in src_items:
         matching = (
-            [i for i, t in enumerate(transfers) if t.source_stage == stage]
-            if transfers is not None and stage is not None
+            _matching_transfer_indices(transfers, "source", scope)
+            if transfers is not None and any(part is not None for part in scope)
             else all_indices
         )
         _assign(res_name, amount, matching)
-    for res_name, amount, stage in dst_items:
+    for res_name, amount, scope in dst_items:
         matching = (
-            [i for i, t in enumerate(transfers) if t.destination_stage == stage]
-            if transfers is not None and stage is not None
+            _matching_transfer_indices(transfers, "destination", scope)
+            if transfers is not None and any(part is not None for part in scope)
             else all_indices
         )
         _assign(res_name, amount, matching)
