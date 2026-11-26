@@ -91,6 +91,7 @@ ABI_MODES = {
     "aclnnGroupedMatmulSwigluMxQuant": frozenset({"gmm_swiglu_quant"}),
     "aclnnDequantSwigluQuant": frozenset({"dequant_swiglu_quant"}),
     "aclnnMegaMoe": ROUTED_MODES,
+    "aclnnDispatchFFNCombine": ROUTED_MODES,
 }
 
 
@@ -98,6 +99,16 @@ def _integer(value, name: str, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
         raise ModelingError(f"grouped_moe_invalid_{name}:{value!r}")
     return int(value)
+
+
+def _nonneg_number(value, name: str) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (Integral, float)):
+        raise ModelingError(f"grouped_moe_invalid_{name}:{value!r}")
+    if isinstance(value, float) and (value != value or value == float("inf") or value == float("-inf")):
+        raise ModelingError(f"grouped_moe_invalid_{name}:{value!r}")
+    if value < 0:
+        raise ModelingError(f"grouped_moe_invalid_{name}:{value!r}")
+    return int(value) if isinstance(value, Integral) else float(value)
 
 
 def _mapping(value, name: str) -> dict:
@@ -355,14 +366,15 @@ class GroupedMoeContract:
     shared_compute_dtype: str
     shared_weight_dtype: str
     wave_rows: int
-    transport_bytes: tuple[int | None, int | None]
-    cohort_transport_bytes: tuple[tuple[int | None, int | None], ...] = ()
+    transport_bytes: tuple[int | float | None, int | float | None]
+    cohort_transport_bytes: tuple[tuple[int | float | None, int | float | None], ...] = ()
     act_mx_scaled: bool = False
     weight_mx_scaled: bool = False
     act_mx_padded: bool = True
     weight_mx_padded: bool = True
     weight_scale_dtype: str = "fp32"
     topk_weights_type: int = 0
+    row_scale: float = 1.0
 
     @property
     def intermediate(self) -> int:
@@ -581,9 +593,9 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
         fractal_k0(shared_compute)
         element_bytes(1, shared_weight)
     transport_fields = ("dispatch_link_bytes", "combine_link_bytes")
-    transfer = tuple(_integer(fields[key], key) if key in fields else None for key in transport_fields)
+    transfer = tuple(_nonneg_number(fields[key], key) if key in fields else None for key in transport_fields)
     cohort_transfer = tuple(
-        tuple(_integer(value, "cohort_link_bytes") for value in pair)
+        tuple(_nonneg_number(value, "cohort_link_bytes") for value in pair)
         for pair in fields.get("cohort_link_bytes", ())
     )
     if cohort_transfer:
@@ -594,6 +606,9 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
     if (routed and ep > 1 and mc2 and (tokens or sum(rows)) and not cohort_transfer
             and None in transfer and not callable(fields.get("cohort_transport_builder"))):
         raise capability_gap(op, ctx, "explicit_dispatch_and_combine_transport")
+    row_scale = float(_nonneg_number(fields.get("expected_row_scale", 1.0), "expected_row_scale"))
+    if not (0.0 < row_scale <= 1.0):
+        raise ModelingError(f"grouped_moe_invalid_expected_row_scale:{row_scale!r}")
     return GroupedMoeContract(
         mode, abi, sum(rows), n, k, rows, allocated, tokens, dtype_a, dtype_b, compute_dtype,
         output_dtype, quant_dtype, handoff_dtype, layout_a, layout_b, transpose, activation,
@@ -604,7 +619,7 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
         top_k, ep, enable_dbo, split, mc2, shared, shared_compute, shared_weight,
         _integer(fields.get("wave_rows", 0), "wave_rows"), transfer, cohort_transfer,
         act_mx_scaled, weight_mx_scaled, act_mx_padded, weight_mx_padded,
-        weight_scale_dtype, topk_weights_type,
+        weight_scale_dtype, topk_weights_type, row_scale,
     )
 
 
@@ -641,11 +656,29 @@ def capability_gap(op: OpSpec, ctx: OperatorPlanningContext, reason: str) -> Unm
     )
 
 
+def geometry_has_l2(geometry) -> bool:
+    """Return True when the target die profile declares an L2 service rate or unit."""
+    rates = getattr(geometry, "rates", None) or {}
+    if float(rates.get("l2", 0.0) or 0.0) > 0.0:
+        return True
+    units = getattr(geometry, "resource_units", None) or {}
+    return bool(units.get("l2", 0))
+
+
 def make_plan(
     implementation: str, ctx: OperatorPlanningContext, stages: Iterable[StageDemand],
     sources: tuple[SourceRef, ...], *, metadata: Mapping | None = None,
 ) -> OperatorPlan:
     stages = tuple(stages)
+    if not geometry_has_l2(ctx.geometry):
+        stages = tuple(
+            replace(stage, work=Work(
+                stage.work.matrix,
+                {role: amount for role, amount in stage.work.resources.items() if role != "l2"},
+            ))
+            if "l2" in stage.work.resources else stage
+            for stage in stages
+        )
     work = Work()
     phases = []
     for stage in stages:

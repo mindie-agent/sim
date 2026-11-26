@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 DEFAULT_MAX_TRIALS = 24
 ORACLE_BATCH_SIZE = 8
 REQUIRED_GATE_COUNT = 5
+_US_PER_SECOND = 1_000_000.0
+_MIN_STREAM_OVERLAP_SERVICE_US = 2.0
 FRAMEWORK_STAGES = (
     "F1_local_k1", "F2_collective_dbo", "F3_stream_core", "F4_prefetch",
 )
@@ -817,6 +819,108 @@ def _independent(left, right, by_id, *, bit=None, anc=None):
                 pending.extend(by_id[op_id].deps)
     return True
 
+def _op_service_us(op, devices) -> float:
+    """Estimate active physical service duration (us) from declared die rates and peaks."""
+    if not devices:
+        return 0.0
+    device = devices[0]
+    rates = dict(getattr(device, "rates", ()) or ())
+    best_us = 0.0
+    for amount, role in (
+        (float(getattr(op, "hbm_bytes", 0.0) or 0.0), "hbm"),
+        (float(getattr(op, "vector_ops", 0.0) or 0.0), "vector"),
+        (float(getattr(op, "mte3_bytes", 0.0) or 0.0), "mte3"),
+    ):
+        rate = float(rates.get(role, 0.0) or 0.0)
+        if amount > 0.0 and rate > 0.0:
+            best_us = max(best_us, amount / rate * _US_PER_SECOND)
+    mte2_bytes = float(getattr(op, "mte2_bytes", 0.0) or 0.0)
+    if mte2_bytes > 0.0:
+        read_pipe = str(dict(getattr(op, "metadata", ()) or ()).get("read_pipe") or "").strip().lower()
+        is_aic_read = (
+            read_pipe in {"aic", "mte2_aic"}
+            or (not read_pipe and bool(op.matrix_flops or op.flops) and not float(getattr(op, "vector_ops", 0.0) or 0.0))
+        )
+        if is_aic_read:
+            mte2_rate = (
+                float(rates.get("mte2_aic", 0.0) or 0.0)
+                or float(rates.get("mte2", 0.0) or 0.0)
+                or float(rates.get("mte2_aiv", 0.0) or 0.0)
+            )
+        elif read_pipe in {"aiv", "mte2_aiv"}:
+            mte2_rate = (
+                float(rates.get("mte2_aiv", 0.0) or 0.0)
+                or float(rates.get("mte2", 0.0) or 0.0)
+                or float(rates.get("mte2_aic", 0.0) or 0.0)
+            )
+        else:
+            mte2_rate = (
+                float(rates.get("mte2_aiv", 0.0) or 0.0)
+                or float(rates.get("mte2", 0.0) or 0.0)
+                or float(rates.get("mte2_aic", 0.0) or 0.0)
+            )
+        if mte2_rate > 0.0:
+            best_us = max(best_us, mte2_bytes / mte2_rate * _US_PER_SECOND)
+    matrix_entries = op.matrix_flops or (((op.dtype, op.flops),) if op.flops else ())
+    if matrix_entries:
+        cube_us = 0.0
+        for dt, flops in matrix_entries:
+            amt = float(flops or 0.0)
+            if amt <= 0.0:
+                continue
+            try:
+                cube_us += amt / float(device.peak(str(dt or "bf16").lower())) * _US_PER_SECOND
+            except ModelingError:
+                try:
+                    cube_us += amt / float(device.cube_flops_per_s) * _US_PER_SECOND
+                except ModelingError:
+                    pass
+        best_us = max(best_us, cube_us)
+    return best_us
+
+
+def _fifo_concurrent_partners(target, partners, ops, idx_of, by_id, bit, anc):
+    """Return independent same-stage partners that sit strictly inside target's main-FIFO window."""
+    tid = target.op_id
+    t_stage = target.stage
+    t_idx = idx_of[tid]
+    t_anc = anc[tid]
+    t_bit = bit[tid]
+    p_max = -1
+    s_min = len(ops)
+    for j, other in enumerate(ops):
+        if j == t_idx or other.stage != t_stage:
+            continue
+        oid = other.op_id
+        if t_anc & bit[oid]:
+            if j > p_max:
+                p_max = j
+        elif anc[oid] & t_bit:
+            if j < s_min:
+                s_min = j
+    return [
+        partner for partner in partners
+        if partner.op_id != tid
+        and partner.stage == t_stage
+        and p_max < idx_of[partner.op_id] < s_min
+        and _independent(partner, target, by_id, bit=bit, anc=anc)
+    ]
+
+
+def _min_stream_service_us(paths) -> float:
+    """Return the minimum active service (us) needed to exceed launch bubble and achieve real overlap."""
+    launch_us = 0.0
+    for _, path in paths:
+        stars = getattr(path, "stars_spec", None)
+        if stars is not None:
+            launch_us = max(
+                launch_us,
+                float(getattr(stars, "first_issue_us", 0.0) or 0.0)
+                + float(getattr(stars, "issue_interval_us", 0.0) or 0.0),
+            )
+    return max(launch_us, _MIN_STREAM_OVERLAP_SERVICE_US)
+
+
 def _stream_candidates(scenario, ops, op_refs=()):
     from mindie_sim.rewrite.schema import OpRef, StreamSchedule
 
@@ -829,7 +933,10 @@ def _stream_candidates(scenario, ops, op_refs=()):
     aiv = min(path.aiv_count for _, path in paths)
     handles = dict(op_refs)
     by_id = {op.op_id: op for op in ops}
+    idx_of = {op.op_id: i for i, op in enumerate(ops)}
     bit, anc = _ancestor_bitmasks(ops)
+    min_service_us = _min_stream_service_us(paths)
+    service_us_by_id = {op.op_id: _op_service_us(op, devices) for op in ops}
     kinds, sparse = {}, set()
     for op in ops:
         meta = dict(op.metadata)
@@ -846,12 +953,16 @@ def _stream_candidates(scenario, ops, op_refs=()):
     )]
     layouts = []
     for transfer in comm:
-        for compute in cube_ops:
-            if not _independent(compute, transfer, by_id, bit=bit, anc=anc):
-                continue
+        concurrent_cubes = _fifo_concurrent_partners(transfer, cube_ops, ops, idx_of, by_id, bit, anc)
+        for compute in concurrent_cubes:
             for auxiliary in side:
-                if auxiliary.op_id != compute.op_id and all(
-                    _independent(auxiliary, other, by_id, bit=bit, anc=anc) for other in (compute, transfer)
+                if (
+                    auxiliary.op_id != compute.op_id
+                    and service_us_by_id[auxiliary.op_id] >= min_service_us
+                    and all(
+                        _independent(auxiliary, other, by_id, bit=bit, anc=anc) for other in (compute, transfer)
+                    )
+                    and compute in _fifo_concurrent_partners(auxiliary, (compute,), ops, idx_of, by_id, bit, anc)
                 ):
                     layouts.append({transfer.op_id: "comm", auxiliary.op_id: "csa"})
                     break
@@ -860,11 +971,24 @@ def _stream_candidates(scenario, ops, op_refs=()):
         if layouts:
             break
     if not layouts:
+        best_aux = None
+        best_overlap_us = 0.0
         for auxiliary in side:
-            if any(compute.op_id != auxiliary.op_id and _independent(compute, auxiliary, by_id, bit=bit, anc=anc)
-                   for compute in cube_ops):
-                layouts.append({auxiliary.op_id: "csa"})
-                break
+            aux_us = service_us_by_id[auxiliary.op_id]
+            if aux_us < min_service_us:
+                continue
+            concurrent = _fifo_concurrent_partners(auxiliary, cube_ops, ops, idx_of, by_id, bit, anc)
+            if not concurrent:
+                continue
+            partner_us = sum(service_us_by_id[compute.op_id] for compute in concurrent)
+            if partner_us < min_service_us:
+                continue
+            overlap_us = min(aux_us, partner_us)
+            if overlap_us > best_overlap_us:
+                best_overlap_us = overlap_us
+                best_aux = auxiliary
+        if best_aux is not None:
+            layouts.append({best_aux.op_id: "csa"})
     counts = tuple(sorted({int(value) for op in ops
                           if (value := dict(op.metadata).get("tile_count", 0)) > 0}))
 

@@ -365,7 +365,9 @@ def native_protocol_recipes(selected):
     return mc2_local_caller.recipes(selected)
 
 
-def _rebind_fused_mc2_op(ops, fused_level: int, weight_dtype: str):
+def _rebind_fused_mc2_op(
+    ops, fused_level: int, weight_dtype: str, *, experts: int = 0, ep: int = 1,
+):
     """Project Arch22 (A3) fused MoE native binding onto the lowered fused MC2 op."""
     from dataclasses import replace
     from . import megamoe as mc2_megamoe
@@ -374,6 +376,7 @@ def _rebind_fused_mc2_op(ops, fused_level: int, weight_dtype: str):
     public_name = binding["public_name"]
     api = binding["api"]
     is_w4 = str(weight_dtype or "int8").strip().lower() in _INT4_WEIGHT_FORMATS
+    local_experts = max(1, int(experts) // max(1, int(ep))) if int(experts or 0) > 0 else 1
     rebuilt = []
     for item in ops:
         if item.recipe != "megamoe_arch35":
@@ -390,22 +393,83 @@ def _rebind_fused_mc2_op(ops, fused_level: int, weight_dtype: str):
             "kernels": ({"name": public_name, "role": "fused_moe_mc2", "evidence": "source_declared"},),
             "execution_core": binding["execution_core"],
         }
+        geo = dict(meta.get("megamoe_geometry") or {})
+        raw_group_rows = meta.get("group_rows")
+        has_explicit_groups = (
+            isinstance(raw_group_rows, (list, tuple)) and len(raw_group_rows) > 0
+        )
+        routed_float = max(0.0, float(geo.get("routed_rows", 0.0) or 0.0))
+        if has_explicit_groups:
+            group_rows = tuple(max(0, int(round(float(x)))) for x in raw_group_rows)
+            routed_int = sum(group_rows)
+        elif routed_float > 0.0:
+            routed_int = max(1, int(round(routed_float)))
+            q_rows, rem_rows = divmod(routed_int, local_experts)
+            group_rows = tuple(q_rows + (1 if idx < rem_rows else 0) for idx in range(local_experts))
+            if abs(routed_float - routed_int) > 0.0:
+                meta["expected_row_scale"] = routed_float / routed_int
+        else:
+            routed_int = 0
+            group_rows = (0,) * local_experts
+        geo["routed_rows"] = routed_int
+        geo["dispatch_link_bytes"] = max(0.0, float(geo.get("dispatch_link_bytes", 0.0) or 0.0))
+        geo["combine_link_bytes"] = max(0.0, float(geo.get("combine_link_bytes", 0.0) or 0.0))
+        act = str(geo.get("activation") or "swiglu").lower()
+        inter_raw = int(geo.get("moe_intermediate", 0) or 0)
+        if inter_raw > 0 and act in mc2_megamoe._ELEMENTWISE_ACTIVATIONS:
+            geo["moe_intermediate"] = mc2_megamoe._gmm2_in_dim(inter_raw, act)
+        meta["group_rows"] = group_rows
+        meta["input_format"] = "int8"
+        meta["dtype_a"] = "int8"
+        meta["layout_b"] = "FRACTAL_NZ"
         op_flops = item.flops
         matrix_flops = item.matrix_flops
-        if is_w4:
-            geo = dict(meta.get("megamoe_geometry") or {})
-            if not (geo.get("gmm1_msd_w4a8") and geo.get("gmm2_msd_w4a8")):
-                logical = float(geo.get("logical_flops") or item.flops)
-                geo["gmm1_msd_w4a8"] = True
-                geo["gmm2_msd_w4a8"] = True
-                geo["logical_flops"] = logical
-                meta["megamoe_geometry"] = geo
-                meta["logical_flops"] = logical
-                op_flops = logical * mc2_megamoe.MSD_INT4_PASSES
-                matrix_flops = (("int4", op_flops),)
-            meta["compute_format"] = "int4"
+        op_vector_ops = float(item.vector_ops)
+        g1_msd = bool(geo.get("gmm1_msd_w4a8"))
+        g2_msd = bool(geo.get("gmm2_msd_w4a8"))
+        newly_enabled_w4 = is_w4 and not (g1_msd or g2_msd)
+        if newly_enabled_w4:
+            logical = float(geo.get("logical_flops") or item.flops)
+            g1_msd = g2_msd = True
+            geo["gmm1_msd_w4a8"] = True
+            geo["gmm2_msd_w4a8"] = True
+            geo["logical_flops"] = logical
+            meta["logical_flops"] = logical
+            op_flops = logical * mc2_megamoe.MSD_INT4_PASSES
+            matrix_flops = (("int4", op_flops),)
+        hidden_dim = int(geo.get("hidden", 0) or 0)
+        gmm2_in_dim = (
+            mc2_megamoe._gmm2_in_dim(inter_raw, act) if inter_raw > 0 else 0
+        )
+        if g1_msd or g2_msd:
+            split_ops = (
+                (routed_float * hidden_dim * mc2_megamoe.MSD_INT4_PASSES if g1_msd else 0.0)
+                + (routed_float * gmm2_in_dim * mc2_megamoe.MSD_INT4_PASSES if g2_msd else 0.0)
+            )
+            merge_added = (
+                (
+                    routed_float * (mc2_megamoe.MSD_INT4_PASSES * inter_raw) * mc2_megamoe.MSD_MERGE_OPS_PER_ELEM
+                    + routed_float * hidden_dim * mc2_megamoe.MSD_MERGE_OPS_PER_ELEM
+                )
+                if newly_enabled_w4 else 0.0
+            )
+            op_vector_ops += split_ops + merge_added
+        meta["gmm1_msd_w4a8"] = g1_msd
+        meta["gmm2_msd_w4a8"] = g2_msd
+        if g1_msd and g2_msd:
+            geo["compute_dtype"] = "w4a8"
+            meta["dtype_b"] = "int4"
+            meta["compute_format"] = "w4a8"
             meta["msd_w4a8"] = True
-        rebuilt.append(replace(item, flops=op_flops, matrix_flops=matrix_flops, metadata=tuple(meta.items())))
+        else:
+            geo["compute_dtype"] = "int8"
+            meta["dtype_b"] = "int8"
+            meta["compute_format"] = "int8"
+        meta["megamoe_geometry"] = geo
+        rebuilt.append(replace(
+            item, recipe="mega_moe", flops=op_flops, matrix_flops=matrix_flops,
+            vector_ops=op_vector_ops, metadata=tuple(meta.items()),
+        ))
     return rebuilt
 
 
@@ -441,7 +505,7 @@ def lower_native_protocol(
                 )
                 if fused is not None:
                     w_fmt = str(gmeta.get("weight_format") or gmeta.get("activation_format") or "int8")
-                    return _rebind_fused_mc2_op(fused, fused_lvl, w_fmt)
+                    return _rebind_fused_mc2_op(fused, fused_lvl, w_fmt, experts=experts, ep=ep)
         if gmeta.get("activation_format") != "int8":
             return ops
         if selected.get("max_inflight_per_rank") is None:

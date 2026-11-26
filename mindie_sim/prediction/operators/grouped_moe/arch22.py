@@ -87,6 +87,7 @@ _V1_DOUBLE_WORKSPACE_SPLIT = 2
 _GATED_ACTIVATION_DIVISOR = 2
 _MSD_ROW_MULTIPLIER = 2
 _MSD_SPLIT_OPS_PER_ELEMENT = 2
+_MSD_RECOMBINE_OPS_PER_ELEMENT = 3
 _DEQUANT_GROUP_KEYS = frozenset({"group_rows", "matrix_group_rows", "expert_rows", "group_list"})
 _DEQUANT_UB_RESERVE_BYTES = 1024
 _DEQUANT_BLOCK_BYTES = 32
@@ -115,11 +116,13 @@ def _dequant_max_input_width(ub_bytes: int, fields: dict) -> int:
     return _GATED_ACTIVATION_DIVISOR * max_out
 
 
-def _is_a8w4_msd(contract) -> bool:
-    return (
-        contract.mode == "gmm_swiglu_quant"
-        and contract.dtype_a == "int8"
-        and contract.matrix_weight_dtype == "int4"
+def _is_a8w4_msd(contract, fields=None) -> bool:
+    if contract.dtype_a != "int8" or contract.matrix_weight_dtype != "int4":
+        return False
+    if contract.mode == "gmm_swiglu_quant":
+        return True
+    return contract.mode in ROUTED_MODES and bool(
+        fields and (fields.get("msd_w4a8") or fields.get("gmm1_msd_w4a8"))
     )
 
 
@@ -286,11 +289,34 @@ def _v1_a8w8_activation_stages(name, preload_after, barrier_after, ctx, contract
     return stages
 
 
-def _gated_stages(contract, ctx, name, after, metadata):
-    if _is_a8w4_msd(contract):
+def _routed_msd_flags(contract, fields) -> tuple[bool, bool]:
+    if contract.dtype_a != "int8" or contract.mode not in ROUTED_MODES or not fields:
+        return False, False
+    if "gmm1_msd_w4a8" in fields or "gmm2_msd_w4a8" in fields:
+        return bool(fields.get("gmm1_msd_w4a8")), bool(fields.get("gmm2_msd_w4a8"))
+    both = contract.matrix_weight_dtype == "int4" and bool(fields.get("msd_w4a8"))
+    return both, both
+
+
+def _scale_stage_demands(stages: list[StageDemand], scale: float) -> list[StageDemand]:
+    if scale == 1.0:
+        return stages
+    return [
+        replace(stage, work=Work(
+            {dt: amt * scale for dt, amt in stage.work.matrix.items()},
+            {role: amt * scale for role, amt in stage.work.resources.items()},
+        ))
+        if (stage.work.matrix or stage.work.resources) else stage
+        for stage in stages
+    ]
+
+
+def _gated_stages(contract, ctx, name, after, metadata, *, msd_w4a8: bool = False):
+    use_msd = msd_w4a8 or _is_a8w4_msd(contract)
+    if use_msd:
         # Arch22 A8W4 MSD runs an AIV preprocessor that reads INT8 activations,
-        # writes the split low/high INT4 planes (2xM rows), then runs 2xM INT4
-        # MMAD and recombines to M logical INT32 output rows.
+        # writes the split low/high INT4 planes (2xM rows), runs 2xM INT4 MMAD,
+        # and recombines the two INT4 partial planes back to M logical rows.
         pre_name = name + "msd_preprocess"
         pre_stages = vector_stages(
             pre_name, after, ctx, contract.group_rows,
@@ -299,7 +325,7 @@ def _gated_stages(contract, ctx, name, after, metadata):
             write=_MSD_ROW_MULTIPLIER * element_bytes(contract.k, "int4"),
             metadata=metadata,
         )
-        msd_contract = replace(contract, compute_dtype="int4")
+        msd_contract = replace(contract, compute_dtype="int4", dtype_b="int4")
         msd_rows = tuple(_MSD_ROW_MULTIPLIER * count for count in contract.group_rows)
         schedule = matrix_schedule(msd_contract, ctx, msd_rows, contract.n, contract.k)
         useful_flops = schedule.useful_flops // _MSD_ROW_MULTIPLIER
@@ -312,6 +338,17 @@ def _gated_stages(contract, ctx, name, after, metadata):
                 metadata=metadata,
             ),
         ]
+        ready = (name + "gmm1",)
+        if contract.mode in ROUTED_MODES:
+            rec1 = name + "gmm1_msd_recombine"
+            stages.extend(vector_stages(
+                rec1, ready, ctx, contract.group_rows,
+                read=_MSD_ROW_MULTIPLIER * element_bytes(contract.n, contract.handoff_dtype),
+                compute=_MSD_RECOMBINE_OPS_PER_ELEMENT * contract.n,
+                write=element_bytes(contract.n, contract.handoff_dtype),
+                metadata=metadata,
+            ))
+            ready = (rec1,)
     else:
         schedule = matrix_schedule(contract, ctx, contract.group_rows, contract.n, contract.k)
         useful_flops = schedule.useful_flops
@@ -319,7 +356,7 @@ def _gated_stages(contract, ctx, name, after, metadata):
             name + "gmm1", after, contract, schedule, contract.k, contract.handoff_dtype,
             input_scaled=contract.mode in ROUTED_MODES and contract.dtype_a == "int8", metadata=metadata,
         )
-    ready = (name + "gmm1",)
+        ready = (name + "gmm1",)
     if contract.abi == XLLM_GATED_ABI and contract.m:
         # The xLLM ABI has one FP32 weight-scale vector per active group.
         scales = sum(bool(rows) for rows in contract.group_rows) * contract.n * PER_TOKEN_SCALE_BYTES
@@ -345,7 +382,10 @@ def _gated_stages(contract, ctx, name, after, metadata):
     return stages, schedule, useful_flops
 
 
-def _routed_stages(ctx, contract, name, after, metadata, transport_builder):
+def _routed_stages(
+    ctx, contract, name, after, metadata, transport_builder,
+    *, gmm1_msd_w4a8: bool = False, gmm2_msd_w4a8: bool = False,
+):
     # Arch22 mega_moe_tiling_arch22.cpp:60 does not consume topk_weights_type.
     contract = replace(contract, topk_weights_type=0) if contract.topk_weights_type else contract
     dispatch, combine = name + "dispatch", name + "combine"
@@ -357,16 +397,46 @@ def _routed_stages(ctx, contract, name, after, metadata, transport_builder):
             combine, (dispatch,), contract, metadata, transport_builder, allow_pre_weighted=False,
         )
     cohort = tuple((key, value) for key, value in metadata if key in {"cohort_id", "slot"})
-    gated, _, _ = _gated_stages(contract, ctx, name, (dispatch,), cohort)
-    stages.extend(gated)
-    schedule2 = matrix_schedule(contract, ctx, contract.group_rows, contract.k, contract.intermediate)
-    stages.extend(matrix_stages(
-        name + "gmm2", (name + "swiglu_quant",), contract, schedule2, contract.intermediate,
-        contract.output_dtype, input_dtype=contract.quant_dtype,
-        input_scaled=contract.quant_dtype == "int8", metadata=cohort,
-    ))
+    compute_stages, _, _ = _gated_stages(contract, ctx, name, (dispatch,), cohort, msd_w4a8=gmm1_msd_w4a8)
+    gmm2_done = name + "gmm2"
+    if gmm2_msd_w4a8:
+        pre2 = name + "gmm2_msd_preprocess"
+        compute_stages.extend(vector_stages(
+            pre2, (name + "swiglu_quant",), ctx, contract.group_rows,
+            read=element_bytes(contract.intermediate, "int8"),
+            compute=_MSD_SPLIT_OPS_PER_ELEMENT * contract.intermediate,
+            write=_MSD_ROW_MULTIPLIER * element_bytes(contract.intermediate, "int4"),
+            metadata=cohort,
+        ))
+        msd_contract = replace(contract, compute_dtype="int4", dtype_b="int4")
+        msd_rows = tuple(_MSD_ROW_MULTIPLIER * count for count in contract.group_rows)
+        schedule2 = matrix_schedule(msd_contract, ctx, msd_rows, contract.k, contract.intermediate)
+        compute_stages.extend(matrix_stages(
+            name + "gmm2", (pre2,), msd_contract, schedule2, contract.intermediate,
+            contract.output_dtype, input_dtype="int4", input_scaled=False,
+            output_row_divisor=_MSD_ROW_MULTIPLIER,
+            useful_flops_override=schedule2.useful_flops // _MSD_ROW_MULTIPLIER,
+            metadata=cohort,
+        ))
+        rec2 = name + "gmm2_msd_recombine"
+        compute_stages.extend(vector_stages(
+            rec2, (name + "gmm2",), ctx, contract.group_rows,
+            read=_MSD_ROW_MULTIPLIER * element_bytes(contract.k, contract.output_dtype),
+            compute=_MSD_RECOMBINE_OPS_PER_ELEMENT * contract.k,
+            write=element_bytes(contract.k, contract.output_dtype),
+            metadata=cohort,
+        ))
+        gmm2_done = rec2
+    else:
+        schedule2 = matrix_schedule(contract, ctx, contract.group_rows, contract.k, contract.intermediate)
+        compute_stages.extend(matrix_stages(
+            name + "gmm2", (name + "swiglu_quant",), contract, schedule2, contract.intermediate,
+            contract.output_dtype, input_dtype=contract.quant_dtype,
+            input_scaled=contract.quant_dtype == "int8", metadata=cohort,
+        ))
+    stages.extend(_scale_stage_demands(compute_stages, contract.row_scale))
     stages.extend(routing_stages(
-        combine, (name + "gmm2",), contract, metadata, transport_builder, allow_pre_weighted=False,
+        combine, (gmm2_done,), contract, metadata, transport_builder, allow_pre_weighted=False,
     ))
     return stages
 
@@ -412,8 +482,10 @@ class _Arch22Strategy:
             )
             implementation = "aclnnDequantSwigluQuant"
         else:
-            transport_builder = contract_fields(op).get("cohort_transport_builder")
-            emit = partial(_routed_stages, ctx)
+            fields = contract_fields(op)
+            transport_builder = fields.get("cohort_transport_builder")
+            g1_msd, g2_msd = _routed_msd_flags(contract, fields)
+            emit = partial(_routed_stages, ctx, gmm1_msd_w4a8=g1_msd, gmm2_msd_w4a8=g2_msd)
             if contract.dbo_split is not None:
                 stages = DualBatchMoEPipeline(contract.dbo_split).stages(
                     contract, ctx, emit, transport_builder=transport_builder
@@ -422,7 +494,7 @@ class _Arch22Strategy:
                 stages = emit(contract, "", (), (), transport_builder)
             else:
                 stages = []
-            implementation = "aclnnMegaMoe"
+            implementation = str(fields.get("aclnn_symbol") or "aclnnMegaMoe")
             metadata["gm_handoff_bytes"] = 2 * contract.m * element_bytes(contract.n, contract.handoff_dtype)
         return make_plan(implementation, ctx, stages, self.sources, metadata=metadata)
 
