@@ -2032,10 +2032,24 @@ def _solve_pareto_pd_ratios_closed_form(
     if st.get("infeasible") is not None or p_dies + d_dies > total:
         return []
     if output - 1 <= 0:
-        row = _solve_optimal_pd_ratio_closed_form(
-            st, total=total, p_dies=p_dies, d_dies=d_dies, output=output, mode=mode,
-        )
-        return [row] if row is not None else []
+        max_np = (total - d_dies) // p_dies
+        if max_np < 1 or float(st.get("rps_p", 0.0) or 0.0) <= 0.0:
+            return []
+        single_tok_rows: list[dict[str, Any]] = []
+        prev_tps: float | None = None
+        for n_p in range(1, max_np + 1):
+            row = _build_pd_ratio_row(
+                st, n_p=n_p, n_d=1, total=total, p_dies=p_dies, d_dies=d_dies,
+                output=output, mode=mode,
+            )
+            if not row["feasible"]:
+                continue
+            row_tps = float(row["sustainable_tps"])
+            if prev_tps is not None and row_tps <= prev_tps + PARETO_EPS:
+                continue
+            single_tok_rows.append(row)
+            prev_tps = row_tps
+        return single_tok_rows
     rate_p = min(float(st["rps_p"]), float(st["p_kv_rps_per_inst"]))
     rate_d = (
         min(float(st["rps_d"]), float(st["d_kv_rps_per_inst"]))
@@ -2528,7 +2542,8 @@ def _provable_decode_tps_upper_bound(
 
 def _matches_pinned(cand: Mapping[str, int], pinned: Mapping[str, int]) -> bool:
     for axis, val in pinned.items():
-        if int(cand.get(axis, 1)) != int(val):
+        key = "dcp" if axis == "cp" else axis
+        if int(cand.get(key, 1)) != int(val):
             return False
     return True
 
@@ -2619,9 +2634,13 @@ def _build_colocated_candidates(
     seeded = _seed_from_profile_topo(rec_topo, role, max_dies=num_devices, pinned=pinned)
     if seeded:
         add(seeded)
-    pp_vals = (pinned["pp"],) if "pp" in pinned else (1, 2)
+    widths = _parallel_width_grid(num_devices)
+    pp_vals = (
+        (pinned["pp"],) if "pp" in pinned
+        else (tuple(w for w in reversed(widths) if w <= layers) or (1,))
+    )
     pcp_vals = (pinned["pcp"],) if "pcp" in pinned else (1,)
-    tp_vals = (pinned["tp"],) if "tp" in pinned else _parallel_width_grid(num_devices)
+    tp_vals = (pinned["tp"],) if "tp" in pinned else widths
     local_pins = {k: int(pinned[k]) for k in _LOCAL_TP_AXES if k in pinned}
     for pp in pp_vals:
         for pcp in pcp_vals:
@@ -2686,10 +2705,14 @@ def _build_pd_stage_candidates(
     if seeded:
         add(seeded)
     widths = _parallel_width_grid(max_dies)
+    pp_vals = (
+        (pinned["pp"],) if "pp" in pinned
+        else (tuple(w for w in reversed(widths) if w <= layers) or (1,))
+    )
     local_pins = {k: int(pinned[k]) for k in _LOCAL_TP_AXES if k in pinned}
     if role == "pd_prefill":
         for tp in ((pinned["tp"],) if "tp" in pinned else widths):
-            for pp in ((pinned["pp"],) if "pp" in pinned else (1, 2)):
+            for pp in pp_vals:
                 pcp_vals = (
                     (pinned["pcp"],) if "pcp" in pinned
                     else (tuple(reversed(_PREFILL_PCP_WIDTHS))
@@ -2703,15 +2726,18 @@ def _build_pd_stage_candidates(
                         (pinned["dp"],) if "dp" in pinned
                         else tuple(dict.fromkeys([max_dies // unit, 1]))
                     )
+                    dcp_choices = _dcp_choices_for_candidate(
+                        model_spec, tp=tp, pcp=pcp, prompt_tokens=prompt_tokens, pinned=pinned,
+                    )
                     for dp in dp_choices:
                         if dp * unit > max_dies or dp < 1:
                             continue
                         ep = int(pinned.get("ep", dp * tp * pcp if is_moe else 1))
-                        add({"dp": dp, "tp": tp, "ep": ep, "pp": pp, "pcp": pcp,
-                             "dcp": int(pinned.get("dcp", 1)), **local_pins})
+                        for dcp in dcp_choices:
+                            add({"dp": dp, "tp": tp, "ep": ep, "pp": pp, "pcp": pcp,
+                                 "dcp": dcp, **local_pins})
     else:
         dp_widths = (pinned["dp"],) if "dp" in pinned else (widths if is_moe else (1,))
-        pp_vals = (pinned["pp"],) if "pp" in pinned else (1, 2)
         for pp in pp_vals:
             for dp in dp_widths:
                 for tp in ((pinned["tp"],) if "tp" in pinned else widths):

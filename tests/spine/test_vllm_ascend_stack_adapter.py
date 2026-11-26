@@ -947,3 +947,86 @@ def test_curated_expert_kv_engram_and_speculative_conv_abi_fidelity() -> None:
     plane_bytes = {p.plane_id: p.bytes_per_unit for p in gdn0.planes}
     assert plane_bytes["conv_history"] == 122_880
     assert plane_bytes["replay_records"] == 197_376
+
+
+def test_launch_codec_honest_ep_bijection_short_flags_and_human_int_suffixes() -> None:
+    """Verify upstream-faithful binary EP bijection, short flags (-dcp/-pcp/-ep), and human-int suffixes."""
+    codec = VllmAscendLaunchCodec()
+
+    # 1. Representable stock vLLM EP states round-trip bit-exact with zero invented flags.
+    base_facts = {
+        "model_name": "qwen3-30b-a3b",
+        "hardware_sku": GEN3_SKU,
+        "hw_family": "a3",
+        "weight_format": "BF16",
+    }
+    ep_off_sh = codec.render_launch_config({**base_facts, "dp": 1, "tp": 4, "ep": 1})
+    assert "--enable-expert-parallel" not in ep_off_sh
+    assert "--expert-parallel-size" not in ep_off_sh
+    assert "--expert-tensor-parallel-size" not in ep_off_sh
+    ep_off_p = codec.parse_launch_config(ep_off_sh).parallel
+    assert (ep_off_p.dp, ep_off_p.tp, ep_off_p.ep, ep_off_p.etp) == (1, 4, 1, 4)
+
+    ep_full_sh = codec.render_launch_config({**base_facts, "dp": 2, "tp": 4, "ep": 8})
+    assert "--enable-expert-parallel" in ep_full_sh
+    assert "--expert-parallel-size" not in ep_full_sh
+    assert "--expert-tensor-parallel-size" not in ep_full_sh
+    ep_full_p = codec.parse_launch_config(ep_full_sh).parallel
+    assert (ep_full_p.dp, ep_full_p.tp, ep_full_p.ep, ep_full_p.etp) == (2, 4, 8, 1)
+
+    # Explicit default ETP matching stock vLLM semantics is accepted.
+    assert codec.parse_launch_config(
+        codec.render_launch_config({**base_facts, "dp": 1, "tp": 4, "ep": 1, "expert_tp": 4}),
+    ).parallel.etp == 4
+    assert codec.parse_launch_config(
+        codec.render_launch_config({**base_facts, "dp": 1, "tp": 4, "ep": 4, "expert_tp": 1}),
+    ).parallel.etp == 1
+
+    # 2. Partial EP or non-default explicit ETP fails loudly instead of silently doubling EP.
+    for unrepresentable in (
+        {"dp": 1, "tp": 4, "ep": 2},
+        {"dp": 2, "tp": 4, "ep": 4},
+        {"dp": 1, "tp": 4, "ep": 4, "expert_tp": 2},
+        {"dp": 1, "tp": 4, "ep": 1, "expert_tp": 2},
+    ):
+        with pytest.raises(ModelingError, match="vllm_ascend_partial_ep_unrepresentable_in_cli"):
+            codec.render_launch_config({**base_facts, **unrepresentable})
+
+    # 3. Documented short flags (-dcp, -pcp, -ep, -q) and '=' syntax match long forms.
+    short_p = codec.parse_launch_config(
+        "vllm serve deepseek-ai/DeepSeek-V3.2 -tp 2 -dcp 2 -pcp 2",
+    ).parallel
+    long_p = codec.parse_launch_config(
+        "vllm serve deepseek-ai/DeepSeek-V3.2 --tensor-parallel-size 2 "
+        "--decode-context-parallel-size 2 --prefill-context-parallel-size 2",
+    ).parallel
+    assert (short_p.tp, short_p.cp, short_p.pcp, short_p.world_size) == (2, 2, 2, 4)
+    assert short_p == long_p
+
+    # -ep is a boolean switch and must never consume the following -tp 4 flag.
+    ep_short = codec.parse_launch_config("vllm serve deepseek-ai/DeepSeek-V3.2 -ep -tp 4").parallel
+    assert (ep_short.tp, ep_short.ep, ep_short.etp, ep_short.world_size) == (4, 4, 1, 4)
+
+    eq_ing = codec.parse_launch_config(
+        "vllm serve /weights/model -tp=2 -dcp=2 -pcp=2 -q=ascend --enable-expert-parallel=false",
+    )
+    assert (eq_ing.parallel.tp, eq_ing.parallel.cp, eq_ing.parallel.pcp, eq_ing.parallel.ep) == (2, 2, 2, 1)
+    assert dict(eq_ing.raw_stack_flags)["quantization"] == "ascend"
+
+    # 4. Human-readable integer suffixes on --max-model-len and --max-num-batched-tokens.
+    for raw_len, expected in (
+        ("131072", 131072),
+        ("128K", 131072),
+        ("128k", 128000),
+        ("1.5K", 1536),
+        ("1M", 1048576),
+        ("2m", 2000000),
+        ("1G", 1073741824),
+        ("1g", 1000000000),
+    ):
+        ing = codec.parse_launch_config(
+            f"vllm serve /weights/model --max-model-len {raw_len} --max-num-batched-tokens 16K",
+        )
+        limits = dict(ing.runtime_limits)
+        assert limits["max_model_len"] == expected
+        assert limits["max_num_batched_tokens"] == 16384

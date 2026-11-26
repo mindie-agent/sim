@@ -563,7 +563,7 @@ def test_vllm_ascend_dcp_codomain_laws_and_tp_rank_reuse() -> None:
     assert legal_vllm_ascend_dcp_values(sfa_model, tp=4, pcp=2) == (1, 2, 8)
     assert legal_vllm_ascend_dcp_values(mla_model, tp=6, pcp=1) == (1, 2, 3, 6)
     assert legal_vllm_ascend_dcp_values(mla_model, tp=4, pcp=2) == (1, 2, 4, 8)
-    assert legal_vllm_ascend_dcp_values(gqa_model, tp=8, pcp=1) == (1,)
+    assert legal_vllm_ascend_dcp_values(gqa_model, tp=8, pcp=1) == (1, 2, 4, 8)
     assert legal_vllm_ascend_dcp_values(gqa_model, tp=8, pcp=2) == (1, 2)
     assert legal_vllm_ascend_dcp_values(non_kv_model, tp=8, pcp=1) == (1,)
 

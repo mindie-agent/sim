@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
 import re
@@ -69,6 +70,17 @@ AUDIT_RATE_DECIMALS = 2
 
 _ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _SHELL_VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+_HUMAN_INT_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([kKmMgGtT])$")
+_HUMAN_INT_SCALES: dict[str, int] = {
+    "k": 1000,
+    "m": 1000 * 1000,
+    "g": 1000 * 1000 * 1000,
+    "t": 1000 * 1000 * 1000 * 1000,
+    "K": 1024,
+    "M": 1024 * 1024,
+    "G": 1024 * 1024 * 1024,
+    "T": 1024 * 1024 * 1024 * 1024,
+}
 _KNOWN_ENV_KEYS = frozenset({
     "HCCL_OP_EXPANSION_MODE",
     "VLLM_ASCEND_ENABLE_MLAPO",
@@ -315,6 +327,28 @@ def _safe_int(raw: Any, default: int = 0) -> int:
         return default
 
 
+def _parse_human_int(raw: Any, default: int = 0) -> int:
+    """Parse decimal ints and vLLM human-readable suffixes (``K``=1024, ``k``=1000, etc.)."""
+    if isinstance(raw, bool):
+        return default
+    text = str(raw if raw is not None else "").strip().replace("_", "")
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    match = _HUMAN_INT_RE.fullmatch(text)
+    if match is None:
+        return default
+    num_text, suffix = match.group(1), match.group(2)
+    scale = _HUMAN_INT_SCALES[suffix]
+    try:
+        return int(Decimal(num_text) * scale)
+    except (InvalidOperation, ValueError):
+        return default
+
+
 def _safe_float(raw: Any, default: float = 0.0) -> float:
     try:
         return float(str(raw).strip())
@@ -383,7 +417,7 @@ def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[s
             origins["model_ref"] = "launch_script"
             idx += 2
             continue
-        if "=" in tok and tok.startswith("--"):
+        if "=" in tok and tok.startswith("-"):
             flag, nxt, step = (*tok.split("=", 1), 1)
         else:
             flag, nxt, step = tok, (tokens[idx + 1] if idx + 1 < len(tokens) else ""), 2
@@ -415,11 +449,11 @@ def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[s
             state["pp"] = max(1, _safe_int(nxt, 1))
             state["has_parallel_flags"] = True
             origins["parallel.pp"] = "launch_script"
-        elif flag in {"--dcp-size", "--cp-size", "--decode-context-parallel-size"}:
+        elif flag in {"-dcp", "--dcp-size", "--cp-size", "--decode-context-parallel-size"}:
             state["dcp"] = max(1, _safe_int(nxt, 1))
             state["has_parallel_flags"] = True
             origins["parallel.cp"] = "launch_script"
-        elif flag in {"--pcp-size", "--prefill-context-parallel-size"}:
+        elif flag in {"-pcp", "--pcp-size", "--prefill-context-parallel-size"}:
             state["pcp"] = max(1, _safe_int(nxt, 1))
             state["has_parallel_flags"] = True
             origins["parallel.pcp"] = "launch_script"
@@ -428,8 +462,13 @@ def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[s
             origins["runtime_limits.nnodes"] = "launch_script"
         elif flag == "--node-rank":
             state["node_rank"] = max(0, _safe_int(nxt, 0))
-        elif flag == "--enable-expert-parallel":
-            state["ep_enabled"], step = True, 1
+        elif flag in {"-ep", "--enable-expert-parallel"}:
+            state["ep_enabled"] = (nxt.strip().lower() not in _FALSE_ENV_TOKENS) if "=" in tok else True
+            step = 1
+            state["has_parallel_flags"] = True
+            origins["parallel.ep"] = "launch_script"
+        elif flag == "--no-enable-expert-parallel":
+            state["ep_enabled"], step = False, 1
             state["has_parallel_flags"] = True
             origins["parallel.ep"] = "launch_script"
         elif flag == "--enforce-eager":
@@ -443,13 +482,13 @@ def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[s
         elif flag == "--no-enable-prefix-caching":
             state["enable_prefix_caching"], step = False, 1
         elif flag == "--max-model-len":
-            state["max_model_len"] = _safe_int(nxt, 0)
+            state["max_model_len"] = _parse_human_int(nxt, 0)
             origins["runtime_limits.max_model_len"] = "launch_script"
         elif flag == "--max-num-seqs":
             state["max_num_seqs"] = _safe_int(nxt, 0)
             origins["runtime_limits.max_num_seqs"] = "launch_script"
         elif flag == "--max-num-batched-tokens":
-            state["max_num_batched_tokens"] = _safe_int(nxt, 0)
+            state["max_num_batched_tokens"] = _parse_human_int(nxt, 0)
             origins["runtime_limits.max_num_batched_tokens"] = "launch_script"
         elif flag == "--block-size":
             state["block_size"] = _safe_int(nxt, 0)
@@ -457,7 +496,7 @@ def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[s
         elif flag == "--gpu-memory-utilization":
             state["gpu_memory_utilization"] = _safe_float(nxt, 0.0)
             origins["runtime_limits.gpu_memory_utilization"] = "launch_script"
-        elif flag == "--quantization":
+        elif flag in {"-q", "--quantization"}:
             state["quantization_flag"] = nxt
             origins["quantization"] = "launch_script"
         elif flag == "--kv-cache-dtype":
@@ -981,9 +1020,24 @@ class VllmAscendLaunchCodec:
         ep = max(1, _safe_int(tuned_facts.get("ep"), 1))
         dcp = max(1, _safe_int(tuned_facts.get("dcp") or tuned_facts.get("cp"), 1))
         pcp = max(1, _safe_int(tuned_facts.get("pcp"), 1))
-        max_len = max(1, _safe_int(tuned_facts.get("max_model_len") or tuned_facts.get("seq_len"), DEFAULT_AUDIT_MAX_MODEL_LEN))
+        full_ep = dp * tp * pcp
+        raw_etp = tuned_facts.get("expert_tp")
+        if raw_etp is None:
+            raw_etp = tuned_facts.get("etp")
+        if raw_etp is not None:
+            eff_etp = -1 if isinstance(raw_etp, bool) else _safe_int(raw_etp, -1)
+        else:
+            eff_etp = ParallelSpec(dp=dp, tp=tp, pp=pp, ep=ep, cp=dcp, pcp=pcp).etp
+        expected_etp = tp if ep == 1 else 1
+        if (ep != 1 and ep != full_ep) or eff_etp != expected_etp:
+            raise ModelingError(
+                f"vllm_ascend_partial_ep_unrepresentable_in_cli:"
+                f"ep={ep},etp={eff_etp},dp={dp},tp={tp},pcp={pcp},"
+                f"supported_ep=(1,{full_ep}),expected_etp={expected_etp}"
+            )
+        max_len = max(1, _parse_human_int(tuned_facts.get("max_model_len") or tuned_facts.get("seq_len"), DEFAULT_AUDIT_MAX_MODEL_LEN))
         max_seqs = max(1, _safe_int(tuned_facts.get("max_num_seqs") or tuned_facts.get("concurrency"), DEFAULT_AUDIT_MAX_NUM_SEQS))
-        max_batched = _safe_int(tuned_facts.get("max_num_batched_tokens"), 0)
+        max_batched = _parse_human_int(tuned_facts.get("max_num_batched_tokens"), 0)
         block_size = _safe_int(tuned_facts.get("block_size") or tuned_facts.get("kv_block_size"), 0)
         enforce_eager = bool(tuned_facts.get("enforce_eager", False))
         use_replayssm = bool(tuned_facts.get("use_replayssm", False))
