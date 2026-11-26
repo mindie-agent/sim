@@ -744,11 +744,12 @@ class _EngineLifecycleMixin:
                     if peer_units is None:
                         continue
                     task_units = task.placement.get(rname)
-                    if task_units is not None and peer_units == task_units:
-                        continue
+                    if task_units is not None:
+                        if peer_units == task_units:
+                            continue
+                        if not (_units_to_mask(peer_units) & _units_to_mask(task_units)):
+                            continue
                     peer_set = set(peer_units)
-                    if task_units is not None and peer_set.isdisjoint(task_units):
-                        continue
                     if len({len(peer_set.intersection(m)) for m in members}) > 1:
                         broken = True
                         break

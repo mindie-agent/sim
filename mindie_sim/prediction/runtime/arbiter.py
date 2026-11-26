@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from typing import Mapping
 
-from ..ownership import unit_rates
+from ..ownership import _unit_mask, unit_rates
 from .arbiter_tiered import (
     _lockstep_coupled, _max_min_rates, _member_placements, _priority_tiers,
     _progressive_unit_fill, _residual_unit_rates, _tier_flows, _tiered_coupled,
@@ -136,7 +136,7 @@ def _partition_coupled_components(resources, tasks, active):
     while changed and uncoupled_keys:
         changed = False
         hot_fifo: set[str] = set()
-        hot_units: dict[str, set[int]] = {}
+        hot_masks: dict[str, int] = {}
         for k in coupled_keys:
             t = tasks[k]
             pl = t.placement
@@ -148,9 +148,8 @@ def _partition_coupled_components(resources, tasks, active):
                     hot_fifo.add(rname)
                 else:
                     us = pl.get(rname) if pl else None
-                    hot_units.setdefault(rname, set()).update(
-                        range(res.units) if us is None else us
-                    )
+                    mask = ((1 << res.units) - 1) if us is None else _unit_mask(us)
+                    hot_masks[rname] = hot_masks.get(rname, 0) | mask
         promoted: list[int] = []
         for k in uncoupled_keys:
             t = tasks[k]
@@ -161,10 +160,10 @@ def _partition_coupled_components(resources, tasks, active):
                 if rname in hot_fifo:
                     promoted.append(k)
                     break
-                hu = hot_units.get(rname)
-                if hu is not None:
+                hmask = hot_masks.get(rname)
+                if hmask:
                     us = pl.get(rname) if pl else None
-                    if us is None or not hu.isdisjoint(us):
+                    if us is None or (hmask & _unit_mask(us)):
                         promoted.append(k)
                         break
         if promoted:

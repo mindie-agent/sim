@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import ctypes
+from functools import lru_cache
 import math
+import os
 import threading
 
 _HALF_STEP = 0.5
@@ -36,10 +38,22 @@ _INITIAL_SCRATCH_CAP = 64
 _SCRATCH_GROWTH_FACTOR = 2
 _MIN_UNIT_COUNT = 1
 _MAX_NATIVE_COHORT = 2_147_483_647
+_INT32_BYTES = ctypes.sizeof(ctypes.c_int32)
+_PLACE_PACK_CACHE_MAXSIZE = 1024
+_PYTHON_MODES = frozenset({"python", "py", "off", "0"})
+_UNSET = object()
 
-_NATIVE_FN_CACHE: dict[str, object] = {}
+_NATIVE_FN_CACHE: dict[tuple, object] = {}
 _NATIVE_FN_LOCK = threading.Lock()
 _THREAD_SCRATCH = threading.local()
+
+
+@lru_cache(maxsize=_PLACE_PACK_CACHE_MAXSIZE)
+def _pack_place_units(decl: tuple[int, ...]) -> tuple[ctypes.Array, int, int]:
+    """Pack a repeated placement tuple into a contiguous ``c_int32`` buffer."""
+    count = len(decl)
+    arr = (ctypes.c_int32 * count)(*(int(u) for u in decl))
+    return arr, count, count * _INT32_BYTES
 
 
 class _CoupledScratch:
@@ -116,14 +130,36 @@ def _get_scratch() -> _CoupledScratch:
 
 def _get_native_coupled_fn():
     """Return bound C11 ``msim_fast_single_tier_coupled`` or ``None``."""
-    from . import accel_build, accel_loader, accel_sync
+    env = os.environ
+    mode_raw = env.get("MINDIE_SIM_ACCEL")
+    if mode_raw is None:
+        mode_raw = env.get("MINDIE_SIM_ENGINE_BACKEND")
+    if mode_raw is not None and mode_raw.strip().lower() in _PYTHON_MODES:
+        return None
+    cache_base = env.get("MINDIE_CACHE_HOME")
+    if cache_base:
+        base_tag = ("cache", cache_base)
+    else:
+        data_base = env.get("MINDIE_DATA_HOME")
+        if data_base:
+            base_tag = ("data", data_base)
+        else:
+            xdg_base = env.get("XDG_CACHE_HOME")
+            if xdg_base:
+                base_tag = ("xdg", xdg_base)
+            else:
+                base_tag = ("home", env.get("HOME"), env.get("USERPROFILE"))
+    env_key = (mode_raw, base_tag, env.get("MINDIE_SIM_CC"))
+    cached = _NATIVE_FN_CACHE.get(env_key, _UNSET)
+    if cached is not _UNSET:
+        return cached
+    from . import accel_loader, accel_sync
 
     if accel_sync.resolve_mode(None) == "python":
         return None
-    cache_key = str(accel_build.cache_root())
     with _NATIVE_FN_LOCK:
-        if cache_key in _NATIVE_FN_CACHE:
-            return _NATIVE_FN_CACHE[cache_key]
+        if env_key in _NATIVE_FN_CACHE:
+            return _NATIVE_FN_CACHE[env_key]
     fn = None
     try:
         _status, lib = accel_loader.load_accel_cdll()
@@ -135,7 +171,7 @@ def _get_native_coupled_fn():
     except (accel_loader.AccelUnavailable, OSError, RuntimeError):
         fn = None
     with _NATIVE_FN_LOCK:
-        _NATIVE_FN_CACHE[cache_key] = fn
+        _NATIVE_FN_CACHE[env_key] = fn
     return fn
 
 
@@ -210,6 +246,8 @@ def fast_single_tier_coupled_c(
     buf.ensure_tasks(n_tasks)
     buf.ensure_links(n_links)
     buf.ensure_place(max(_MIN_UNIT_COUNT, n_place))
+    place_base = ctypes.addressof(buf.place_units)
+    memmove = ctypes.memmove
 
     for ri, name in enumerate(res_names):
         res = resources[name]
@@ -246,9 +284,14 @@ def fast_single_tier_coupled_c(
                 buf.link_unplaced[li] = _MIN_UNIT_COUNT
             else:
                 buf.link_unplaced[li] = _FAULT_OK
-                for unit in decl:
-                    buf.place_units[pi] = int(unit)
-                    pi += _MIN_UNIT_COUNT
+                if type(decl) is tuple and decl:
+                    packed_arr, packed_cnt, packed_bytes = _pack_place_units(decl)
+                    memmove(place_base + pi * _INT32_BYTES, packed_arr, packed_bytes)
+                    pi += packed_cnt
+                else:
+                    for unit in decl:
+                        buf.place_units[pi] = int(unit)
+                        pi += _MIN_UNIT_COUNT
             link_res_names.append(name)
             link_task_keys.append(key)
             li += _MIN_UNIT_COUNT

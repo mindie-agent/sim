@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import Hashable, Mapping
+from functools import lru_cache
 from typing import Any
 
 
@@ -28,6 +29,30 @@ _MAX_STATE_DEPTH = 64
 _MAX_CANONICAL_DEPTH = 2 * _MAX_STATE_DEPTH + 8
 _TEMPLATE_REPR_LIMIT = 256
 _MAPPING_ENTRY_OVERHEAD = 64
+_TUPLE_BASE_SIZE = sys.getsizeof(())
+_TUPLE_PTR_SIZE = sys.getsizeof((None,)) - _TUPLE_BASE_SIZE
+_NONE_NODE = ("none",)
+_TRUE_NODE = ("bool", True)
+_FALSE_NODE = ("bool", False)
+_ZERO_FLOAT_NODE = ("float", 0.0)
+_EMPTY_TUPLE_NODE = ("tuple", ())
+_SMALL_INT_LIMIT = 256
+_SMALL_INT_NODES = tuple(("int", i) for i in range(_SMALL_INT_LIMIT))
+_INT_TUPLE_CACHE_LIMIT = 512
+_INT_TUPLE_MAX_LEN = 64
+_PAIR_TUPLE_SIZE = _TUPLE_BASE_SIZE + _TUPLE_PTR_SIZE * 2
+
+
+@lru_cache(maxsize=_INT_TUPLE_CACHE_LIMIT)
+def _freeze_int_tuple(value: tuple[int, ...]) -> tuple:
+    """Cache canonical tagged form for small all-exact-int tuples (e.g. placements)."""
+    return (
+        "tuple",
+        tuple(
+            _SMALL_INT_NODES[item] if 0 <= item < _SMALL_INT_LIMIT else ("int", item)
+            for item in value
+        ),
+    )
 
 
 def _is_int(value: Any) -> bool:
@@ -252,12 +277,17 @@ def _measure_retained(value: Any, *, seen: set[int] | None = None) -> int:
     if ident in seen:
         return 0
     seen.add(ident)
+    kind = type(value)
+    if kind is tuple:
+        size = _TUPLE_BASE_SIZE + _TUPLE_PTR_SIZE * len(value)
+        for item in value:
+            size += _measure_retained(item, seen=seen)
+        return size
     try:
         size = sys.getsizeof(value)
     except TypeError:  # pragma: no cover - builtin state only
         size = 0
-    kind = type(value)
-    if kind is tuple or kind is list:
+    if kind is list:
         for item in value:
             size += _measure_retained(item, seen=seen)
     elif kind is set or kind is frozenset:
@@ -383,24 +413,44 @@ def _freeze_snapshot(
         counter[0] += 1
     kind = type(value)
     if value is None:
-        result = ("none",)
+        result = _NONE_NODE
     elif kind is bool:
-        result = ("bool", value)
+        result = _TRUE_NODE if value else _FALSE_NODE
     elif kind is int:
-        result = ("int", value)
+        result = _SMALL_INT_NODES[value] if 0 <= value < _SMALL_INT_LIMIT else ("int", value)
     elif kind is float:
         if math.isnan(value):
             raise PeriodicContractError(f"periodic_snapshot_nan:{path}")
-        result = ("float", value)
+        result = _ZERO_FLOAT_NODE if (value == 0.0 and not math.copysign(1.0, value) < 0.0) else ("float", value)
     elif kind is str:
         result = ("str", value)
     elif kind is bytes:
         result = ("bytes", value)
     elif kind is tuple:
-        result = ("tuple", tuple(
-            _freeze_snapshot(item, path=f"{path}[{index}]", depth=depth + 1,
-                             counter=counter, sizes=sizes)
-            for index, item in enumerate(value)))
+        if not value:
+            result = _EMPTY_TUPLE_NODE
+        elif len(value) <= _INT_TUPLE_MAX_LEN and type(value[0]) is int:
+            all_int = True
+            for item in value:
+                if type(item) is not int:
+                    all_int = False
+                    break
+            if all_int:
+                result = _freeze_int_tuple(value)
+                if counter is not None:
+                    counter[0] += len(value)
+                if sizes is not None:
+                    sizes[0] += _PAIR_TUPLE_SIZE * (len(value) + 1)
+                return result
+            result = ("tuple", tuple(
+                _freeze_snapshot(item, path=f"{path}[{index}]", depth=depth + 1,
+                                 counter=counter, sizes=sizes)
+                for index, item in enumerate(value)))
+        else:
+            result = ("tuple", tuple(
+                _freeze_snapshot(item, path=f"{path}[{index}]", depth=depth + 1,
+                                 counter=counter, sizes=sizes)
+                for index, item in enumerate(value)))
     elif kind is list:
         result = ("list", tuple(
             _freeze_snapshot(item, path=f"{path}[{index}]", depth=depth + 1,
@@ -437,5 +487,5 @@ def _freeze_snapshot(
         raise PeriodicContractError(
             f"periodic_snapshot_opaque:{path}:{kind.__name__}")
     if sizes is not None:
-        sizes[0] += sys.getsizeof(result)
+        sizes[0] += _TUPLE_BASE_SIZE + _TUPLE_PTR_SIZE * len(result)
     return result
