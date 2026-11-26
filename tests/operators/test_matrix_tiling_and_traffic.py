@@ -396,21 +396,22 @@ def test_tiled_panel_and_accumulator_residency(shape, groups, tile):
         assert engine.serviced == pytest.approx(expected) and after > before
         assert max(engine.peak_unit_allocated["l1", i] for i in range(2)) == panel
 def test_frontend_grouped_mla_traffic_and_source_binding():
-    raw = json.loads((REPO_ROOT / "examples/source-families/mla-decode-control.json").read_text())
+    raw = json.loads((REPO_ROOT / "examples/source-families/indexed-mla-a3-control.json").read_text())
+    raw["machine"]["num_devices"] = raw["machine"]["ranks_per_node"] = raw["runtime"]["tp"] = 1
     raw["model"]["num_heads"] = 16
-    raw["machine"]["device"].update(compute_units=16, l0a_bytes=65536, l0b_bytes=65536, l0c_bytes=262144, l1_bytes=524288)
-    raw["machine"]["device"]["rates"].update(mte2=1000, mte3=1000)
+    raw["model"]["quantization"] = "bf16"
     raw["runtime"]["kernels"]["programs"] = {"matmul": {"kind": "tiled_matmul"}}
-    ops = target_graphs(raw, apply_body_defaults=False, phase="decode", tokens=1, context=33, sequences=1, scope="model")[0]
+    ops = target_graphs(raw, apply_body_defaults=False, phase="decode", tokens=1, context=512, sequences=1, scope="model")[0]
     rows = {row["operator"]["op_id"]: row for row in operator_costs(raw, ops)["operators"]}
     grouped = [op for op in ops if op.op_id.endswith(("q_absorb", "v_expand"))]
+    assert len(grouped) == 2
     for op in grouped:
         assert dict(op.metadata)["matrix_groups"] == 16 and rows[op.op_id]["program"] == "TiledMatmul"
         expected = _tiled_oracle(op, TiledMatmul())[0]
-        for logical, physical in (("hbm", "memory"), ("mte2", "mte2"), ("mte3", "mte3")):
+        for logical, physical in (("hbm", "memory"), ("mte2", "mte2_aic"), ("mte3", "fixpipe")):
             assert rows[op.op_id]["serviced"][physical + "@r0:s0"] == pytest.approx(expected[logical])
     assert {(row["operator"]["recipe"], row["program"]) for row in rows.values()
-            if row["operator"].get("source_boundary") == "kernel"} == {("triton_decode_grouped_mla", "OperatorPlan")}
+            if row["operator"].get("source_boundary") == "kernel"} == {("ascend_sparse_flash_attention_arch22", "OperatorPlan")}
     case = parse_case(raw)
     execution = Execution(case, CostModel(case), trace_limit=5000)
     op, recipe = execution.prepare(next(op for op in grouped if op.op_id.endswith("v_expand")))
@@ -418,7 +419,7 @@ def test_frontend_grouped_mla_traffic_and_source_binding():
     program = recipe.lower(execution._context(op, 0, "none", recipe=recipe))
     engine.advance(until=(program.start(engine, "mla", engine.submit("ready", release=7)),))
     compute = [r for r in engine.trace if r["demand"].get("matrix@r0:s0") and r["task"].endswith(":compute")]
-    assert len({owner for row in compute for owner in row["placement"]["matrix@r0:s0"]}) == 16
+    assert len({owner for row in compute for owner in row["placement"]["matrix@r0:s0"]}) == case.machine.dies[0].compute_units
     assert min(r["start_ms"] for r in compute) >= 7
 
 def _price(m=128, n=288, k=4096, *, groups=1, options=None, scale=1, dtype="fp32", primitive_table=None):
@@ -439,20 +440,25 @@ def test_owner_grid_subtiles_and_explicit_domain(m, n, dtype):
     tile = report["selected"]
     if dtype != "fp32":
         if n == 288:
-            # With exact strided sector-union pricing, 128x256 beats 128x128 on
-            # unaligned N=288 panels (higher sector efficiency and full AIC grid).
-            assert (tile["tile_m"], tile["tile_n"]) == (128, 256)
+            # Dense BF16 admits Stream-K (128x128 k_splits=8); block-quantized FP8/INT8
+            # stay non-Stream-K (k_splits=1) where 128x256 maximizes sector efficiency.
+            assert (tile["tile_m"], tile["tile_n"]) == ((128, 128) if dtype == "bf16" else (128, 256))
+            assert tile["k_splits"] == (8 if dtype == "bf16" else 1)
         else:
-            assert tile["tile_m"] == tile["tile_n"] == (32 if dtype == "bf16" else 16)
+            assert (tile["tile_m"], tile["tile_n"]) == ((16, 32) if dtype == "bf16" else (16, 16))
+            assert tile["k_splits"] == (8 if dtype == "bf16" else 1)
         if dtype == "bf16" or n == 24:
             assert _price(m, n, dtype=dtype, options={"underfilled_candidates": UNDERFILLED_CANDIDATES})[:2] == (span, work)
     else:
-        control, coarse, _ = _price(options={"underfilled_candidates": ()})
+        control, coarse, coarse_report = _price(options={"underfilled_candidates": ()})
         assert span <= control and len(owner_tiles(m, n, tile["tile_m"], tile["tile_n"], 32)) * tile["k_splits"] >= 16
         partial = tile["k_splits"] * 4 * m * n
         assert work["memory@r0:s0"] == pytest.approx(6_963_200) and coarse["memory@r0:s0"] == pytest.approx(6_963_200)
         assert work["l2@r0:s0"] == pytest.approx(2 * partial) and work["fixpipe@r0:s0"] == pytest.approx(partial)
-        assert work["mte2_aic@r0:s0"] == pytest.approx(coarse["mte2_aic@r0:s0"])
+        # Tile-grid MTE2 traffic scales with output-tile operand reuse (ceil(N/tile_n)*A + ceil(M/tile_m)*B).
+        for metrics, sel in ((work, tile), (coarse, coarse_report["selected"])):
+            expected_mte2 = math.ceil(n / sel["tile_n"]) * (4 * m * 4096) + math.ceil(m / sel["tile_m"]) * (4 * n * 4096)
+            assert metrics["mte2_aic@r0:s0"] == pytest.approx(expected_mte2)
 def test_full_grid_and_compute_sweep_preserve_logical_work():
     assert _price(1024, 4096, 128)[:2] == _price(1024, 4096, 128, options={"underfilled_candidates": ()})[:2]
     _, work, mapping = _price(57, 145, 319, groups=3, primitive_table=False)

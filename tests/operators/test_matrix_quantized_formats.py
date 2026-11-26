@@ -61,22 +61,38 @@ def run(case, op, ready=0, **options):
     return graph_costs(case, [op], external_inputs=dict.fromkeys(op.deps, ready), **options)
 
 
+def _issued_int4_flops(rows, n, k, *, down):
+    """Arch2201 INT4 Cube 16x16x64 issued FLOPs across active double-row MSD tiles."""
+    m = sum(rows)
+    base_m, base_n = ((64, 512) if (m // len(rows)) < 32 else (128, 256)) if down else (128, 256)
+    align = lambda v, g: ((v + g - 1) // g) * g
+    issued_k = align(k, 64)
+    return sum(
+        2 * align(min(base_m, 2 * count - row), 16) * align(min(base_n, n - col), 16) * issued_k
+        for count in rows if count
+        for row in range(0, 2 * count, base_m)
+        for col in range(0, n, base_n)
+    )
+
+
 def phase_work(rows, n, k, *, down, aivs):
-    """Account for each GM read/write and the per-owner assist reloads."""
+    """Account for each GM read/write, INT4 subtile issue, and per-owner assist reloads."""
     m, active = sum(rows), sum(count > 0 for count in rows)
     labels = [bank for bank, count in enumerate(rows) for _ in range(count)]
     quotient, remainder = divmod(m, min(m, aivs))
     boundaries = [i * quotient + min(i, remainder) for i in range(min(m, aivs) + 1)]
     assist = active if down else sum(len(set(labels[i:j])) for i, j in zip(boundaries, boundaries[1:]))
     packed, encoded = n * k * active / 2, 8 * n * active
-    metadata = 4 * len(rows) if down else 0
+    down_owners = aivs // 2
+    metadata = down_owners * len(rows) if down else 0
     pre_read = m * k + 8 * metadata
     matrix_read, matrix_write = m * k + packed + encoded, 4 * m * n
     post_read = matrix_write + 4 * n * assist + 4 * m
     out_write = 2 * m * n if down else m * (n // 2) + 4 * m
     reads, writes = pre_read + matrix_read + post_read, m * k + out_write
-    vector = 6.5 * m * k + 8 * m * n + (m * n + 2 * metadata if down else 10 * m * (n // 2) + m)
-    return dict(flops=4 * m * n * k, mte2_bytes=reads, mte3_bytes=writes,
+    vector = (6.5 * m * k + 7 * m * n + down_owners * (2 * len(rows) + 128)
+              if down else 6.5 * m * k + 6 * m * n + 10 * m * (n // 2) + m + 128 * aivs)
+    return dict(flops=_issued_int4_flops(rows, n, k, down=down), mte2_bytes=reads, mte3_bytes=writes,
                 hbm_bytes=reads + writes + matrix_write, vector_ops=vector,
                 weight_bytes=packed, encoded_scale_bytes=encoded)
 
@@ -122,7 +138,7 @@ def test_down_binding_preserves_semantic_identity_and_input_quantizer():
     quant = next(op for op in operators if op.op_id == down.deps[0])
     semantic = pick(ops(case_input(True, down_binding=False), fusion=False), "grouped_down")
     assert down.source_boundary == "kernel" and down.dtype == "int4"
-    assert dict(down.matrix_flops) == {"int4": 4 * 8 * 64 * 64}
+    assert dict(down.matrix_flops) == {"int4": _issued_int4_flops(ROWS, 64, 64, down=True)}
     metadata = dict(down.metadata)
     assert metadata["output_format"] == "bf16" and not metadata["w4a8_msd_down"]["output_quantization"]
     assert quant.op_id == down.op_id + ".quantize"
@@ -143,7 +159,8 @@ def test_empty_bank_has_no_matrix_reads_and_balancing_conserves_rows(recipe, dow
     config = dict(balanced.metadata)[key]
     assert config["expert_rows"] == [2, 2, 2, 2] and config["active_groups"] == 4
     assert dict(uneven.metadata)[key]["expert_rows"] == list(ROWS)
-    assert balanced.flops == uneven.flops == 4 * 8 * 64 * k
+    assert balanced.flops == _issued_int4_flops((2, 2, 2, 2), 64, k, down=down)
+    assert uneven.flops == _issued_int4_flops(ROWS, 64, k, down=down)
     extra_bank = 0.5 * 64 * k + 8 * 64
     if down:
         assert config["routing_basis"] == "forced_balanced_integer_counts"
@@ -157,7 +174,7 @@ def test_empty_bank_has_no_matrix_reads_and_balancing_conserves_rows(recipe, dow
         raw["runtime"]["routing"] = {"realizations": [{
             "scope": "body", "layer": 0, "phase": "prefill", "tokens": 1, "expert_rows": [1, 1, 0, 0]}]}
         small = pick(ops(raw, tokens=1), GATE)
-        assert dict(small.metadata)[key]["m"] == 2 and small.flops == 4 * 2 * 64 * 32
+        assert dict(small.metadata)[key]["m"] == 2 and small.flops == _issued_int4_flops((1, 1, 0, 0), 64, 32, down=False)
         assert small.mte2_bytes == phase_work((1, 1, 0, 0), 64, 32, down=False, aivs=2)["mte2_bytes"]
         assert small.mte2_bytes < phase_work((1, 1, 1, 1), 64, 32, down=False, aivs=2)["mte2_bytes"]
 
@@ -287,7 +304,7 @@ def test_cross_dp_balanced_source_consumes_each_local_expert_histogram():
         assert config["expert_rows"] == [4, 4]
         quant = next(op for op in operators if op.op_id == down.deps[0])
         assert quant.local_shape == (8, 64)
-        assert down.flops == 4 * 8 * 64 * 64
+        assert down.flops == _issued_int4_flops((4, 4), 64, 64, down=True)
     report = graph_costs(case, graphs, external_inputs={"analysis_input": 0})
     assert_drained(report)
     assert report["execution"]["recipes"][DOWN] == 2
@@ -398,15 +415,17 @@ def test_steady_and_detailed_match_physical_work_and_serial_owner_boundary(down,
     matrix = total_work(schedule.matrix)
     assert compact.serviced["hbm"] == pytest.approx(matrix.resources["hbm"])
     assert compact.serviced["mte2_aic"] == pytest.approx(matrix.resources["mte2"])
-    assert compact.serviced["vector"] == pytest.approx(matrix.resources["vector"])
+    assert "vector" not in matrix.resources and compact.serviced["vector"] == 0
     assert compact.serviced["fixpipe"] == pytest.approx(4 * schedule.m * schedule.n)
     assert compact.serviced["mte3"] == 0
-    # Directional MTE1 services A at twice the rate of B.
+    # Directional MTE1 services A at twice the rate of B; operands pad to INT4 16x16x64 subtiles.
+    align = lambda v, g: ((v + g - 1) // g) * g
+    issued_k = align(k, 64)
     a = b = 0
     for owner in range(schedule.aic_owners):
         for rows, cols in owner_rectangles(schedule, owner):
-            a += 0.5 * rows * k * math.ceil(cols / 128)
-            b += 0.5 * cols * k * math.ceil(rows / min(schedule.base_m, 128))
+            a += 0.5 * align(rows, 16) * issued_k * math.ceil(cols / 128)
+            b += 0.5 * align(cols, 16) * issued_k * math.ceil(rows / min(schedule.base_m, 128))
     assert compact.serviced["mte1"] == pytest.approx((a / 2 if modes else a) + b)
 
 def test_owner_tiles_remain_independent_bank_loads_and_k_compression_is_bounded():
@@ -427,7 +446,7 @@ def test_group_count_bulk_copy_includes_idle_aivs_without_256_active_weight_bank
     schedule = _schedule((1,) * 8 + (0,) * 248, n=6144, k=256, cores=20, down=True)
     pre = total_work(schedule.pre)
     assert pre.resources["mte2"] == 8 * 256 + 40 * 256 * 8
-    assert pre.resources["vector"] == 6.5 * 8 * 256 + 40 * 2 * 256
+    assert pre.resources["vector"] == 6.5 * 8 * 256 + 40 * (2 * 256 + 128)
     _, engine = _run(schedule, modes=True)
     assert engine.serviced["mte2_aic"] == pytest.approx(
         8 * 0.5 * 6144 * 256 + 96 * 8 * 512 + 96 * 256)
@@ -461,12 +480,14 @@ def test_packed_weights_and_cube_work_follow_real_expert_rectangles(rows, n, k, 
     assert schedule.expert_scan_count == len(rows) and schedule.active_experts == sum(r > 0 for r in rows)
     assert schedule.zero_bank_offsets == tuple(i * n * k for i, r in enumerate(rows) if not r)
     matrix = {record.owner: record for record in schedule.matrix}
+    align = lambda v, g: ((v + g - 1) // g) * g
+    issued_k = align(k, 64)
     for owner in range(min(20, len(rectangles))):
         owned = rectangles[owner::20]
         assert matrix[owner].tiles == len(owned)
-        assert matrix[owner].work.matrix["int4"] == sum(2 * m * width * k for m, width in owned)
+        assert matrix[owner].work.matrix["int4"] == sum(2 * align(m, 16) * align(width, 16) * issued_k for m, width in owned)
         assert matrix[owner].work.resources["hbm"] >= sum(width * k / 2 for _, width in owned)
-    assert total_work(schedule.matrix).matrix["int4"] == 4 * sum(rows) * n * k
+    assert total_work(schedule.matrix).matrix["int4"] == _issued_int4_flops(rows, n, k, down=down)
     if read is not None:
         assert total_work(schedule.matrix).resources["mte2"] == pytest.approx(read)
     if (n, down) == (320, False):
@@ -484,8 +505,10 @@ def test_packed_weights_and_cube_work_follow_real_expert_rectangles(rows, n, k, 
 @pytest.mark.parametrize("cores,rows_per_owner", [(20, (1,) * 8), (2, (2,) * 4)])
 def test_gate_aiv_partitions_conserve_rows(cores, rows_per_owner):
     schedule = _schedule(SPARSE_ROWS, 512, 6144, cores)
-    for records in (schedule.pre, schedule.post_dequant):
-        assert [(r.owner, r.rows) for r in records] == list(enumerate(rows_per_owner))
+    assert len(schedule.pre) == 2 * cores
+    assert [(r.owner, r.rows) for r in schedule.pre if r.rows] == list(enumerate(rows_per_owner))
+    assert all(r.work.resources == {"hbm": 0, "mte2": 0, "mte3": 0, "vector": 128} for r in schedule.pre if not r.rows)
+    assert [(r.owner, r.rows) for r in schedule.post_dequant] == list(enumerate(rows_per_owner))
     assert not any(r.assist_loads for r in schedule.pre)
     if cores == 20:
         assert source_row_partition(8, 40) == tuple((i, i, 1) for i in range(8))
@@ -506,9 +529,9 @@ def test_down_aiv_assist_reloads_and_idle_group_list_reads():
     assert total_work(schedule.post_dequant).resources["vector"] == 3 * 16 * 6144
     assert len(schedule.pre) == 40 and sum(r.rows > 0 for r in schedule.pre) == 8
     for record in schedule.pre[8:]:
-        assert record.rows == 0 and record.work.resources == {"hbm": 256 * 8, "mte2": 256 * 8, "mte3": 0, "vector": 512}
+        assert record.rows == 0 and record.work.resources == {"hbm": 256 * 8, "mte2": 256 * 8, "mte3": 0, "vector": 512 + 128}
     pre = total_work(schedule.pre).resources
-    assert pre["hbm"] == 2 * 8 * 256 + 40 * 256 * 8 and pre["vector"] == 6.5 * 8 * 256 + 40 * 512
+    assert pre["hbm"] == 2 * 8 * 256 + 40 * 256 * 8 and pre["vector"] == 6.5 * 8 * 256 + 40 * (512 + 128)
     single = down_schedule(8, 64, 64, ROWS, aic_owners=4, aiv_owners=8)
     assert single.aivs_per_aic == 1
     assert total_work(single.post_dequant).resources["hbm"] == 4 * 8 * 64 + 4 * 64 * 3 + 4 * 8
@@ -530,7 +553,7 @@ def test_large_declared_gate_geometry_conserves_work_under_contention():
     report, late = (run(case, op, t, include_submission=True, isolated=True) for t in (0, 5))
     applied = report["isolated"]["operators"][0]["operator"]
     assert report["execution"]["recipes"] == {GATE: 1}
-    assert applied["flops"] == expected.matrix["int4"] == 4 * 8 * 512 * 6144
+    assert applied["flops"] == expected.matrix["int4"] == _issued_int4_flops(SPARSE_ROWS, 512, 6144, down=False)
     for field, role in (("hbm_bytes", "hbm"), ("mte3_bytes", "mte3"), ("vector_ops", "vector")):
         assert applied[field] == pytest.approx(expected.resources[role])
     assert late["timeline"][0]["ready_ms"] == 5 and report["timeline"][0]["ready_ms"] == 0

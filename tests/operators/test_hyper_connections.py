@@ -551,7 +551,7 @@ def test_bf16_caller_replaces_split_ops_and_retains_prefix(batch):
         assert not any(name.startswith(("cube", "matrix")) for name in row["serviced"])
 
 def test_receive_only_replicas_keep_expert_work_and_active_selection_is_checked():
-    case = parse_case(_raw("source-families/v41-hc-source-control.json"))
+    case = parse_case(_raw("source-families/v41-hc-arch35-source-control.json"))
     layers = case.model.layer_plans[:1]
     case = replace(case, model=replace(case.model, layers=1, body_layers=1, layer_plans=layers),
                    runtime=replace(case.runtime, pp_layer_partition=(1,)))
@@ -564,6 +564,15 @@ def test_receive_only_replicas_keep_expert_work_and_active_selection_is_checked(
     assert all(row["ready_ms"] >= 7 for row in result["timeline"])
     assert {row["replica"] for row in result["timeline"] if row["family"] == "grouped_gemm"} == set(graphs)
     assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
+    bad_raw = _raw("source-families/v41-hc-arch35-source-control.json")
+    bad_raw["runtime"]["kernels"]["lowerings"]["native_fusion"]["options"]["traffic_profile"] = {
+        PRE: "hc_pre_m_k_split_175ef4d4", POST: "hc_post_d_split_175ef4d4",
+    }
+    bad_arch = parse_case(bad_raw)
+    bad_arch = replace(bad_arch, model=replace(bad_arch.model, layers=1, body_layers=1, layer_plans=layers),
+                       runtime=replace(bad_arch.runtime, pp_layer_partition=(1,)))
+    with pytest.raises(ModelingError, match="hc_pre_m_k_split_175ef4d4_unsupported_arch:npu_arch_3510"):
+        graph_costs(bad_arch, target_graphs(bad_arch, **options), input_ready_ms=7, external_inputs={"analysis_input": 7}, isolated=False)
     plain = replace(case, model=replace(case.model, layer_plans=(replace(layers[0], hyper_connections=False),)))
     with pytest.raises(ModelingError, match="native_fusion_selected_roles_unmatched"):
         target_graphs(plain, **options)

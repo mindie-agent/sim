@@ -70,10 +70,10 @@ def mx4_source():
     return raw, [op for op in ops if op.family == "grouped_gemm"][:2], ops
 def grouped_op(op, rows, n, k, *, wide=False):
     meta = dict(op.metadata, matrix_group_rows=rows, matrix_weight_bank_groups=len(rows),
-                matrix_groups=len(rows) if wide else sum(r > 0 for r in rows))
+                matrix_groups=len(rows) if wide else sum(r > 0 for r in rows),
+                activation_scale_shape=(sum(rows), ceil(k / 64), 2))
     shape = (sum(rows), n, k)
     if wide:
-        meta["activation_scale_shape"] = (sum(rows), ceil(k / 64), 2)
         return replace(op, local_shape=(len(rows), *shape), metadata=tuple(meta.items()))
     return replace(op, local_shape=shape, semantic_shape=shape, launch_shape=shape, metadata=tuple(meta.items()))
 def mx4_meta(row):
@@ -280,7 +280,7 @@ def test_mx_eight_frontend_runs_grouped_and_fused_source_kernels(mx8_source):
     row = price(raw, down)
     md = row["operator"]["metadata"]["program_execution"]["source_mapping"]
     assert md["output_tiles_by_owner"] == (144,)*32 and Counter(md["group_rows"]) == {4:160, 3:128}
-    assert row["operator"]["flops"] == 2*1024*4096*256 and service(row, "fixpipe") == 2*1024*4096
+    assert row["operator"]["flops"] == 2*(288*16)*4096*256 and service(row, "fixpipe") == 2*1024*4096
     drained(row)
     calls = {o.op_id:o for o in fused if o.recipe == mxfp8_swiglu.PROFILE}
     downs = [[o for o in graph if o.op_id.endswith(".expert_down")] for graph in (plain, fused)]
@@ -288,7 +288,7 @@ def test_mx_eight_frontend_runs_grouped_and_fused_source_kernels(mx8_source):
     for a, b in zip(*downs, strict=True):
         assert same_semantics(a, replace(b, deps=a.deps)) and len(b.deps) == 1 and b.deps[0] in calls
     row = price(case, next(iter(calls.values())))
-    assert row["operator"]["flops"] == 4*1024*256*4096 and service(row, "mte3") == pytest.approx(1024*264, rel=1e-12)
+    assert row["operator"]["flops"] == 4*(288*16)*256*4096 and service(row, "mte3") == pytest.approx(1024*264, rel=1e-12)
 def same_semantics(a, b):
     ignored = {"fused_origin_scopes", "input_conversion_subgraphs"}
     strip = lambda op: replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in ignored))
@@ -305,6 +305,7 @@ def test_mx_eight_paired_stores_and_padded_panels_conserve_work(mx8_source, swig
     if single_owner:
         case = change_dies(case, lambda d:replace(d, compute_units=1, kernel_invocations=(),
             resource_units=tuple((r, 1) for r, _ in d.resource_units), buffer_units=tuple((r, 1) for r, _ in d.buffer_units)))
+    align = lambda v, g: ((v + g - 1) // g) * g
     results = []
     for compact in (False, True):
         if swiglu:
@@ -313,11 +314,18 @@ def test_mx_eight_paired_stores_and_padded_panels_conserve_work(mx8_source, swig
             meta["mxfp8_swiglu_config"] = dict(meta["mxfp8_swiglu_config"], rows=rows, width=n, k=k, compact=compact)
             op = replace(source, local_shape=(sum(rows), n), metadata=tuple(meta.items()))
             row = price(case, op, ready=11)
-            assert [service(row, r) for r in ("fixpipe", "mte3")] == pytest.approx([8*sum(rows)*n, sum(rows)*(n+n//32)])
+            bm = align(min(sum(rows), 128), 16)
+            bn = align(min(2 * n, 256), 16)
+            tiles = [t for owner in mxfp8_swiglu.owner_tiles(rows, n, mxfp8_grouped.Mapping(bm, bn, 128, 256, 1), 32) for t in owner]
+            expected_fixpipe = sum(8 * align(tm, 2) * tn for _, tm, tn, _, _ in tiles)
+            expected_flops = sum(4 * align(tm, 16) * align(tn, 16) * align(k, 64) for _, tm, tn, _, _ in tiles)
+            assert [service(row, r) for r in ("fixpipe", "mte3")] == pytest.approx([expected_fixpipe, sum(rows)*(n+n//32)])
         else:
             op = grouped_op(down, rows, n, k, wide=True)
             row = price(case, op, RecipeBook({op.recipe:mxfp8_grouped.recipe(compact=compact, l1_k=256)}))
-        assert row["operator"]["flops"] == (4*k if swiglu else 128*ceil(k/64))*sum(rows)*n
+            tiles = [t for owner in mxfp8_grouped.owner_tiles(rows, n, mxfp8_grouped.Mapping(256, 256, 128, 256, 1), 1 if single_owner else 32) for t in owner]
+            expected_flops = sum(2 * align(tm, 16) * align(tn, 16) * align(k, 64) for _, tm, tn, _, _ in tiles)
+        assert row["operator"]["flops"] == expected_flops
         drained(row)
         results.append(row)
     a, b = results
@@ -417,7 +425,7 @@ def test_mx_eight_owner_tiles_partition_actual_output():
     load, steps = mxfp8_grouped.panel_work(3, 33, 128, 128)
     assert load.resources["mte2_aic"] == 3*128+64*128+(3+33)*4
     assert steps[0][0].resources["mte1"] == (16+64)*128+(16+48)*4
-    assert steps[0][1].matrix["fp8_e4m3"] == 2*3*33*128
+    assert steps[0][1].matrix["fp8_e4m3"] == 2*16*48*128
 def test_grouped_device_minimum_applies_once(mx4_source, mx8_source):
     raw, (gate, _), _ = mx4_source
     raw = deepcopy(raw)
@@ -513,7 +521,19 @@ def test_weight_supply_tracks_real_banks_and_ignores_capacity(k, width, rows):
     recipe = mxfp4_supply.recipe_book()
     row = price(raw, mxfp4_supply.make_op(cfg), recipe)
     count = 2*width*k*sum(r>0 for r in rows)
-    assert [service(row, r) for r in ("hbm", "mte3", "vector", "mte2_aic")] == pytest.approx([count/2, count, count*3.5, 0])
+    ntiles = sum(r > 0 for r in rows) * (width // cfg.half_tile)
+    issue_slots = data_writes = ub_accesses = ub_stores = 0
+    for offset in range(0, k, cfg.k_tile):
+        for sub in (0, 1):
+            packed = min(cfg.k_tile // 2, max(0, k - offset - sub * cfg.k_tile // 2)) * cfg.half_tile
+            groups = packed // 256
+            vf = max(1, ceil(groups / 64))
+            issue_slots += ntiles * (4 * vf + 12 * groups)
+            data_writes += ntiles * (3 * vf + 8 * groups)
+            ub_accesses += ntiles * (3 * groups)
+            ub_stores += ntiles * (2 * groups)
+    assert [service(row, r) for r in ("hbm", "mte3", "vector", "reg_data_writes", "reg_ub_accesses", "reg_ub_stores", "mte2_aic")] == pytest.approx([
+        count/2, count, 32 * issue_slots, data_writes, ub_accesses, ub_stores, 0])
     drained(row)
     tiles = [(i, m, n) for i, m in enumerate(rows) if m for n in range(0, width, cfg.half_tile)]
     assert {t:o for o in range(32) for t in mxfp4_supply.tiles(cfg, o, 32)} == {t:i%32 for i, t in enumerate(tiles)}
@@ -525,7 +545,8 @@ def test_weight_supply_tracks_real_banks_and_ignores_capacity(k, width, rows):
 def test_supply_service_uses_reciprocal_physical_rates(role):
     raw = read_case("kimi-k3-a5-current-checkpoint-conditional")
     op = mxfp4_supply.make_op(mxfp4_supply.Config(256, 128, (1,), 512))
-    rates, times = dict.fromkeys(("hbm", "mte2_aiv", "mte3", "vector"), 1e18), []
+    rates = dict.fromkeys(("hbm", "mte2_aiv", "mte3", "vector", "reg_data_writes", "reg_ub_accesses", "reg_ub_stores"), 1e18)
+    times = []
     for factor in (.5, 1, 2):
         raw["machine"].setdefault("device", {})["rates"] = dict(rates, **{role:1e8*factor})
         times.append(price(raw, op, mxfp4_supply.recipe_book())["duration_ms"])

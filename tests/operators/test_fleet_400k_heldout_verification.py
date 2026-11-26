@@ -355,7 +355,7 @@ def test_whitebox_operator_physics_conservation_regressions_13_to_21() -> None:
                       metadata=(("indexed_attention_geometry", dict(query=1, context=32768, topk=2048, heads=128, latent=512, rope=64, query_dtype="bf16", cache_dtype="bf16", window=0, compression_ratio=1, cp=1, split_kv=True)),))
     assert indexed_attention.build(op_sfa22, Geometry.from_devices(c9362.machine.dies), scratch_policy="offchip").work.matrix == {"bf16": 838860800}
 
-    # #18: Arch35 SFA rejects TQ4, binds selection ReuseKey L2 hits, and conserves 1-AIC stream.
+    # #18: Arch35 SFA rejects TQ4, binds selection ReuseKey L2 hits, guards Split-G <2 AICs, and conserves 1-AIC non-Split-G stream.
     op_tq4 = attention.make_kv_quant_sfa_c8_op(op_id="c8_tq4", query_tokens=1, num_heads=128, rope_dim=64, quant_mode=QUANT_MODE_TQ4, selected_tokens=2048)
     with pytest.raises(UnmodeledCapabilityError, match="attention_arch35_tq4_unsupported"):
         attention.build(op_tq4, Geometry.from_devices(c9582.machine.dies))
@@ -369,7 +369,14 @@ def test_whitebox_operator_physics_conservation_regressions_13_to_21() -> None:
     assert (attention.build(op_sfa_a5, _ctx(c9582, op_sfa_a5, memory_view=AdmissionMemoryView({0: 128 * 1024 * 1024}))).work.resources["hbm"]
             < attention.build(op_sfa_a5, _ctx(c9582, op_sfa_a5, memory_view=AdmissionMemoryView({0: 0}))).work.resources["hbm"])
     so1 = StreamOwners(aic=(0,), aiv=(0, 1), aic_limit=1, aiv_limit=2)
-    assert verify_operator(c9582, op_sfa_a5, lambda o, _g: attention.build(o, _ctx(c9582, o, stream_owners=so1)))["status"] == "passed"
+    with pytest.raises(UnmodeledCapabilityError, match="attention_sfa_split_g_insufficient_aics"):
+        attention.build(op_sfa_a5, _ctx(c9582, op_sfa_a5, stream_owners=so1))
+    op_sfa_a5_h64 = attention.make_attention_op(AttentionContract(
+        query_tokens=2, num_heads=64, num_kv_heads=1, head_dim=576, v_head_dim=512,
+        sequences=((1, 4096), (1, 4096)), phase="decode", abi=SFA_V1_ABI, selected_tokens=2048,
+        batch_size=2, kv_tensor_id="kv_sfa",
+    ), op_id="sfa_h64_1aic")
+    assert verify_operator(c9582, op_sfa_a5_h64, lambda o, _g: attention.build(o, _ctx(c9582, o, stream_owners=so1)))["status"] == "passed"
 
     # #19: Arch35 GDN 65th-token tail panel = 233,472 ops; recurrent state read+write unconditional.
     assert arch35_gdn_vf_vector_ops(65, 128, 128)[1] == 233472

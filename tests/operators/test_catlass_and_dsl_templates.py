@@ -118,7 +118,11 @@ def test_streamk_signals_before_the_last_normal_work_and_reduction(direct):
     stages = _stages(lower_catlass_spec(spec, p, direct))
     flag = "cross_core_set_flag"
     assert set(stages[flag].after) == {f"tile:{i}:partial" for i in range(4, 8)}
-    assert all({f"tile:{i}:fixpipe" for i in range(4)} <= _ancestors(stages, partial) for partial in stages[flag].after)
+    for i in range(4):
+        anc = _ancestors(stages, f"tile:{4 + i}:partial")
+        assert f"tile:{i}:fixpipe" in anc
+        assert not anc.intersection(f"tile:{j}:fixpipe" for j in range(4) if j != i)
+    assert {f"tile:{i}:fixpipe" for i in range(4)} <= _ancestors(stages, flag)
     assert all(flag in stages[f"tile:{i}:k0:gm_a"].after for i in range(8, 12))
     for i in range(2):
         deps = _ancestors(stages, f"reduce:{i}:add")
@@ -196,18 +200,21 @@ def test_grouped_scheduler_carries_core_index_and_bypasses_single_row_tiles(dire
     assert [i for i, read in enumerate(reads) if read.reuse_key is not None] == [2, 3, 4, 5]
     only, = _matrix("grouped_slice_m", replace(p, m=32, groups=(16, 0, 16)), direct)
     assert only.l2_cache_hint_b == "disable"
-@pytest.mark.parametrize("acc,width", [("fp32", 4), ("bf16", 2)])
-def test_grouped_swiglu_quantization_avoids_gate_up_spills(direct, acc, width):
-    dp, m, f = with_mx_modes(direct), 48, 64
-    p = CatlassProblem(m, 2 * f, 32, "mxfp8", "mxfp8", dtype_acc=acc, groups=(16, 0, 32))
-    spec, = _matrix("grouped_mx_swiglu_mx_quant", p, dp)
+def test_grouped_swiglu_quantization_avoids_gate_up_spills(direct):
+    dp, m, f, k = with_mx_modes(direct), 48, 64, 64
+    p = CatlassProblem(m, 2 * f, k, "mxfp8", "mxfp8", "mxfp8", "fp32", groups=(16, 0, 32))
+    spec, = _matrix("grouped_mx_swiglu_mx_quant", p, dp, tile=(32, 32, 64), l0_tiles=((32, 32, 64),))
     result = lower_catlass_spec(spec, p, dp)
     assert (spec.l2_cache_hint_b, spec.workspace_bytes) == ("disable", 0)
-    assert sum(s.metadata.get("saved_logical_bytes", 0) for s in result.program.stages) == 4 * m * f * width
-    # Four A reads per row, two B experts, one scale per K block.
-    assert result.summary.logical_transfer_bytes == (4 * m + 2 * p.n) * (p.k + 1) + m * (2 * f + f // 32)
-    assert next(x.ranges for x in result.summary.write_obligations if x.allocation_id == p.c_id) == ((0, m * f * 2),)
-    assert result.summary.semantic_work[0].logical_ops == 2 * m * (2 * f) * p.k
+    assert sum(s.metadata.get("saved_logical_bytes", 0) for s in result.program.stages) == 4 * m * f * 4
+    # Four A reads per row, two B experts, one scale per 32-element K block, FP8 output + scale.
+    assert result.summary.logical_transfer_bytes == (4 * m + 2 * p.n) * (k + k // 32) + m * (f + f // 32)
+    assert next(x.ranges for x in result.summary.write_obligations if x.allocation_id == p.c_id) == ((0, m * f),)
+    assert next(x.ranges for x in result.summary.write_obligations if x.allocation_id == p.c_id + ":scale") == ((0, m * f // 32),)
+    assert result.summary.semantic_work[0].logical_ops == 2 * m * (2 * f) * k
+    # Upstream grouped MX SwiGLU requires FP32 accumulation and FP8 output.
+    for bad in (replace(p, dtype_acc="bf16"), replace(p, dtype_c="bf16")):
+        assert _matrix("grouped_mx_swiglu_mx_quant", bad, dp, tile=(32, 32, 64), l0_tiles=((32, 32, 64),)) == ()
 @pytest.mark.parametrize("mode,a,b,a_width,b_width,factor", [
     ("mxfp8", "mxfp8", "mxfp8", 1, 1, 1), ("mxfp4", "mxfp4", "mxfp4", 0.5, 0.5, 1),
     ("a8w4_mx", "fp8_e4m3", "fp4_e2m1", 1, 0.5, 16),
@@ -237,19 +244,29 @@ def test_mx_scale_storage_and_decompression_follow_declared_mode(direct, mode, a
 def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, threads):
     indirect, direct = datapaths
     indexed = policy == "MatmulGatherScatterSimt"
-    p = CatlassProblem(1, 32, 32, "fp16", "fp16", "fp16", indices=(7,), physical_m=8) if indexed else CatlassProblem(32, 32, 32)
+    grouped_mx = policy == "GroupedMxMatmulFinalizeRoutingTla"
+    dp = with_mx_modes(direct) if grouped_mx else direct
+    if indexed:
+        p = CatlassProblem(1, 32, 32, "fp16", "fp16", "fp16", indices=(7,), physical_m=8)
+    elif grouped_mx:
+        p = CatlassProblem(32, 64, 64, "mxfp8", "mxfp8", "fp32", "fp32",
+                           groups=(16, 16), indices=tuple(range(32)), physical_m=32)
+    else:
+        p = CatlassProblem(32, 32, 32)
     options = dict(simt_variants=(policy,), simt_thread_blocks=((32, threads // 32, 1),))
-    spec, = _matrix("a5_simt", p, direct, **options)
+    if grouped_mx:
+        options.update(tile=(32, 64, 64), l0_tiles=((32, 64, 64),))
+    spec, = _matrix("a5_simt", p, dp, **options)
     assert direct.usable_bytes("ub") == 248 * KIB and direct.usable_bytes("ub", kernel=True) == 216 * KIB
     with pytest.raises(UnmodeledCapabilityError, match="simt_capability_missing"):
         solve_catlass_tile(replace(spec, arch_tag="AtlasA2"), p, indirect)
     with pytest.raises(ModelingError, match="simt_thread_block_invalid"):
-        solve_catlass_tile(replace(spec, simt_thread_block_dim=(threads + 1, 1, 1)), p, direct)
-    lowered = lower_catlass_spec(spec, p, direct)
+        solve_catlass_tile(replace(spec, simt_thread_block_dim=(threads + 1, 1, 1)), p, dp)
+    lowered = lower_catlass_spec(spec, p, dp)
     stages = _stages(lowered)
-    if policy == "GroupedMxMatmulFinalizeRoutingTla":
-        assert spec.workspace_bytes == 32 * 32 * spec.aic_budget * 2
-        assert _bytes(stages, ":routing_read", "mte2_aiv") == _bytes(stages, ":routing_write", "fixpipe") == p.m * p.n * 2
+    if grouped_mx:
+        assert spec.workspace_bytes == 32 * 64 * spec.aic_budget * 4
+        assert _bytes(stages, ":routing_read", "mte2_aiv") == _bytes(stages, ":routing_write", "fixpipe") == p.m * p.n * 4
     else:
         assert lowered.summary.semantic_work == (SemanticWorkItem(
             "catlass.a5_simt:matrix", "matrix_mac", p.dtype_a, 2 * p.m * p.n * p.k,
@@ -326,9 +343,10 @@ def test_flash_kda_cost_threshold_and_saved_output_visibility(direct):
         assert dict(spec.l2_cache_policies)[tensor] == "disable"
         carry = _bytes(stages, ":carry_h", "hbm") if tensor == "h" else 0
         assert _bytes(stages, f":save_{tensor}", "hbm") + carry == size
-    assert "kda:0:0:0:save_h" in _ancestors(stages, "kda:0:0:0:fp32_state_update")
-    reload = stages["kda:0:0:1:reload_h"]
-    assert reload.work["hbm"] == 128**2 * 4 and "kda:0:0:0:carry_h" in _ancestors(stages, reload.name)
+    assert {"kda:0:0:0:sub0:save_h", "kda:0:0:0:sub1:save_h"} <= _ancestors(stages, "kda:0:0:0:fp32_state_update")
+    reloads = [stages[f"kda:0:0:1:sub{sub}:reload_h"] for sub in (0, 1)]
+    assert sum(stage.work["hbm"] for stage in reloads) == 128**2 * 4
+    assert all({"kda:0:0:0:sub0:carry_h", "kda:0:0:0:sub1:carry_h"} <= _ancestors(stages, stage.name) for stage in reloads)
     _, persistent_result = _reference(dsl.FLASH_KDA, replace(p, requested_template="persistent"), direct)
     assert _bytes(stages, ":q_decayed:read", "mte2_aic") == 65 * 128 * 2
     assert _bytes(_stages(persistent_result), ":q_decayed:read", "mte2_aic") == 0
@@ -356,17 +374,24 @@ def test_mega_recurrent_variant_workspace_reads_and_launch_savings(direct, tp, s
         assert AddressRunPlan((*entry.address_runs, *ranges), sector_bytes=1).sector_intervals() == expected
 @pytest.mark.parametrize("mode", tuple(dsl.QkvQuantMode))
 def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
-    p = dsl.MlaPrologProblem(3, 192, 96, 128, 2, 32, 64, mode=mode, weight_format="nd")
+    p = dsl.MlaPrologProblem(3, 1024, 640, 576, 2, 128, 64, mode=mode, weight_format="nd")
     spec, result = _reference(dsl.MLA_PROLOG, p, direct)
     stages = _stages(result)
-    widths = dict(wqa=192 * 96, wkva=192 * 128, wqb=96 * 2 * (32 + 64), wkb=2 * 32 * (128 - 64))
+    widths = dict(wqa=1024 * 640, wkva=1024 * 576, wqb=640 * 2 * (128 + 64), wkb=2 * 128 * (576 - 64))
     assert spec.template_variant == mode.value
-    assert {k: stages[f"mla:0:{k}"].work["cube"] for k in widths} == {k: 2 * p.tokens * v for k, v in widths.items()}
-    for tensor, width, element, pipe in (("ws_qa", 96, 16, "mte2_aiv"), ("ws_kva", 192, 2, "mte2_aiv"),
-                                         ("ws_q_proj", 192, 2, "mte2_aic")):
-        name = f"mla:0:{tensor}"
-        assert stages[name + ":read"].work[pipe] == stages[name + ":write"].work["fixpipe"] == 8 * width * element
-        assert stages[name + ":read"].after == (name + ":write",)
+    assert {k: _bytes(stages, f":{k}", "cube") for k in widths} == {k: 2 * p.tokens * v for k, v in widths.items()}
+    # ws_qa writes exact q_lora=640 cols (4 partials x FP32 = 16 B/col) and reads 96-aligned 672 cols.
+    for tensor, write_bytes, read_bytes, pipe in (
+        ("ws_qa", 8 * 640 * 16, 8 * 672 * 16, "mte2_aiv"),
+        ("ws_kva", 8 * 576 * 2, 8 * 576 * 2, "mte2_aiv"),
+    ):
+        writes = {n for n in stages if f"mla:0:{tensor}:" in n and n.endswith(":write")}
+        assert sum(stages[n].work["fixpipe"] for n in writes) == write_bytes
+        read = stages[f"mla:0:{tensor}:read"]
+        assert read.work[pipe] == read_bytes and set(read.after) == writes
+    qp_writes = {n for n in stages if "mla:0:ws_q_proj:" in n and n.endswith(":write")}
+    assert sum(stages[n].work["fixpipe"] for n in qp_writes) == 8 * (2 * 192) * 2
+    assert _bytes(stages, ":wkb:a_l1", "mte2_aic") == 4 * (p.tokens * 2 * 128 * 2)
     barrier = "q_global_quant_launch_barrier"
     if mode == dsl.QkvQuantMode.HiF8:
         assert set(stages[barrier].after) == {f"mla:ws_amax_write:{i}" for i in range(spec.aic_budget)}
@@ -374,8 +399,10 @@ def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
         assert barrier in _ancestors(stages, "mla:0:q_output")
     else:
         assert barrier not in stages
-    assert all(stages[f"mla:0:{matrix}:l0{bank}"].work["mte1"] > 0 for matrix, bank in product(widths, "ab"))
+    assert all(_bytes(stages, f":{matrix}:l0{bank}", "mte1") > 0 for matrix, bank in product(widths, "ab"))
     if mode == dsl.QkvQuantMode.FP8:
+        with pytest.raises(ModelingError, match="mla_prolog_problem_invalid"):
+            enumerate_dsl_specs(dsl.MLA_PROLOG, dsl.MlaPrologProblem(3, 192, 96, 128, 2, 32, 64, mode=mode), direct)
         packed = replace(p, tokens=2, kvr=576, mode=1, cache_index=(7, -1))
         _, live = _reference(dsl.MLA_PROLOG, packed, direct, live_rates={"vec_alu": 10**6})
         indexed = _stages(live)
@@ -439,20 +466,26 @@ def test_mixed_sparse_mla_bank_bytes_and_split_row_reduction(direct, splits):
     p = dsl.MixedQuantSparseMlaProblem(129, 72, split_parts=splits)
     spec, result = _reference(dsl.MQSMLA, p, direct)
     stages = _stages(result)
-    assert tuple(_bytes(stages, tag, "mte2_aiv") for tag in (":ori", ":cmp", ":sink")) == (544 * p.n_ori, 320 * p.n_cmp, splits * 256)
+    # KV gathers pad to 128-row tiles; split_parts=2 replays prefix ori tile 0 on part 1.
+    ori_tiles = 2 if splits == 1 else 3
+    assert tuple(_bytes(stages, tag, "mte2_aiv") for tag in (":ori", ":cmp", ":sink")) == (
+        ori_tiles * 128 * 544, 128 * 320, splits * 256)
     slot = (64 * 512 + 2 * 64) * 4
     assert spec.workspace_bytes_total == 2 * slot * spec.aic_budget == 263_168 * spec.aic_budget
     writes = {name for name in stages if name.endswith(":fd_partial_write")}
-    assert len(writes) == (splits > 1) * splits and sum(stages[n].work["mte3"] for n in writes) == len(writes) * slot
-    barrier, reduce = "mqsmla:fd_barrier", "mqsmla:0:fd_reduce"
+    assert len(writes) == (splits > 1) * splits * 2
+    assert sum(stages[n].work["mte3"] for n in writes) == (splits > 1) * splits * slot
+    barrier = "mqsmla:fd_barrier"
     if splits > 1:
         assert set(stages[barrier].after) == writes
-        for name in stages[reduce].after:
-            assert (stages[name].after, stages[name].work["mte2_aiv"]) == ((barrier,), slot)
-        assert stages[reduce].work["vec_reduce"] == splits * slot // 4
-        assert stages["mqsmla:0:output"].after == (reduce,)
+        for sub in (0, 1):
+            reduce = f"mqsmla:0:sub{sub}:fd_reduce"
+            for name in stages[reduce].after:
+                assert (stages[name].after, stages[name].work["mte2_aiv"]) == ((barrier,), slot // 2)
+            assert stages[reduce].work["vec_reduce"] == splits * (slot // 2) // 4
+            assert stages[f"mqsmla:0:sub{sub}:output"].after == (reduce,)
     else:
-        assert barrier not in stages and reduce not in stages
+        assert barrier not in stages and all(f"mqsmla:0:sub{sub}:fd_reduce" not in stages for sub in (0, 1))
         p = replace(p, n_ori=1, n_cmp=1, topk_indices=(0, 7), ori_block_table=(1,), cmp_block_table=(3,))
         _, indexed = _reference(dsl.MQSMLA, p, direct)
         reads = {entry.allocation_id: entry.ranges for entry in indexed.summary.read_obligations}

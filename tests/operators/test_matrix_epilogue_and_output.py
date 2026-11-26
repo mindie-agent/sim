@@ -297,14 +297,18 @@ def test_shared_matrix_geometry_conserves_issued_and_published_work(family_case,
     assert geometry.resource_units["vector"] == AIV_COUNT and shared_w4a8.matches_source_interface(op)
     plan, row = shared_w4a8.build(op, geometry), _served(case, op)
     detail = row["operator"]["metadata"]["program_execution"]["shared_w4a8"]
-    step = math.ceil(m / math.ceil(m / 256))
-    extents = [min(step, m - start) for start in range(0, m, step)]
-    padded = [16 * math.ceil(rows / 16) for rows in extents]
-    issued = 2 * n * k * sum(padded)
-    assert detail["mmad_parameter_m"] == detail["fixpipe_m"] == tuple(sorted(set(extents)))
-    assert detail["l0a_issue_fractal_m"] == tuple(sorted(set(padded)))
+    tiling = shared_w4a8._solve_swat_tiling(m, n, k, geometry.compute_units, geometry.buffers)
+    owner_runs, owner_counts, _ = shared_w4a8._swat_owner_schedule(m, n, tiling, geometry.compute_units)
+    assert detail["owner_tiles"] == owner_counts
+    assert sum(tm * tn * rep for sched in owner_runs for tm, tn, rep in sched) == m * n
+    extents = tuple(sorted({tm for sched in owner_runs for tm, _, _ in sched}))
+    padded = tuple(sorted({16 * math.ceil(tm / 16) for tm in extents}))
+    issued = 2 * k * sum(16 * math.ceil(tm / 16) * (16 * math.ceil(tn / 16)) * rep
+                         for sched in owner_runs for tm, tn, rep in sched)
+    assert detail["mmad_parameter_m"] == detail["fixpipe_m"] == extents
+    assert detail["l0a_issue_fractal_m"] == padded
     assert detail["logical_flops"] == 2*m*n*k and detail["issued_cube_flops"] == issued
-    assert detail["init_mx_bytes"] == shared_w4a8.INIT_PERMUTATION_BYTES * AIV_COUNT
+    assert detail["init_mx_bytes"] == 0
     assert plan.work.matrix == pytest.approx({"fp8_e4m3": issued})
     assert row["serviced"]["fixpipe@r0:s0"] == pytest.approx(2*m*n)
 @pytest.mark.parametrize("change", [
@@ -332,8 +336,10 @@ def test_gate_up_banks_conserve_issued_tiles_and_padded_publication(family_case,
                  mte3_bytes=0, deps=(), local_shape=shape, semantic_shape=shape, launch_shape=shape, metadata=tuple(meta.items()))
     plan = gate_situ.build(op, Geometry.from_devices(case.machine.dies))
     detail = plan.metadata
-    tiles = [(min(128, r - start), min(128, width - col)) for r in rows
-             for start in range(0, r, 128) for col in range(0, width, 128)]
+    tile_n = 128 if width % 128 == 0 else 64
+    tiles = [(min(step, r - mi * step), min(tile_n, width - col)) for r in rows if r
+             for nm in (math.ceil(r / 128),) for step in (math.ceil(r / nm),)
+             for mi in range(nm) for col in range(0, width, tile_n)]
     assert detail["source_output_tiles"] == len(tiles)
     if not tiles:
         assert not plan.work.matrix and not plan.work.resources
@@ -521,8 +527,18 @@ def test_wrapper_preserves_matrix_work_and_matches_retained_single_bank(tokens, 
     case, ops = _wrapper_ops(tokens, phase, "eager")
     native = {observed_contract(row): row for row in _capture_rows(WRAPPER_CAPTURE) if row.kind == "GroupedMatmul"}
     bound = _wrapper(ops, case)
-    assert all(replace(b, metadata=o.metadata) == o for o, b in zip(ops, bound, strict=True))
-    projections = [op for op in bound if op.recipe == "latent_projection"]
+    fills = {op.op_id: op for op in bound if op.family == "tensor_fill"}
+    bound_main = [op for op in bound if op.family != "tensor_fill"]
+    assert len(bound_main) == len(ops)
+    for o, b in zip(ops, bound_main, strict=True):
+        if o.recipe == "latent_projection":
+            fill_id = dict(b.metadata)["group_list_producer"]
+            assert fill_id in fills and b.deps == (*o.deps, fill_id)
+            assert dict(fills[fill_id].metadata)["fill_value"] == o.local_shape[0]
+            assert replace(b, deps=o.deps, metadata=o.metadata) == o
+        else:
+            assert b == o
+    projections = [op for op in bound_main if op.recipe == "latent_projection"]
     assert {op.local_shape[1:] for op in projections} == {(3584, 7168), (7168, 3584)}
     for op in projections:
         contract, scope = predicted_contract(op.to_dict()), comparison_scope(op.to_dict())
@@ -592,7 +608,10 @@ def test_source_wrapper_identity_and_protected_programs():
                  _meta(op, implementation_binding={"implementation": "independent_source_program"}))
     assert matrix_wrappers.apply_matrix_wrapper(ops, None, case.runtime) == ops
     assert _wrapper(protected, case) == protected
-    wrapper = dict(_wrapper((op,), case)[0].metadata)["matrix_wrapper"]
+    fill_op, wrapped_op = _wrapper((op,), case)
+    assert fill_op.family == "tensor_fill" and wrapped_op.deps == (*op.deps, fill_op.op_id)
+    assert dict(fill_op.metadata)["fill_value"] == op.local_shape[0]
+    wrapper = dict(wrapped_op.metadata)["matrix_wrapper"]
     identity = wrapper["source_identity"]
     assert identity["wrapper_image_id"] == matrix_wrappers.SOURCE["image_id"] and identity["current_executable_source"] is False
     assert identity["basis"] == wrapper["source_basis"] == "declared_source_wrapper_not_capture_dispatch_proof"
