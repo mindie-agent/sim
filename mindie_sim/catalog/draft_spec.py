@@ -198,7 +198,14 @@ class DraftSpec:
 
     @property
     def input_width(self) -> int:
-        if self.kind in {"dspark", "mtp_dspark", "standalone_draft", "eagle3"} and self.target_layer_ids:
+        if (
+            self.target_layer_ids
+            and (
+                self.kind in {"dspark", "mtp_dspark", "standalone_draft", "eagle3"}
+                or self.input_mode == "projected_concat"
+                or self.execution_mode == "block_dspark"
+            )
+        ):
             return int(len(self.target_layer_ids) * self.hidden_size)
         return int(2 * self.hidden_size)
 

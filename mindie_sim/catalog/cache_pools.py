@@ -253,18 +253,41 @@ def _state_page_bytes(model: Any, parallel: Any, block_size: int,
 
 def _draft_row_bytes_int(model: Any, draft: Any, *, tp: int) -> int:
     """Exact integer KV row width for one draft token on one TP rank."""
+    from dataclasses import is_dataclass, replace as _replace
+    from types import SimpleNamespace
     from mindie_sim.catalog.cache import local_kv_heads
     from mindie_sim.catalog.draft import draft_quant
 
+    dq = draft_quant(model, draft)
+    kv_dtype = str(dq.kv_dtype)
     if str(getattr(draft, "attention_kind", "")) == "mla":
-        width = int(
-            getattr(draft, "kv_cache_elements", 0)
-            or (int(getattr(draft, "kv_lora_rank", 0))
-                + int(getattr(draft, "qk_rope_head_dim", 0)))
+        latent = int(getattr(draft, "kv_lora_rank", 0) or 0)
+        rope = int(getattr(draft, "qk_rope_head_dim", 0) or 0)
+        width = int(getattr(draft, "kv_cache_elements", 0) or (latent + rope))
+        draft_plans = tuple(getattr(draft, "layer_plans", ()) or ())
+        plan = (
+            draft_plans[0]
+            if draft_plans and getattr(draft_plans[0], "attention", "") == "mla"
+            else SimpleNamespace(
+                index=0, native_layer_id=0, attention="mla",
+                kv_lora_rank=latent, qk_rope_head_dim=rope, cache_row_elements=width,
+            )
         )
-    else:
-        width = 2 * int(local_kv_heads(int(draft.num_kv_heads), tp)) * int(draft.head_dim)
-    kv_dtype = str(draft_quant(model, draft).kv_dtype)
+        target_kv = getattr(getattr(model, "quant", None), "kv_dtype", "")
+        meta = dict(getattr(model, "metadata", ()) or ())
+        if getattr(draft, "independent_context", False) or kv_dtype != target_kv:
+            for key in (
+                "cache_representations", "layer_cache_representations",
+                "kv_cache_tag", "kv_cache_type", "kv_scale_dtype", "mqsmla_kv_mode",
+            ):
+                meta.pop(key, None)
+        draft_model = (
+            _replace(model, quant=dq, kv_dtype=kv_dtype, metadata=tuple(meta.items()))
+            if is_dataclass(model)
+            else SimpleNamespace(quant=dq, kv_dtype=kv_dtype, metadata=tuple(meta.items()), layer_plans=(plan,))
+        )
+        return _packed_mla_row_bytes(draft_model, plan)
+    width = 2 * int(local_kv_heads(int(draft.num_kv_heads), tp)) * int(draft.head_dim)
     return exact_element_bytes(width, kv_dtype)
 
 

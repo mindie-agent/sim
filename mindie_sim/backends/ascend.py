@@ -317,13 +317,18 @@ def apply_observed_aicore_clock(device, profile, *, reference_mhz=None, explicit
                 and name not in {"mte2_aic_dram", "mte2_aiv_dram"}
                 and "rate" not in explicit.get("service_modes", {}).get(name, {})):
             mode["rate"] *= ratio
+    explicit_services = explicit_arch.get("instruction_services", {})
     for name, service in data.get("compute_arch", {}).get("instruction_services", {}).items():
-        if (name in explicit_arch.get("instruction_services", {})
-                or name == "gm_hbm_cacheline_128b"
+        if (name == "gm_hbm_cacheline_128b"
                 or (name == "vbitsort32" and "clock_hz" in explicit_arch)):
             continue
+        explicit_svc = explicit_services.get(name) if isinstance(explicit_services, dict) else None
+        explicit_svc = explicit_svc if isinstance(explicit_svc, dict) else {}
+        if "per_owner_rate" in explicit_svc or "issue_ns" in explicit_svc:
+            continue
         if "clock_hz" in service:
-            service["clock_hz"] *= ratio
+            if "clock_hz" not in explicit_svc:
+                service["clock_hz"] *= ratio
         elif "per_owner_rate" in service and "scale_with" not in service:
             service["per_owner_rate"] *= ratio
     return data

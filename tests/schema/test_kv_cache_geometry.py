@@ -679,3 +679,72 @@ def test_paired_sfa_caps_draft_kv_pages_at_draft_max_model_len() -> None:
     assert bytes_capped < bytes_uncapped
     # At 4096 tokens, capped draft group holds the exact same draft pages as 131072 tokens.
     assert pages_capped.groups[1].pages(4096, 131072) == pages_capped.groups[1].pages(131072, 131072)
+
+
+def test_per_layer_kv_override_window_pages_shared_asymmetric_gqa_and_packed_mla_draft() -> None:
+    """Per-layer KV dtype, SWA live pages, shared/asymmetric GQA ABIs, and packed MLA draft rows stay exact."""
+    from mindie_sim.api import compose_case as api_compose_case
+    from mindie_sim.catalog.cache_format import resolve_layer_cache_abis
+
+    # 1. Per-layer KV dtype override reaches HBM cache accounting.
+    m_mix = dict(layers=2, hidden_size=128, num_heads=2, num_kv_heads=1, head_dim=64,
+                 intermediate_size=256, vocab_size=128)
+    q_mix = dict(name="mixed", kv_dtype="int8", layer_quant_overrides={"layers": {"1": {"kv_dtype": "bf16"}}})
+    c_mix = api_compose_case(m_mix, "a3", options=dict(quant=q_mix, num_devices=1, block_size=16, prompt_tokens=16, output_tokens=1))
+    assert int(Memory(c_mix).cache_bytes(16)[0]) == 16 * 2 * 64 * (1 + 2)
+
+    # 2. Sliding-window allocation uses monotonic page-aligned capacity and rank-exact DCP striping.
+    m_swa = dict(model_type="mistral", num_hidden_layers=1, hidden_size=128, num_attention_heads=2,
+                 num_key_value_heads=1, head_dim=64, intermediate_size=256, vocab_size=128,
+                 max_position_embeddings=256, sliding_window=16)
+    c_swa = api_compose_case(m_swa, "a3", options=dict(
+        num_devices=1, block_size=128, max_model_len=256, prompt_tokens=17, output_tokens=1,
+    ))
+    mem_swa = Memory(c_swa)
+    for tokens, exp_pages in ((16, 1), (17, 1), (128, 1), (129, 2), (144, 2)):
+        assert int(mem_swa.cache_bytes(tokens)[0]) == exp_pages * 128 * 2 * 64 * 2, tokens
+    assert [
+        layer_cache_components(c_swa.model, c_swa.model.layer_plans[0], ParallelSpec(tp=2, cp=2), 17,
+                               interleave=128, block_size=128, rank=r)["gqa_kv"]
+        for r in (0, 1)
+    ] == [32768.0, 0.0]
+    from mindie_sim.prediction.capacity import MemoryPolicy
+    mem_1pg = Memory(c_swa, policy=MemoryPolicy(runtime_bytes=mem_swa.rank_capacity[0][0][0] - 32768))
+    assert mem_1pg.admissible_tokens(0, "r", 144) == 128 and int(mem_1pg.cache_bytes(144)[0]) == 65536
+
+    # 3. Shared GQA row format applies alignment and suffix once across the combined K+V width.
+    m_pack = dict(name="packed", layers=1, hidden_size=128, num_heads=2, num_kv_heads=1,
+                  head_dim=64, intermediate_size=256, vocab_size=128)
+    opts = dict(num_devices=1, block_size=16, prompt_tokens=16, output_tokens=1)
+    for fmt, expected in (
+        (dict(dtype="int8", alignment=128), 2048),
+        (dict(dtype="int8", suffix_elements=96, suffix_dtype="bf16"), 16 * 224),
+    ):
+        c_p = api_compose_case(dict(m_pack, metadata={"cache_representations": {"gqa_kv": fmt}}), "a3", options=opts)
+        mem_p = Memory(c_p)
+        abis = resolve_layer_cache_abis(c_p.model, c_p.model.layer_plans[0], c_p.runtime.parallel, runtime=c_p.runtime)
+        assert 16 * sum(pl.bytes_per_unit for a in abis for pl in a.planes) == int(mem_p.cache_bytes(16)[0]) == expected
+
+    # 4. Asymmetric GQA K/V formats pass v_head_dim to the value formatter in receipts.
+    lp_asym = dict(index=0, num_heads=2, num_kv_heads=1, head_dim=64, v_head_dim=128, intermediate_size=256)
+    m_asym = dict(name="asymmetric", layers=1, hidden_size=128, num_heads=2, num_kv_heads=1,
+                  head_dim=64, intermediate_size=256, vocab_size=128, layer_plans=[lp_asym])
+    for v_fmt, exp_payload, exp_scale in (
+        (dict(dtype="int8", group_size=32, scale_dtype="fp32"), 4096.0, 256.0),
+        (dict(dtype="int8", suffix_elements=96, suffix_dtype="bf16"), 5632.0, 0.0),
+    ):
+        c_a = api_compose_case(
+            dict(m_asym, metadata={"cache_representations": {"gqa_kv_key": {"dtype": "bf16"}, "gqa_kv_value": v_fmt}}),
+            "a3", options=opts,
+        )
+        valid = Memory(c_a).cache_allocation(16)["valid"]
+        assert valid["payload_bytes_per_stage_rank"][0] == exp_payload
+        assert valid["scale_bytes_per_stage_rank"][0] == exp_scale
+
+    # 5. Packed INT8 MLA MTP draft bills 656 B/token (512 latent + 16 scale + 128 BF16 RoPE).
+    def _mla_draft_quote(k_prop: int) -> int:
+        raw = compose_case("deepseek-v3", hardware="a3", tp=8, ep=8, layers=4,
+                           kv_cache_dtype="int8", mtp_proposal_tokens=k_prop, max_model_len=65536)
+        return int(Memory(parse_case(raw)).cache_bytes(32768, padded=False)[0])
+
+    assert _mla_draft_quote(1) - _mla_draft_quote(0) == 32768 * (512 + 4 * 4 + 64 * 2)

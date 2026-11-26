@@ -98,6 +98,12 @@ def _profile(config: Mapping[str, Any], merged: Mapping[str, Any]) -> str:
                 else "generic")
     # Structural fallbacks when a renamed/unseen HF config carries unambiguous
     # native schema geometry without a recognized model_type or architecture name.
+    if (
+        ("linear_attention" in (merged.get("layer_types") or ())
+         or _int(merged, "full_attention_interval") > 0)
+        and merged.get("linear_num_key_heads")
+    ):
+        return "qwen"
     if merged.get("layer_types"):
         if any(field in merged for field in _STRUCTURAL_SANDWICH_SLIDING_KEYS):
             return "gemma4"

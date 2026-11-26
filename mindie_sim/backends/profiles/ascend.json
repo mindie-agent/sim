@@ -3008,21 +3008,21 @@
     "device": {
       "memory_bytes": 34359738368,
       "compute_peaks": {
-        "int8": 491520000000000.0,
-        "bf16": 245760000000000.0,
-        "fp16": 245760000000000.0,
-        "fp32": 61440000000000.0,
-        "hf32": 122880000000000.0,
-        "int4": 983040000000000.0
+        "int8": 540672000000000.0,
+        "bf16": 270336000000000.0,
+        "fp16": 270336000000000.0,
+        "fp32": 67584000000000.0,
+        "hf32": 135168000000000.0,
+        "int4": 1081344000000000.0
       },
       "rates": {
         "hbm": 800000000000.0,
-        "vector": 1920000000000.0,
-        "mte2_aic": 7680000000000.0,
-        "mte2_aiv": 7680000000000.0,
-        "mte3": 3840000000000.0,
-        "fixpipe": 3840000000000.0,
-        "mte1": 3840000000000.0
+        "vector": 2112000000000.0,
+        "mte2_aic": 8448000000000.0,
+        "mte2_aiv": 8448000000000.0,
+        "mte3": 4224000000000.0,
+        "fixpipe": 4224000000000.0,
+        "mte1": 4224000000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -3086,19 +3086,19 @@
       "service_modes": {
         "mte1_l0a": {
           "resource": "mte1",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte1_l0b": {
           "resource": "mte1",
-          "rate": 3840000000000.0
+          "rate": 4224000000000.0
         },
         "mte2_aic_l2": {
           "resource": "mte2_aic",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte2_aiv_l2": {
           "resource": "mte2_aiv",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte2_aic_dram": {
           "resource": "mte2_aic",
@@ -3650,63 +3650,63 @@
         "dies_per_package": 1,
         "aic_count_per_die": 20,
         "aiv_count_per_die": 40,
-        "configured_clock_mhz": 1500.0,
+        "configured_clock_mhz": 1650.0,
         "platform_config_hbm_mib": 32768.0,
         "l2_capacity_mib": 96.0,
         "hbm_peak_bw_gbps": 800.0,
         "hbm_peak_bw_verified": true,
         "npu_arch": "2201",
         "vec_execution_bytes_per_cycle_per_aiv": 128,
-        "vector_fp32_lane_ops_per_s_per_die": 1920000000000.0,
-        "vector_fp32_fma_tflops_per_die": 3.84,
-        "vector_fp16_lane_ops_per_s_per_die": 3840000000000.0,
-        "vector_fp16_fma_tflops_per_die": 7.68,
-        "cann_fused_mul_add_fp32_tflops_per_die": 7.68,
-        "cann_fused_mul_add_fp16_tflops_per_die": 15.36,
+        "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.224,
+        "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+        "vector_fp16_fma_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
         "cann_ini_nominal_version": "9.3.0"
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
-        "clock_hz": 1500000000.0,
+        "clock_hz": 1650000000.0,
         "fields": {
           "mte1": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 20,
             "bytes_per_cycle_per_aic": 128,
             "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
           },
           "mte1_l0a": {
             "resource": "mte1",
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "bytes_per_cycle_per_aic": 256,
             "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
           },
           "mte1_l0b": {
             "resource": "mte1",
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "bytes_per_cycle_per_aic": 128,
             "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
           },
           "mte2_aic": {
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "units": 20,
             "bytes_per_cycle_per_owner": 256,
             "basis": "L2-hit local copy port ceiling per owner; cold HBM service is separate."
           },
           "mte2_aiv": {
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "units": 40,
             "bytes_per_cycle_per_owner": 128,
             "basis": "L2-hit local copy port ceiling per owner; cold HBM service is separate."
           },
           "mte3": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 40,
             "bytes_per_cycle_per_owner": 64,
             "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
           },
           "fixpipe": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 20,
             "bytes_per_cycle_per_owner": 128,
             "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
@@ -3716,16 +3716,16 @@
             "basis": "Live Ascend910B4 silicon truth (P01 cold-HBM read 761.0 GB/s, cv=0.27%; mte2_aic cold saturation 759 GB/s; CANN 9.2.1 Ascend910B4.ini=800 GB/s) superseding buggy CANN 9.3.0 .ini 1600 GB/s text entry"
           },
           "vector": {
-            "rate_ops_per_s": 1920000000000.0,
+            "rate_ops_per_s": 2112000000000.0,
             "units": 40,
             "ops_per_cycle_per_aiv": 32,
             "vec_execution_bytes_per_cycle_per_aiv": 128,
-            "vector_fp32_lane_ops_per_s_per_die": 1920000000000.0,
-            "vector_fp32_fma_tflops_per_die": 3.84,
-            "vector_fp16_lane_ops_per_s_per_die": 3840000000000.0,
-            "vector_fp16_fma_tflops_per_die": 7.68,
-            "cann_fused_mul_add_fp32_tflops_per_die": 7.68,
-            "cann_fused_mul_add_fp16_tflops_per_die": 15.36,
+            "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.224,
+            "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+            "vector_fp16_fma_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
             "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
@@ -3761,21 +3761,21 @@
     "device": {
       "memory_bytes": 68719476736,
       "compute_peaks": {
-        "int8": 491520000000000.0,
-        "bf16": 245760000000000.0,
-        "fp16": 245760000000000.0,
-        "fp32": 61440000000000.0,
-        "hf32": 122880000000000.0,
-        "int4": 983040000000000.0
+        "int8": 540672000000000.0,
+        "bf16": 270336000000000.0,
+        "fp16": 270336000000000.0,
+        "fp32": 67584000000000.0,
+        "hf32": 135168000000000.0,
+        "int4": 1081344000000000.0
       },
       "rates": {
         "hbm": 800000000000.0,
-        "vector": 1920000000000.0,
-        "mte2_aic": 7680000000000.0,
-        "mte2_aiv": 7680000000000.0,
-        "mte3": 3840000000000.0,
-        "fixpipe": 3840000000000.0,
-        "mte1": 3840000000000.0
+        "vector": 2112000000000.0,
+        "mte2_aic": 8448000000000.0,
+        "mte2_aiv": 8448000000000.0,
+        "mte3": 4224000000000.0,
+        "fixpipe": 4224000000000.0,
+        "mte1": 4224000000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -3839,19 +3839,19 @@
       "service_modes": {
         "mte1_l0a": {
           "resource": "mte1",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte1_l0b": {
           "resource": "mte1",
-          "rate": 3840000000000.0
+          "rate": 4224000000000.0
         },
         "mte2_aic_l2": {
           "resource": "mte2_aic",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte2_aiv_l2": {
           "resource": "mte2_aiv",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte2_aic_dram": {
           "resource": "mte2_aic",
@@ -4402,62 +4402,62 @@
         "dies_per_package": 1,
         "aic_count_per_die": 20,
         "aiv_count_per_die": 40,
-        "configured_clock_mhz": 1500.0,
+        "configured_clock_mhz": 1650.0,
         "platform_config_hbm_mib": 32768.0,
         "l2_capacity_mib": 168.0,
         "hbm_peak_bw_gbps": 800.0,
         "npu_arch": "2201",
         "vec_execution_bytes_per_cycle_per_aiv": 128,
-        "vector_fp32_lane_ops_per_s_per_die": 1920000000000.0,
-        "vector_fp32_fma_tflops_per_die": 3.84,
-        "vector_fp16_lane_ops_per_s_per_die": 3840000000000.0,
-        "vector_fp16_fma_tflops_per_die": 7.68,
-        "cann_fused_mul_add_fp32_tflops_per_die": 7.68,
-        "cann_fused_mul_add_fp16_tflops_per_die": 15.36,
+        "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.224,
+        "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+        "vector_fp16_fma_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
         "cann_ini_nominal_version": "9.3.0"
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
-        "clock_hz": 1500000000.0,
+        "clock_hz": 1650000000.0,
         "fields": {
           "mte1": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 20,
             "bytes_per_cycle_per_aic": 128,
             "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
           },
           "mte1_l0a": {
             "resource": "mte1",
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "bytes_per_cycle_per_aic": 256,
             "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
           },
           "mte1_l0b": {
             "resource": "mte1",
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "bytes_per_cycle_per_aic": 128,
             "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
           },
           "mte2_aic": {
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "units": 20,
             "bytes_per_cycle_per_owner": 256,
             "basis": "L2-hit local copy port ceiling per owner; cold HBM service is separate."
           },
           "mte2_aiv": {
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "units": 40,
             "bytes_per_cycle_per_owner": 128,
             "basis": "L2-hit local copy port ceiling per owner; cold HBM service is separate."
           },
           "mte3": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 40,
             "bytes_per_cycle_per_owner": 64,
             "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
           },
           "fixpipe": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 20,
             "bytes_per_cycle_per_owner": 128,
             "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
@@ -4467,16 +4467,16 @@
             "basis": "CANN 9.3.0 nominal shared die HBM bandwidth"
           },
           "vector": {
-            "rate_ops_per_s": 1920000000000.0,
+            "rate_ops_per_s": 2112000000000.0,
             "units": 40,
             "ops_per_cycle_per_aiv": 32,
             "vec_execution_bytes_per_cycle_per_aiv": 128,
-            "vector_fp32_lane_ops_per_s_per_die": 1920000000000.0,
-            "vector_fp32_fma_tflops_per_die": 3.84,
-            "vector_fp16_lane_ops_per_s_per_die": 3840000000000.0,
-            "vector_fp16_fma_tflops_per_die": 7.68,
-            "cann_fused_mul_add_fp32_tflops_per_die": 7.68,
-            "cann_fused_mul_add_fp16_tflops_per_die": 15.36,
+            "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.224,
+            "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+            "vector_fp16_fma_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
             "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
@@ -4893,7 +4893,7 @@
       "mte3": "AIV-owned UB-to-GM supply uses 64 B/cycle per AIV.",
       "fixpipe": "Generic 128 B/cycle per AIC assumption. The instruction table establishes 128 B/cycle for L0C-to-L1 FP16/BF16 output and 64 B/cycle for INT8 output.",
       "clock_provenance": "CANN 9.3.0 cube_freq is nominal. An explicit observed_aicore_freq_mhz supplies a board clock.",
-      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 \u00a71.2 and the pinned AscendC instruction tables."
+      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 §1.2 and the pinned AscendC instruction tables."
     },
     "transfer_channels": {
       "d2d_intra_package": {
@@ -4912,7 +4912,7 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service. Effective rate estimated from the A3 training capture.",
+        "notes": "Vol. 8 §7.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service. Effective rate estimated from the A3 training capture.",
         "scope": "package",
         "rail_id": "sio_r0",
         "protocol_bands": [
@@ -5711,7 +5711,7 @@
       "mte3": "AIV-owned UB-to-GM supply uses 64 B/cycle per AIV.",
       "fixpipe": "Generic 128 B/cycle per AIC assumption. The instruction table establishes 128 B/cycle for L0C-to-L1 FP16/BF16 output and 64 B/cycle for INT8 output.",
       "clock_provenance": "CANN 9.3.0 cube_freq is nominal. An explicit observed_aicore_freq_mhz supplies a board clock.",
-      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 \u00a71.2 and the pinned AscendC instruction tables."
+      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 §1.2 and the pinned AscendC instruction tables."
     },
     "transfer_channels": {
       "d2d_intra_package": {
@@ -5730,7 +5730,7 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service. Effective rate estimated from the A3 training capture.",
+        "notes": "Vol. 8 §7.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service. Effective rate estimated from the A3 training capture.",
         "scope": "package",
         "rail_id": "sio_r0",
         "protocol_bands": [
@@ -6529,7 +6529,7 @@
       "mte3": "AIV-owned UB-to-GM supply uses 64 B/cycle per AIV.",
       "fixpipe": "Generic 128 B/cycle per AIC assumption. The instruction table establishes 128 B/cycle for L0C-to-L1 FP16/BF16 output and 64 B/cycle for INT8 output.",
       "clock_provenance": "CANN 9.3.0 cube_freq is nominal. An explicit observed_aicore_freq_mhz supplies a board clock.",
-      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 \u00a71.2 and the pinned AscendC instruction tables."
+      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 §1.2 and the pinned AscendC instruction tables."
     },
     "transfer_channels": {
       "d2d_intra_package": {
@@ -6548,7 +6548,7 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service. Effective rate estimated from the A3 training capture.",
+        "notes": "Vol. 8 §7.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service. Effective rate estimated from the A3 training capture.",
         "scope": "package",
         "rail_id": "sio_r0",
         "protocol_bands": [
@@ -7347,7 +7347,7 @@
       "mte3": "AIV-owned UB-to-GM supply uses 64 B/cycle per AIV.",
       "fixpipe": "Generic 128 B/cycle per AIC assumption. The instruction table establishes 128 B/cycle for L0C-to-L1 FP16/BF16 output and 64 B/cycle for INT8 output.",
       "clock_provenance": "CANN 9.3.0 cube_freq is nominal. An explicit observed_aicore_freq_mhz supplies a board clock.",
-      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 \u00a71.2 and the pinned AscendC instruction tables."
+      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 §1.2 and the pinned AscendC instruction tables."
     },
     "transfer_channels": {
       "d2d_intra_package": {
@@ -7366,7 +7366,7 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service.",
+        "notes": "Vol. 8 §7.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service.",
         "scope": "package",
         "rail_id": "sio_r0",
         "protocol_bands": [
@@ -8165,7 +8165,7 @@
       "mte3": "AIV-owned UB-to-GM supply uses 64 B/cycle per AIV.",
       "fixpipe": "Generic 128 B/cycle per AIC assumption. The instruction table establishes 128 B/cycle for L0C-to-L1 FP16/BF16 output and 64 B/cycle for INT8 output.",
       "clock_provenance": "CANN 9.3.0 cube_freq is nominal. An explicit observed_aicore_freq_mhz supplies a board clock.",
-      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 \u00a71.2 and the pinned AscendC instruction tables."
+      "pipeline_provenance": "Architecture-level analytical bounds from Vol. 8 §1.2 and the pinned AscendC instruction tables."
     },
     "transfer_channels": {
       "d2d_intra_package": {
@@ -8184,7 +8184,7 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service. Effective rate estimated from the A3 training capture.",
+        "notes": "Vol. 8 §7.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service. Effective rate estimated from the A3 training capture.",
         "scope": "package",
         "rail_id": "sio_r0",
         "protocol_bands": [
@@ -8602,38 +8602,38 @@
     "device": {
       "memory_bytes": 68719476736,
       "compute_peaks": {
-        "int8": 491520000000000.0,
-        "bf16": 245760000000000.0,
-        "fp16": 245760000000000.0,
-        "fp32": 61440000000000.0,
-        "hf32": 122880000000000.0,
-        "int4": 983040000000000.0
+        "int8": 540672000000000.0,
+        "bf16": 270336000000000.0,
+        "fp16": 270336000000000.0,
+        "fp32": 67584000000000.0,
+        "hf32": 135168000000000.0,
+        "int4": 1081344000000000.0
       },
       "rates": {
         "hbm": 1600000000000.0,
-        "vector": 1920000000000.0,
-        "mte1": 3840000000000.0,
-        "mte2_aic": 7680000000000.0,
-        "mte2_aiv": 7680000000000.0,
-        "mte3": 3840000000000.0,
-        "fixpipe": 3840000000000.0
+        "vector": 2112000000000.0,
+        "mte1": 4224000000000.0,
+        "mte2_aic": 8448000000000.0,
+        "mte2_aiv": 8448000000000.0,
+        "mte3": 4224000000000.0,
+        "fixpipe": 4224000000000.0
       },
       "service_modes": {
         "mte1_l0a": {
           "resource": "mte1",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte1_l0b": {
           "resource": "mte1",
-          "rate": 3840000000000.0
+          "rate": 4224000000000.0
         },
         "mte2_aic_l2": {
           "resource": "mte2_aic",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte2_aiv_l2": {
           "resource": "mte2_aiv",
-          "rate": 7680000000000.0
+          "rate": 8448000000000.0
         },
         "mte2_aic_dram": {
           "resource": "mte2_aic",
@@ -9004,7 +9004,7 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service.",
+        "notes": "Vol. 8 §7.1. Train summary 224 GB/s peak, 163.8 raw SDMA, 122 effective; 9382 large-message AllGather 232, AllToAll 218, and P2P 126.7 GB/s. Collective bus bandwidth has a different boundary from point-to-point service.",
         "scope": "package",
         "rail_id": "sio_r0",
         "protocol_bands": [
@@ -9312,63 +9312,63 @@
         "dies_per_package": 2,
         "aic_count_per_die": 20,
         "aiv_count_per_die": 40,
-        "configured_clock_mhz": 1500.0,
+        "configured_clock_mhz": 1650.0,
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 168.0,
         "hbm_peak_bw_gbps": 1600.0,
         "hbm_peak_bw_verified": true,
         "intra_package_die_bw_gbps": 270.0,
         "vec_execution_bytes_per_cycle_per_aiv": 128,
-        "vector_fp32_lane_ops_per_s_per_die": 1920000000000.0,
-        "vector_fp32_fma_tflops_per_die": 3.84,
-        "vector_fp16_lane_ops_per_s_per_die": 3840000000000.0,
-        "vector_fp16_fma_tflops_per_die": 7.68,
-        "cann_fused_mul_add_fp32_tflops_per_die": 7.68,
-        "cann_fused_mul_add_fp16_tflops_per_die": 15.36,
+        "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.224,
+        "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+        "vector_fp16_fma_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
         "cann_ini_nominal_version": "9.3.0"
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
-        "clock_hz": 1500000000.0,
+        "clock_hz": 1650000000.0,
         "fields": {
           "mte1": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 20,
             "bytes_per_cycle_per_aic": 128,
             "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply, not exact mixed-operand timing"
           },
           "mte1_l0a": {
             "resource": "mte1",
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "bytes_per_cycle_per_aic": 256,
             "basis": "L1->L0A PIPE_MTE1 instruction table 256 B/cycle * AIC * clock; shares the physical mte1 resource and owners"
           },
           "mte1_l0b": {
             "resource": "mte1",
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "bytes_per_cycle_per_aic": 128,
             "basis": "L1->L0B PIPE_MTE1 instruction table 128 B/cycle * AIC * clock; shares the physical mte1 resource and owners"
           },
           "mte2_aic": {
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "units": 20,
             "bytes_per_cycle_per_owner": 256,
             "basis": "L2-hit local copy port ceiling per owner; cold HBM service is separate."
           },
           "mte2_aiv": {
-            "rate_bytes_per_s": 7680000000000.0,
+            "rate_bytes_per_s": 8448000000000.0,
             "units": 40,
             "bytes_per_cycle_per_owner": 128,
             "basis": "L2-hit local copy port ceiling per owner; cold HBM service is separate."
           },
           "mte3": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 40,
             "bytes_per_cycle_per_owner": 64,
             "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
           },
           "fixpipe": {
-            "rate_bytes_per_s": 3840000000000.0,
+            "rate_bytes_per_s": 4224000000000.0,
             "units": 20,
             "bytes_per_cycle_per_owner": 128,
             "basis": "128 B/cycle * AIC * clock; generic GM destination is an explicit assumption. Direct source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle, not universal 128 B/cycle"
@@ -9378,16 +9378,16 @@
             "basis": "CANN 9.3.0 nominal shared die HBM bandwidth"
           },
           "vector": {
-            "rate_ops_per_s": 1920000000000.0,
+            "rate_ops_per_s": 2112000000000.0,
             "units": 40,
             "ops_per_cycle_per_aiv": 32,
             "vec_execution_bytes_per_cycle_per_aiv": 128,
-            "vector_fp32_lane_ops_per_s_per_die": 1920000000000.0,
-            "vector_fp32_fma_tflops_per_die": 3.84,
-            "vector_fp16_lane_ops_per_s_per_die": 3840000000000.0,
-            "vector_fp16_fma_tflops_per_die": 7.68,
-            "cann_fused_mul_add_fp32_tflops_per_die": 7.68,
-            "cann_fused_mul_add_fp16_tflops_per_die": 15.36,
+            "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.224,
+            "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+            "vector_fp16_fma_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
             "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
@@ -9417,7 +9417,7 @@
         },
         "conflicts": {
           "mte1_ini_vs_instruction": "INI l1_to_l0_a/l1_to_l0_b 512/256 B/cycle contradicts the public instruction table 256/128 B/cycle. The profile chooses documented instruction 256/128 and preserves the discrepancy.",
-          "clock": "CANN 9.3.0 nominal clock is 1500 MHz. Live 1650 MHz boards require an explicit observed_aicore_freq_mhz."
+          "clock": "Product nominal clock is 1650 MHz (matching live 1650 MHz boards); CANN 9.2/9.3 .ini cube_freq=1500 is retained for provenance only."
         },
         "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
       },
@@ -10500,7 +10500,7 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1, 9582 P20 pinned DMA used as an estimate for this board.",
+        "notes": "Vol. 8 §7.1, 9582 P20 pinned DMA used as an estimate for this board.",
         "scope": "host",
         "root_complex_id": "rc0",
         "node_peak_bw_gbps": 400.0,
@@ -10522,7 +10522,7 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1, 9582 P20 pinned DMA used as an estimate for this board.",
+        "notes": "Vol. 8 §7.1, 9582 P20 pinned DMA used as an estimate for this board.",
         "scope": "host",
         "root_complex_id": "rc0",
         "node_peak_bw_gbps": 400.0,
@@ -11692,7 +11692,7 @@
         "alpha_us": 20.6,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1, 9582 P20 pinned large-payload DMA.",
+        "notes": "Vol. 8 §7.1, 9582 P20 pinned large-payload DMA.",
         "scope": "host",
         "root_complex_id": "rc0",
         "node_peak_bw_gbps": 400.0,
@@ -11714,7 +11714,7 @@
         "alpha_us": 20.8,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1, 9582 P20 pinned large-payload DMA.",
+        "notes": "Vol. 8 §7.1, 9582 P20 pinned large-payload DMA.",
         "scope": "host",
         "root_complex_id": "rc0",
         "node_peak_bw_gbps": 400.0,
@@ -12881,7 +12881,7 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1, 9582 P20 pinned DMA used as an estimate for this board.",
+        "notes": "Vol. 8 §7.1, 9582 P20 pinned DMA used as an estimate for this board.",
         "scope": "host",
         "root_complex_id": "rc0",
         "node_peak_bw_gbps": 400.0,
@@ -12903,7 +12903,7 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1, 9582 P20 pinned DMA used as an estimate for this board.",
+        "notes": "Vol. 8 §7.1, 9582 P20 pinned DMA used as an estimate for this board.",
         "scope": "host",
         "root_complex_id": "rc0",
         "node_peak_bw_gbps": 400.0,
@@ -14073,7 +14073,7 @@
         "alpha_us": 20.6,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1, 9582 P20 pinned DMA used as an estimate for this board.",
+        "notes": "Vol. 8 §7.1, 9582 P20 pinned DMA used as an estimate for this board.",
         "scope": "host",
         "root_complex_id": "rc0",
         "node_peak_bw_gbps": 400.0,
@@ -14095,7 +14095,7 @@
         "alpha_us": 20.8,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Vol. 8 \u00a77.1, 9582 P20 pinned DMA used as an estimate for this board.",
+        "notes": "Vol. 8 §7.1, 9582 P20 pinned DMA used as an estimate for this board.",
         "scope": "host",
         "root_complex_id": "rc0",
         "node_peak_bw_gbps": 400.0,

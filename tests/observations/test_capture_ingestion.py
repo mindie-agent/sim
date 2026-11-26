@@ -607,4 +607,15 @@ def test_capture_envelope_clock_reaches_canonical_device_configuration():
     canonical = materialize(updated)["device"]
     assert canonical["observed_aicore_freq_mhz"] == canonical["aicore_freq_mhz"] == 1650
     assert canonical["rates"]["hbm"] == pytest.approx(explicit_hbm)
-    assert canonical["rates"]["mte2_aic"] == pytest.approx(nominal["rates"]["mte2_aic"] * 1650 / 1500)
+    assert canonical["rates"]["mte2_aic"] == pytest.approx(nominal["rates"]["mte2_aic"])
+    scaled_env = {
+        **envelope,
+        "payload": {
+            **envelope["payload"],
+            "observed_silicon": {**envelope["payload"]["observed_silicon"], "observed_aicore_freq_mhz": 1500},
+        },
+    }
+    scaled_raw = apply_capture_observed_clock(raw, scaled_env)["machine"]
+    scaled_canonical = materialize(scaled_raw)["device"]
+    assert scaled_canonical["rates"]["hbm"] == pytest.approx(explicit_hbm)
+    assert scaled_canonical["rates"]["mte2_aic"] == pytest.approx(nominal["rates"]["mte2_aic"] * 1500 / 1650)
