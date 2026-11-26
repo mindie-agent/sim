@@ -486,16 +486,17 @@ def test_g1_sp_padding_p_eq_w_sharded_sort_m1_m1b_m5_and_m10():
     assert p_k128.native_calls.index("_pack_candidates") < p_k128.native_calls.index("Sort")
     assert "_unpack_candidates" in p_k128.native_calls and "_select_local_candidates" in p_k128.native_calls
 
-    # M1 5-branch MLA preprocess selector (BF16 required per mla_v1.py:1919; strided adapter requires A5 draft).
-    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="bf16") == "prolog_v3"
-    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, act_dtype="fp16", weight_quant="fp16") == "native_decomposed"
-    assert resolve_mla_preprocess_mode(arch="A3", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="bf16") == "prolog_v3"
-    assert resolve_mla_preprocess_mode(arch="A3", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="mxfp8") == "native_decomposed"
+    # M1 5-branch MLA preprocess selector (dense prolog_v3 requires strided KV cache per mla_v1.py:1921-1958).
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="bf16") == "native_decomposed"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="bf16", is_strided_kv_cache=True) == "prolog_v3"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, act_dtype="fp16", weight_quant="fp16", is_strided_kv_cache=True) == "native_decomposed"
+    assert resolve_mla_preprocess_mode(arch="A3", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="bf16", is_strided_kv_cache=True) == "prolog_v3"
+    assert resolve_mla_preprocess_mode(arch="A3", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="mxfp8", is_strided_kv_cache=True) == "native_decomposed"
     assert resolve_mla_preprocess_mode(arch="A3", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, enable_mlapo=True) == "mlapo"
     assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, is_strided_kv_cache=True, is_draft_model=True, input_size=14336) == "strided_kv_adapter"
-    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, is_strided_kv_cache=True, is_draft_model=True, input_size=7168) == "native_decomposed"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, is_strided_kv_cache=True, is_draft_model=True, input_size=7168) == "prolog_v3"
     assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, is_strided_kv_cache=False, is_draft_model=True) == "native_decomposed"
-    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, has_learned_rope_tail=True) == "prolog_v3_learned_rope_tail"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, is_strided_kv_cache=True, has_learned_rope_tail=True) == "prolog_v3_learned_rope_tail"
 
     # M1b zero-row sentinel & M5 store-on-completion (I % R != 0) & prefix_block_size vs CP interleave.
     hier = MemoryHierarchySpec(l2_capacity_bytes=64 * 1024 * 1024, l2_effective_fraction=0.8, cache_line_bytes=128, write_allocate=True)

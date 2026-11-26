@@ -110,21 +110,27 @@ def test_contiguous_rows_share_sectors_and_verify_retains_repeated_accesses(mode
 @pytest.mark.parametrize("block", [8, 16])
 def test_block_sparse_modes_and_metadata_reuse_conserve_compute(mode, block):
     geom = geometry()
-    opts = dict(op_id="gbsa", query_tokens=2, num_heads=4, num_kv_heads=2, head_dim=128,
-                v_head_dim=64, selected_tokens=17, block_size=block, quant_mode=mode)
+    opts = dict(op_id="gbsa", query_tokens=2, num_heads=4, num_kv_heads=2, head_dim=192,
+                v_head_dim=192, selected_tokens=17, block_size=block, quant_mode=mode)
     op = governed.make_gbsa_op(**opts)
     plan = governed.build(op, geom)
     changed = stages(governed.build(governed.make_gbsa_op(**opts, ssmax=True, metadata_reuse=True), geom))
     phase = stages(plan)
     count = ceil(17 / block) * 2 * 2
     assert phase["sparse_index"].work.resources["hbm"] == count * 4
-    assert changed["sparse_index"].work.resources["hbm"] == 0
-    assert phase["offset_workspace_write"].work.resources["hbm"] == count * 2 * 8
+    # Reusing cross-layer scheduling metadata skips metadata build, not per-layer sparse index reads.
+    assert changed["sparse_index"].work.resources["hbm"] == count * 4
+    # Dense GBSA writes one 32B-aligned offset descriptor (header + 2-word span = 96 B) per (query, kv_head).
+    assert phase["offset_workspace_write"].work.resources["hbm"] == 2 * 2 * 12 * 8
     assert changed["online_softmax"].work.resources["vector"] - phase["online_softmax"].work.resources["vector"] == 2 * 17 * 2 * 4
-    assert ("key_dequant" in phase) == ("value_dequant" in phase) == (mode in {1, 5})
-    assert plan.work.matrix == {("fp8_e4m3" if mode == 6 else "bf16"): 2 * 17 * 2 * 4 * (128 + 64)}
+    assert ("key_dequant" in phase) == ("value_dequant" in phase) == (mode == 1)
+    assert plan.work.matrix == {("fp8_e4m3" if mode in {5, 6} else "bf16"): 2 * 17 * 2 * 4 * (192 + 192)}
     bound = governed.recipes()[op.recipe].build(op, geom)
     assert bound.work == plan.work and bound.pipeline_spec == plan.pipeline_spec
+    if mode == 0 and block == 8:
+        asym = governed.make_gbsa_op(**(opts | {"head_dim": 128, "v_head_dim": 64}))
+        with pytest.raises(UnmodeledCapabilityError, match="attention_gbsa_head_dim"):
+            governed.build(asym, geom)
 
 
 @pytest.mark.parametrize("abi", [MINDIE_V1_ABI, MINDIE_V2_ABI, MINDIE_V3_ABI])
@@ -215,7 +221,8 @@ def test_sparse_metadata_grouping_retains_padding_and_index_dependency():
     controllers = [op for op in ops if op.recipe == METADATA_RECIPE]
     assert len(controllers) == 3
     by_id = {op.op_id: op for op in ops}
-    assert all(by_id[op.deps[0]].family == "indexer" for op in controllers)
+    assert all(by_id[op.deps[0]].family == "topk" and by_id[op.deps[0]].recipe == "index_topk"
+               for op in controllers)
 
 
 def test_local_projection_pads_the_split_axis_to_the_weight_scale_block():
@@ -274,7 +281,7 @@ def test_sparse_prefill_frontend_accounts_independent_selections_and_resident_kv
 def test_paired_sparse_decode_keeps_rank_owned_index_and_lse_pack():
     config = json.loads((REPO_ROOT / "mindie_sim/model_configs/kimi-k3.1.json").read_text())
     quant = dict(name="packed", weight_format="bf16", activation_format="bf16", expert_weight_format="bf16",
-                 kv_dtype="fp8_e4m3", index_dtype="fp8_e4m3", index_scale_dtype="fp16")
+                 kv_dtype="fp8_e4m3", index_dtype="fp8_e4m3", index_scale_dtype="fp32")
     raw = compose_case(config, hardware=REGBASE_SKU, tp=8, dp=4, ep=32, dcp=8, num_devices=32,
                        block_size=1536, max_model_len=140000, quant=quant, prompt_tokens=131072,
                        output_tokens=1, graph_capture_mode="none")
@@ -282,7 +289,7 @@ def test_paired_sparse_decode_keeps_rank_owned_index_and_lse_pack():
     index = next(op for op in ops if op.family == "indexer_quant_cache")
     attention, pack, exchange = [next(op for op in ops if op.recipe == recipe)
         for recipe in ("paired_fp8_qsfa_analytic", "dcp_output_pack", "dcp_output_alltoall")]
-    assert index.local_shape[0] == 1 and index.mte3_bytes == 128 + 2
+    assert index.local_shape[0] == 1 and index.mte3_bytes == 128 + 4
     assert dict(attention.metadata)["qsfa_statistics_bytes"] == 96 * 2 * 4
     assert attention.mte3_bytes == pack.mte2_bytes == 96 * (512 * 2 + 2 * 4)
     assert pack.mte3_bytes == 96 * (512 + 4) * 2 and pack.vector_ops == 96 * PACK_LSE_OPS
