@@ -61,7 +61,7 @@ from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.workload import RequestView
-from tools._fleet_400k_reconcile import (
+from mindie_sim.observations.campaign_reconcile import (
     apply_sku_observed_clock, canonical_capture_sha256, load_verified_capture, score_verdict,
 )
 
@@ -69,7 +69,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.tier0
 BUNDLE_PATH = REPO_ROOT / "data" / "verification" / "all-skus-512-400k-cliff-heldout-20261121.json"
 PRODUCER_PATH = REPO_ROOT / "data" / "verification" / "all-skus-512-400k-cliff-heldout-20261121.producer.py"
-RECONCILE_PATH = REPO_ROOT / "tools" / "_fleet_400k_reconcile.py"
+RECONCILE_PATH = REPO_ROOT / "mindie_sim" / "observations" / "campaign_reconcile.py"
 MANIFEST_PATH = REPO_ROOT / "data" / "primitives" / "manifest.json"
 
 REACHABLE_SKUS = ("Ascend910B4", "Ascend910_9362", "Ascend910_9382", "Ascend950DT_9582")
@@ -447,7 +447,7 @@ def test_active_core_calibration_and_scoped_p18_topology() -> None:
 def test_nearest_rank_p90_unrounded_two_tier_and_kda_sfu_conservation() -> None:
     """Lock nearest-rank P90, unrounded threshold comparison, and KDA gate exp() BK SFU count."""
     import importlib.util
-    from tools._fleet_400k_reconcile import nearest_rank_p90
+    from mindie_sim.observations.campaign_reconcile import nearest_rank_p90
 
     assert nearest_rank_p90([1.0, 2.0, 3.0, 4.0, 14.56]) == pytest.approx(14.56)
     assert nearest_rank_p90([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 29.69]) == pytest.approx(29.69)

@@ -53,6 +53,15 @@ def _delegate(command: str, rest: tuple[str, ...], *, prog: str) -> int | None:
     if command == "subgraph-parity":
         from mindie_sim.observations.subgraph_parity import main as subgraph_parity_main
         return subgraph_parity_main(list(rest), prog=f"{prog} obs subgraph-parity")
+    if command == "bench-packets":
+        from mindie_sim.observations.bench_packets import main as bench_packets_main
+        return bench_packets_main(list(rest), prog=f"{prog} obs bench-packets")
+    if command == "reconcile-campaign":
+        from mindie_sim.observations.campaign_reconcile import reconcile_main
+        return reconcile_main(list(rest), prog=f"{prog} obs reconcile-campaign")
+    if command == "diff-campaigns":
+        from mindie_sim.observations.campaign_reconcile import diff_main
+        return diff_main(list(rest), prog=f"{prog} obs diff-campaigns")
     return None
 
 

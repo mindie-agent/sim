@@ -567,19 +567,23 @@ def accuracy_report(campaign):
 
 _CLOCK_TELEMETRY_KEYS = (
     "observed_aicore_freq_mhz",
+    "observed_clock_mhz",
     "aicore_freq_mhz",
     "device_aicore_freq_mhz",
 )
 
 
 def extract_observed_aicore_freq_mhz(envelope: Mapping | None) -> float | None:
-    """Extract observed AICore clock (MHz) from a silicon capture or msprof envelope."""
+    """Extract observed AICore clock (MHz) from a silicon capture or campaign envelope."""
     if not isinstance(envelope, Mapping):
         return None
     payload = envelope.get("payload")
     silicon = payload.get("observed_silicon") if isinstance(payload, Mapping) else None
     containers = [container for container in (silicon, envelope, payload) if isinstance(container, Mapping)]
-    for sub in ("observed_silicon", "device", "hardware", "metadata", "boundary", "telemetry", "clock"):
+    for sub in (
+        "observed_silicon", "version_fingerprint", "clock_start", "clock_end",
+        "device", "hardware", "metadata", "boundary", "telemetry", "clock",
+    ):
         nested = envelope.get(sub)
         if isinstance(nested, Mapping):
             containers.append(nested)

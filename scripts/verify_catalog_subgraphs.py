@@ -72,7 +72,7 @@ from mindie_sim.primitives import load_primitives  # noqa: E402
 from mindie_sim.schema.common import ModelingError  # noqa: E402
 from mindie_sim.schema.parallel import ParallelSpec  # noqa: E402
 from mindie_sim.schema.workload import IterationPlan, RequestView  # noqa: E402
-from tools._fleet_400k_reconcile import nearest_rank_p90  # noqa: E402
+from mindie_sim.observations.campaign_reconcile import nearest_rank_p90  # noqa: E402
 
 PHYSICAL_TOL_PCT = 10.0
 PHYSICAL_ATOL_NS = 2000.0

@@ -74,7 +74,7 @@ from mindie_sim.schema.operators import OpSpec
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from tools._fleet_400k_reconcile import nearest_rank_p90  # noqa: E402
+from mindie_sim.observations.campaign_reconcile import nearest_rank_p90  # noqa: E402
 
 PERCENT_SCALE = 100.0
 L1_MEDIAN_APE_LIMIT_PCT = 8.0

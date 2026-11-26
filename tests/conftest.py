@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -31,6 +32,10 @@ TESTS = Path(__file__).resolve().parent
 #: ``mprof-`` plus the 8-character ``mkdtemp`` suffix.
 SHORT_PARENT_MAX_BYTES = 34
 REQUIRE_ALL_ENV = "MINDIE_SIM_REQUIRE_ALL"
+CAMPAIGN_PATHS_ENV = "MINDIE_SIM_CAMPAIGN_PATHS"
+DEFAULT_CAMPAIGNS_DIR = ROOT / "data" / "verification" / "campaigns"
+GOLDEN_CAMPAIGN_FIXTURE = TESTS / "fixtures" / "bench_matrix" / "v2_contract_golden.json"
+VA_COMMIT_SHORT_LEN = 8
 #: Per-test host-path variables -> subdirectory of the worker runtime root.
 HOST_PATH_VARS = {
     "HOME": "home",
@@ -70,6 +75,110 @@ def pytest_addoption(parser):
         "--num-shards", action="store", type=int, default=1,
         help="Total number of deterministic CI shards (default: 1)",
     )
+    camp = parser.getgroup("campaign")
+    camp.addoption(
+        "--campaign-manifest", action="append", default=[],
+        help="Path(s) to mindie-bench-campaign/1 JSON manifest(s) to reconcile",
+    )
+    camp.addoption(
+        "--campaign-dir", action="append", default=[],
+        help="Directory(ies) recursively searched for campaign_manifest.json / *.campaign.json",
+    )
+    camp.addoption(
+        "--campaign-sku", action="store", default=None,
+        help="Optional SKU filter for dynamically mounted campaigns",
+    )
+    camp.addoption(
+        "--campaign-cann-version", action="store", default=None,
+        help="Optional CANN version filter for dynamically mounted campaigns",
+    )
+    camp.addoption(
+        "--campaign-va-commit", action="store", default=None,
+        help="Optional vllm-ascend commit prefix filter for dynamically mounted campaigns",
+    )
+
+
+def _discover_campaign_manifests(config) -> tuple[list[tuple[Path, str]], bool]:
+    """Discover dynamically mounted campaign manifests from CLI flags, env, or default dir."""
+    raw_manifests = list(config.getoption("--campaign-manifest") or [])
+    raw_dirs = list(config.getoption("--campaign-dir") or [])
+    env_raw = os.environ.get(CAMPAIGN_PATHS_ENV, "").strip()
+    env_entries = [p.strip() for p in env_raw.split(os.pathsep) if p.strip()] if env_raw else []
+    sku_filter = config.getoption("--campaign-sku")
+    cann_filter = config.getoption("--campaign-cann-version")
+    va_filter = config.getoption("--campaign-va-commit")
+    has_explicit_source = bool(raw_manifests or raw_dirs or env_entries)
+    explicit = has_explicit_source or bool(sku_filter or cann_filter or va_filter)
+
+    candidates: list[Path] = []
+    for raw in raw_manifests:
+        candidates.append(Path(raw))
+    for raw in raw_dirs:
+        base = Path(raw)
+        if base.is_dir():
+            candidates.extend(sorted(base.rglob("campaign_manifest.json")))
+            candidates.extend(sorted(base.rglob("*.campaign.json")))
+    for raw in env_entries:
+        p = Path(raw)
+        if p.is_file():
+            candidates.append(p)
+        elif p.is_dir():
+            candidates.extend(sorted(p.rglob("campaign_manifest.json")))
+            candidates.extend(sorted(p.rglob("*.campaign.json")))
+    if not has_explicit_source and DEFAULT_CAMPAIGNS_DIR.is_dir():
+        candidates.extend(sorted(DEFAULT_CAMPAIGNS_DIR.rglob("campaign_manifest.json")))
+        candidates.extend(sorted(DEFAULT_CAMPAIGNS_DIR.rglob("*.campaign.json")))
+
+    seen: set[Path] = set()
+    entries: list[tuple[Path, str]] = []
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            doc = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            entries.append((resolved, resolved.name))
+            continue
+        if not isinstance(doc, dict):
+            continue
+        fp = doc.get("version_fingerprint") if isinstance(doc.get("version_fingerprint"), dict) else {}
+        sku = str(fp.get("sku") or "unknown")
+        cann = str(fp.get("cann_version") or "unknown")
+        va = str(fp.get("va_commit") or "unknown")
+        cid = str(doc.get("campaign_id") or resolved.stem)
+        if sku_filter and sku != sku_filter:
+            continue
+        if cann_filter and cann != cann_filter:
+            continue
+        if va_filter and not va.startswith(va_filter):
+            continue
+        test_id = f"{sku}[cann={cann},va={va[:VA_COMMIT_SHORT_LEN]}]::{cid}"
+        entries.append((resolved, test_id))
+    return entries, explicit
+
+
+def pytest_generate_tests(metafunc):
+    if "mounted_campaign_manifest" not in metafunc.fixturenames:
+        return
+    entries, explicit = _discover_campaign_manifests(metafunc.config)
+    if entries:
+        metafunc.parametrize(
+            "mounted_campaign_manifest",
+            [path for path, _ in entries],
+            ids=[label for _, label in entries],
+        )
+    elif explicit:
+        metafunc.parametrize(
+            "mounted_campaign_manifest",
+            [pytest.param(None, id="explicit-campaign-mount-empty")],
+        )
+    else:
+        metafunc.parametrize(
+            "mounted_campaign_manifest",
+            [pytest.param(GOLDEN_CAMPAIGN_FIXTURE, id="golden-v2-contract-campaign")],
+        )
 
 
 def pytest_collection_modifyitems(config, items):
