@@ -166,6 +166,7 @@ class CycleDetector:
         self._history_templates: dict[int, list] = {}
         self._last_rejection = "initial"
         self._last_difference: str | None = None
+        self._last_difference_pair: tuple[_HistoryFrame, _HistoryFrame] | None = None
         self._last_skip: CycleSkip | None = None
         self.observations_seen = 0
         self.skips_returned = 0
@@ -185,9 +186,16 @@ class CycleDetector:
         """Why the most recent observation did not return a skip."""
         return self._last_rejection
 
+    def _materialize_last_difference(self) -> None:
+        pair = self._last_difference_pair
+        if pair is not None:
+            self._last_difference = _state_difference(pair[0], pair[1])
+            self._last_difference_pair = None
+
     @property
     def last_difference(self) -> str | None:
         """First unequal structural component of the latest adjacent frontier."""
+        self._materialize_last_difference()
         return self._last_difference
 
     @property
@@ -235,6 +243,7 @@ class CycleDetector:
 
     def reset(self) -> None:
         """Forget the private history; the next observe becomes a baseline."""
+        self._materialize_last_difference()
         self._clear_history()
         self._last_rejection = "reset"
 
@@ -298,6 +307,9 @@ class CycleDetector:
                 self._clear_history()
                 return False
             removed = self._observations.pop(0)
+            pair = self._last_difference_pair
+            if pair is not None and (removed.frame is pair[0] or removed.frame is pair[1]):
+                self._materialize_last_difference()
             self._history_bytes -= removed.retained_bytes
             self._release_template(removed.frame)
         return True
@@ -351,18 +363,32 @@ class CycleDetector:
             # phase class in the bounded cache.
             self._clear_history()
             reset_reason = "phase_changed"
+        prev_frame = (
+            self._observations[-1].frame
+            if self._observations and interval is not None
+            else None
+        )
         self._last_difference = None
-        if self._observations and interval is not None:
-            self._last_difference = _state_difference(self._observations[-1].frame, frame)
+        self._last_difference_pair = None
         if interval is not None and interval.crossed_external_or_opaque:
             self._clear_history()
-            self._store_observation(frame, interval)
+            stored = self._store_observation(frame, interval)
+            if prev_frame is not None and stored and self._observations:
+                self._last_difference = _state_difference(prev_frame, self._observations[-1].frame)
+            elif prev_frame is not None:
+                self._last_difference = _state_difference(prev_frame, frame)
             self._set_rejection("external_or_opaque")
             return None
         if not self._store_observation(frame, interval):
             self._last_difference = None
+            self._last_difference_pair = None
             self._set_rejection("history_budget")
             return None
+        if prev_frame is not None:
+            if len(self._observations) >= 2 and self._observations[-2].frame is prev_frame:
+                self._last_difference_pair = (prev_frame, self._observations[-1].frame)
+            else:
+                self._last_difference = _state_difference(prev_frame, self._observations[-1].frame)
 
         evidence = self._find_evidence()
         if evidence is None:

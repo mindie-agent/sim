@@ -13,18 +13,21 @@ import math
 
 from .engine_types import ExecutionError, _structural_value
 
-_PERIODIC_EPOCH_MISS_MULTIPLIER = 2
 _PERIODIC_COLD_ISSUE_MULTIPLIER = 2
 _PERIODIC_BASE_MAX_LAG = 24
-_PERIODIC_LAG_MULTIPLIER = 2
-_MAX_PERIODIC_DETECTOR_LAG = 128
+_PERIODIC_NO_ISSUE_STEPS_PER_RUN = 8
+_MAX_PERIODIC_NO_ISSUE_STEPS = 256
+_PERIODIC_CLOCK_STEPS_PER_RUN = 16
+_MAX_PERIODIC_CLOCK_STEPS = 512
 _PERIODIC_BASE_HISTORY_BYTES = 8 * 1024 * 1024
-_PERIODIC_HISTORY_BYTES_PER_RUN = 1024 * 1024
+_PERIODIC_HISTORY_BYTES_PER_RUN = 512 * 1024
+_MAX_PERIODIC_HISTORY_BYTES = 16 * 1024 * 1024
 _MAX_PERIODIC_LIVE_TASKS = 4096
 _MAX_PERIODIC_RUNS = 64
 _MAX_PERIODIC_LIVE_SLOTS = 128
 _BINARY64_EXACT_INT_LIMIT = 1 << 53
 _BINARY64_DYADIC_DEN_LIMIT = 1 << 500
+_TIME_ROUND_DIGITS = 12
 
 
 def _advance_periodic_clock_single_step(now: float, dt: float, cycles: int) -> float:
@@ -134,37 +137,75 @@ class _EnginePeriodicMixin:
 
     def _periodic_state(self, epoch: str | None = None) -> tuple:
         """Tile-index-independent exact structural view for the detector."""
-        def task_key(task):
-            metadata = self._periodic_tasks.get(task.event.sequence)
+        periodic_tasks = self._periodic_tasks
+        periodic_runs = self._periodic_runs
+        now = self.now
+        round_ = round
+        digits = _TIME_ROUND_DIGITS
+        task_entries = []
+        for task in self._tasks.values():
+            metadata = periodic_tasks.get(task.event.sequence)
             if metadata is not None:
                 run_id, tile, ordinal, kind = metadata
-                run = self._periodic_runs.get(run_id, {})
-                return ("periodic", run_id, tile - run.get("finished", 0),
-                        ordinal, kind)
-            return ("opaque", task.event.name)
-
-        tasks = tuple(sorted(
-            (task_key(task),
-             tuple(sorted((key, value) for key, value in task.remaining.items()
-                          if value > 0)),
-             task.waiting,
-             round(max(0.0, task.release - self.now), 12),
-             (None if task.start is None else
-              round(max(0.0, task.start + task.latency - self.now), 12)),
-             task.priority,
-             tuple(sorted(task.caps.items())),
-             tuple(sorted(task.placement.items())),
-             task.coupled, task.owner)
-            for task in self._tasks.values()))
+                run = periodic_runs.get(run_id)
+                finished = run.get("finished", 0) if run is not None else 0
+                tkey = ("periodic", run_id, tile - finished, ordinal, kind)
+            else:
+                tkey = ("opaque", task.event.name)
+            rem = task.remaining
+            if not rem:
+                rem_tuple = ()
+            elif len(rem) == 1:
+                rk, rv = next(iter(rem.items()))
+                rem_tuple = ((rk, rv),) if rv > 0 else ()
+            else:
+                rem_tuple = tuple(sorted((rk, rv) for rk, rv in rem.items() if rv > 0))
+            caps = task.caps
+            if not caps:
+                caps_tuple = ()
+            elif len(caps) == 1:
+                caps_tuple = (next(iter(caps.items())),)
+            else:
+                caps_tuple = tuple(sorted(caps.items()))
+            pl = task.placement
+            if not pl:
+                pl_tuple = ()
+            elif len(pl) == 1:
+                pl_tuple = (next(iter(pl.items())),)
+            else:
+                pl_tuple = tuple(sorted(pl.items()))
+            rel_dt = task.release - now
+            rel_val = round_(rel_dt, digits) if rel_dt > 0.0 else 0.0
+            if task.latency_from_first_service:
+                if task.first_service is None:
+                    lat_val = (
+                        round_(task.latency, digits)
+                        if task.latency > 0.0
+                        else (None if task.start is None else 0.0)
+                    )
+                else:
+                    lat_dt = task.first_service + task.latency - now
+                    lat_val = round_(lat_dt, digits) if lat_dt > 0.0 else 0.0
+            elif task.start is None:
+                lat_val = None
+            else:
+                lat_dt = task.start + task.latency - now
+                lat_val = round_(lat_dt, digits) if lat_dt > 0.0 else 0.0
+            task_entries.append((
+                tkey, rem_tuple, task.waiting, rel_val, lat_val,
+                task.priority, caps_tuple, pl_tuple, task.coupled, task.owner,
+            ))
+        task_entries.sort()
+        tasks = tuple(task_entries)
         runs = tuple(sorted(
             (run_id, run.get("phase_ordinal", 0), run.get("phase_end", 0),
              tuple(run.get("slots", ())),
              tuple(sorted((a.pool, a.size, a.units)
                           for a in run.get("persistent_allocations", ()))))
-            for run_id, run in self._periodic_runs.items()))
+            for run_id, run in periodic_runs.items()))
         allocations, pools, grants = self._allocation_frontier()
         releases = tuple(
-            (round(when - self.now, 12), key) for when, key in self._releases)
+            (round_(when - now, digits), key) for when, key in self._releases)
         # Keep the frozen 5-tuple adapter shape so engine_periodic can intern
         # the static task template. Memory budget/grants are structural too,
         # so they ride in the pool part rather than changing the outer arity.
@@ -231,17 +272,38 @@ class _EnginePeriodicMixin:
             return True
         if self._releases:
             stop_at = min(stop_at, self._releases[0][0])
-        for task in self._tasks.values():
-            if task.event.sequence in self._periodic_tasks:
+        periodic_tasks = self._periodic_tasks
+        tasks = self._tasks
+        now = self.now
+        for pool_keys in (
+            self._active,
+            self._ready_seen,
+            self._completable_seen,
+            self._latency_active,
+        ):
+            for key in pool_keys:
+                if key in periodic_tasks:
+                    continue
+                task = tasks.get(key)
+                if task is None or task.waiting > 0:
+                    continue
+                if (task.start is not None and not task.remaining
+                        and task.release > stop_at
+                        and (now >= task.start + task.latency
+                             or task.start + task.latency > stop_at)):
+                    continue
+                if bool(task.remaining) or bool(task.acquire) or bool(task.free):
+                    return True
+        for _, key in self._releases:
+            if key in periodic_tasks:
                 continue
-            if task.waiting > 0:
-                # Still blocked on an unresolved predecessor: no pipe rate.
+            task = tasks.get(key)
+            if task is None or task.waiting > 0:
                 continue
             if (task.start is not None and not task.remaining
                     and task.release > stop_at
-                    and (self.now >= task.start + task.latency
+                    and (now >= task.start + task.latency
                          or task.start + task.latency > stop_at)):
-                # Passive lease holder: cannot release before ``stop_at``.
                 continue
             if bool(task.remaining) or bool(task.acquire) or bool(task.free):
                 return True
@@ -250,30 +312,57 @@ class _EnginePeriodicMixin:
     def _periodic_stop(self, horizon: float) -> float:
         if self._releases:
             horizon = min(horizon, self._releases[0][0])
+        periodic_tasks = self._periodic_tasks
+        periodic_runs = self._periodic_runs
         for key in self._latency_active:
-            if key in self._periodic_tasks:
-                continue
+            meta = periodic_tasks.get(key)
+            if meta is not None:
+                run = periodic_runs.get(meta[0])
+                if run is not None and int(run.get("next", 0)) < int(run.get("phase_end", run.get("total", 0))):
+                    continue
             task = self._tasks[key]
             anchor = task.first_service if task.latency_from_first_service else task.start
             if anchor is not None and anchor + task.latency > self.now:
                 horizon = min(horizon, anchor + task.latency)
         return horizon
 
-    def _periodic_epoch_stalled(self, detector) -> bool:
+    def _periodic_runs_snapshot(self):
+        """Single-pass summary over ``_periodic_runs`` avoiding repeated scans."""
+        indexed = False
+        total_slots = 0
+        active_items = []
+        for run_id, run in self._periodic_runs.items():
+            if run.get("indexed"):
+                indexed = True
+                break
+            slots = run.get("slots")
+            if slots:
+                total_slots += len(slots)
+                active_items.append((run_id, run, slots))
+        if len(active_items) > 1:
+            active_items.sort(key=lambda item: item[0])
+        return indexed, total_slots, active_items
+
+    def _periodic_epoch_stalled(self, detector, active_items=None) -> bool:
         """Return True once the active periodic epoch cannot match within ``max_lag``."""
+        if active_items is None:
+            _, _, active_items = self._periodic_runs_snapshot()
         epoch_key = tuple(
             (run_id, run.get("phase_ordinal", 0), run.get("phase_end", 0))
-            for run_id, run in sorted(self._periodic_runs.items())
-            if run.get("slots")
+            for run_id, run, _ in active_items
         )
         active_runs = max(1, len(epoch_key))
-        miss_budget = _PERIODIC_EPOCH_MISS_MULTIPLIER * detector.history_limit
-        any_retired = any(
-            int(run.get("finished", 0)) > 0
-            for run in self._periodic_runs.values()
-            if run.get("slots")
+        miss_budget = detector.history_limit
+        any_retired = False
+        next_sum = 0
+        for _, run, _ in active_items:
+            if int(run.get("finished", 0)) > 0:
+                any_retired = True
+            next_sum += int(run.get("next", 0))
+        base_issue_limit = min(
+            _MAX_PERIODIC_NO_ISSUE_STEPS,
+            max(detector.max_lag, active_runs * _PERIODIC_NO_ISSUE_STEPS_PER_RUN),
         )
-        base_issue_limit = detector.max_lag * active_runs
         issue_limit = (
             base_issue_limit
             if any_retired
@@ -290,11 +379,6 @@ class _EnginePeriodicMixin:
         if (self._periodic_stall_obs >= miss_budget
                 or self._periodic_no_issue_streak > issue_limit):
             return True
-        next_sum = sum(
-            int(run.get("next", 0))
-            for run in self._periodic_runs.values()
-            if run.get("slots")
-        )
         if next_sum == self._periodic_last_next_sum:
             self._periodic_no_issue_streak += 1
             return self._periodic_no_issue_streak > issue_limit
@@ -302,20 +386,24 @@ class _EnginePeriodicMixin:
         self._periodic_no_issue_streak = 0
         return False
 
-    def _ensure_periodic_detector(self):
+    def _ensure_periodic_detector(self, active_runs: int | None = None):
         """Return (or auto-size) the CycleDetector for the current active periodic run count."""
-        active_runs = max(
-            1,
-            sum(1 for run in self._periodic_runs.values() if run.get("slots")),
-        )
-        required_lag = (
-            _PERIODIC_BASE_MAX_LAG
-            if active_runs * _PERIODIC_LAG_MULTIPLIER <= _PERIODIC_BASE_MAX_LAG
-            else min(_MAX_PERIODIC_DETECTOR_LAG, active_runs * _PERIODIC_LAG_MULTIPLIER)
-        )
-        required_bytes = max(
-            _PERIODIC_BASE_HISTORY_BYTES,
-            active_runs * _PERIODIC_HISTORY_BYTES_PER_RUN,
+        if active_runs is None:
+            active_runs = max(
+                1,
+                sum(1 for run in self._periodic_runs.values() if run.get("slots")),
+            )
+        else:
+            active_runs = max(1, active_runs)
+        # Wave-aligned landmarks collapse concurrent cohorts to O(1) lag per wave;
+        # keep max_lag bounded while scaling history bytes linearly with run count.
+        required_lag = _PERIODIC_BASE_MAX_LAG
+        required_bytes = min(
+            _MAX_PERIODIC_HISTORY_BYTES,
+            max(
+                _PERIODIC_BASE_HISTORY_BYTES,
+                active_runs * _PERIODIC_HISTORY_BYTES_PER_RUN,
+            ),
         )
         detector = self._periodic_detector
         if detector is None:
@@ -342,30 +430,34 @@ class _EnginePeriodicMixin:
             self._periodic_last = None
         return detector
 
-    def _periodic_wave_landmark(self):
+    def _periodic_wave_landmark(self, active_items=None):
         """Compute the issue-wave landmark (per-tile for 1 run; wave-aligned for >1 runs)."""
         stall_runs = max(1, len(self._periodic_stall_epoch))
         if stall_runs <= 1:
             return (self._periodic_stall_epoch, self._periodic_last_next_sum)
-        progressing_next = [
-            int(run.get("next", 0))
-            for run in self._periodic_runs.values()
-            if run.get("slots")
-            and int(run.get("next", 0)) < int(run.get("phase_end", run.get("total", 0)))
-        ]
-        wave_cursor = (
-            min(progressing_next)
-            if progressing_next
-            else self._periodic_last_next_sum
-        )
+        if active_items is None:
+            _, _, active_items = self._periodic_runs_snapshot()
+        wave_cursor = None
+        for _, run, _ in active_items:
+            nxt = int(run.get("next", 0))
+            if nxt < int(run.get("phase_end", run.get("total", 0))):
+                if wave_cursor is None or nxt < wave_cursor:
+                    wave_cursor = nxt
+        if wave_cursor is None:
+            wave_cursor = self._periodic_last_next_sum
         wave_bucket = self._periodic_last_next_sum // stall_runs
         return (self._periodic_stall_epoch, wave_cursor, wave_bucket)
 
     def _periodic_observe(self, stop_at: float):
         """Read-only periodic frontier observation on the settled Engine."""
-        if not self._periodic_runs or self._trace_maxlen > 0:
+        if not self._periodic_runs:
             return None
-        if any(run.get("indexed") for run in self._periodic_runs.values()):
+        if len(self._tasks) > _MAX_PERIODIC_LIVE_TASKS:
+            return None
+        if len(self._periodic_runs) > _MAX_PERIODIC_RUNS:
+            return None
+        indexed, total_slots, active_items = self._periodic_runs_snapshot()
+        if indexed:
             # G1 selects an indexed catalog by absolute panel. The ordered
             # phase cursor and cycle correspondence are only proven for the
             # legacy ordered template; G3 owns an exact indexed preflight.
@@ -377,21 +469,24 @@ class _EnginePeriodicMixin:
         # this observation bounded to an active cohort that can actually be
         # compared; an oversized ordinary graph keeps the detailed Engine path
         # instead of paying O(live tasks) validation on every step.
-        if len(self._tasks) > _MAX_PERIODIC_LIVE_TASKS:
+        if total_slots > _MAX_PERIODIC_LIVE_SLOTS:
             return None
-        if (len(self._periodic_runs) > _MAX_PERIODIC_RUNS
-                or sum(len(tuple(run.get("slots", ())))
-                       for run in self._periodic_runs.values()) > _MAX_PERIODIC_LIVE_SLOTS):
-            return None
-        detector = self._ensure_periodic_detector()
+        detector = self._ensure_periodic_detector(len(active_items))
         if detector is None:
             return None
-        if not self._progressable_periodic_run(detector.evidence_periods):
+        periods = detector.evidence_periods
+        progressable = False
+        for _, run, slots in active_items:
+            end = int(run.get("phase_end", run.get("total", 0)))
+            if end - int(run.get("next", 0)) > periods * len(slots):
+                progressable = True
+                break
+        if not progressable:
             # No run can reach the next comparable period, so no skip is
             # possible here.  Keep the measured interval baseline: the next
             # real observation then aggregates this whole span exactly.
             return None
-        if self._periodic_epoch_stalled(detector):
+        if self._periodic_epoch_stalled(detector, active_items):
             return None
         if (self._periodic_last is not None
                 and self._external_completions
@@ -402,12 +497,16 @@ class _EnginePeriodicMixin:
             return None
         previous = self._periodic_last
         stop_at = self._periodic_stop(stop_at)
-        landmark = self._periodic_wave_landmark()
+        landmark = self._periodic_wave_landmark(active_items)
         clock_steps = None
         if previous is not None:
             clock_steps = previous["clock_steps"]
             clock = self._periodic_clock_step
-            clock_step_limit = detector.max_lag * max(1, len(self._periodic_stall_epoch))
+            active_runs = max(1, len(self._periodic_stall_epoch))
+            clock_step_limit = min(
+                _MAX_PERIODIC_CLOCK_STEPS,
+                max(detector.max_lag, active_runs * _PERIODIC_CLOCK_STEPS_PER_RUN),
+            )
             if (clock_steps is not None and len(clock_steps) < clock_step_limit
                     and clock is not None and clock[0] == self.advance_steps == previous["advance_steps"] + 1
                     and not self._crossed_external_or_opaque(previous, stop_at)):
@@ -518,7 +617,10 @@ class _EnginePeriodicMixin:
                 raise ExecutionError("periodic_skip_missing_proved_cycle_pattern")
         self._sequence += int(total.sequence_count)
         self.allocation_event_count += int(total.allocation_event_count)
-        self.completed_count += int(total.logical_completions)
+        skipped_completions = int(total.logical_completions)
+        self.completed_count += skipped_completions
+        if self._trace_maxlen != 0 and skipped_completions > 0:
+            self.trace_dropped += skipped_completions
         for resource, amount in dict(total.service_by_resource).items():
             if resource in self.serviced:
                 self.serviced[resource] += float(amount)
@@ -557,7 +659,14 @@ class _EnginePeriodicMixin:
             if correspondence is not None:
                 self._periodic_tasks[sequence] = (
                     run_id, tile + correspondence.tile_offset, ordinal, kind)
-        for key in self._periodic_tasks:
+        skipped_runs = {
+            item.run_id
+            for item in skip.correspondence.runs
+            if item.tile_offset != 0
+        }
+        for key, meta in self._periodic_tasks.items():
+            if meta[0] not in skipped_runs:
+                continue
             task = self._tasks[key]
             if task.start is not None:
                 task.start += dt
@@ -1283,6 +1392,8 @@ class Engine(
         if dt > 0 and next_time == now:
             next_time = math.nextafter(now, math.inf)
         wave_rec = self._wave_recorder
+        hbm_touched = None
+        deliv_touched = None
         for name, consumers in rates.items():
             busy_ms[name] += dt
             for key, rate in consumers.items():
@@ -1314,9 +1425,21 @@ class Engine(
                         completable_seen.add(key)
                         heapq.heappush(completable, key)
                 if task.hbm_accounting:
-                    _sync_task_hbm_accounting(self, task)
+                    if hbm_touched is None:
+                        hbm_touched = {key: task}
+                    else:
+                        hbm_touched[key] = task
                 if task.deliveries:
-                    self._update_task_deliveries(task)
+                    if deliv_touched is None:
+                        deliv_touched = {key: task}
+                    else:
+                        deliv_touched[key] = task
+        if hbm_touched is not None:
+            for task in hbm_touched.values():
+                _sync_task_hbm_accounting(self, task)
+        if deliv_touched is not None:
+            for task in deliv_touched.values():
+                self._update_task_deliveries(task)
         return next_time
 
     def service_of(self, event: Event) -> dict[str, float]:

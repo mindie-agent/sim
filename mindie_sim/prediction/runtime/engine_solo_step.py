@@ -335,7 +335,7 @@ class _EngineSoloStepMixin:
     def _update_task_deliveries(self, task: _Task) -> None:
         if not task.deliveries:
             return
-        hbm_frac = _hbm_delivery_fraction(task)
+        hbm_frac = _hbm_delivery_fraction(task) if task.hbm_accounting else None
         if hbm_frac is not None:
             frac = hbm_frac
         else:

@@ -13,7 +13,12 @@ from collections import OrderedDict
 from collections.abc import Hashable
 from dataclasses import dataclass
 
-from .engine_state import _engine_static_key, _freeze_engine_dynamic
+from .engine_state import (
+    _clear_engine_state_caches,
+    _engine_static_key,
+    _freeze_engine_dynamic,
+    _freeze_engine_static,
+)
 from .snapshots import (
     PeriodicContractError,
     _TEMPLATE_REPR_LIMIT,
@@ -180,9 +185,14 @@ class TemplateRef:
         fingerprint: int,
         snapshot: tuple,
         nodes: int,
+        measured_bytes: int | None = None,
     ) -> "TemplateRef":
         """Build a ref directly from an internal ``_freeze_snapshot`` result."""
-        retained_bytes = _template_cost(snapshot, "")
+        retained_bytes = (
+            _template_cost(snapshot, "")
+            if measured_bytes is None
+            else measured_bytes + _TEMPLATE_OVERHEAD
+        )
         obj = object.__new__(cls)
         object.__setattr__(obj, "template_id", template_id)
         object.__setattr__(obj, "generation", generation)
@@ -221,6 +231,7 @@ class StateInterner:
         self._buckets: dict[int, list[TemplateRef]] = {}
         self._engine_buckets: dict[int, list[tuple[tuple, TemplateRef]]] = {}
         self._refs: dict[int, TemplateRef] = {}
+        self._entry_bytes: dict[int, int] = {}
         self._order: OrderedDict[int, None] = OrderedDict()
         self._next_id = 1
         self._generation: Hashable | None = None
@@ -249,8 +260,9 @@ class StateInterner:
         if self._refs.pop(ref.template_id, None) is None:
             return
         self._order.pop(ref.template_id, None)
+        entry_bytes = self._entry_bytes.pop(ref.template_id, ref.retained_bytes)
         self._retained_bytes = max(
-            0, self._retained_bytes - ref.retained_bytes)
+            0, self._retained_bytes - entry_bytes)
         bucket = self._buckets.get(ref.fingerprint)
         if bucket is not None:
             self._buckets[ref.fingerprint] = [item for item in bucket if item.template_id != ref.template_id]
@@ -284,6 +296,7 @@ class StateInterner:
         self._buckets.clear()
         self._engine_buckets.clear()
         self._refs.clear()
+        self._entry_bytes.clear()
         self._order.clear()
         self._next_id = 1
         self._generation = None
@@ -346,6 +359,7 @@ class StateInterner:
             self.rejected += 1
             return ref
         self._refs[ref.template_id] = ref
+        self._entry_bytes[ref.template_id] = ref.retained_bytes
         self._buckets.setdefault(ref.fingerprint, []).append(ref)
         self._touch(ref)
         self._retained_bytes += ref.retained_bytes
@@ -388,28 +402,31 @@ class StateInterner:
         _STATE_METRICS["template_probes"] += probes
         self.misses += 1
         build_counter = [0]
-        snapshot = _freeze_snapshot(
-            static, path="template", counter=build_counter)
+        snapshot, measured_bytes, seen = _freeze_engine_static(static, build_counter)
         _STATE_METRICS["template_builds"] += 1
         _STATE_METRICS["template_build_nodes"] += build_counter[0]
         ref = TemplateRef._from_internal_frozen(
             self._next_id, generation, fingerprint, snapshot, build_counter[0],
+            measured_bytes=measured_bytes,
         )
         self._next_id += 1
         try:
             self._live.add(ref)
         except TypeError:  # pragma: no cover - refs are weakref-able
             pass
-        if ref.retained_bytes > self.retained_bytes_limit:
+        # Account for both the frozen template and the retained lookup key.
+        admitted_bytes = ref.retained_bytes + _measure_retained(key, seen=seen)
+        if admitted_bytes > self.retained_bytes_limit:
             self.uncached += 1
             self.oversized += 1
             self.rejected += 1
             return ref
         self._refs[ref.template_id] = ref
+        self._entry_bytes[ref.template_id] = admitted_bytes
         self._engine_buckets.setdefault(
             ref.fingerprint, []).append((key, ref))
         self._touch(ref)
-        self._retained_bytes += ref.retained_bytes
+        self._retained_bytes += admitted_bytes
         self._evict_oldest()
         return ref
 
@@ -491,6 +508,7 @@ _DEFAULT_INTERNER = StateInterner(
 def reset_state_caches() -> None:
     """Reset the process-local template interner and structural counters."""
     _DEFAULT_INTERNER.clear()
+    _clear_engine_state_caches()
     reset_metrics()
 
 
