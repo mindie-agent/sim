@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Architecture governance gate (AG001..AG014) for ``mindie_sim``.
+"""Architecture governance gate (AG001..AG015) for ``mindie_sim``.
 
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
@@ -7,12 +7,13 @@
   capability sniffing, verify ISA provenance, check dispatched recipe ownership
   and physical work conservation, reject silent physical hardware defaults,
   enforce unidirectional layer imports, ensure operator Engine reachability,
-  and detect per-model-name branching across executable ``mindie_sim/`` +
-  ``manifest.json`` (AG014).
+  detect per-model-name branching across executable ``mindie_sim/`` +
+  ``manifest.json`` (AG014), and enforce zero-allowlist UML bijection,
+  production-root reachability, and Ascend/neutral hardware targets (AG015).
 [Invariants] ``AG001`` scans strictly ``mindie_sim/**/*.py`` so model catalog
   JSON files (e.g. ``qwen3.5-35b-a3b.json``) are never flagged. Governed
-  ``operators/<family>/**`` modules allow zero violations in every mode.
-  Differential mode (``--base``) subtracts violations by multiset fingerprint.
+  ``operators/<family>/**`` modules, ``AG014``, and ``AG015`` allow zero
+  violations in every mode and bypass ``--base`` differential subtraction.
 [Timeouts & Locks] Bounded local AST scans and git ls-tree/show calls; no locks
   or network access.
 [Side-Effect Policy] Read-only; never modifies repository files or git state.
@@ -33,6 +34,7 @@ from types import MappingProxyType
 
 if __package__:
     from ._arch_governance_ag012 import check_ag012  # noqa: F401
+    from ._arch_governance_ag015 import check_ag015  # noqa: F401
     from ._arch_governance_runtime import (  # noqa: F401
         DOCSTRING_HEADER_MAX_LINE, FAMILY_PKG_DEPTH, GOVERNED_PATH_DEPTH,
         MAX_FLAT_PREDICTION_MODULES, MAX_ONBOARDING_FILES, MAX_ONBOARDING_LOC,
@@ -47,6 +49,7 @@ if __package__:
     )
 else:
     from _arch_governance_ag012 import check_ag012  # noqa: F401
+    from _arch_governance_ag015 import check_ag015  # noqa: F401
     from _arch_governance_runtime import (  # noqa: F401
         DOCSTRING_HEADER_MAX_LINE, FAMILY_PKG_DEPTH, GOVERNED_PATH_DEPTH,
         MAX_FLAT_PREDICTION_MODULES, MAX_ONBOARDING_FILES, MAX_ONBOARDING_LOC,
@@ -1296,6 +1299,10 @@ def scan_repository(
     violations.extend(_check_ag008_repo_bounds([rel for rel, _ in files], texts=texts))
     violations.extend(_check_ag010_package_sccs(parsed_files))
     violations.extend(_check_ag011_operator_reachability(parsed_files))
+    violations.extend(check_ag015(
+        root, revision=revision, require_manifest=False,
+        preparsed_py=dict(parsed_files), preloaded_texts=texts,
+    ))
     if include_ag014:
         violations.extend(_ag014_manifest_for_revision(root, revision))
     violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
@@ -1303,11 +1310,16 @@ def scan_repository(
 
 
 def filter_allowlisted(violations: Sequence[Violation], /) -> tuple[Violation, ...]:
-    """Drop only tracked pre-Stage-3 legacy violations; never waive governed operators or AG014."""
+    """Drop only tracked pre-Stage-3 legacy violations; never waive governed operators, AG014, or AG015."""
     kept: list[Violation] = []
     for item in violations:
         in_pkg, _family, _fname = _is_governed_family_path(item.path)
-        if in_pkg or item.rule == "AG014" or item.rule not in LEGACY_ALLOWLIST.get(item.path.as_posix(), frozenset()):
+        if (
+            in_pkg
+            or item.rule == "AG014"
+            or item.rule.startswith("AG015")
+            or item.rule not in LEGACY_ALLOWLIST.get(item.path.as_posix(), frozenset())
+        ):
             kept.append(item)
     return tuple(kept)
 
@@ -1315,14 +1327,14 @@ def filter_allowlisted(violations: Sequence[Violation], /) -> tuple[Violation, .
 def new_violations(
     current: Sequence[Violation], baseline: Sequence[Violation], /
 ) -> tuple[Violation, ...]:
-    """Multiset differential subtraction preserving governed-package strictness."""
+    """Multiset differential subtraction preserving governed-package, AG014, and AG015 strictness."""
     remaining: Counter[tuple[str, str, str]] = Counter(
         (v.rule, v.path.as_posix(), v.fingerprint) for v in baseline
     )
     added: list[Violation] = []
     for item in current:
         in_pkg, _family, _fname = _is_governed_family_path(item.path)
-        if in_pkg or item.rule == "AG014":
+        if in_pkg or item.rule == "AG014" or item.rule.startswith("AG015"):
             added.append(item)
             continue
         key = (item.rule, item.path.as_posix(), item.fingerprint)

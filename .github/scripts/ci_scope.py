@@ -3,7 +3,9 @@
 
 [Invariants]
 - Only `pull_request` diffs touching exclusively pure documentation Markdown
-  (`*.md` outside `docs/releases/`, `data/`, and `tests/`) set `docs_only=true`.
+  (`*.md` outside `docs/releases/`, `docs/architecture*.md`, `data/`, and
+  `tests/`) set `docs_only=true`.
+- Architecture contract manifests (`docs/architecture*.md`) are never pure docs.
 - Any `push` event (`main` / `codex/**`), empty/unresolvable diff, missing
   `README.md`, or non-doc file fails closed (`docs_only=false`).
 - `verify-needs` always requires `quality == "success"`; `docs_only=false`
@@ -28,6 +30,7 @@ from typing import Sequence
 
 GIT_TIMEOUT_S = 30
 EXCLUDED_DOC_PREFIXES = ("docs/releases/", "data/", "tests/")
+ARCHITECTURE_CONTRACT_PREFIX = "docs/architecture"
 
 
 def is_pure_doc_path(rel_path: str) -> bool:
@@ -35,6 +38,8 @@ def is_pure_doc_path(rel_path: str) -> bool:
     if not rel or ".." in rel.split("/"):
         return False
     if not rel.endswith(".md"):
+        return False
+    if rel.startswith(ARCHITECTURE_CONTRACT_PREFIX) and "/" not in rel[len("docs/"):]:
         return False
     return not rel.startswith(EXCLUDED_DOC_PREFIXES)
 
@@ -54,7 +59,7 @@ def classify_pr_scope(
         return False, [], "README.md missing from repository root"
     try:
         proc = subprocess.run(
-            ["git", "-C", str(repo_root), "diff", "--name-only", "-z", f"{base_sha}...{head_sha}"],
+            ["git", "-C", str(repo_root), "diff", "--no-renames", "--name-only", "-z", f"{base_sha}...{head_sha}"],
             capture_output=True,
             text=True,
             encoding="utf-8",

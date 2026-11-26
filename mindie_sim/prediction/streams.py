@@ -733,7 +733,7 @@ def _split_shared_uncoupled_stage(
     bind_kw: dict[str, Any], pool_names: Mapping[str, str] | None,
     pool_units: Mapping[str, int] | None, stream_id: StreamId,
 ) -> Any:
-    from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
+    from mindie_sim.prediction.program.stages import KernelProgram, ParallelProgram, Stage
 
     branches = []
     for idx, (res, amt) in enumerate(stage.work.items()):
@@ -927,9 +927,11 @@ def apply_stream_owners_to_program(
     pool_names: Mapping[str, str] | None = None, pool_units: Mapping[str, int] | None = None,
 ) -> Any:
     """Recursively bind all stages of ``program`` and its wrappers to ``owners``."""
-    from mindie_sim.prediction.program import (
-        KernelProgram, NativeProgram, ParallelProgram,
-        PipelineProgram, PipelineTemplateProgram, Stage,
+    from mindie_sim.prediction.program.pipeline import (
+        PipelineProgram, PipelineTemplateProgram,
+    )
+    from mindie_sim.prediction.program.stages import (
+        KernelProgram, NativeProgram, ParallelProgram, Stage,
     )
 
     kwargs = dict(
@@ -1192,9 +1194,11 @@ def validate_program_owners(
     require_placement: bool = True,
 ) -> None:
     """Recursively validate post-binding per-owner placements and grant/release parity."""
-    from mindie_sim.prediction.program import (
-        KernelProgram, NativeProgram, ParallelProgram,
-        PipelineProgram, PipelineTemplateProgram, Stage,
+    from mindie_sim.prediction.program.pipeline import (
+        PipelineProgram, PipelineTemplateProgram,
+    )
+    from mindie_sim.prediction.program.stages import (
+        KernelProgram, NativeProgram, ParallelProgram, Stage,
     )
 
     vkw = dict(

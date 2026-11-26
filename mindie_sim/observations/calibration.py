@@ -605,120 +605,19 @@ import math
 from .resource_services import (
     RESOURCE_SERVICE_BINDING_SCHEMA,
     NormalizedResourceService,
+    _RESOURCE_PROFILE_MAX_BYTES,
+    _profile_origin,
     _profiler_service_id,
+    _resource_profile_payload,
+    attach_operator_resource_service_binding,
+    bind_operator_resource_service,
     identity_digest,
+    load_resource_profile,
     normalize_resource_service,
+    resource_service_binding,
     select_resource_service_candidate,
     service_conditions_match,
 )
-
-
-def resource_service_binding(service, *, resource_role=None, phase=None,
-                             work_unit=None, conditions=None):
-    """Generate the exact T04/T14 binding for one normalized service.
-
-    The binding names the service, the actual physical resource role, the
-    declared work unit and the phase.  If the service declares applicability
-    conditions, a real placement context must be supplied and match.  The
-    produced mapping is the one consumed by ``Execution._context`` /
-    ``_apply_resource_service_program``; it is not a whole-call duration.
-    """
-    if not isinstance(service, NormalizedResourceService):
-        service = normalize_resource_service(service)
-    if service.scope != "independent_resource" or service.kind != "resource_rate":
-        raise ValueError("resource_service_binding_requires_independent_rate")
-    role = str(resource_role or service.resource or "")
-    if role not in service.resources:
-        raise ValueError("resource_service_binding_role_not_declared:" + role)
-    unit = str(work_unit or service.work_unit)
-    if unit != service.work_unit:
-        raise ValueError(
-            "resource_service_binding_work_unit_mismatch:"
-            + service.service_id + ":" + unit + ":" + service.work_unit)
-    selected_phase = str(phase or service.phase)
-    if service.phase and selected_phase != service.phase:
-        raise ValueError(
-            "resource_service_binding_phase_mismatch:"
-            + service.service_id + ":" + selected_phase + ":" + service.phase)
-    has_conditions = bool(service.conditions or service.optional_conditions)
-    if has_conditions:
-        if conditions is None:
-            raise ValueError(
-                "resource_service_binding_requires_conditions_context:"
-                + service.service_id)
-        if not service_conditions_match(service, conditions)["applies"]:
-            raise ValueError(
-                "resource_service_binding_conditions_do_not_match:"
-                + service.service_id)
-    source = deepcopy(service.provenance.get("source")
-                      or service.provenance.get("sources"))
-    return {
-        "schema": RESOURCE_SERVICE_BINDING_SCHEMA,
-        "service_id": service.service_id,
-        "model_id": service.model_id,
-        "resource_role": role,
-        "work_unit": unit,
-        "phase": selected_phase,
-        "rate_scope": service.rate_scope,
-        "active_units": service.active_units,
-        "fixed_us": service.fixed_us,
-        "effective_rate": service.effective_rate,
-        "formula": service.formula,
-        "conditions": deepcopy(service.conditions),
-        "optional_conditions": deepcopy(service.optional_conditions),
-        "conditions_checked": has_conditions,
-        "boundary": service.boundary,
-        "resource": service.resource,
-        "resources": list(service.resources),
-        "startup_us": service.startup_us,
-        "response_us": service.response_us,
-        "work_scope": service.rate_scope,
-        "aggregate_rate": service.aggregate_rate,
-        "per_owner_rate": service.per_owner_rate,
-        "identification": deepcopy(service.identification),
-        "rate_representation": deepcopy(service.rate_representation),
-        "normalization": {**deepcopy(service.normalization),
-                          "applied_once": True},
-        "startup_once": True,
-        "fixed_once": True,
-        "source": source,
-        "production_prediction": True,
-        "legacy": False,
-    }
-
-
-def attach_operator_resource_service_binding(op, binding):
-    """Attach a previously selected binding to an OpSpec without re-selecting."""
-    if not isinstance(binding, Mapping):
-        raise ValueError("resource_service_binding_requires_mapping")
-    metadata = [(key, value) for key, value in tuple(op.metadata)
-                if key != "resource_service"]
-    previous = dict(op.metadata).get("resource_service")
-    if previous is not None and previous != dict(binding):
-        raise ValueError("resource_service_binding_already_present")
-    metadata.append(("resource_service", dict(binding)))
-    return replace(op, metadata=tuple(metadata))
-
-
-def bind_operator_resource_service(op, service, *, resource_role=None,
-                                   phase=None, work_unit=None, conditions=None):
-    """Return a new OpSpec carrying the exact T04/T14 resource-service binding.
-
-    The actual selected producer calls this once after it has chosen the
-    program/phase/context; T14 can pass the returned op to the common
-    Execution.  The binding is never inferred later from a model label or a
-    whole-call observation.
-    """
-    binding = resource_service_binding(
-        service, resource_role=resource_role, phase=phase,
-        work_unit=work_unit, conditions=conditions)
-    binding.update({
-        "op_id": getattr(op, "op_id", None),
-        "op_family": getattr(op, "family", None),
-        "op_stage": getattr(op, "stage", None),
-        "op_phase": getattr(op, "phase", None),
-    })
-    return attach_operator_resource_service_binding(op, binding)
 
 
 def bind_a5_local_service(record, *, domain, op=None, resource_role=None,
@@ -1177,140 +1076,6 @@ def apply_profiler_supply(case, source, *, recipe=None, kernel=None,
         kernels["service_regimes"] = regimes
         metadata["legacy_diagnostics"] = True
     return result
-
-_RESOURCE_PROFILE_MAX_BYTES = 50 * 1024 ** 2
-
-
-def _resource_profile_payload(source, *, source_kind=None):
-    if isinstance(source, Mapping):
-        payload = deepcopy(dict(source))
-        origin = {
-            "kind": source_kind or "in_memory",
-            "label": str(payload.get("name") or "resource_service_profile"),
-        }
-        return payload, origin
-    path = Path(source).expanduser().resolve()
-    if not path.is_file():
-        raise ValueError("resource_profile_source_missing:" + str(path))
-    size = path.stat().st_size
-    if size > _RESOURCE_PROFILE_MAX_BYTES:
-        raise ValueError("resource_profile_source_exceeds_50_mib")
-    raw = path.read_bytes()
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("resource_profile_source_requires_utf8_json") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("resource_profile_source_requires_object")
-    return payload, {
-        "kind": source_kind or "file",
-        "path": str(path),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "bytes": size,
-    }
-
-
-def _profile_origin(source):
-    """Return a preserved loaded-profile origin, never a caller request."""
-    if not isinstance(source, Mapping):
-        return None
-    if source.get("schema") != RESOURCE_SERVICE_PROFILE_SCHEMA:
-        return None
-    origin = source.get("source")
-    if not isinstance(origin, Mapping):
-        return None
-    kind = origin.get("kind")
-    if kind not in {"file", "builtin", "in_memory", "user"}:
-        return None
-    if kind == "file" and not (origin.get("path") and origin.get("sha256")):
-        return None
-    return deepcopy(dict(origin))
-
-
-def load_resource_profile(source, *, nominal_rates=None, hardware=None,
-                          source_kind=None):
-    """Load one built-in or user resource-service profile through one path.
-
-    ``source`` is a mapping (built-in profile) or a JSON file path (user
-    profile).  Exactly the same normalization runs for both.  Every declared
-    multiplier resolves against an explicit nominal rate; an incompatible or
-    incomplete profile raises instead of falling back to a nominal service.
-    """
-    preserved_origin = (_profile_origin(source)
-                        if source_kind is None else None)
-    raw, origin = _resource_profile_payload(source, source_kind=source_kind)
-    if preserved_origin is not None:
-        origin = preserved_origin
-    schema = raw.get("schema")
-    if schema == RESOURCE_SERVICE_PROFILE_SCHEMA:
-        services = raw.get("services")
-        profile_hardware = raw.get("hardware")
-        profile_scope = raw.get("scope") or "resource_and_phase_services"
-        profile_provenance = raw.get("provenance") or {}
-        profile_source = raw.get("source")
-    elif schema == RESOURCE_SERVICE_SCHEMA:
-        services = [raw]
-        profile_hardware = None
-        profile_scope = "single_resource_service"
-        profile_provenance = raw.get("provenance") or {}
-        profile_source = None
-    else:
-        raise ValueError("resource_profile_schema_unknown")
-    if not isinstance(services, (list, tuple)) or not services:
-        raise ValueError("resource_profile_requires_at_least_one_service")
-    if not isinstance(profile_provenance, Mapping):
-        raise ValueError("resource_profile_provenance_requires_mapping")
-    try:
-        profile_provenance = json.loads(json.dumps(
-            dict(profile_provenance), sort_keys=True, allow_nan=False))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("resource_profile_provenance_requires_json_values") from exc
-    if hardware and profile_hardware and str(profile_hardware) != str(hardware):
-        raise ValueError("resource_profile_hardware_mismatch")
-    effective_hardware = str(hardware or profile_hardware or "") or None
-    normalized = []
-    identifiers = set()
-    for index, service in enumerate(services):
-        if not isinstance(service, Mapping):
-            raise ValueError(f"resource_profile_service_{index}_requires_mapping")
-        item = deepcopy(dict(service))
-        conditions = item.get("conditions") or {}
-        if not isinstance(conditions, Mapping):
-            raise ValueError("resource_profile_service_conditions_requires_mapping")
-        conditions = dict(conditions)
-        if effective_hardware and not conditions.get("hardware"):
-            conditions["hardware"] = effective_hardware
-        item["conditions"] = conditions
-        provenance = item.get("provenance") or {}
-        if not isinstance(provenance, Mapping):
-            raise ValueError("resource_profile_service_provenance_requires_mapping")
-        provenance = dict(provenance)
-        provenance.setdefault("profile_source", origin)
-        item["provenance"] = provenance
-        model = normalize_resource_service(
-            item, nominal_rates=nominal_rates, hardware=effective_hardware)
-        if model.service_id in identifiers:
-            raise ValueError("resource_profile_requires_distinct_service_ids")
-        identifiers.add(model.service_id)
-        normalized.append(model)
-    formulas = {model.service_id: model.formula for model in normalized}
-    return {
-        "schema": RESOURCE_SERVICE_PROFILE_SCHEMA,
-        "source": origin,
-        "profile_source": deepcopy(profile_source),
-        "hardware": effective_hardware,
-        "scope": profile_scope,
-        "provenance": deepcopy(profile_provenance),
-        "services": [model.to_dict() for model in normalized],
-        "formulas": formulas,
-        "service_ids": [model.service_id for model in normalized],
-        "normalization": {
-            "applied_once": True,
-            "service_count": len(normalized),
-            "nominal_rates_supplied": nominal_rates is not None,
-        },
-    }
-
 
 def export_resource_profile(profile, *, path=None):
     """Export normalized parameters and formulas; write only when asked."""

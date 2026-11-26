@@ -52,7 +52,7 @@ from mindie_sim.catalog.context_parallel import (
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.workload import RequestView
 
-from .cache import _DCP_KV_SHARDED_COMPONENTS
+from mindie_sim.prediction.capacity.cache import _DCP_KV_SHARDED_COMPONENTS
 
 
 DECODE = "decode"

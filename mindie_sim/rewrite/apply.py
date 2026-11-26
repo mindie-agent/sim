@@ -297,7 +297,8 @@ def resolve_scenario(case, request: StepRequest, *, spine=None,
                      stack_id: str | None = DEFAULT_STACK_ID, primitives=None,
                      primitive_table=None) -> ResolvedScenario:
     """Lower atomic and shipping graphs against a shared declared scenario."""
-    case = Case.from_mapping(case)
+    from mindie_sim.prediction.structure import parse_case
+    case = parse_case(case)
     spine = PredictionSpine() if spine is None else spine
     resolved_stack_id, stack = _resolve_rewrite_stack(case, request, stack_id)
     atomic = _lower_prepared_step_for_rewrite(

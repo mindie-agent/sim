@@ -17,7 +17,8 @@ from typing import Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
-from .program import KernelProgram, PipelineProgram, Stage
+from .program.pipeline import PipelineProgram
+from .program.stages import KernelProgram, Stage
 
 MAX_TILES = 64
 MIN_TILE_BYTES = 4096

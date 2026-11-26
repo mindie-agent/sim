@@ -16,7 +16,8 @@ from typing import Callable, Mapping
 from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_devices
 from mindie_sim.schema.operators import OpSpec
-from .program import KernelProgram, Program, RecipeContext, Stage
+from .program.binding import RecipeContext
+from .program.stages import KernelProgram, Program, Stage
 
 
 @dataclass(frozen=True)
@@ -177,7 +178,7 @@ class OperatorPlan:
 
     def lower(self, context: RecipeContext) -> Program:
         if self.native:
-            from .program import NativeProgram
+            from .program.stages import NativeProgram
             inner = self.program(replace(context, setup_ms=0, minimum_ms=0))
             return NativeProgram(
                 inner, tuple(getattr(inner, "work", ()) or ()))

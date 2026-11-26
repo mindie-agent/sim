@@ -21,7 +21,8 @@ from mindie_sim.prediction.physical_recipe_base import (
     IO_HBM_CATEGORY, Phase, _phase_amounts, _phase_caps, _resource_categories, _tile_count,
     io_weight, phased_program, tiled_phased_program,
 )
-from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
+from mindie_sim.prediction.program.pipeline import PipelineProgram
+from mindie_sim.prediction.program.stages import KernelProgram, Stage
 from mindie_sim.prediction.program.binding import RecipeContext
 from mindie_sim.prediction.runtime.engine import Engine
 from mindie_sim.prediction.runtime.engine_types import Resource

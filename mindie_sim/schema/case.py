@@ -8,14 +8,14 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any
 
 from .hardware import Hardware
 from .model import ModelSpec, SloSpec, WorkloadSpec
 from .parallel import PARALLEL_AXIS_ALIASES, PARALLEL_SWITCHES, ParallelSpec
-from .common import ModelingError
+from .common import ModelingError, _unknown
 from . import runtime_features
 
 
@@ -373,6 +373,48 @@ class Software:
         return data
 
 
+_CASE_NORMALIZER: Callable[[Case], Case] | None = None
+
+
+def register_case_normalizer(normalizer: Callable[[Case], Case]) -> None:
+    """Register the L3 case normalizer without introducing an L0->L3 import edge."""
+    global _CASE_NORMALIZER
+    _CASE_NORMALIZER = normalizer
+
+
+def _decode_raw_case(value: Case | Mapping[str, Any]) -> Case:
+    if not isinstance(value, Mapping):
+        case = value
+        if not isinstance(case.machine, Hardware):
+            return Case(
+                Hardware.from_mapping(case.machine.to_dict()),
+                case.model,
+                case.workload,
+                Software.from_mapping(case.runtime.to_dict()),
+                case.slo,
+            )
+        return case
+    normalized = runtime_features.normalize_case_runtime(value)
+    _unknown(
+        normalized,
+        {"machine", "model", "workload", "runtime", "slo",
+         "schema", "structure_variant", "software"},
+        "case",
+    )
+    missing = {"machine", "model", "workload"} - normalized.keys()
+    if missing:
+        raise ModelingError("case_missing_fields:" + ",".join(sorted(missing)))
+    if normalized.get("structure_variant"):
+        raise ModelingError("structure_variant_retired:use_model_layer_plans_or_layer_overrides")
+    return Case(
+        machine=Hardware.from_mapping(normalized["machine"]),
+        model=ModelSpec.from_mapping(normalized["model"]),
+        workload=WorkloadSpec.from_mapping(normalized["workload"]),
+        runtime=Software.from_mapping(normalized.get("runtime", {})),
+        slo=SloSpec.from_mapping(normalized.get("slo")),
+    )
+
+
 @dataclass(frozen=True)
 class Case:
     machine: Hardware
@@ -383,8 +425,10 @@ class Case:
 
     @classmethod
     def from_mapping(cls, value):
-        from mindie_sim.prediction.structure import parse_case
-        return parse_case(value)
+        raw_case = _decode_raw_case(value)
+        if _CASE_NORMALIZER is not None:
+            return _CASE_NORMALIZER(raw_case)
+        return replace(raw_case, model=raw_case.model.normalized())
 
     def to_dict(self):
         return {

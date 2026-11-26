@@ -7,10 +7,12 @@
 [Side-Effect Policy] Returns immutable plans/operators on the shared Engine.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.kda import kda_recurrent
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = RECIPE = "vllm_ascend_recurrent_kda_arch22"
 SOURCE = {
     **kda_recurrent.SOURCE,

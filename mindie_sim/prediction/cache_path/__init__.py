@@ -64,8 +64,8 @@ from ..cache_path.geometry import (
 from ..engine import Allocation as Allocation
 from ..engine import Engine as Engine
 from ..engine import Event as Event
-from ..program import KernelProgram as KernelProgram
-from ..program import Stage as Stage
+from ..program.stages import KernelProgram as KernelProgram
+from ..program.stages import Stage as Stage
 from ..collectives.transfer import FiniteTransfer as FiniteTransfer
 from .contracts import (
     A5_LINE_BYTES,

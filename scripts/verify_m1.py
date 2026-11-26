@@ -298,7 +298,8 @@ def hygiene(args) -> dict:
     ).returncode == 0
     if has_base:
         base_gov = arch_gov.scan_repository(sim, revision=arch_gov_base)
-        gov_active = arch_gov.new_violations(raw_gov, base_gov)
+        base_non_ag015 = tuple(item for item in base_gov if not item.rule.startswith("AG015"))
+        gov_active = arch_gov.new_violations(raw_gov, base_non_ag015)
     else:
         gov_active = arch_gov.filter_allowlisted(raw_gov)
     gov_list = [

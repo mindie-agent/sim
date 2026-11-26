@@ -128,12 +128,6 @@ def recipes():
     }
 
 
-def build(op, geometry):
-    if op.recipe == KEY_POOL_RECIPE:
-        return KeyPoolRingRecipe().build(op, geometry)
-    return PoolKeyIndexerRecipe().build(op, geometry)
-
-
 def prepare_model(model, runtime, binding):
     options = binding.options
     pools = [p.index_kpool for p in model.layer_plans if p.index_kpool > 1]

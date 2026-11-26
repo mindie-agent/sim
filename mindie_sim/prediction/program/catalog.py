@@ -40,12 +40,14 @@ from mindie_sim.prediction.runtime.contracts import (
     StageSpec,
     WorkTerm,
 )
-from mindie_sim.prediction.program import (
-    KernelProgram,
-    ParallelProgram,
+from mindie_sim.prediction.program.pipeline import (
     PipelineProgram,
     PipelineTemplate,
     PipelineTemplateProgram,
+)
+from mindie_sim.prediction.program.stages import (
+    KernelProgram,
+    ParallelProgram,
     Stage,
 )
 

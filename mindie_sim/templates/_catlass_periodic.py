@@ -21,10 +21,10 @@ from math import gcd
 from typing import Any
 
 from mindie_sim.prediction.mechanism import Work
-from mindie_sim.prediction.program import (
-    KernelProgram, ParallelProgram, PipelinePhase, PipelineTemplate,
-    PipelineTemplateProgram, Stage,
+from mindie_sim.prediction.program.pipeline import (
+    PipelinePhase, PipelineTemplate, PipelineTemplateProgram,
 )
+from mindie_sim.prediction.program.stages import KernelProgram, ParallelProgram, Stage
 from mindie_sim.prediction.runtime.l2_residency import _access_plan, bind_memory_access
 from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, AddressRunPlan, ByteLedger, HbmBusSpec, MemoryAccessPattern, ReuseKey, SectorCoverage,

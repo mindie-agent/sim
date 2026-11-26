@@ -52,6 +52,7 @@
     "ascend_shared_gate_up_int32",
     "ascend_sparse_flash_attention_arch22",
     "ascend_w4a8_msd_grouped_down",
+    "ascendc_grouped_nd_bf16",
     "cann_bf16_lightning_indexer_v2_complete",
     "cann_megamoe_fusion",
     "cann_quant_lightning_indexer_v2_complete",
