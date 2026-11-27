@@ -42,6 +42,7 @@ SOURCE = {
     },
 }
 UB_BYTES = 247808
+MIN_RECURRENT_UB_BYTES = 131072
 _MAX_HEAD_DIM = 512
 _MAX_VALUE_HEADS = 256
 _MAX_QUERY_ROWS = 8
@@ -543,7 +544,9 @@ def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = N
             pool = context.pool_names.get("ub")
             if pool is None:
                 return heads_program
-            allocation = (Allocation("recurrent_buffers", pool, UB_BYTES,
+            ub_cap = int(context.pool_capacities.get("ub", UB_BYTES) or UB_BYTES)
+            ub_alloc = min(UB_BYTES, ub_cap) if ub_cap >= MIN_RECURRENT_UB_BYTES else UB_BYTES
+            allocation = (Allocation("recurrent_buffers", pool, ub_alloc,
                                      unit_group(owner, units, context.pool_units.get("ub", units))),)
             return KernelProgram((Stage("buffers", acquire=allocation),
                                   Stage("heads", after=("buffers",), program=heads_program),

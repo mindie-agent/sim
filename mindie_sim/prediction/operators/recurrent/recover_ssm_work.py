@@ -402,7 +402,13 @@ def build_gdn_arch35_recover_ssm(
             pool = context.pool_names.get("ub")
             if pool is None:
                 return heads_prog
-            alloc = (Allocation("recurrent_buffers", pool, gdn_recurrent.UB_BYTES,
+            ub_cap = int(context.pool_capacities.get("ub", gdn_recurrent.UB_BYTES) or gdn_recurrent.UB_BYTES)
+            ub_alloc = (
+                min(gdn_recurrent.UB_BYTES, ub_cap)
+                if ub_cap >= gdn_recurrent.MIN_RECURRENT_UB_BYTES
+                else gdn_recurrent.UB_BYTES
+            )
+            alloc = (Allocation("recurrent_buffers", pool, ub_alloc,
                                 unit_group(owner, units, context.pool_units.get("ub", units))),)
             return KernelProgram((Stage("buffers", acquire=alloc),
                                   Stage("heads", after=("buffers",), program=heads_prog),

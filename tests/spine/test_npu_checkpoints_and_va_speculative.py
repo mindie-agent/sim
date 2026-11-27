@@ -1021,17 +1021,18 @@ def test_kimi_k31_dspark7_c8_draft_mla_local_tp_mc2_and_mso_guard() -> None:
         _, qp_a3, _ = resolve_case_contracts(a3_cases[trk])
         assert [a.total_plane_bytes() for a in qp_a3.kv_cache_abi if a.scope == "draft"] == [656] * 5
 
-    # 3. MSO stays True across all tracks; localTP enables tp_mc2_overlap on A5 target; WY verify is target-only.
+    # 3. Shipping/proposed preserve MSO; target enables cann_megamoe_fusion (with runtime route search) + localTP MC2 + WY verify.
     for trk in ("shipping", "proposed", "target"):
-        assert a5_cases[trk].runtime.multistream_overlap_shared_expert is True
         meta_t = dict(a5_cases[trk].runtime.metadata)
         if trk == "target":
+            assert dict(meta_t.get("additional_config") or {}).get("enable_fused_mc2", 0) != 0
             assert meta_t.get("tp_mc2_overlap") is True
             assert "tp_mc2_overlap" in a5_cases[trk].runtime.lowering_passes
             assert meta_t.get("wy_cube_speculative_verify") is True
             assert meta_t.get("async_recover_ssm_commit") is True
             assert dict(a3_cases[trk].runtime.metadata).get("wy_cube_speculative_verify") is True
         else:
+            assert a5_cases[trk].runtime.multistream_overlap_shared_expert is True
             assert meta_t.get("wy_cube_speculative_verify") is None
 
     # 4. 5L DSpark decode attention at TP=1 + localTP=8 reads C8 KV bytes (576 B on A5, 656 B on A3) at 128K.

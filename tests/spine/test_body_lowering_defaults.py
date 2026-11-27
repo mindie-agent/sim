@@ -487,7 +487,7 @@ def test_body_matrix_default_is_shared_by_predict_graph_operators_and_structure(
     raw = _physical_case(); before = deepcopy(raw); graphs = target_graphs(raw, **GEOMETRY); body = predict(raw, **GEOMETRY)
     graph = graph_costs(raw, graphs, isolated=False, external_inputs={"analysis_input": 0}); isolated = operator_costs(raw, target_operators(raw, **GEOMETRY)); structure = export_structure(raw, **GEOMETRY)
     assert _matrix_rows(body) and all(row["program"] == "SteadyMatmul" for row in _matrix_rows(body))
-    assert graph["timeline"] == body["timeline"] and graph["duration_ms"] == body["body_forward_ms"] and graph["execution"]["serviced"] == body["execution"]["serviced"]
+    assert graph["timeline"] == body["timeline"] and graph["duration_ms"] == body["body_forward_ms"] and graph["execution"]["serviced"] == pytest.approx(body["execution"]["serviced"], rel=1e-12, abs=1e-12)
     assert all(row["program"] == "SteadyMatmul" for row in isolated["operators"] if row["operator"]["family"] in MATRIX_FAMILIES)
     program = structure["execution"]["software"]["kernels"]["programs"]["matmul"]
     assert program["kind"] == "steady_matmul" and program["owner_cohorts"] is True

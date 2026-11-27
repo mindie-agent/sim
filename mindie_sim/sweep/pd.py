@@ -142,6 +142,8 @@ _AUTO_LOCAL_TP_AXES = (
     "lm_head_tp",
 )
 _AUTO_LOCAL_TP_WIDTHS = (8, 16)
+_AUTO_LOCAL_TP_MIN_DP = 32
+_VRAM_BRACKET_DOUBLING_FACTOR = 2
 _PREFILL_PCP_WIDTHS = (1, 2, 4)
 PREFILL_PCP_MIN_PROMPT_TOKENS = 1024
 DEFAULT_CHUNKED_PREFILL_TOKENS = 8192
@@ -2657,13 +2659,21 @@ def _emit_auto_local_tp_candidates(
     ep: int,
     dcp_choices: Sequence[int],
     pinned: Mapping[str, int],
+    ranks_per_node: int | None = None,
 ) -> None:
-    """Append intra-node ``TP=1 + Local-TP`` high-DP MoE candidates when unpinned."""
+    """Append intra-node ``TP=1 + Local-TP`` high-DP multi-node MoE candidates when unpinned."""
+    if dp < _AUTO_LOCAL_TP_MIN_DP:
+        return
     if any(k in pinned for k in _LOCAL_TP_AXES):
         return
     if int(pinned.get("tp", 1)) != 1:
         return
-    for ltp in _AUTO_LOCAL_TP_WIDTHS:
+    widths: tuple[int, ...] = (
+        (int(ranks_per_node),)
+        if (ranks_per_node is not None and int(ranks_per_node) in _AUTO_LOCAL_TP_WIDTHS)
+        else _AUTO_LOCAL_TP_WIDTHS
+    )
+    for ltp in widths:
         if dp < ltp or dp % ltp != 0:
             continue
         ltp_map = {axis: ltp for axis in _AUTO_LOCAL_TP_AXES}
@@ -3734,18 +3744,30 @@ def _solve_b_vram_max(
     )
     if ok_top:
         cap_lim = max(0, int(cap_bound)) if cap_bound is not None else None
-        best_b, best_mem = upper, mem_top
-        while cap_lim is None or best_b < cap_lim:
+        lo, best_mem = upper, mem_top
+        if cap_lim is not None and lo >= cap_lim:
+            return _store(best_mem, lo)
+        step = 1
+        hi: int | None = None
+        while True:
+            probe = lo + step
+            if cap_lim is not None and probe > cap_lim:
+                probe = cap_lim
             ok_next, mem_next = _fits_vram_batch(
-                parsed, cand_b=best_b + 1, base_ws=base_ws, decode_q=q_step, seq_len=seq_len,
+                parsed, cand_b=probe, base_ws=base_ws, decode_q=q_step, seq_len=seq_len,
             )
-            if not ok_next:
+            if ok_next:
+                lo = probe
+                best_mem = mem_next
+                if cap_lim is not None and lo >= cap_lim:
+                    return _store(best_mem, lo)
+                step *= _VRAM_BRACKET_DOUBLING_FACTOR
+            else:
+                hi = probe
                 break
-            best_b += 1
-            best_mem = mem_next
-        return _store(best_mem, best_b)
-    lo, hi = 1, upper
-    best_mem = b1_mem
+    else:
+        lo, hi = 1, upper
+        best_mem = b1_mem
     while lo + 1 < hi:
         mid = (lo + hi) // 2
         ok_mid, mem_mid = _fits_vram_batch(
@@ -4015,6 +4037,8 @@ def _certified_sla_next_probes(
 
     best_b, best_t, max_feas_b = _select_best_feasible_batch(memo, hi_cut, sla_ms)
     best_tps = (float(best_b) / float(best_t)) if (best_b >= 1 and best_t is not None and best_t > 0.0) else -1.0
+    capture_set = frozenset(int(c) for c in capture_bs)
+    max_cap = max(capture_set, default=0)
     pts = sorted(k for k in memo if 1 <= k <= hi_cut)
     active_intervals: list[tuple[float, int, int, int]] = []
     for lo_i, hi_i in zip(pts, pts[1:]):
@@ -4028,6 +4052,19 @@ def _certified_sla_next_probes(
         )
         sla_max_dom = (hi_i - 1) <= max_feas_b
         if tps_dom and sla_max_dom:
+            continue
+        inner_caps = [c for c in capture_set if lo_i < c < hi_i and c not in memo]
+        hi_strictly_padded = bool(capture_set and hi_i not in capture_set and hi_i < max_cap)
+        has_pad_cliff = bool(hi_strictly_padded and inner_caps)
+        t_lo = float(memo[lo_i])
+        t_hi = float(memo[hi_i])
+        if (
+            best_b >= 1
+            and sla_max_dom
+            and not has_pad_cliff
+            and 0.0 < t_lo <= t_hi <= sla_ms + PARETO_EPS
+            and (float(lo_i) / t_lo) < (float(hi_i) / t_hi) - PARETO_EPS
+        ):
             continue
         active_intervals.append((-ub, -(hi_i - lo_i), lo_i, hi_i))
     if not active_intervals:

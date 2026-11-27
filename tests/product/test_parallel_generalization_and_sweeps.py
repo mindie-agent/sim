@@ -102,10 +102,11 @@ def test_composable_local_tp_all_axes_model_scope_and_idle_ffn_symmetry():
 
     for r, ops in g_model.items():
         ltp_ops = [op for op in ops if dict(op.metadata).get("group_axis") == "local_tp"]
-        assert len(ltp_ops) == 42, f"rank {r} missing model-scope local_tp collectives"
+        assert len(ltp_ops) == 38, f"rank {r} local_tp collective count mismatch after shared-input gather dedup"
         _assert_local_tp_wire_floor(ltp_ops, f"combo:r{r}")
         ltp_ids = {op.op_id for op in ltp_ops}
-        assert {"logits:local_tp:gather", "logits", "s0.l0.q_a:local_tp:gather", "s0.l0.output", "s0.l0.down", "s0.l3.shared.down"} <= ltp_ids
+        assert {"logits:local_tp:gather", "logits", "s0.l0.q_a:local_tp:gather", "s0.l0.kv_a", "s0.l0.output", "s0.l0.down", "s0.l3.shared.down"} <= ltp_ids
+        assert "s0.l0.kv_a:local_tp:gather" not in ltp_ids
 
     # Remaining 2 Local-TP axes (dcp_linear_tp & linear_proj_tp): exact analytical wire floors.
     for model_id, axis_kw in (

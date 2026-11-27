@@ -621,6 +621,8 @@ def _resolve_ladder_stack_id(case: Case, stack_id: str | None) -> str:
 
 
 _RECURRENT_WY_ATTN_KINDS = frozenset({"kda", "gdn"})
+_WY_SYNTH_MAX_TRIALS = 2
+_WY_FAST_PROBE_TRIAL_LIMIT = 1
 
 
 def _case_supports_recurrent_wy_target(case: Case, request: StepRequest) -> bool:
@@ -677,9 +679,10 @@ def _synthesize_recurrent_wy_target(
     primitive_table: CapacityTable | None,
     allow_unbound_formula: bool,
     max_trials: int,
+    framework_seed: FrameworkSolveResult | None = None,
 ) -> tuple[Any, Any] | None:
     """Evaluate target-track WY Cube verify + async RecoverSSM commit candidate dossier."""
-    from mindie_sim.rewrite.oracle import ScenarioRequest, prepare_scenario
+    from mindie_sim.rewrite.oracle import ScenarioRequest, finalize_plan, prepare_scenario
 
     if eff_stack_id.strip().lower() in {"raw-eager", "raw_eager"}:
         return None
@@ -694,19 +697,53 @@ def _synthesize_recurrent_wy_target(
         primitive_table=primitive_table,
         allow_unbound_formula=bool(allow_unbound_formula),
     )
-    t_pricing = _build_stage_pricing(_resolved(target_dossier))
-    t_fw = solve_framework(
-        target_dossier,
-        dual_report=t_pricing,
-        max_trials=max_trials,
-        track_override="proposed",
-        stages=("F1_local_k1",),
+    seed_u_eval = _field(target_dossier, "unmerge_eval", "unmerge")
+    seed_m_eval = _field(target_dossier, "mainline_eval", "mainline")
+    seed_u_ns = _wall(seed_u_eval)
+    seed_m_ns = _wall(seed_m_eval)
+    _, best_plan = _seed_plans(target_dossier)
+    best_eval = seed_m_eval
+    best_ns = seed_m_ns
+    if framework_seed is not None and framework_seed.best_plan.edits:
+        try:
+            seeded_eval = finalize_plan(target_dossier.handle, framework_seed.best_plan)
+        except TimeoutError:
+            raise
+        except (ModelingError, ValueError, KeyError):
+            seeded_eval = None
+        if seeded_eval is not None and _accepted(seeded_eval) and _wall(seeded_eval) <= best_ns:
+            best_plan = framework_seed.best_plan
+            best_eval = seeded_eval
+            best_ns = _wall(seeded_eval)
+    t_fw = FrameworkSolveResult(
+        best_plan=best_plan,
+        best_eval=best_eval,
+        best_wall_ns=best_ns,
+        seed_u_ns=seed_u_ns,
+        seed_m_ns=seed_m_ns,
+        stage_history=(("WY_seed", best_ns, "seed"),),
+        loo_impacts=(),
+        tried_candidates=1,
     )
+    if int(max_trials) <= _WY_FAST_PROBE_TRIAL_LIMIT:
+        if not _accepted(best_eval):
+            return None
+        return target_dossier, UnifiedRegionSolveResult(
+            best_plan=best_plan,
+            best_eval=best_eval,
+            best_wall_ns=best_ns,
+            catlass_specs=(),
+            dsl_specs=(),
+            fuse_specs=(),
+            stage_history=(("WY_seed", best_ns, "seed"),),
+            tried_candidates=1,
+        )
+    t_pricing = _build_stage_pricing(_resolved(target_dossier))
     t_unified = solve_unified_regions(
         target_dossier,
         t_fw,
         dual_report=t_pricing,
-        max_trials=max_trials,
+        max_trials=min(int(max_trials), _WY_SYNTH_MAX_TRIALS),
         allow_target_synthesis=True,
     )
     if not _accepted(t_unified.best_eval):
@@ -868,6 +905,7 @@ def solve_five_level_ladder(
         primitive_table=primitive_table,
         allow_unbound_formula=allow_unbound_formula,
         max_trials=max_trials,
+        framework_seed=framework,
     )
     if wy_cand is not None and wy_cand[1].best_wall_ns < dsl.best_wall_ns:
         dsl_dossier, dsl = wy_cand
@@ -1518,6 +1556,7 @@ def _evaluate_stage3_target(
             primitive_table=primitive_table,
             allow_unbound_formula=allow_unbound_formula,
             max_trials=max_trials,
+            framework_seed=framework_result,
         )
         if wy_cand is not None:
             wy_eval = _step(wy_cand[1].best_eval)
@@ -1579,7 +1618,13 @@ def solve_target_step_receipt(
     parsed_case = Case.from_mapping(case)
     eff_stack_id = _resolve_ladder_stack_id(parsed_case, stack_id)
     eff_case = _normalize_case_for_stack_override(parsed_case, eff_stack_id)
-    base_case = _with_recurrent_wy_flags(eff_case, enabled=False)
+    eff_meta = dict(eff_case.runtime.metadata) if eff_case.runtime.metadata else {}
+    caller_has_wy = bool(
+        stack_track == "target"
+        and eff_meta.get("wy_cube_speculative_verify")
+        and eff_meta.get("async_recover_ssm_commit")
+    )
+    base_case = eff_case if caller_has_wy else _with_recurrent_wy_flags(eff_case, enabled=False)
     eff_spine = _ensure_spine_for_stack(spine, eff_stack_id)
     ext_plan = load_rewrite_plan(rewrite_plan) if rewrite_plan is not None else None
     budget = EvalBudget(deadline_mono=replay.deadline_mono)
@@ -1659,7 +1704,7 @@ def solve_target_step_receipt(
         max_trials=max_trials,
         allow_unbound_formula=allow_unbound_formula,
         stack_id=eff_stack_id,
-        eff_case=eff_case,
+        eff_case=(None if caller_has_wy else eff_case),
         request=request,
         replay=replay,
         eff_spine=eff_spine,

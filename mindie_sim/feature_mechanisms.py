@@ -284,18 +284,6 @@ def _cann_megamoe_routed_only(model: ModelSpec) -> bool:
     )
 
 
-def _cann_megamoe_sacrifices_shared_expert_mso(ctx: MechanismContext) -> bool:
-    if "enable_fused_mc2" in ctx.caller_explicit or "moe_comm_mode" in ctx.caller_explicit:
-        return False
-    if int(ctx.parallel.get("ep", 1) or 1) <= 1:
-        return False
-    has_moe_shared_expert = any(
-        p.ffn == "moe" and int(getattr(p, "num_shared_experts", 0) or 0) > 0
-        for p in ctx.model.layer_plans
-    )
-    return has_moe_shared_expert and _cann_megamoe_routed_only(ctx.model)
-
-
 def _has_dspark_mla_draft(model: ModelSpec) -> bool:
     aux = getattr(model, "auxiliary", None)
     dspark = getattr(aux, "dspark", None) if aux is not None else None
@@ -315,8 +303,6 @@ def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if not _ep_within_ub_domain(ctx):
         return
     if int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) > 0:
-        return
-    if _cann_megamoe_sacrifices_shared_expert_mso(ctx):
         return
     routed_only = _cann_megamoe_routed_only(ctx.model)
     default_mode = FUSED_MC2_ROUTED_MODE if routed_only else FUSED_MC2_SHARED_MODE
@@ -690,7 +676,6 @@ def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
                 and any(p.ffn == "moe" for p in ctx.model.layer_plans)
                 and _is_mxfp_moe(ctx)
                 and _model_supports_shipping_megamoe_activation(ctx)
-                and not _cann_megamoe_sacrifices_shared_expert_mso(ctx)
             ),
             apply=_apply_cann_megamoe,
         ),
