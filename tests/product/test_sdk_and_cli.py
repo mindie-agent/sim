@@ -1138,3 +1138,100 @@ def test_report_monotonicity_guard_uses_operators_and_preserves_disaggregated_po
     assert retry["pd_pool_summary"]["used_dies"] == 2
     assert retry["request"].sequences == 2
 
+
+def test_report_monotonicity_retry_preserves_solved_prefill_chunk_budget(tmp_path, monkeypatch):
+    """Monotonicity exclusion retry keeps solved prefill max_num_batched_tokens (2x8192 chunks for 16K)."""
+    from dataclasses import replace as dc_replace
+    from mindie_sim.cli.parser import build_parser
+    from mindie_sim.cli import report as report_mod
+    from mindie_sim.sweep import pd as pd_mod
+
+    p_case = compose_raw_case(
+        "qwen3-32b", "a3", tp=1, dp=1, ep=1, layers=1,
+        prompt_tokens=16384, output_tokens=32, quant="w8a8_dynamic",
+        role="pd_prefill", ttft_slo_ms=5000.0,
+        max_num_batched_tokens=8192, enable_chunked_prefill=True,
+    )
+    d_case = compose_raw_case(
+        "qwen3-32b", "a3", tp=1, dp=1, ep=1, layers=1,
+        prompt_tokens=16384, output_tokens=32, quant="w8a8_dynamic",
+        role="pd_decode", tpot_slo_ms=50.0,
+    )
+    p_case["runtime"].setdefault("metadata", {})["mqsmla_dsl_544_320_active"] = False
+    pd_summary = {
+        "pd_ratio": "1P:1D",
+        "pd_transfer_mode": "layerwise_overlap_d2d",
+        "prefill_instances": 1,
+        "decode_instances": 1,
+        "prefill_used_dies": 1,
+        "decode_used_dies": 1,
+        "used_dies": 2,
+        "handoff_tpot_ms": 0.0,
+        "prefill_kv_rps": 10.0,
+        "e2e_total_tps": 320.0,
+    }
+
+    def _fake_solve(*_a, **_kw):
+        return {
+            "feasible": True,
+            "winner_mode": "pd_disaggregated",
+            "best_configuration": {
+                "deployment_mode": "pd_disaggregated",
+                "pd_transfer_mode": "layerwise_overlap_d2d",
+                "prefill_parallel": {"dp": 1, "tp": 1, "ep": 1, "pp": 1, "pcp": 1, "cp": 1},
+                "decode_parallel": {"dp": 1, "tp": 1, "ep": 1, "pp": 1, "pcp": 1, "cp": 1},
+                "b_feasible": 1,
+                "b_vram_max": 2,
+                "mtp_proposal_tokens": 0,
+                "handoff_tpot_ms": 0.0,
+                "used_dies": 2,
+                "e2e_total_tps": 320.0,
+                "prefill_kv_rps": 10.0,
+            },
+            "prefill_case": p_case,
+            "decode_case": d_case,
+            "recommended_case": p_case,
+            "pd_pool_summary": dict(pd_summary),
+        }
+
+    orig_build = report_mod.build_export_bundle
+    retry_cases: list[tuple[dict, object]] = []
+    saved_bundles: list[object] = []
+    call_idx = {"n": 0}
+
+    def _stub_build_bundle(raw_case, **kw):
+        call_idx["n"] += 1
+        if call_idx["n"] == 3:
+            retry_cases.append((raw_case, kw.get("request")))
+            return dc_replace(saved_bundles[0], step_span_us=9.5)
+        bundle = orig_build(raw_case, **dict(kw, apply_target_envelope=False))
+        saved_bundles.append(bundle)
+        if call_idx["n"] == 1:
+            return dc_replace(bundle, step_span_us=10.0)
+        if call_idx["n"] == 2:
+            dsl_op = dc_replace(bundle.operators[0], ascend_kernel="tilelang_dsl.mixed_quant_sparse_flash_mla")
+            return dc_replace(bundle, step_span_us=11.0, operators=(dsl_op, *bundle.operators[1:]))
+        return bundle
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "report", "--model", "qwen3-32b", "--hardware", "a3", "--num-devices", "2",
+        "--phase", "prefill", "--prompt-tokens", "16384", "--output-tokens", "32",
+        "--ttft-ms", "5000", "--tpot-ms", "50", "--weight-quant", "w8a8_dynamic",
+        "--deployment-mode", "pd_disaggregated", "--mode", "modeling",
+        "--no-xlsx", "--no-trace", "--json", "--out-dir", str(tmp_path / "pd_prefill_retry"),
+    ])
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "solve_optimal_deployment", _fake_solve)
+        mp.setattr(report_mod, "build_export_bundle", _stub_build_bundle)
+        receipt = report_mod.run_report_command(args)
+
+    assert receipt["ok"] is True
+    assert len(retry_cases) == 1
+    alt_case, alt_req = retry_cases[0]
+    assert int(alt_case["runtime"]["max_num_batched_tokens"]) == 8192
+    assert bool(alt_case["runtime"]["enable_chunked_prefill"]) is True
+    chunks = report_mod._colocated_prefill_requests(alt_case, alt_req)
+    assert len(chunks) == 2
+    assert [(c.tokens, c.context) for c in chunks] == [(8192, 0), (8192, 8192)]
+

@@ -835,3 +835,105 @@ def test_trace_replacement_generation_blocks_epoch_on_deque_address_reuse() -> N
         assert eng._accel._trace_blocks_epoch(eng) is True
     finally:
         eng.close()
+
+
+def test_mc2_preflight_forwards_requires_peer_collectives_for_megamoe() -> None:
+    """Preflight forwards requires_peer_collectives so MegaMoE + overlapping MC2 never disagrees with replay."""
+    from mindie_sim.prediction.runtime.dp_cohort_dedup import (
+        _has_unsynced_peer_die_overlap,
+        evaluate_dp_cohort_dedup,
+    )
+    from mindie_sim.schema.operators import IterationWork, OpSpec
+    from mindie_sim.schema.workload import IterationPlan
+
+    mc2_phase = {"kind": "dispatch", "ep": 4, "experts": 8, "uniform_payload_bytes": 1024.0}
+    link = SimpleNamespace(name="hccs", semantics="fully_connected", members=(0, 1, 2, 3))
+    topo = SimpleNamespace(
+        namespace="",
+        links={"hccs": link},
+        ranks=lambda rep, _stg: (rep * 2, rep * 2 + 1),
+        groups=lambda _axis, _rep, _stg: ((0, 1, 2, 3),),
+    )
+    eng = SimpleNamespace(
+        resources={}, memory=None, _memory_grants={}, _trace_maxlen=0, _wave_recorder=None,
+    )
+    ex = SimpleNamespace(
+        topology=topo,
+        engine=eng,
+        readiness_report=None,
+        participant_profile=None,
+        legacy_diagnostics=None,
+        regimes=None,
+        stream_owners=None,
+        stream_quota_by_res=None,
+        stars_queues=None,
+        offload_policy=None,
+        _joint_collective_trace=None,
+        case=SimpleNamespace(runtime=SimpleNamespace(parallel=SimpleNamespace(pp=1))),
+        _verify_canonical_cohort_reciprocity=lambda *_a, **_kw: (True, 4, (0, 1)),
+    )
+    op_mc2 = OpSpec(
+        "s0.l0.mc2", "mc2_protocol", "decode", 0, 0, (), (8, 64), (8, 64), (8, 64), (8, 64),
+        dtype="bf16", stream="main", metadata=(("mc2_phase", mc2_phase), ("group_axis", "ep")),
+    )
+    op_gemm = OpSpec(
+        "s0.l0.gemm", "gemm", "decode", 0, 0, (), (8, 64), (8, 64), (8, 64), (8, 64),
+        dtype="bf16", stream="aux",
+    )
+    w0 = IterationWork((op_mc2, op_gemm), IterationPlan(()), 1, 8, 8, None, "graph", "declared_graph")
+    assert _has_unsynced_peer_die_overlap(ex, w0, 0, replicas=(0, 1), requires_peer_collectives=False) is False
+    assert _has_unsynced_peer_die_overlap(ex, w0, 0, replicas=(0, 1), requires_peer_collectives=True) is True
+
+    op_mega = OpSpec(
+        "s0.l1.mega", "moe", "decode", 0, 1, ("s0.l0.mc2", "s0.l0.gemm"),
+        (8, 64), (8, 64), (8, 64), (8, 64), dtype="bf16", stream="main",
+        link_bytes=1024.0,
+        metadata=(("megamoe_geometry", {"ep": 4}), ("group_axis", "ep")),
+    )
+    w_mega = IterationWork(
+        (op_mc2, op_gemm, op_mega), IterationPlan(()), 1, 8, 8, None, "graph", "declared_graph",
+    )
+    elig = evaluate_dp_cohort_dedup(ex, {0: w_mega, 1: w_mega})
+    assert elig.symmetric is False
+    assert elig.reason == "unsynced_peer_die_overlap"
+
+
+def test_dense_multistream_dp_dedup_skips_dag_reachability_masks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dense multi-stream DP chains with zero collectives never allocate O(N^2) reachability masks."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.runtime import dp_cohort_dedup
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import IterationWork, OpSpec
+    from mindie_sim.schema.workload import IterationPlan
+
+    raw = compose_case(
+        "qwen3-32b", "a3", dp=2, tp=1, ep=1, layers=1,
+        prompt_tokens=128, output_tokens=16, quant="w8a8_dynamic",
+    )
+    parsed = parse_case(raw)
+    ops = []
+    prev_id = ()
+    for idx in range(16):
+        op_id = f"s0.l0.g{idx}"
+        ops.append(OpSpec(
+            op_id, "gemm", "decode", 0, 0, prev_id, (8, 64, 64), (8, 64, 64), (8, 64, 64), (8, 64, 64),
+            flops=1024.0, hbm_bytes=512.0, mte2_bytes=256.0, mte3_bytes=256.0,
+            dtype="bf16", stream=("main" if idx % 2 == 0 else "aux"),
+        ))
+        prev_id = (op_id,)
+    work = IterationWork(tuple(ops), IterationPlan(()), 1, 8, 8, None, "graph", "declared_graph")
+
+    def _forbid_masks(_ops):
+        raise AssertionError("dag_reachability_masks_must_not_run_without_collectives")
+
+    monkeypatch.setattr(dp_cohort_dedup, "_dag_reachability_masks", _forbid_masks)
+    ex = Execution(parsed, CostModel(parsed))
+    try:
+        steps = ex.add_group({0: work, 1: work}, 0.0)
+        ex.engine.advance()
+        assert set(steps) == {0, 1}
+        assert getattr(ex, "_dedup_cohorts", None)
+    finally:
+        ex.engine.close()

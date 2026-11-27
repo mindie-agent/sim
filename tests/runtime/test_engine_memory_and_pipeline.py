@@ -968,3 +968,54 @@ def test_coalesce_execution_program_zero_unroll_limit_no_exponential_blowup_and_
     assert sig_first == sig_cached == sig_fresh
 
 
+def test_empty_pipeline_with_setup_or_minimum_span_resolves_cleanly():
+    """Zero-tile pipelines with setup_ms and/or minimum_ms resolve without unresolved futures."""
+    for slots, setup_ms, minimum_ms, expected in (
+        (2, 1.0, 0.0, 1.0),
+        (1, 1.0, 0.0, 1.0),
+        (2, 0.0, 2.5, 2.5),
+        (2, 1.0, 2.5, 3.5),
+        (2, 0.0, 0.0, 0.0),
+    ):
+        eng = Engine([Resource("cube", 10.0)], backend="python")
+        try:
+            ready = eng.submit("ready")
+            done = PipelineProgram(
+                0, slots, lambda _i: (), setup_ms=setup_ms, minimum_ms=minimum_ms,
+            ).start(eng, "empty_pipe", ready)
+            eng.advance()
+            assert done.done and done.time == pytest.approx(expected)
+            assert eng.summary()["live_tasks"] == 0
+            assert eng.summary()["live_programs"] == 0
+        finally:
+            eng.close()
+
+
+def test_intern_pool_set_bounds_distinct_subsets_without_unbounded_retention():
+    """Submitting thousands of distinct pool subsets bounds both Engine intern indexes."""
+    from mindie_sim.prediction.runtime.accel_tables import _inert_pool_set
+    from mindie_sim.prediction.runtime.engine import _ENGINE_POOL_SET_CACHE_LIMIT
+
+    pool_names = [f"p{i}" for i in range(20)]
+    eng = Engine(
+        [Resource("r0", 100.0)],
+        pools={name: 1024.0 for name in pool_names},
+        backend="python",
+    )
+    try:
+        uninterned_sample = None
+        for mask in range(1, 4097):
+            subset = tuple(pool_names[bit] for bit in range(20) if (mask >> bit) & 1)
+            ev = eng.submit(f"t{mask}", {"r0": 1.0}, memory_pools=subset)
+            if mask == 4096:
+                uninterned_sample = eng._tasks[ev.sequence].memory_pools
+        eng.advance()
+        assert eng.summary()["live_tasks"] == 0
+        assert len(eng._engine_pool_sets) <= _ENGINE_POOL_SET_CACHE_LIMIT
+        assert len(eng._engine_pool_set_ids) <= _ENGINE_POOL_SET_CACHE_LIMIT
+        assert uninterned_sample is not None
+        assert _inert_pool_set(uninterned_sample, eng) is False
+    finally:
+        eng.close()
+
+

@@ -641,6 +641,27 @@ def _summarize_iso_sla_state(
     }
 
 
+def _resolve_prefill_tokens_and_context(
+    solved: Mapping[str, Any],
+    parsed_case: Any,
+    prompt_tokens: int,
+) -> tuple[int, int]:
+    """Return evaluated ``(query_tokens, context_tokens)`` honoring persisted pooled prefix hits."""
+    for source in (solved.get("best_configuration"), solved.get("pd_pool_summary"), solved):
+        if not isinstance(source, Mapping):
+            continue
+        raw_q = source.get("effective_prefill_tokens")
+        raw_ctx = source.get("prefix_hit_tokens")
+        if raw_q is not None:
+            q_tok = max(1, int(raw_q))
+            ctx_tok = max(0, int(raw_ctx or 0))
+            return q_tok, ctx_tok
+        if raw_ctx is not None:
+            ctx_tok = max(0, min(int(raw_ctx), max(0, int(prompt_tokens) - 1)))
+            return max(1, int(prompt_tokens) - ctx_tok), ctx_tok
+    return _prefill_prefix_split(parsed_case, int(prompt_tokens))
+
+
 def _bundle_inputs_for_solution(
     solved: Mapping[str, Any],
     *,
@@ -673,7 +694,9 @@ def _bundle_inputs_for_solution(
     seq = max(1, int(best.get("b_feasible", 1) or 1))
     mtp_n = int(best.get("mtp_proposal_tokens", 0) or 0)
     if is_prefill_only:
-        p_tokens, p_context = _prefill_prefix_split(parse_case(rec_case), int(prompt_tokens))
+        p_tokens, p_context = _resolve_prefill_tokens_and_context(
+            solved, parse_case(rec_case), int(prompt_tokens),
+        )
         req = StepRequest(
             phase="prefill", tokens=p_tokens, context=p_context,
             sequences=1, scope=scope,
@@ -833,7 +856,7 @@ def _evaluate_winner_analysis(
     win_phase = "prefill" if is_prefill_only else "decode"
     win_seq = 1 if is_prefill_only else max(1, int((best or {}).get("b_feasible", 1) or 1))
     if is_prefill_only:
-        win_tokens, win_context = _prefill_prefix_split(parsed_rec, prompt)
+        win_tokens, win_context = _resolve_prefill_tokens_and_context(solved, parsed_rec, prompt)
     else:
         win_tokens, win_context = 1 + win_mtp, prompt
     win_scope = "model"

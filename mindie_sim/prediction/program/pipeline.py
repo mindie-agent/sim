@@ -263,6 +263,8 @@ class PipelineProgram:
             engine.submit(name + ":span", after=(setup,), latency=self.minimum_ms, owner=owner)
             if self.minimum_ms else None
         )
+        if self.count == 0:
+            return observation if observation is not None else setup
         static_result = self._try_start_static_dag(engine, name, setup, observation, scoped, owner)
         if isinstance(static_result, Event):
             return static_result

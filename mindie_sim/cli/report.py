@@ -74,6 +74,10 @@ TOKEN_MULTIPLIERS = {"": 1, "k": 1024, "m": 1024 * 1024}
 SAFE_PREFIX_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _URL_PREFIXES = ("http://", "https://")
 _PARALLEL_AXES = ("dp", "tp", "ep", "pp", "dcp", "pcp")
+_LOCAL_TP_AXES = (
+    "q_proj_tp", "o_proj_tp", "linear_proj_tp", "dcp_linear_tp",
+    "mlp_tp", "shared_expert_tp", "lm_head_tp",
+)
 _DEPLOYMENT_MODE_CHOICES = ("colocated", "pd_disaggregated", "pd_prefill", "pd_decode")
 _KV_POOLING_CHOICES = ("auto", "off", "pooled_dram_ssd", "layerwise_overlap_d2d", "direct_blocking_d2d")
 
@@ -409,6 +413,63 @@ def _auto_solve_report_layout(
         "infeasible_outcome": infeasible_outcome,
         "solved": solved,
     }
+
+
+def _winning_role_compose_overrides(
+    raw_case: Mapping[str, Any],
+    *,
+    dep_mode: str,
+    eff_phase: str,
+    default_spec_tokens: int,
+) -> tuple[dict[str, int], dict[str, Any]]:
+    """Extract the winning solved role configuration (parallel, chunking/batch limits, MTP, prefix)."""
+    parsed = parse_case(raw_case)
+    rt = parsed.runtime
+    par = rt.parallel
+    raw_rt = raw_case.get("runtime") or {}
+    raw_rt_meta = raw_rt.get("metadata") or {}
+    win_par = {
+        "dp": int(par.dp), "tp": int(par.tp), "ep": int(par.ep),
+        "pp": int(par.pp), "dcp": int(par.cp), "pcp": int(par.pcp),
+    }
+    local_tp = {
+        axis: int(getattr(par, axis))
+        for axis in _LOCAL_TP_AXES
+        if int(getattr(par, axis, 1) or 1) > 1
+    }
+    win_reqs = tuple(getattr(getattr(parsed, "workload", None), "requests", ()) or ())
+    win_prefix = int(getattr(win_reqs[0], "prefix_tokens", 0) or 0) if win_reqs else 0
+    role_mode = (
+        ("pd_prefill" if eff_phase == "prefill" else "pd_decode")
+        if dep_mode == "pd_disaggregated" else dep_mode
+    )
+    raw_spec = raw_rt.get("mtp_proposal_tokens")
+    if raw_spec is None:
+        stack_req = (
+            ((raw_rt_meta.get("stack_binding") or {}).get("contract_inputs") or {})
+            .get("requested_options") or {}
+        )
+        raw_spec = stack_req.get("num_speculative_tokens")
+    win_mtp = int(raw_spec) if raw_spec is not None else int(default_spec_tokens)
+    overrides: dict[str, Any] = {
+        "deployment_mode": role_mode,
+        "max_num_seqs": int(rt.max_num_seqs),
+        "max_num_batched_tokens": int(rt.max_num_batched_tokens),
+        "enable_chunked_prefill": bool(rt.enable_chunked_prefill),
+        "max_model_len": int(rt.max_model_len),
+        "mtp_proposal_tokens": win_mtp,
+        "mtp_acceptance_length": float(rt.mtp_acceptance_length),
+    }
+    if local_tp:
+        overrides["local_tp_axes"] = local_tp
+    if win_prefix > 0:
+        overrides["prefix_tokens"] = win_prefix
+    if dep_mode == "pd_disaggregated":
+        if eff_phase == "prefill":
+            overrides["tpot_slo_ms"] = None
+        else:
+            overrides["ttft_slo_ms"] = None
+    return win_par, overrides
 
 
 def _report_column(
@@ -1244,19 +1305,18 @@ def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
             alt_common = dict(common_kw)
             prev_excl = tuple(alt_common.get("exclude_optimizations") or ())
             next_excl = tuple(dict.fromkeys((*prev_excl, excl_id)))
+            win_par, win_overrides = _winning_role_compose_overrides(
+                raw_after, dep_mode=dep_mode, eff_phase=eff_phase,
+                default_spec_tokens=cols["after_spec"],
+            )
+            alt_common.update(win_overrides)
             alt_common["exclude_optimizations"] = next_excl
-            if dep_mode == "pd_disaggregated":
-                alt_common["deployment_mode"] = "pd_prefill" if eff_phase == "prefill" else "pd_decode"
-                if eff_phase == "prefill":
-                    alt_common["tpot_slo_ms"] = None
-                else:
-                    alt_common["ttft_slo_ms"] = None
-            solved_after_accept = (raw_after.get("runtime") or {}).get("mtp_acceptance_length")
             alt_col_kw = dict(column_kw, common_kw=alt_common)
             raw_after_alt, step_a_alt, meta_a_alt = _report_column(
                 None, track=after_track, quant=after_quant, kv=after_kv,
-                idx_kv=after_idx_kv, par=cols["after_par"], conc=cols["conc"],
-                accept_len=(float(solved_after_accept) if solved_after_accept is not None else None),
+                idx_kv=after_idx_kv, par=win_par, conc=cols["conc"],
+                spec_tokens=int(win_overrides["mtp_proposal_tokens"]),
+                accept_len=float(win_overrides["mtp_acceptance_length"]),
                 **alt_col_kw,
             )
             if cols["layout_after"] is not None:

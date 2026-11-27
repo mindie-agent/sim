@@ -31,6 +31,7 @@ _MAX_PERIODIC_LIVE_SLOTS = 128
 _BINARY64_EXACT_INT_LIMIT = 1 << 53
 _BINARY64_DYADIC_DEN_LIMIT = 1 << 500
 _TIME_ROUND_DIGITS = 12
+_ENGINE_POOL_SET_CACHE_LIMIT = 256
 
 
 def _advance_periodic_clock_single_step(now: float, dt: float, cycles: int) -> float:
@@ -1132,8 +1133,9 @@ class Engine(
         pools_frozen = self._engine_pool_sets.get(pool_key)
         if pools_frozen is None:
             pools_frozen = frozenset(pool_key)
-            self._engine_pool_sets[pool_key] = pools_frozen
-            self._engine_pool_set_ids.add(id(pools_frozen))
+            if len(self._engine_pool_sets) < _ENGINE_POOL_SET_CACHE_LIMIT:
+                self._engine_pool_sets[pool_key] = pools_frozen
+                self._engine_pool_set_ids.add(id(pools_frozen))
         return pools_frozen
 
     @contextmanager

@@ -234,6 +234,13 @@ def compose_export_case(
     phase: str | None = None,
     ready_state_source: str = "pre_populated_hbm",
     exclude_optimizations: Sequence[str] = (),
+    role: str | None = None,
+    max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
+    enable_chunked_prefill: bool | None = None,
+    max_model_len: int | None = None,
+    prefix_tokens: int | None = None,
+    local_tp_axes: Mapping[str, int] | None = None,
 ) -> tuple[dict[str, Any], StepRequest]:
     """Compose a 4-mode validated scenario returning ``(case_dict, StepRequest)``."""
     from mindie_sim.compose import compose_case
@@ -286,14 +293,26 @@ def compose_export_case(
         "prompt_tokens": p_tok,
         "output_tokens": o_tok,
         "concurrency": conc,
-        "max_num_seqs": max(conc, 1),
-        "max_num_batched_tokens": min_batched,
-        "max_model_len": model_len,
+        "max_num_seqs": max(1, int(max_num_seqs)) if max_num_seqs is not None else max(conc, 1),
+        "max_num_batched_tokens": (
+            max(1, int(max_num_batched_tokens)) if max_num_batched_tokens is not None else min_batched
+        ),
+        "max_model_len": max(1, int(max_model_len)) if max_model_len is not None else model_len,
         "mtp_proposal_tokens": spec_toks,
         "mtp_acceptance_length": float(mtp_acceptance_length),
         "_stack_phase": eff_phase,
         "feature_track": canonical_track,
     }
+    if enable_chunked_prefill is not None:
+        compose_kw["enable_chunked_prefill"] = bool(enable_chunked_prefill)
+    if prefix_tokens is not None and int(prefix_tokens) > 0:
+        compose_kw["prefix_tokens"] = int(prefix_tokens)
+    if role is not None:
+        compose_kw["role"] = str(role)
+    if local_tp_axes:
+        for axis, width in local_tp_axes.items():
+            if int(width) > 1:
+                compose_kw[str(axis)] = int(width)
     if tpot_slo_ms is not None:
         compose_kw["tpot_slo_ms"] = float(tpot_slo_ms)
     if ttft_slo_ms is not None:

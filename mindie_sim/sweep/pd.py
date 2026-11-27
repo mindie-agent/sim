@@ -2827,12 +2827,13 @@ def _colocated_prefill_only_row(
     par: ParallelSpec, *, used_dies: int, mtp_tokens: int, p_step: float,
     output_tokens: int, feasible: bool, deployment_mode: str = "colocated",
     b_vram_max: int = 1, configured_max_num_seqs: int = 1,
+    effective_prefill_tokens: int | None = None, prefix_hit_tokens: int = 0,
 ) -> dict[str, Any]:
     rps = (par.dp * MS_PER_S) / max(p_step, PARETO_EPS) if feasible else 0.0
     e2e_tps = rps * float(output_tokens)
     e2e_per_die = e2e_tps / float(used_dies)
     is_pd_prefill = deployment_mode == "pd_prefill"
-    return {
+    row: dict[str, Any] = {
         "deployment_mode": deployment_mode, "used_dies": used_dies, "parallel": par.to_dict(),
         "mtp_proposal_tokens": mtp_tokens, "ttft_ms": p_step,
         "decode_step_ms": (None if is_pd_prefill else 0.0),
@@ -2850,6 +2851,10 @@ def _colocated_prefill_only_row(
         "free_hbm_headroom_gib": 0.0, "dcp_codomain_valid": True, "dcp_codomain_reason": None,
         "feasible": feasible, "infeasible_reason": None if feasible else "prefill_sla_or_oom",
     }
+    if effective_prefill_tokens is not None:
+        row["effective_prefill_tokens"] = int(effective_prefill_tokens)
+        row["prefix_hit_tokens"] = max(0, int(prefix_hit_tokens))
+    return row
 
 
 def _prefill_prefix_split(parsed: CaseSpec, prompt_tokens: int) -> tuple[int, int]:
@@ -2924,6 +2929,7 @@ def _evaluate_pd_prefill_candidate(
         par, used_dies=used_dies, mtp_tokens=mtp_tokens, p_step=p_step,
         output_tokens=output_tokens, feasible=feasible, deployment_mode="pd_prefill",
         b_vram_max=max(1, p_slots), configured_max_num_seqs=int(parsed.runtime.max_num_seqs),
+        effective_prefill_tokens=compute_tokens, prefix_hit_tokens=hit_tokens,
     )
 
 
@@ -3008,6 +3014,7 @@ def _evaluate_colocated_candidate(
         return _colocated_prefill_only_row(
             par, used_dies=used_dies, mtp_tokens=mtp_tokens,
             p_step=p_step, output_tokens=output_tokens, feasible=feasible,
+            effective_prefill_tokens=prompt_tokens, prefix_hit_tokens=0,
         )
     resolved_vram = vram_info or _solve_b_vram_max(
         parsed, base_ws=base_ws, decode_q=max(1, int(q_tok)),
@@ -5154,6 +5161,8 @@ def _build_pd_candidate_row_from_stage(
         "b_vram_max": int(st["b_vram"]),
         "configured_max_num_seqs": int(st.get("configured_max_num_seqs", d_parsed.runtime.max_num_seqs)),
         "ttft_ms": float(st.get("effective_ttft_ms", st["p_step"])),
+        "effective_prefill_tokens": int(st["compute_tokens"]),
+        "prefix_hit_tokens": int(st["hit_tokens"]),
         "decode_step_ms": float(st["decode_step"]),
         "handoff_tpot_ms": float(st.get("handoff_tpot_ms", 0.0) or 0.0),
         "effective_tpot_ms": float(st["effective_tpot"]),
@@ -5951,6 +5960,13 @@ def _finalize_optimal_deployment(
             "handoff_tpot_ms": float(winner_row.get("handoff_tpot_ms", 0.0) or 0.0),
             "prefill_kv_rps": float(winner_row.get("prefill_kv_rps", 0.0) or 0.0),
             "e2e_total_tps": float(winner_row.get("e2e_total_tps", 0.0) or 0.0),
+            **(
+                {
+                    "effective_prefill_tokens": int(winner_row["effective_prefill_tokens"]),
+                    "prefix_hit_tokens": max(0, int(winner_row.get("prefix_hit_tokens", 0) or 0)),
+                }
+                if winner_row.get("effective_prefill_tokens") is not None else {}
+            ),
         }
     elif best_coloc_entry:
         winner_row, recommended_case = best_coloc_entry[0], deepcopy(best_coloc_entry[1])

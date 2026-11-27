@@ -269,7 +269,6 @@ class _CohortMixin(_CohortNativeMixin):
     ):
         """Execute one canonical replica for a provably symmetric DP cohort."""
         from ..runtime.dp_cohort_dedup import (
-            _dag_reachability_masks,
             can_dedup_collective_to_canonical,
             is_symmetric_native_program,
             mirror_deduplicated_step,
@@ -281,24 +280,6 @@ class _CohortMixin(_CohortNativeMixin):
         base_work = dict(self.work)
         base_recipes = dict(self.recipes_used)
         base_cost_counts = dict(self.cost.counts)
-
-        ops0 = works[r0].ops
-        overlapping_stream_ops: set[str] = set()
-        if len({op.stream for op in ops0}) > 1:
-            stage_nb: dict[int, int] = {}
-            ss_nb: dict[tuple[int, Any], int] = {}
-            for idx, op in enumerate(ops0):
-                if op.family != "barrier":
-                    bit = 1 << idx
-                    stage_nb[op.stage] = stage_nb.get(op.stage, 0) | bit
-                    skey = (op.stage, op.stream)
-                    ss_nb[skey] = ss_nb.get(skey, 0) | bit
-            anc, desc = _dag_reachability_masks(ops0)
-            for idx, op in enumerate(ops0):
-                src_stg = int(dict(op.metadata).get("source_stage", op.stage)) if op.metadata else op.stage
-                other_m = stage_nb.get(src_stg, 0) & ~ss_nb.get((src_stg, op.stream), 0)
-                if other_m & ~(anc[idx] | desc[idx] | (1 << idx)):
-                    overlapping_stream_ops.add(op.op_id)
 
         step0 = self.add(
             works[r0], r0, release_ms,
@@ -323,8 +304,6 @@ class _CohortMixin(_CohortNativeMixin):
                 ):
                     used_r0_only_links = True
                     continue
-                if item0.context.op.op_id in overlapping_stream_ops:
-                    raise ModelingError(f"dp_dedup_overlapping_mc2_requires_canonical_symmetry:{key}")
                 synth = self._synthesize_cohort_participants(item0, works, peer_replicas)
                 self._schedule_native_cohort(key, synth)
                 continue
@@ -339,8 +318,6 @@ class _CohortMixin(_CohortNativeMixin):
                     ):
                         used_r0_only_links = True
                         continue
-                    if item0.context.op.op_id in overlapping_stream_ops:
-                        raise ModelingError(f"dp_dedup_overlapping_mc2_requires_canonical_symmetry:{key}")
                     synth = self._synthesize_cohort_participants(item0, works, peer_replicas)
                     progs = {
                         p.replica: (prog0 if p.replica == r0

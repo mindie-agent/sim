@@ -649,3 +649,95 @@ def test_prefill_prefix_cache_threads_query_and_context_to_export_and_ablation(m
         )
     assert captured_analyze == [("prefill", 1024, 1024)]
     assert captured_wf == [("prefill", 1024, 1024)]
+
+
+def test_pooled_disaggregated_prefill_persists_prefix_hit_for_export_and_ablation(monkeypatch: pytest.MonkeyPatch):
+    """Pooled disaggregated winner persists (8192, 8192) on the solution record for export and ablation."""
+    from mindie_sim import solve as solve_mod
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.sweep import pd as pd_mod
+
+    # Role case omits prefix_tokens (pooled hit ratio is evaluated dynamically per PD mode).
+    p_raw = compose_case(
+        "qwen3-32b", "a3", dp=1, tp=2, ep=1, layers=2,
+        prompt_tokens=16384, output_tokens=1, role="pd_prefill", ttft_slo_ms=5000.0,
+    )
+    d_raw = compose_case(
+        "qwen3-32b", "a3", dp=1, tp=2, ep=1, layers=2,
+        prompt_tokens=16384, output_tokens=1, role="pd_decode", tpot_slo_ms=50.0,
+    )
+    p_parsed = parse_case(p_raw)
+    d_parsed = parse_case(d_raw)
+    stage = {
+        "p_step": 100.0, "effective_ttft_ms": 100.0,
+        "compute_tokens": 8192, "hit_tokens": 8192,
+        "b_feasible": 1, "b_vram": 4, "configured_max_num_seqs": 4,
+        "decode_step": 0.0, "handoff_tpot_ms": 0.0, "effective_tpot": 0.0,
+        "avg_accepted_tokens": 1.0, "n_tok_per_die": 0.0, "us_per_tok_die": 0.0,
+        "unused_sla_slack_ms": 0.0, "operating_regime": "SLA_LATENCY_BOUND",
+        "limiting_constraint": "", "free_hbm_headroom_gib": 10.0,
+        "kv_ms": 5.0, "infeasible": None,
+    }
+    best_ratio = {
+        "pd_ratio": "1P:1D", "n_prefill": 1, "n_decode": 1,
+        "prefill_dies": 2, "decode_dies": 2, "used_dies": 4,
+        "sustainable_rps": 10.0, "prefill_rps": 10.0, "kv_transfer_rps": 20.0,
+        "sustainable_tps": 10.0, "e2e_tps_per_die": 2.5,
+    }
+    winner_row = pd_mod._build_pd_candidate_row_from_stage(
+        stage, p_parsed=p_parsed, d_parsed=d_parsed, best_ratio=best_ratio,
+        pd_mode="pooled_dram_ssd", mtp_n=0, p_world=2, d_world=2,
+    )
+    assert winner_row["effective_prefill_tokens"] == 8192
+    assert winner_row["prefix_hit_tokens"] == 8192
+
+    solved = pd_mod._finalize_optimal_deployment(
+        model_id="qwen3-32b", sku="a3", n_dev=4, prompt=16384, output=1,
+        ttft=5000.0, tpot=50.0, dep_norm="pd_disaggregated",
+        all_candidates=[winner_row], coloc_entries=[],
+        pd_entries=[(winner_row, p_raw, d_raw)],
+        compose_for=lambda *_a, **_kw: d_raw,
+    )
+    assert solved["pd_pool_summary"]["effective_prefill_tokens"] == 8192
+    assert solved["pd_pool_summary"]["prefix_hit_tokens"] == 8192
+
+    _rec_case, req, _meta = solve_mod._bundle_inputs_for_solution(
+        solved, model="qwen3-32b", hardware="a3", runtime_stack="vllm-ascend",
+        base_kw={}, feature_track="shipping", prompt_tokens=16384, output_tokens=1, scope="model",
+    )
+    assert req.phase == "prefill"
+    assert (req.tokens, req.context) == (8192, 8192)
+
+    captured_analyze: list[tuple[str, int, int]] = []
+    captured_wf: list[tuple[str, int, int]] = []
+
+    def _spy_analyze(_case, *, phase, tokens, context, **_kw):
+        captured_analyze.append((phase, int(tokens), int(context)))
+        return {
+            "geometry": {"dp": 1, "tp": 2, "ep": 1},
+            "included_components": {},
+            "graph_duration_ms": 1.0,
+            "network_cube_mfu": 0.5, "network_vec_mfu": 0.2,
+            "network_mbu": 0.4, "network_link_util": 0.1,
+            "network_cv_overlap": 0.3, "network_roofline_efficiency": 0.5,
+            "breakdown_by_family": [],
+        }
+
+    def _spy_compare(*_a, phase, tokens, context, **_kw):
+        captured_wf.append((phase, int(tokens), int(context)))
+        return {"waterfall": {}}
+
+    with monkeypatch.context() as mp:
+        mp.setattr(solve_mod, "_analyze_case_bounded", _spy_analyze)
+        mp.setattr(solve_mod, "compare_feature_tracks", _spy_compare)
+        solve_mod._evaluate_winner_analysis(
+            solved=solved, before_solved=solved, after_solved=solved,
+            model="qwen3-32b", hardware="a3", runtime_stack="vllm-ascend",
+            prompt=16384, output=1, ttft_slo_ms=5000.0, tpot_slo_ms=50.0,
+            layers=2, quant=None, kv_cache_dtype=None, indexer_kv_dtype=None,
+            topology_preset=None, ranks_per_node=None, mtp_accept=None,
+            ablate_prs=True, xlsx_path=None, trace_path=None,
+            compare_track="shipping", target_track="target", mode="simulation",
+        )
+    assert captured_analyze == [("prefill", 8192, 8192)]
+    assert captured_wf == [("prefill", 8192, 8192)]
