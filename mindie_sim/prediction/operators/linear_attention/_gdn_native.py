@@ -415,7 +415,7 @@ def _build_rgdr_run_stages(
 def build_native_recurrent_gdn(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
 ) -> OperatorPlan:
-    """Lower native CANN aclnnRecurrentGatedDeltaRule (BF16 or FP32 state, Arch22/Arch35)."""
+    """[Cohesive-Pipeline] Lower native CANN aclnnRecurrentGatedDeltaRule (BF16 or FP32 state, Arch22/Arch35)."""
     verify_native_gdn_abi(c, ctx, abi_id=RECURRENT_GDN_ABI)
     aics, aivs = owner_units(ctx)
     if not aivs:

@@ -365,6 +365,7 @@ def kernel_work_terms(lengths, heads, dk, dv, *, input_bytes, state_bytes, recor
 
 
 def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = None):
+    """[Cohesive-Pipeline] Build governed GDN decode recurrence or WY Cube speculative verification plan."""
     meta = dict(op.metadata)
     lengths = recurrent_lengths(op, ctx)
     plan_meta = _state_plan_meta(meta)

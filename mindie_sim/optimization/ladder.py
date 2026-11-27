@@ -820,6 +820,7 @@ def solve_five_level_ladder(
     max_trials: int = DEFAULT_LADDER_TRIALS,
     allow_unbound_formula: bool = False,
 ) -> FiveLevelReport:
+    """[Cohesive-Pipeline] Solve the five-level Primal-Dual optimization ladder and synthesize Stage-3 targets."""
     from mindie_sim.rewrite.oracle import EvalBudget, ScenarioRequest, _baseline, prepare_scenario
     from mindie_sim.rewrite.verify import SoundnessInversionError
 

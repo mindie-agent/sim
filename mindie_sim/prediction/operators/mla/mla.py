@@ -1743,6 +1743,7 @@ def _append_mla_request(
     unabsorbed_qk_dim=None, unabsorbed_v_dim=None, q_unabsorbed=None,
     kv_b_dep=None, view_unabsorbed=False, emit_dcp_lse=False,
 ):
+    """[Cohesive-Pipeline] Append one request's MLA prefill/decode attention, C8 NZ KV, and DCP LSE lowering."""
     plan, model = b.plan, b.model
     mode = b.common["phase"]
     orig_idx = rec["orig_idx"]

@@ -664,6 +664,7 @@ class _FrontendIteration:
         preparation_views, global_views, global_preparation, selections, resource_fusion,
         next_proposal_widths, ngram_propose_views,
     ):
+        """[Cohesive-Pipeline] Lower target logits, service tail, async RecoverSSM commits, and draft steps."""
         restored_rows = padded
         if pcp_prefill:
             previous, restored_rows = _restore_target_pcp_hidden(
