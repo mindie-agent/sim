@@ -1328,19 +1328,31 @@ class _ContextMixin:
                 return True
         return False
 
+    def _post_local_tp_transform(self, ops):
+        """Apply L3 TP/Local-TP MC2 overlap fusion after L2 Local-TP sharding."""
+        if (
+            "tp_mc2_overlap" in tuple(getattr(self.case.runtime, "lowering_passes", ()) or ())
+            or bool(dict(getattr(self.case.runtime, "metadata", ()) or ()).get("tp_mc2_overlap", False))
+        ):
+            from ..operators.mc2.mc2_tp_overlap import tp_mc2_overlap_fusion
+            act_dt = str(getattr(self.case.model, "activation_dtype", "bf16") or "bf16")
+            return tuple(tp_mc2_overlap_fusion(ops, act_dt))
+        return ops
+
     def _lower_local_tp_work(self, work: IterationWork, replica: int) -> IterationWork:
         """Apply the declared node-local dense placement once per graph."""
         parallel = self.case.runtime.parallel
-        if max(int(parallel.o_proj_tp), int(parallel.linear_proj_tp),
-               int(parallel.lm_head_tp)) <= 1:
+        if not parallel.has_local_tp:
             return work
         from ..sharding.local_tp import lower_local_projection_tp
 
         cohort_views = self._cohort_views
         if cohort_views is None:
-            local_width = max(int(parallel.tp), int(parallel.o_proj_tp),
-                              int(parallel.linear_proj_tp),
-                              int(parallel.lm_head_tp))
+            local_width = max(
+                int(parallel.tp), int(parallel.q_proj_tp), int(parallel.o_proj_tp),
+                int(parallel.linear_proj_tp), int(parallel.dcp_linear_tp),
+                int(parallel.mlp_tp), int(parallel.shared_expert_tp), int(parallel.lm_head_tp),
+            )
             if (int(parallel.tp) == 1 and local_width > 1
                     and (work.plan.requests or work.mode != "graph")):
                 from ..sharding.local_tp import local_tp_replica_cohorts
@@ -1364,4 +1376,5 @@ class _ContextMixin:
             work.ops, model=self.case.model, runtime=self.case.runtime,
             machine=self.case.machine, replica=replica,
             cohort_views=cohort_views, scope="target")
+        ops = self._post_local_tp_transform(ops)
         return work if ops is work.ops else replace(work, ops=ops)

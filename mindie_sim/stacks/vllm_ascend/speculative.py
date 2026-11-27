@@ -316,12 +316,13 @@ _DOC_SD = "user_guide/feature_guide/speculative_decoding.md"
 _BASE_SPECULATIVE_COMPANIONS: dict[str, tuple[SpeculativeCompanion, ...]] = {
     "kimi-k3.1": (
         _c("kimi-k3.1", "dspark", "Eco-Tech/Kimi-K3-DSpark-MLA-NPU", DEFAULT_DSPARK_K,
-           k_min=DSPARK_MIN_K, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target",
+           k_min=DSPARK_MIN_K, k_max=DSPARK_LONG_K, draft_tp_policy="match_target",
            draft_kv_on_fp8="bfloat16", sample_method="greedy", pd_match=True,
+           hw_overrides=(("a3", "Eco-Tech/Kimi-K3-DSpark-MLA-NPU"), ("a5", "Eco-Tech/Kimi-K3-DSpark-MLA-NPU")),
            doc="tutorials/models/Kimi-K3.1-Pro.md",
            notes="DSpark external draft; draft_tensor_parallel_size must equal target TP"),
         _c("kimi-k3.1", "dspark", "Inferact/Kimi-K3-DSpark-Block5", DEFAULT_DSPARK_K,
-           k_min=DSPARK_MIN_K, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target",
+           k_min=DSPARK_MIN_K, k_max=DSPARK_LONG_K, draft_tp_policy="match_target",
            draft_kv_on_fp8="bfloat16", sample_method="greedy", pd_match=True, primary=False,
            doc="tutorials/models/Kimi-K3.md",
            notes="950DT DSpark Block-5 alternative draft checkpoint"),
@@ -1423,6 +1424,7 @@ def _build_speculative_config(
     eff_k: int,
     target_kv_dtype: str,
     draft_model: str | None,
+    dspark_c8_mla: bool = False,
 ) -> tuple[str, int | None, str, dict[str, Any]]:
     resolved_draft = str(draft_model) if draft_model else selected.draft_model_for_hw(hw)
     if selected.draft_tp_policy == "one":
@@ -1432,14 +1434,17 @@ def _build_speculative_config(
     else:
         draft_tp = None
     kv_lower = str(target_kv_dtype or "bf16").strip().lower()
-    needs_bf16_draft_kv = bool(
-        selected.draft_kv_dtype_on_fp8_target
-        and (
-            kv_lower in {"fp8", "fp8_e4m3", "mxfp8"}
-            or (hw in A2_A3_INT_ONLY_FAMILIES and kv_lower in {"int8", "c8"} and selected.method == "dspark")
+    if dspark_c8_mla and selected.method == "dspark" and hw in {"a3", "a5"}:
+        draft_kv = "fp8_e4m3" if hw == "a5" else "int8"
+    else:
+        needs_bf16_draft_kv = bool(
+            selected.draft_kv_dtype_on_fp8_target
+            and (
+                kv_lower in {"fp8", "fp8_e4m3", "mxfp8"}
+                or (hw in A2_A3_INT_ONLY_FAMILIES and kv_lower in {"int8", "c8"} and selected.method == "dspark")
+            )
         )
-    )
-    draft_kv = selected.draft_kv_dtype_on_fp8_target if needs_bf16_draft_kv else ""
+        draft_kv = selected.draft_kv_dtype_on_fp8_target if needs_bf16_draft_kv else ""
     spec_cfg: dict[str, Any] = {
         "method": selected.method,
         "num_speculative_tokens": eff_k,
@@ -1469,6 +1474,7 @@ def resolve_speculative_companion(
     num_speculative_tokens: int | None = None,
     draft_model: str | None = None,
     draft_architecture: str | None = None,
+    dspark_c8_mla: bool = False,
 ) -> ResolvedSpeculativeCompanion:
     """Resolve the primary or method-selected speculative companion with Ascend rules applied."""
     key = _resolve_spec_model_key(model_id)
@@ -1503,6 +1509,7 @@ def resolve_speculative_companion(
     resolved_draft, draft_tp, draft_kv, spec_cfg = _build_speculative_config(
         selected, hw=hw, tp=tp, eff_k=eff_k,
         target_kv_dtype=target_kv_dtype, draft_model=draft_model,
+        dspark_c8_mla=dspark_c8_mla,
     )
     if hw == "a2" and is_hybrid_recurrent_model(key) and (eff_k + 1) >= A2_GDN_STRIDED_RECURRENT_MIN_VERIFY_TOKENS:
         warnings.append(

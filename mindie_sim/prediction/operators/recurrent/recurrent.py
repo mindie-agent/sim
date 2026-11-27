@@ -866,12 +866,19 @@ def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, bet
         if options.get("gate_dtype", model.activation_dtype) != model.activation_dtype:
             raise ModelingError("kda_source_raw_gate_dtype_must_match_projection")
         options.update(beta_dtype=beta_dtype, gate_dtype=model.activation_dtype)
+        rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+        wy_cube_verify = bool(rt_meta.get("wy_cube_speculative_verify", False))
+        machine = getattr(b, "machine", None)
+        dies = getattr(machine, "dies", ()) if machine is not None else ()
+        has_aic = True if not dies else any(int(getattr(d, "compute_units", 0) or 0) > 0 for d in dies)
         if use_recover_ssm and any(view.q_len > 1 for view in active_views):
             options["recover_ssm"] = True
             if options.get("record_stride") is None:
                 num_spec = _configured_kda_num_spec(runtime, model, active_views)
                 max_q = max((int(view.q_len) for view in active_views), default=1)
                 options["record_stride"] = max(num_spec + 1, max_q)
+        if wy_cube_verify and has_aic and any(view.q_len > 1 for view in active_views):
+            options["wy_cube_verify"] = True
         scans = tuple(op for op in b.ops if op.family == "recurrent_scan")
         active_requests = tuple(view.request_id for view in active_views)
         decode_core = decode_binder(

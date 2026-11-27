@@ -2264,6 +2264,30 @@ def _apply_aliased_window_backing_tags(
             rec_abis[i] = replace(a, page_group=pg, overlay_region="compressor_state")
 
 
+def _is_dspark_c8_mla_active(
+    *,
+    draft_kind: str,
+    draft_spec: Any,
+    hw: str,
+    effective_opts: Mapping[str, Any] | None,
+) -> bool:
+    """True when 5-layer MLA DSpark C8 KV cache is active via track/mechanism options."""
+    if effective_opts is None or hw not in {"a3", "a5"} or draft_kind != "dspark":
+        return False
+    if str(getattr(draft_spec, "attention_kind", "") or "").strip().lower() != "mla":
+        return False
+    excluded = {
+        str(item).strip()
+        for item in (effective_opts.get("exclude_optimizations") or ())
+        if str(item).strip()
+    }
+    if "latent_moe_dspark_c8_mla" in excluded or "dspark_mla_c8_quant_mla" in excluded:
+        return False
+    if effective_opts.get("latent_moe_dspark_c8_mla") is not None:
+        return bool(effective_opts.get("latent_moe_dspark_c8_mla"))
+    return bool(effective_opts.get("include_proposed_pr", False))
+
+
 def _resolve_draft_kv_tag(
     model: ModelSpec,
     *,
@@ -2280,10 +2304,16 @@ def _resolve_draft_kv_tag(
     dq = getattr(draft_spec, "quant", None)
     if dq is not None and str(getattr(dq, "kv_dtype", "") or "").strip():
         return str(dq.kv_dtype).strip().upper()
+    dspark_c8 = _is_dspark_c8_mla_active(
+        draft_kind=draft_kind, draft_spec=draft_spec, hw=hw, effective_opts=effective_opts,
+    )
+    if dspark_c8:
+        return "FP8_E4M3" if hw == "a5" else "INT8"
     try:
         comp = resolve_speculative_companion(
             model.name, target_tp=parallel.tp, target_kv_dtype=kv_mode,
             hw_family=hw, method=draft_kind, num_speculative_tokens=speculative_k,
+            dspark_c8_mla=dspark_c8,
         )
         if comp.draft_kv_cache_dtype:
             return str(comp.draft_kv_cache_dtype).strip().upper()
@@ -2436,12 +2466,26 @@ def _append_draft_cache_abis(
         role=role, phase=phase, kv_block_size=kv_block_size,
         kda_parallel_axis="tp_x_pcp", stage=last_stage,
     )
+    dspark_c8_nz_a5 = (
+        hw == "a5"
+        and _is_dspark_c8_mla_active(
+            draft_kind=draft_kind, draft_spec=draft_spec, hw=hw, effective_opts=effective_opts,
+        )
+    )
+    draft_model_meta: Mapping[str, Any] = (
+        {**dict(model_meta), "cache_representations": {"mla_kv": {"dtype": "fp8_e4m3"}}}
+        if dspark_c8_nz_a5 else model_meta
+    )
+    draft_model_for_abi = (
+        replace(model, metadata=tuple(draft_model_meta.items()))
+        if dspark_c8_nz_a5 else model
+    )
     d_plan_by_native = {(p.native_layer_id if p.native_layer_id >= 0 else p.index): p for p in d_plans}
     for d_abi in d_raw_kv:
         d_plan = d_plan_by_native[d_abi.native_layer]
         dm, ds, df = d_layer_meta.get(d_abi.native_layer, (d_kv_mode, d_eff_scale, d_has_faq))
         kv_abis.append(_finalize_kv_cache_abi(
-            d_abi, model, d_plan, parallel=parallel, model_meta=model_meta, stage=last_stage,
+            d_abi, draft_model_for_abi, d_plan, parallel=parallel, model_meta=draft_model_meta, stage=last_stage,
             kv_block_size=kv_block_size, phase=phase, native_float=native_float,
             ckpt_digest=ckpt_digest, eff_kv_scale=d_eff_scale,
             l_mode=dm, l_scale=ds, l_faq=df,

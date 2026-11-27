@@ -715,14 +715,26 @@ class _FrontendIteration:
                     index for index, op in enumerate(kept)
                     if op.op_id == anchor.op_id) + 1
                 kept[position:position] = bound
+                from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import (
+                    ASYNC_COMMIT_STREAM,
+                    async_recover_ssm_commit_enabled,
+                )
                 pub_ids = tuple(
                     op.op_id for op in bound
                     if dict(op.metadata).get("recover_ssm_stage") == "state_publish"
                 )
                 commit_ids = pub_ids or tuple(op.op_id for op in bound)
+                async_commit = bool(
+                    has_decode_draft
+                    and not has_prefill_draft
+                    and async_recover_ssm_commit_enabled(runtime)
+                )
                 ops = [
-                    _frontend.replace(op, deps=tuple(dict.fromkeys(
-                        (*op.deps, *commit_ids))))
+                    _frontend.replace(
+                        op,
+                        deps=tuple(dict.fromkeys((*op.deps, *commit_ids))),
+                        stream=(ASYNC_COMMIT_STREAM if async_commit else op.stream),
+                    )
                     if op.family == "token_commit" else op
                     for op in kept
                 ]
@@ -731,10 +743,14 @@ class _FrontendIteration:
         if has_decode_draft or has_prefill_draft:
             from .speculation import append_draft_proposal_transfer, lower_draft_regions
             if has_decode_draft:
+                from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import (
+                    async_recover_ssm_commit_enabled,
+                )
                 decode_anchor = accept_op.op_id if accept_op is not None else previous
+                async_decode_commit = async_recover_ssm_commit_enabled(runtime)
                 decode_ready: str | tuple[str, ...] = (
                     tuple(dict.fromkeys((decode_anchor, *commit_ids)))
-                    if commit_ids else decode_anchor
+                    if (commit_ids and not async_decode_commit) else decode_anchor
                 )
                 dec_regions, _dec_prev, dec_last = lower_draft_regions(
                     self, model, declared_runtime, decode_proposal_views, decode_ready,

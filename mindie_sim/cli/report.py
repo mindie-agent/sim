@@ -355,6 +355,7 @@ def _auto_solve_report_layout(
     apply_target_envelope: bool = False, rewrite_plan: Any = None,
     allow_unbound_formula: bool = True, phase: str = "decode",
     pinned_parallel: Mapping[str, int] | None = None, max_sequences_per_dp: int | None = None,
+    prefix_hit_ratio: float = 0.0,
 ) -> dict[str, Any]:
     """Auto-solve HBM-safe parallelism + concurrency via ``solve_optimal_deployment``."""
     from mindie_sim.solve import _resolve_kv_pooling_mode
@@ -367,6 +368,9 @@ def _auto_solve_report_layout(
     compose_overrides: dict[str, Any] = {}
     if validated_mode in {"pd_prefill", "pd_decode"}:
         compose_overrides["role"] = validated_mode
+    hit_ratio = float(prefix_hit_ratio or 0.0)
+    if hit_ratio > 0.0 and validated_mode != "pd_disaggregated":
+        compose_overrides["prefix_tokens"] = min(int(prompt_tokens * hit_ratio), max(0, int(prompt_tokens) - 1))
     eff_ttft = None if validated_mode == "pd_decode" else ttft_slo_ms
     solve_kw: dict[str, Any] = dict(
         num_devices=int(num_devices), prompt_tokens=int(prompt_tokens), output_tokens=int(output_tokens),
@@ -381,6 +385,8 @@ def _auto_solve_report_layout(
         apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
         allow_unbound_formula=allow_unbound_formula,
     )
+    if hit_ratio > 0.0 and validated_mode in {"pd_prefill", "pd_disaggregated"}:
+        solve_kw["pool_prefix_hit_ratio"] = hit_ratio
     if compose_overrides:
         solve_kw["compose_overrides"] = compose_overrides
     if pinned_parallel:
@@ -558,6 +564,7 @@ def add_report_commands(subparsers) -> None:
         rep.add_argument(flag, type=int, default=None)
     rep.add_argument("--prompt-tokens", "--context", dest="prompt_tokens", type=parse_token_shorthand, default=None)
     rep.add_argument("--output-tokens", type=parse_token_shorthand, default=DEFAULT_SCENARIO_OUTPUT_TOKENS)
+    rep.add_argument("--prefix-hit-ratio", dest="prefix_hit_ratio", type=float, default=0.0, help="shared prefix KV cache hit ratio in [0.0, 1.0) for prefill")
     rep.add_argument("--concurrency", type=int, default=None, help="sequences per DP replica (auto-solved when omitted)")
     rep.add_argument("--tpot-ms", "--tpot-slo-ms", dest="tpot_ms", type=float, default=None)
     rep.add_argument("--ttft-ms", "--ttft-slo-ms", dest="ttft_ms", type=float, default=None)
@@ -792,6 +799,7 @@ def _solve_report_columns(
             mtp_acceptance_length=explicit_accept, phase=eff_phase,
             pinned_parallel=pinned_parallel or None,
             max_sequences_per_dp=int(args.concurrency) if args.concurrency is not None else None,
+            prefix_hit_ratio=float(getattr(args, "prefix_hit_ratio", 0.0) or 0.0),
         )
         layout_after = _auto_solve_report_layout(
             **common_solve, quant=after_quant, kv_cache_dtype=after_kv, indexer_kv_dtype=after_idx_kv,
@@ -1237,6 +1245,10 @@ def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
         engram_cpu_offload=args.engram_offload, deployment_mode=dep_mode,
         runtime_stack=stack_arg,
     )
+    if float(getattr(args, "prefix_hit_ratio", 0.0) or 0.0) > 0.0:
+        common_kw["prefix_tokens"] = min(
+            int(prompt_tokens * float(args.prefix_hit_ratio)), max(0, prompt_tokens - 1),
+        )
     column_kw = dict(model=model_arg, sku=policy["sku"], phase=eff_phase, common_kw=common_kw)
     raw_before, step_b, meta_b = _report_column(
         cols["layout_before"], track=before_track, quant=before_quant, kv=before_kv,

@@ -57,6 +57,13 @@ A_LOG_TRANSFORM_OPS = 3
 QK_PREP_OPS_PER_LANE = 3
 QK_NORM_EXTRA_OPS_PER_LANE = 6
 RECURRENCE_OPS_PER_STATE_ELEMENT = 7
+MIN_WY_SPECULATIVE_TOKENS = 2
+WY_GRAM_OPS_FACTOR = 4
+WY_SOLVE_OPS_PER_PAIR = 4
+WY_ROW_SCALE_OPS_FACTOR = 4
+WY_CUBE_FLOPS_PER_STATE_ELEMENT = 4
+WY_EPILOGUE_QUAD_FACTOR = 4
+WY_EPILOGUE_LINEAR_FACTOR = 4
 
 IMPLEMENTATION = RECIPE = "vllm_ascend_recurrent_kda_arch35"
 SOURCE = {
@@ -157,12 +164,15 @@ class Params:
     state_targets: tuple | None = None
     recover_ssm: bool = False
     record_stride: int | None = None
+    wy_cube_verify: bool = False
 
     @classmethod
     def parse(cls, raw):
         p = cls(**{**raw, "lengths": tuple(raw["lengths"])})
         if not isinstance(p.recover_ssm, bool):
             raise ModelingError("recurrent_kda_recover_ssm_invalid")
+        if not isinstance(p.wy_cube_verify, bool):
+            raise ModelingError("recurrent_kda_wy_cube_verify_invalid")
         if not p.lengths or any(not isinstance(q, int) or not 1 <= q <= KDA_MAX_QUERY_ROWS for q in p.lengths):
             raise ModelingError("recurrent_kda_requires_nonempty_q1_to_q8_sequences")
         if p.record_stride is not None:
@@ -302,8 +312,38 @@ def beta_work(p, q, read):
                            "vector": align_up(q * p.heads, BETA_LANE_ALIGNMENT)})
 
 
-def head_work(p, q, parts, read, *, include_beta=True, delta_broadcast=False):
-    """Payload and vector operations for one physical (sequence,value-head)."""
+def _use_wy_cube_head(p: Params, q: int, aic_units: int) -> bool:
+    return bool(
+        p.wy_cube_verify
+        and aic_units > 0
+        and MIN_WY_SPECULATIVE_TOKENS <= q <= KDA_MAX_QUERY_ROWS
+    )
+
+
+def wy_verify_head_terms(
+    q: int, dk: int, dv: int, *, state_dtype: str,
+) -> tuple[int, int, int, int]:
+    """Closed-form ``(state_cast_ops, wy_prep_ops, cube_flops, wy_epilogue_ops)`` per head."""
+    state_cast_ops = dk * dv if state_dtype == "fp32" else 0
+    strict_pairs = q * (q - 1) // 2
+    wy_prep_ops = (
+        WY_GRAM_OPS_FACTOR * q * q * dk
+        + WY_SOLVE_OPS_PER_PAIR * strict_pairs
+        + WY_ROW_SCALE_OPS_FACTOR * q * dk
+        + q * dv
+    )
+    cube_flops = WY_CUBE_FLOPS_PER_STATE_ELEMENT * q * dk * dv
+    wy_epilogue_ops = (
+        WY_EPILOGUE_QUAD_FACTOR * q * q * dv
+        + WY_EPILOGUE_LINEAR_FACTOR * q * dv
+    )
+    return state_cast_ops, wy_prep_ops, cube_flops, wy_epilogue_ops
+
+
+def head_work(
+    p, q, parts, read, *, include_beta=True, delta_broadcast=False, aic_units=0,
+):
+    """Payload, matrix FLOPs, and vector ops for one physical (sequence,value-head)."""
     k, v = p.dk, p.dv
     state = k*v*_BYTES[p.state_dtype]
     incoming = q*((2*k+v)*2 + k*_BYTES[p.gate_dtype]) + state
@@ -311,27 +351,46 @@ def head_work(p, q, parts, read, *, include_beta=True, delta_broadcast=False):
     if p.use_gate_in_kernel:
         incoming += FP32_BYTES * (int(p.has_a_log) + k * int(p.has_dt_bias))
         gate += q*k*((SAFE_GATE_OPS_PER_LANE if p.safe_gate else GATE_OPS_PER_LANE) + int(p.has_dt_bias)) + A_LOG_TRANSFORM_OPS * int(p.has_a_log)
-    vector = (q * (QK_PREP_OPS_PER_LANE * k + v) + gate
-              + (QK_NORM_EXTRA_OPS_PER_LANE * q * k if p.use_qk_l2norm else 0) + k*v
-              + q*((RECURRENCE_OPS_PER_STATE_ELEMENT + 1 + int(delta_broadcast))*k+1)*v + 2*q*parts*int(p.use_beta_sigmoid))
+    base_prep = (
+        q * (QK_PREP_OPS_PER_LANE * k + v)
+        + gate
+        + (QK_NORM_EXTRA_OPS_PER_LANE * q * k if p.use_qk_l2norm else 0)
+        + 2 * q * parts * int(p.use_beta_sigmoid)
+    )
     state_out = record_head_bytes(k, v, p.dtype) if (p.recover_ssm and q > 1) else state
     outgoing = q*(state_out + v*2)
-    result = Work(resources={"hbm": incoming + outgoing, read: incoming,
-                             "mte3": outgoing, "vector": vector})
+    if _use_wy_cube_head(p, q, aic_units):
+        state_cast, wy_prep, cube_flops, wy_epilogue = wy_verify_head_terms(
+            q, k, v, state_dtype=p.state_dtype,
+        )
+        vector = base_prep + state_cast + wy_prep + wy_epilogue
+        result = Work(
+            matrix={"bf16": cube_flops},
+            resources={"hbm": incoming + outgoing, read: incoming, "mte3": outgoing, "vector": vector},
+        )
+    else:
+        vector = (
+            base_prep
+            + k * v
+            + q * ((RECURRENCE_OPS_PER_STATE_ELEMENT + 1 + int(delta_broadcast)) * k + 1) * v
+        )
+        result = Work(resources={"hbm": incoming + outgoing, read: incoming,
+                                 "mte3": outgoing, "vector": vector})
     return result + beta_work(p, q, read) if include_beta else result
 
 
 def _head_stages(p, q, repeat, profile, context, placement, read,
                  *, beta_repetitions=None, delta_broadcast=False,
-                 cohort_size=1, cohort_widened=(), cohort_members=None):
+                 cohort_size=1, cohort_widened=(), cohort_members=None,
+                 aic_units=0, cube_placement=None):
     """Source queue order; delayed exports preserve their finite slot reuse."""
     stages = []
     c_members = cohort_members or {}
-    def add(name, work=Work(), after=(), count=None):
+    def add(name, work=Work(), after=(), count=None, stage_placement=None):
         scale = (repeat if count is None else count) * cohort_size
         stages.append(Stage(
             name, context.bind(work.scaled(scale)),
-            after=tuple(after), placement=placement,
+            after=tuple(after), placement=placement if stage_placement is None else stage_placement,
             cohort_size=cohort_size, cohort_widened=cohort_widened,
             cohort_members=c_members,
         ))
@@ -359,6 +418,31 @@ def _head_stages(p, q, repeat, profile, context, placement, read,
     ready = vec("gate_exp", q*k, ready)
     step = profile["value_step"]
     widths = tuple(min(step, v-offset) for offset in range(0, v, step))
+    if _use_wy_cube_head(p, q, aic_units) and cube_placement is not None:
+        state_cast, wy_prep, cube_flops, wy_epilogue = wy_verify_head_terms(
+            q, k, v, state_dtype=p.state_dtype,
+        )
+        state_out = record_head_bytes(k, v, p.dtype) if (p.recover_ssm and q > 1) else k * v * _BYTES[p.state_dtype]
+        st_load = mem("state_load0", k * v * _BYTES[p.state_dtype], read, ready)
+        prep_after = (st_load, ready)
+        if state_cast > 0:
+            cast_stage = vec("state_cast_bf16", state_cast, st_load, ready)
+            prep_after = (cast_stage,)
+        wy_prep_stage = vec(
+            "wy_intra_prep",
+            wy_prep + 2 * q * len(widths) * int(p.use_beta_sigmoid),
+            *prep_after,
+        )
+        cube_scale = repeat * cohort_size
+        stages.append(Stage(
+            "wy_cube_contract",
+            context.bind(Work(matrix={"bf16": cube_flops}).scaled(cube_scale)),
+            after=(wy_prep_stage,),
+            placement=cube_placement,
+        ))
+        wy_epi_stage = vec("wy_epilogue", wy_epilogue, "wy_cube_contract")
+        mem("wy_store", q * (state_out + v * 2), "mte3", wy_epi_stage)
+        return tuple(stages)
     state_load = mem("state_load0", k*widths[0]*_BYTES[p.state_dtype], read, ready)
     last_compute = ready
     last_write = None
@@ -416,6 +500,7 @@ def summarize_work(params, geometry, *, execution=SourceExecution()):
     """Canonical frontend/source-plan work for one complete KDA launch."""
     p = params if isinstance(params, Params) else Params.parse(params)
     units = geometry.resource_units.get("vector", geometry.compute_units)
+    aic_units = int(getattr(geometry, "compute_units", 0) or 0)
     blocks = min(units, len(p.lengths)*p.heads)
     if "ub" not in geometry.buffers:
         raise ModelingError("recurrent_kda_requires_declared_ub_capacity")
@@ -428,14 +513,18 @@ def summarize_work(params, geometry, *, execution=SourceExecution()):
                 beta_per_head=execution.beta_per_head):
             work += head_work(
                 p, q, profile["parts"], read, include_beta=False,
-                delta_broadcast=execution.delta_broadcast).scaled(heads)
+                delta_broadcast=execution.delta_broadcast,
+                aic_units=aic_units).scaled(heads)
             work += beta_work(p, q, read).scaled(beta_count)
     return work
 
 
 def build(op, geometry, *, compact=True, execution=SourceExecution()):
+    """[Cohesive-Pipeline] Build source-grounded KDA recurrent or WY-Cube OperatorPlan."""
     p = Params.parse(dict(op.metadata)["kda_recurrent_params"])
     units = geometry.resource_units.get("vector", geometry.compute_units)
+    aic_units = int(getattr(geometry, "compute_units", 0) or 0)
+    wy_active = any(_use_wy_cube_head(p, q, aic_units) for q in p.lengths)
     blocks = min(units, len(p.lengths)*p.heads)
     if "ub" not in geometry.buffers:
         raise ModelingError("recurrent_kda_requires_declared_ub_capacity")
@@ -454,6 +543,7 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
     cycles = tuple(cycles)
     fragments = state_fragments(op)
     def program(context):
+        """[Cohesive-Pipeline] Bind KDA per-owner or symmetric wave-cohort KernelProgram."""
         def _disjoint_cohort_binding(cohort_owners):
             """Merge ``cohort_owners`` into one exact symmetric cohort when placements & UB units are disjoint."""
             roles = ("vector", read, "mte3")
@@ -481,6 +571,11 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
 
         def owner_program(owner):
             placement = context.owned(owner, units, ("vector", read, "mte3"))
+            cube_pl = (
+                context.owned(owner % aic_units, aic_units, ("cube",))
+                if (wy_active and aic_units > 0 and "cube" in context.resource_names)
+                else None
+            )
             pending = tuple(runs(owner))
             stage_cache: dict[tuple[int, int, int], tuple[Stage, ...]] = {}
             def head(index):
@@ -491,7 +586,8 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
                 q, count, beta_count = key
                 built = _head_stages(p, q, count, profile, context, placement, read,
                                      beta_repetitions=beta_count,
-                                     delta_broadcast=execution.delta_broadcast)
+                                     delta_broadcast=execution.delta_broadcast,
+                                     aic_units=aic_units, cube_placement=cube_pl)
                 stage_cache[key] = built
                 return built
             heads = PipelineProgram(cycles[owner], 1, head, interior_fold=False)
@@ -562,8 +658,16 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
                     binding_cache[seg_owners] = bound
                 pl_s, wid_s, mem_s, _ = bound
                 c_size = len(seg_owners)
+                seg_cube_pl = None
+                if wy_active and aic_units > 0 and "cube" in context.resource_names:
+                    aic_set = tuple(sorted({
+                        u
+                        for o in seg_owners
+                        for u in context.owned(o % aic_units, aic_units, ("cube",))[context.resource_names["cube"]]
+                    }))
+                    seg_cube_pl = {context.resource_names["cube"]: aic_set}
                 stage_cache: dict[tuple[int, int, int], tuple[Stage, ...]] = {}
-                def _make_head(keys_t, pl_t, wid_t, mem_t, cs_t, cache_t):
+                def _make_head(keys_t, pl_t, wid_t, mem_t, cs_t, cache_t, cube_pl_t):
                     def _head(index):
                         key = keys_t[index]
                         cached = cache_t.get(key)
@@ -577,13 +681,15 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
                             cohort_size=cs_t,
                             cohort_widened=wid_t if cs_t > 1 else (),
                             cohort_members=mem_t if cs_t > 1 else None,
+                            aic_units=aic_units,
+                            cube_placement=cube_pl_t,
                         )
                         cache_t[key] = built
                         return built
                     return _head
                 seg_pipe = PipelineProgram(
                     len(seg_keys), 1,
-                    _make_head(seg_keys, pl_s, wid_s, mem_s, c_size, stage_cache),
+                    _make_head(seg_keys, pl_s, wid_s, mem_s, c_size, stage_cache, seg_cube_pl),
                     interior_fold=False,
                 )
                 seg_name = f"heads_seg{seg_idx}"
@@ -632,9 +738,12 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
     accepted_loads = validated_sequences + resolved_sequences if p.has_accepted_tokens else 0
     metadata_values += accepted_loads
     spec_recover = bool(p.recover_ssm and any(q > 1 for q in p.lengths))
-    plan_metadata = {"execution_class": "vector", "state_accesses": state_accesses(op)}
+    exec_cls = "mixed_aic_aiv" if wy_active else "vector"
+    plan_metadata = {"execution_class": exec_cls, "state_accesses": state_accesses(op)}
     if spec_recover:
         plan_metadata["recover_ssm"] = True
+    if wy_active:
+        plan_metadata["wy_cube_verify"] = True
     contract = dict(op.metadata).get("kda_state_contract")
     if contract is not None:
         plan_metadata["state_contract"] = contract
@@ -686,16 +795,19 @@ def make_op(params, *, op_id="kda_recurrent", deps=(), requests=(), stage=0,
     p = Params.parse(raw_params)
     shape = (sum(p.lengths), p.heads, p.dk, p.dv)
     spec_recover = bool(p.recover_ssm and any(q > 1 for q in p.lengths))
+    wy_spec = bool(p.wy_cube_verify and any(q >= MIN_WY_SPECULATIVE_TOKENS for q in p.lengths))
     metadata = {
         "kda_recurrent_params": dict(p.__dict__), "native_kind": "RecurrentKda",
         "implementation": IMPLEMENTATION, "source": SOURCE,
-        "invocation_class": "vector", "program_kind": "recurrent_vector",
+        "invocation_class": "mixed_aic_aiv" if wy_spec else "vector",
+        "program_kind": "recurrent_vector",
         "heads": p.heads, "key_heads": p.key_heads, "dk": p.dk, "dv": p.dv,
         "sequence_tokens": p.lengths, "state_dtype": p.state_dtype,
         "state_mutation": "recover_ssm_compact_record" if spec_recover else "inplace_per_query_checkpoint",
         "source_binding": "explicit_arch35_kernel_selection_not_binary_equivalence",
         "caller_materializations": "outside_selected_kernel",
         **({"recover_ssm": True} if spec_recover else {}),
+        **({"wy_cube_verify": True} if p.wy_cube_verify else {}),
     }
     selection = resolve_state_selection(p.state_selection, p.lengths)
     if selection is not None:

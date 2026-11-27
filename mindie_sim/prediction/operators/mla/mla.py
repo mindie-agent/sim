@@ -1789,6 +1789,28 @@ def _append_mla_request(
         and plan.cache_kind == "dense" and not topk and not plan.indexer
         and model.activation_dtype == "bf16" and quant.kv_dtype == "bf16"
     )
+    is_c8_draft_mla = (
+        latent
+        and mode == "draft"
+        and plan.cache_kind == "dense"
+        and not topk
+        and not plan.indexer
+        and str(getattr(quant, "kv_dtype", "") or "").strip().lower() in {"fp8", "fp8_e4m3", "int8"}
+    )
+    c8_draft_meta = (
+        (
+            ("c8_quant_mla", True),
+            ("kv_cache_dtype", str(quant.kv_dtype).strip().lower()),
+            ("kv_row_bytes", int(kv_row_b)),
+            (
+                "native_kind",
+                "aclnnQuantFlashMla"
+                if str(quant.kv_dtype).strip().lower().startswith("fp8")
+                else "aclnnFusedInferAttentionScoreV3",
+            ),
+        )
+        if is_c8_draft_mla else ()
+    )
     tensor_view_meta = (
         (("mla_attention_mode", "unabsorbed_prefill"), ("lse_write_bytes", float(lse_write)))
         if view_unabsorbed
@@ -1796,6 +1818,7 @@ def _append_mla_request(
             attention_tensor_view(plan, view, attn_heads, model, quant,
                                   parallel, eff_cp=eff_cp, machine=machine)
             + ((("lse_write_bytes", float(lse_write)),) if lse_write > 0 else ())
+            + c8_draft_meta
         )
     )
     last = b.work(

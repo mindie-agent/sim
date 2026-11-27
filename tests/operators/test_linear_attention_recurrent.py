@@ -1345,3 +1345,94 @@ def test_recurrent_permuted_die_pcp_lane_and_kda_record_stride():
     ops_spec = Frontend()(IterationPlan(views_spec), c_spec.model, c_spec.runtime, c_spec.machine).ops
     core_spec = next(op for op in ops_spec if "kda_recurrent_params" in dict(op.metadata))
     assert dict(core_spec.metadata)["kda_recurrent_params"]["record_stride"] == 4
+
+
+def test_wy_cube_speculative_verify_and_async_recover_ssm_commit():
+    from mindie_sim import compose_case
+    from mindie_sim.prediction.operators.kda import kda_recurrent
+    from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
+    from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import (
+        ASYNC_COMMIT_AIV_DENOMINATOR,
+        ASYNC_COMMIT_AIV_NUMERATOR,
+        ASYNC_COMMIT_STREAM,
+    )
+    from mindie_sim.prediction.operators.recurrent.recover_ssm_work import (
+        build_gdn_arch35_recover_ssm,
+        stamp_gdn_kernel_spec,
+    )
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import IterationPlan
+
+    geom = kda_recurrent.frontend_geometry()
+    for q in (4, 8):
+        op_base = kda_recurrent.make_op(
+            {"lengths": (q,), "heads": 8, "key_heads": 8, "recover_ssm": True, "wy_cube_verify": False},
+        )
+        op_wy = kda_recurrent.make_op(
+            {"lengths": (q,), "heads": 8, "key_heads": 8, "recover_ssm": True, "wy_cube_verify": True},
+        )
+        assert op_wy.hbm_bytes == op_base.hbm_bytes
+        assert op_wy.mte2_bytes == op_base.mte2_bytes
+        assert op_wy.mte3_bytes == op_base.mte3_bytes
+        assert op_wy.flops == float(4 * q * 8 * 128 * 128)
+        assert op_wy.matrix_flops == (("bf16", float(4 * q * 8 * 128 * 128)),)
+        assert op_wy.vector_ops < op_base.vector_ops * 0.25
+        plan_wy = kda_recurrent.build(op_wy, geom)
+        assert plan_wy.work.matrix == {"bf16": 4 * q * 8 * 128 * 128}
+        assert plan_wy.work.resources["vector"] == int(op_wy.vector_ops)
+        assert plan_wy.work.resources["hbm"] == int(op_wy.hbm_bytes)
+
+    op_q1_base = kda_recurrent.make_op(
+        {"lengths": (1,), "heads": 8, "key_heads": 8, "recover_ssm": True, "wy_cube_verify": False},
+    )
+    op_q1_wy = kda_recurrent.make_op(
+        {"lengths": (1,), "heads": 8, "key_heads": 8, "recover_ssm": True, "wy_cube_verify": True},
+    )
+    assert op_q1_wy.flops == 0.0
+    assert op_q1_wy.vector_ops == op_q1_base.vector_ops
+
+    gen5_sku = REPRESENTATIVE_SKUS["a5"]
+    c_gdn = parse_case(compose_case(
+        "qwen3.8-flash-next", gen5_sku, layers=2, tp=1, ep=1,
+        mtp_proposal_tokens=3, feature_track="proposed", recover_ssm=True,
+    ))
+    gdn_views = (
+        RequestView("r0", 4, 64, True, "decode", draft_verify=True, draft_proposal_tokens=3,
+                    draft_advanced_tokens=3, state_slot=1),
+    )
+    gdn_ops_base = Frontend()(IterationPlan(gdn_views), c_gdn.model, c_gdn.runtime, c_gdn.machine).ops
+    scan_base = next(op for op in gdn_ops_base if op.op_id.endswith(".decode_recurrent_scan"))
+    scan_wy = stamp_gdn_kernel_spec(
+        replace(scan_base, metadata=scan_base.metadata + (("wy_cube_verify", True),)),
+        compact_records=True,
+    )
+    assert scan_wy.hbm_bytes == scan_base.hbm_bytes
+    assert scan_wy.mte2_bytes == scan_base.mte2_bytes
+    assert scan_wy.mte3_bytes == scan_base.mte3_bytes
+    gdn_heads = int(dict(scan_base.metadata)["heads"])
+    assert scan_wy.flops == float(4 * 4 * gdn_heads * 128 * 128)
+    assert scan_wy.vector_ops < scan_base.vector_ops * 0.25
+    gdn_plan = build_gdn_arch35_recover_ssm(scan_wy, geom)
+    assert gdn_plan.work.matrix == {"bf16": 4 * 4 * gdn_heads * 128 * 128}
+    assert gdn_plan.work.resources["vector"] == int(scan_wy.vector_ops)
+
+    rt_meta_async = {
+        **dict(c_gdn.runtime.metadata),
+        "wy_cube_speculative_verify": True,
+        "async_recover_ssm_commit": True,
+    }
+    c_gdn_async = replace(
+        c_gdn, runtime=replace(c_gdn.runtime, metadata=tuple(rt_meta_async.items())),
+    )
+    gdn_ops_async = Frontend()(IterationPlan(gdn_views), c_gdn_async.model, c_gdn_async.runtime, c_gdn_async.machine).ops
+    commit_phys = next(op for op in gdn_ops_async if op.recipe == "recover_ssm_commit")
+    phys_aivs = int(dict(c_gdn_async.machine.dies[0].units_by_role if hasattr(c_gdn_async.machine.dies[0], "units_by_role") else {}).get("vector", c_gdn_async.machine.dies[0].units("vector")))
+    expected_cap = (phys_aivs * ASYNC_COMMIT_AIV_NUMERATOR) // ASYNC_COMMIT_AIV_DENOMINATOR
+    assert commit_phys.stream == ASYNC_COMMIT_STREAM
+    assert commit_phys.owner_schedule is not None
+    assert commit_phys.owner_schedule.active_owners <= expected_cap
+    assert commit_phys.owner_schedule.total_owners == phys_aivs
+    draft_entries = [op for op in gdn_ops_async if op.op_id.startswith("draft0.")][:2]
+    assert draft_entries
+    assert all(not any("recover_ssm_commit" in d for d in op.deps) for op in draft_entries)
+    assert gdn_recurrent.MIN_WY_SPECULATIVE_TOKENS == 2

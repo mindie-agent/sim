@@ -893,6 +893,7 @@
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22115",
       "archs": [
+        "a3",
         "a5"
       ],
       "notes": "5L MLA DSpark C8 QuantFlashMLA (#22115), Latent-MoE norm+quant overlap (#22450), KDA decode gate fusion (#22346)",
@@ -909,7 +910,9 @@
         "has_dspark_mla_draft"
       ],
       "phase_scope": [
-        "decode"
+        "prefill",
+        "decode",
+        "mixed"
       ]
     },
     {

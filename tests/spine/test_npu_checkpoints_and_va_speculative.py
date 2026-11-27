@@ -955,3 +955,103 @@ def test_minimax_dspark_companion_structural_parsing_and_draft_weight_dedup() ->
     assert cloned_flash.auxiliary.mtp is not cloned_flash.auxiliary.dspark
     dup_params, dup_bytes = draft_weight_summary(cloned_flash)
     assert (dup_params, dup_bytes) == (base_params, base_bytes)
+
+
+def test_kimi_k31_dspark7_c8_draft_mla_local_tp_mc2_and_mso_guard() -> None:
+    """Verify Kimi-K3.1 DSpark-7, C8 draft MLA KV/attention at TP=1+localTP, MSO guard, and WY target verify."""
+    from mindie_sim import compose_case, target_graphs
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.compose.runtime import resolve_case_contracts
+
+    # 1. Both Kimi-K3.1 DSpark companions support k=7, hw_overrides on a3/a5, and C8 draft KV opt-in.
+    comp_ship = resolve_speculative_companion(
+        "kimi-k3.1", target_tp=1, target_kv_dtype="fp8", hw_family="a5", num_speculative_tokens=7,
+    )
+    assert comp_ship.num_speculative_tokens == 7
+    assert comp_ship.draft_model == "Eco-Tech/Kimi-K3-DSpark-MLA-NPU"
+    assert comp_ship.draft_kv_cache_dtype == "bfloat16"
+    comp_a3 = resolve_speculative_companion(
+        "kimi-k3.1", target_tp=1, target_kv_dtype="int8", hw_family="a3",
+        num_speculative_tokens=7, dspark_c8_mla=True,
+    )
+    assert comp_a3.draft_model == "Eco-Tech/Kimi-K3-DSpark-MLA-NPU"
+    assert comp_a3.draft_kv_cache_dtype == "int8"
+    comp_a5_c8 = resolve_speculative_companion(
+        "kimi-k3.1", target_tp=1, target_kv_dtype="fp8", hw_family="a5",
+        num_speculative_tokens=7, dspark_c8_mla=True,
+    )
+    assert comp_a5_c8.draft_kv_cache_dtype == "fp8_e4m3"
+    comp_alt = resolve_speculative_companion(
+        "kimi-k3.1", target_tp=1, target_kv_dtype="fp8", hw_family="a5",
+        num_speculative_tokens=7, draft_model="Inferact/Kimi-K3-DSpark-Block5",
+    )
+    assert comp_alt.num_speculative_tokens == 7
+    with pytest.raises(ModelingError, match="speculative_tokens_exceed_companion_limit"):
+        resolve_speculative_companion("kimi-k3.1", target_tp=1, hw_family="a5", num_speculative_tokens=8)
+
+    # 2. End-to-end 128K DP8/TP1/EP8 + localTP=8 across shipping, proposed, and target on A5 and A3.
+    common_kw = dict(
+        dp=8, tp=1, ep=8, q_proj_tp=8, o_proj_tp=8, lm_head_tp=8,
+        concurrency=16, prompt_tokens=130048, output_tokens=1024, max_model_len=131072,
+        spec_method="dspark", mtp_proposal_tokens=7, runtime_stack="vllm-ascend",
+    )
+    a5_cases = {
+        trk: parse_case(compose_case("kimi-k3.1", "Ascend950DT_9582", feature_track=trk, **common_kw))
+        for trk in ("shipping", "proposed", "target")
+    }
+    a3_cases = {
+        trk: parse_case(compose_case("kimi-k3.1", "Ascend910_9392", feature_track=trk, **common_kw))
+        for trk in ("shipping", "proposed", "target")
+    }
+
+    ship_draft_kv = Memory(a5_cases["shipping"]).cache_pool_breakdown(131072)["draft_kv_bytes"]
+    for trk in ("proposed", "target"):
+        mem_a5 = Memory(a5_cases[trk])
+        mem_a5.cache_allocation(131072)
+        assert mem_a5.cache_pool_breakdown(131072)["draft_kv_bytes"] == pytest.approx(ship_draft_kv * 0.5)
+        _, qp_a5, _ = resolve_case_contracts(a5_cases[trk])
+        assert [a.total_plane_bytes() for a in qp_a5.kv_cache_abi if a.scope == "draft"] == [576] * 5
+
+        mem_a3 = Memory(a3_cases[trk])
+        mem_a3.cache_allocation(131072)
+        assert mem_a3.cache_pool_breakdown(131072)["draft_kv_bytes"] == pytest.approx(
+            ship_draft_kv * (656.0 / 1152.0)
+        )
+        _, qp_a3, _ = resolve_case_contracts(a3_cases[trk])
+        assert [a.total_plane_bytes() for a in qp_a3.kv_cache_abi if a.scope == "draft"] == [656] * 5
+
+    # 3. MSO stays True across all tracks; localTP enables tp_mc2_overlap on A5 target; WY verify is target-only.
+    for trk in ("shipping", "proposed", "target"):
+        assert a5_cases[trk].runtime.multistream_overlap_shared_expert is True
+        meta_t = dict(a5_cases[trk].runtime.metadata)
+        if trk == "target":
+            assert meta_t.get("tp_mc2_overlap") is True
+            assert "tp_mc2_overlap" in a5_cases[trk].runtime.lowering_passes
+            assert meta_t.get("wy_cube_speculative_verify") is True
+            assert meta_t.get("async_recover_ssm_commit") is True
+            assert dict(a3_cases[trk].runtime.metadata).get("wy_cube_speculative_verify") is True
+        else:
+            assert meta_t.get("wy_cube_speculative_verify") is None
+
+    # 4. 5L DSpark decode attention at TP=1 + localTP=8 reads C8 KV bytes (576 B on A5, 656 B on A3) at 128K.
+    graph_kw = {**common_kw, "layers": 4}
+    tg_ship = target_graphs(
+        compose_case("kimi-k3.1", "Ascend950DT_9582", feature_track="shipping", **graph_kw),
+        phase="decode", tokens=8, context=131072,
+    )
+    tg_prop = target_graphs(
+        compose_case("kimi-k3.1", "Ascend950DT_9582", feature_track="proposed", **graph_kw),
+        phase="decode", tokens=8, context=131072,
+    )
+    tg_a3_prop = target_graphs(
+        compose_case("kimi-k3.1", "Ascend910_9392", feature_track="proposed", **graph_kw),
+        phase="decode", tokens=8, context=131072,
+    )
+    attn_ship = next(o for o in tg_ship[0] if o.op_id == "draft0.s0.l0.latent_attention0")
+    attn_prop = next(o for o in tg_prop[0] if o.op_id == "draft0.s0.l0.latent_attention0")
+    attn_a3 = next(o for o in tg_a3_prop[0] if o.op_id == "draft0.s0.l0.latent_attention0")
+    assert dict(attn_prop.metadata).get("kv_row_bytes") == 576
+    assert dict(attn_a3.metadata).get("kv_row_bytes") == 656
+    assert attn_prop.mte2_bytes < attn_ship.mte2_bytes * 0.55
+    assert attn_a3.mte2_bytes < attn_ship.mte2_bytes * 0.60

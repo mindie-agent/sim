@@ -1124,6 +1124,7 @@ def _rewrite_single_projection(
     quant: Any, op_scope: str, by_id: Mapping[str, OpSpec],
     users: Mapping[str, list[str]], metadata: dict[str, Any],
     model: Any = None,
+    shared_gathers: dict[tuple[Any, ...], str] | None = None,
 ) -> tuple[OpSpec, ...]:
     m, n, k = (int(op.local_shape[0]), int(op.local_shape[1]), int(op.local_shape[2]))
     act = _dtype(metadata, "activation_format", op.dtype or FALLBACK_ACTIVATION)
@@ -1179,10 +1180,29 @@ def _rewrite_single_projection(
             metadata["vocab_padded_size"] = restore_n
             metadata["vocab_cols_per_rank"] = local_n
         _localize_packed_slices(metadata, factor, quant, rows=col_rows)
+        gather_key = (
+            None if is_logits else (
+                int(op.stage), op_scope, tuple(op.deps), int(factor), int(stride),
+                tuple(int(r) for r in group), int(col_rows), int(k), str(act), str(op.stream or ""),
+            )
+        )
+        shared_gather_id = shared_gathers.get(gather_key) if (gather_key is not None and shared_gathers is not None) else None
+        if shared_gather_id is not None:
+            gemm = _rewrite_matrix(op, gemm_id=gemm_id, rows=col_rows, cols=local_n, reduced=k,
+                                   role=role, width=factor, dep_ids=(shared_gather_id,),
+                                   weight_ratio=float(local_n) / float(max(1, n)), quant=quant, extra_metadata=metadata)
+            restore = _collective(op, suffix="exchange", family="alltoall", recipe="alltoall",
+                                  payload=float(pad_tok * remote_n) * dtype_bytes(out),
+                                  shape=(m, restore_n),
+                                  role=role, group=group, width=factor, deps=(gemm.op_id,), scope=op_scope,
+                                  dtype=out, public_id=op.op_id, stride=stride)
+            return (gemm, restore)
         gather = _collective(op, suffix="gather", family="allgather", recipe="ring_allgather",
                              payload=float((factor - 1) * pad_tok * k) * dtype_bytes(act), shape=(col_rows, k),
                              role=role, group=group, width=factor, deps=op.deps, scope=op_scope, dtype=act,
                              stride=stride)
+        if gather_key is not None and shared_gathers is not None:
+            shared_gathers[gather_key] = gather.op_id
         gemm = _rewrite_matrix(op, gemm_id=gemm_id, rows=col_rows, cols=local_n, reduced=k,
                                role=role, width=factor, dep_ids=(gather.op_id,),
                                weight_ratio=float(local_n) / float(max(1, n)), quant=quant, extra_metadata=metadata)
@@ -1277,6 +1297,7 @@ def lower_local_projection_tp(
             if pre is not None:
                 retire.add(pre.op_id)
     rewritten: list[OpSpec] = []
+    shared_gathers: dict[tuple[Any, ...], str] = {}
     for op in ops:
         if op.op_id in retire or op.op_id in paired_members:
             continue
@@ -1333,7 +1354,7 @@ def lower_local_projection_tp(
             op, role=role, partition=partition, factor=factor, stride=stride,
             group=group, total_tok=total_tok, pad_tok=pad_tok, quant=quant,
             op_scope=op_scope, by_id=by_id, users=users, metadata=metadata,
-            model=model,
+            model=model, shared_gathers=shared_gathers,
         ))
     return tuple(rewritten)
 

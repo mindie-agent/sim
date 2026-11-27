@@ -37,6 +37,7 @@ QSA_INDEX_COMPRESSED_GROUPS = 512
 QSA_INDEX_RAW_TAIL_TOKENS = 3
 QSA_INDEX_BUFFER_COLS = QSA_INDEX_COMPRESSED_GROUPS * QSA_INDEX_GROUP_TOKENS + QSA_INDEX_RAW_TAIL_TOKENS
 KPOOL_TAIL_ALIGNMENT = 128
+MLA_C8_SCALE_GROUP_SIZE = 128
 _NON_NEURAL_SPEC_METHODS = frozenset({"ngram", "ngram_gpu"})
 _DSPARK_SPEC_METHODS = frozenset({"dspark", "dflash"})
 PROLOG_ROLE = "mla_prolog"
@@ -153,6 +154,11 @@ def _independent_draft_runtime(runtime, selections=(), *, draft_model=None):
             graph_capture_mode="none",
             kernels={**kernels, "lowerings": lowerings},
         )
+    draft_kv_low = str(getattr(draft_model, "kv_dtype", "bf16") or "bf16").strip().lower()
+    if draft_kv_low not in {"bf16", "bfloat16"} and isinstance(lowerings.get("paged_mla_attention"), str):
+        lowerings.pop("paged_mla_attention", None)
+        kernels["lowerings"] = lowerings
+        runtime = replace(runtime, kernels=kernels)
     if PROLOG_ROLE not in lowerings:
         return runtime
     draft_binding = any(
@@ -197,13 +203,58 @@ def _cyclic_draft_model(model, plans, step):
     return replace(model, layers=1, layer_plans=(plan,))
 
 
+def _resolve_draft_c8_arch(runtime, machine) -> str:
+    if machine is not None:
+        m_arch = str(getattr(machine, "arch_family", "") or "").strip().lower()
+        if m_arch in {"a2", "a3", "a5"}:
+            return m_arch
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    raw_arch = str(rt_meta.get("arch_family") or rt_meta.get("device_arch") or "").strip().lower()
+    if raw_arch in {"a2", "a3", "a5"}:
+        return raw_arch
+    return ""
+
+
 def _draft_cache_model(model, draft, draft_model, runtime, machine):
     from mindie_sim.prediction.operators.mla_prolog.draft_context import draft_cache_requires_prolog_v3
     draft_kv_dtype = str(getattr(draft_model.quant, "kv_dtype", "") or "bf16")
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    c8_mla_active = (
+        draft.attention_kind == "mla"
+        and draft.kind in {"dspark", "mtp_dspark"}
+        and bool(rt_meta.get("latent_moe_dspark_c8_mla", False))
+        and not bool(rt_meta.get("raw_eager", False))
+        and getattr(draft, "quant", None) is None
+    )
     if draft.attention_kind == "mla":
+        arch = _resolve_draft_c8_arch(runtime, machine)
+        if c8_mla_active and arch == "a5":
+            draft_kv_dtype = "fp8_e4m3"
+            draft_model = replace(
+                draft_model,
+                quant=replace(draft_model.quant, kv_dtype="fp8_e4m3"),
+            )
+            cache_reps: dict[str, object] = {"mla_kv": {"dtype": "fp8_e4m3"}}
+        elif c8_mla_active and arch == "a3":
+            draft_kv_dtype = "int8"
+            draft_model = replace(
+                draft_model,
+                quant=replace(draft_model.quant, kv_dtype="int8"),
+            )
+            rope_elems = int(getattr(draft, "qk_rope_head_dim", 0) or 0)
+            mla_rep: dict[str, object] = {
+                "dtype": "int8",
+                "group_size": MLA_C8_SCALE_GROUP_SIZE,
+                "scale_dtype": "fp32",
+            }
+            if rope_elems > 0:
+                mla_rep["suffix_elements"] = rope_elems
+                mla_rep["suffix_dtype"] = "bf16"
+            cache_reps = {"mla_kv": mla_rep}
+        else:
+            cache_reps = {"mla_kv": {"dtype": draft_kv_dtype}}
         context_prolog_v3 = draft_cache_requires_prolog_v3(
             model, runtime=runtime, machine=machine)
-        cache_reps = {"mla_kv": {"dtype": draft_kv_dtype}}
     else:
         context_prolog_v3 = False
         cache_reps = {
@@ -669,7 +720,55 @@ def lower_dspark_context_kv(
         layer_slot_valid_rows=per_layer_valid if has_explicit_slots else None,
         requires_staging_scatter=requires_staging_scatter,
     )
+    if draft.attention_kind == "mla" and str(draft_model.kv_dtype).lower() in {"fp8_e4m3", "int8"}:
+        _reconcile_dspark_context_kv_c8(ops, draft=draft, draft_model=draft_model)
     return ops, ctx_ready
+
+
+def _reconcile_dspark_context_kv_c8(ops: list, *, draft, draft_model) -> None:
+    """Reconcile external DSpark MLA context-KV prolog/scatter bytes when C8 draft KV is active."""
+    from mindie_sim.catalog.cache import packed_region_row_bytes
+    d_plans = tuple(getattr(draft_model, "layer_plans", ()) or ())
+    plan0 = d_plans[0] if d_plans else None
+    kv_width = int(draft.kv_lora_rank + draft.qk_rope_head_dim)
+    c8_row_b = int(packed_region_row_bytes(draft_model, "mla_kv", kv_width, plan=plan0, phase="draft"))
+    bf16_row_b = kv_width * int(dtype_bytes("bf16"))
+    if c8_row_b <= 0 or c8_row_b == bf16_row_b:
+        return
+    kv_dt = str(draft_model.kv_dtype).lower()
+    for idx, op in enumerate(ops):
+        meta = dict(op.metadata)
+        if op.op_id.endswith(".mla_prolog_v3") and meta.get("kv_row_bytes") == bf16_row_b:
+            old_write = int(meta.get("kv_write_bytes", 0) or 0)
+            write_rows = old_write // bf16_row_b if bf16_row_b > 0 else 0
+            new_write = write_rows * c8_row_b
+            delta = float(new_write - old_write)
+            meta["kv_row_bytes"] = c8_row_b
+            meta["kv_write_bytes"] = new_write
+            meta["kv_cache_dtype"] = kv_dt
+            ops[idx] = replace(
+                op,
+                mte3_bytes=max(0.0, float(op.mte3_bytes) + delta),
+                hbm_bytes=max(0.0, float(op.hbm_bytes) + delta),
+                metadata=tuple(meta.items()),
+            )
+        elif op.op_id.endswith(".kv_scatter") and isinstance(meta.get("cache_epilog"), Mapping):
+            epilog = dict(meta["cache_epilog"])
+            if epilog.get("kv_row_bytes") != bf16_row_b:
+                continue
+            rank_rows = int(epilog.get("rank_owned_rows", 0) or 0)
+            new_store = float(rank_rows * c8_row_b)
+            epilog["kv_row_bytes"] = c8_row_b
+            meta["cache_epilog"] = epilog
+            meta["kv_cache_dtype"] = kv_dt
+            ops[idx] = replace(
+                op,
+                dtype=kv_dt,
+                mte2_bytes=new_store,
+                mte3_bytes=new_store,
+                hbm_bytes=2.0 * new_store,
+                metadata=tuple(meta.items()),
+            )
 
 
 def _lmhead_tp_pad_rows(runtime, valid_rows: int, *, max_k: int) -> int:

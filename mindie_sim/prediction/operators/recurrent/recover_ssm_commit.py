@@ -83,6 +83,51 @@ KDA_CONV_CHANNELS_PER_HEAD_FACTOR = 3
 INTENT_STAGE = "commit_intent"
 BODY_BOUNDARY = "declared_body_input"
 ACCEPTANCE_BOUNDARY = "sampling_acceptance"
+ASYNC_COMMIT_STREAM = "recover_ssm_commit_aux"
+ASYNC_COMMIT_AIV_NUMERATOR = 3
+ASYNC_COMMIT_AIV_DENOMINATOR = 4
+_DRAFT_LAYER_SCOPES = frozenset({"draft", "mtp", "dspark"})
+_NON_NEURAL_SPEC_METHODS = frozenset({"none", "ngram", "ngram_gpu"})
+
+
+def async_recover_ssm_commit_enabled(runtime: Any) -> bool:
+    """Return True when async auxiliary-stream RecoverSSM commit overlap is enabled."""
+    if runtime is None:
+        return False
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    return bool(
+        rt_meta.get("async_recover_ssm_commit", False)
+        or rt_meta.get("wy_cube_speculative_verify", False)
+    )
+
+
+def _has_following_speculative_draft(
+    ops: Sequence[OpSpec], views: Sequence[Any], runtime: Any,
+) -> bool:
+    """Return True when speculative draft ops follow commit intents in the step."""
+    if any(
+        str(dict(o.metadata).get("layer_scope", "")) in _DRAFT_LAYER_SCOPES
+        or o.op_id.startswith("draft")
+        for o in ops
+    ):
+        return True
+    if ops and all(is_recover_ssm_intent(o) or _is_pending_commit(o) for o in ops):
+        rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+        spec_m = str(rt_meta.get("spec_method") or "").strip().lower()
+        if spec_m in _NON_NEURAL_SPEC_METHODS:
+            return False
+        return any(int(getattr(v, "draft_proposal_tokens", 0) or 0) > 0 for v in views)
+    return False
+
+
+def _cap_async_commit_aivs(available_aivs: int | None, async_commit: bool) -> int | None:
+    """Partition AIV ownership to 3/4 of physical AIVs when async commit overlaps draft."""
+    if not async_commit or available_aivs is None or int(available_aivs) <= 0:
+        return available_aivs
+    return max(
+        1,
+        (int(available_aivs) * ASYNC_COMMIT_AIV_NUMERATOR) // ASYNC_COMMIT_AIV_DENOMINATOR,
+    )
 
 
 def _next_power_of_two(value: int) -> int:
@@ -457,6 +502,7 @@ def _commit_owner_schedule(
     v_tiles: int = 1,
     head_groups: int | None = None,
     available_aivs: int | None = None,
+    total_aivs: int | None = None,
 ) -> OwnerScheduleSpec:
     """Physical Triton 1D flattened grid distributed across physical rank AIVs."""
     eff_head_groups = max(1, int(head_groups)) if head_groups is not None else max(1, int(heads))
@@ -464,7 +510,8 @@ def _commit_owner_schedule(
     has_cap = available_aivs is not None and int(available_aivs) > 0
     cap_aivs = int(available_aivs) if has_cap else 0
     owners = min(work_tiles, cap_aivs) if has_cap else work_tiles
-    total_owners = cap_aivs if has_cap else max(1, owners)
+    phys_total = int(total_aivs) if (total_aivs is not None and int(total_aivs) > 0) else cap_aivs
+    total_owners = max(phys_total, owners) if phys_total > 0 else max(1, owners)
     max_tiles = math.ceil(work_tiles / owners) if owners > 0 else 0
     per_head_state = int(dk * dv * dtype_bytes(state_dtype))
     ub_live = max(FP32_RECORD_BYTES, per_head_state // max(1, int(v_tiles)))
@@ -824,6 +871,8 @@ def _build_shared_kda_plan_and_conv(
     metadata: Mapping[str, Any],
     group_suffix: str = "",
     boundary_count: int = 0,
+    commit_stream: str = "",
+    capped_aivs: int | None = None,
 ) -> tuple[OpSpec, OpSpec]:
     """Emit stage-shared ``_prepare_commit_plan_kernel`` and ``_compact_conv_state_kernel``."""
     batch = max(1, len(requests))
@@ -836,6 +885,11 @@ def _build_shared_kda_plan_and_conv(
         arch_family=arch_family, submodule="recurrent_state", macro_module="attention",
         readiness=readiness, recipe_id="kda_prepare_commit_plan",  # type: ignore[arg-type]
     )
+    async_meta: tuple[tuple[str, Any], ...] = (
+        (("async_recover_ssm_commit", True),)
+        + ((("active_aivs", int(capped_aivs)),) if capped_aivs and int(capped_aivs) > 0 else ())
+        if commit_stream else ()
+    )
     plan_op = OpSpec(
         op_id=f"s{stage}.kda_prepare_commit_plan{group_suffix}", family="elementwise", phase=phase,
         stage=stage, layer=-1, requests=requests,
@@ -843,13 +897,14 @@ def _build_shared_kda_plan_and_conv(
         flops=0.0, vector_ops=float(batch * KDA_PLAN_OPS_PER_REQ),
         hbm_bytes=plan_read + plan_write, mte2_bytes=plan_read, mte3_bytes=plan_write,
         deps=plan_deps, recipe="kda_prepare_commit_plan", dtype="int32",
-        source_boundary="", kernel_binding=plan_kb,
-        metadata=(
+        stream=commit_stream, source_boundary="", kernel_binding=plan_kb,
+        metadata=tuple(sorted((
             ("align_mode", align_mode),
             ("native_kind", KDA_COMMIT_PLAN_KERNEL_NAME),
             ("num_layers", num_layers),
             ("recover_ssm_stage", "commit_plan"),
-        ),
+            *async_meta,
+        ))),
     )
     geometry = _geometry(metadata)
     conv_dim = int(metadata.get("conv_dim") or geometry.get("conv_dim") or (heads * (dk * 2 + dv)))
@@ -874,8 +929,8 @@ def _build_shared_kda_plan_and_conv(
         hbm_bytes=2.0 * conv_bytes, mte2_bytes=conv_bytes, mte3_bytes=conv_bytes,
         deps=tuple(dict.fromkeys((plan_op.op_id, *verify_deps))),
         recipe="kda_compact_conv_state", dtype="bf16",
-        source_boundary="", kernel_binding=conv_kb,
-        metadata=(
+        stream=commit_stream, source_boundary="", kernel_binding=conv_kb,
+        metadata=tuple(sorted((
             ("align_boundary_triggered", eff_boundary_count),
             ("align_mode", align_mode),
             ("conv_dim", conv_dim),
@@ -883,7 +938,8 @@ def _build_shared_kda_plan_and_conv(
             ("native_kind", KDA_CONV_COMPACT_KERNEL_NAME),
             ("num_layers", num_layers),
             ("recover_ssm_stage", "conv_compact"),
-        ),
+            *async_meta,
+        ))),
     )
     return plan_op, conv_op
 
@@ -914,6 +970,8 @@ def _build_shared_kda_physical_commit(
     k_binding: KernelBinding,
     available_aivs: int | None,
     version_meta: Mapping[str, Any],
+    total_aivs: int | None = None,
+    commit_stream: str = "",
 ) -> OpSpec:
     """Build one cross-layer physical KDA commit kernel launch (ordinary or boundary)."""
     scale = float(max(1, num_layers))
@@ -935,6 +993,7 @@ def _build_shared_kda_physical_commit(
         active_count, heads, dk, dv, total_tokens, read, write, vector,
         state_dtype, num_layers=num_layers, v_tiles=v_tiles,
         head_groups=head_groups, available_aivs=available_aivs,
+        total_aivs=total_aivs,
     )
     meta: dict[str, Any] = {
         **version_meta,
@@ -977,6 +1036,11 @@ def _build_shared_kda_physical_commit(
         "record_kg_dtype": kg_dtype,
         "acceptance_boundary": ACCEPTANCE_BOUNDARY,
     }
+    if commit_stream:
+        meta["async_recover_ssm_commit"] = True
+        if owner_schedule.active_owners > 0:
+            meta["active_aivs"] = int(owner_schedule.active_owners)
+            meta["launched_blocks"] = int(owner_schedule.launched_owners)
     candidate = OpSpec(
         op_id=op_id, family="elementwise", phase=phase, stage=stage,
         layer=covered_layers[0] if len(covered_layers) == 1 else -1,
@@ -988,7 +1052,7 @@ def _build_shared_kda_physical_commit(
         flops=0.0, vector_ops=vector, hbm_bytes=read + write,
         mte2_bytes=read, mte3_bytes=write, deps=deps,
         recipe="recover_ssm_commit", dtype=state_dtype,
-        source_boundary="kernel", kernel_binding=k_binding,
+        stream=commit_stream, source_boundary="kernel", kernel_binding=k_binding,
         owner_schedule=owner_schedule,
         metadata=tuple(sorted(meta.items(), key=lambda pair: pair[0])),
         notes=("recover_ssm_commit_after_acceptance", "kda_cross_layer_shared_launch"),
@@ -1047,6 +1111,7 @@ def _emit_layer_publish_barriers(
     *,
     family_kind: str,
     phys_dep_tuple: tuple[str, ...],
+    barrier_stream: str = "",
 ) -> list[OpSpec]:
     """Emit zero-work per-layer logical state publication barriers after a shared commit."""
     out: list[OpSpec] = []
@@ -1073,7 +1138,7 @@ def _emit_layer_publish_barriers(
             padded_shape=(len(seq),), launch_shape=(len(seq),),
             flops=0.0, vector_ops=0.0, hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0,
             deps=phys_dep_tuple, recipe="recover_ssm_state_publish", dtype="int32",
-            source_boundary="",
+            stream=barrier_stream, source_boundary="",
             metadata=tuple(sorted(pub_meta.items(), key=lambda pair: pair[0])),
             notes=("recover_ssm_logical_layer_state_publish",),
         ))
@@ -1089,6 +1154,7 @@ def _materialize_shared_kda_group(
     runtime: Any,
     machine: Any,
     group_suffix: str = "",
+    async_commit: bool = False,
 ) -> list[OpSpec]:
     """Upstream Option A (`recoverssm.py:1412-1568`): shared plan/conv/commit + per-layer publish barriers."""
     first_op, first_meta, first_owner, _first_ver, first_sel = group[0]
@@ -1101,7 +1167,9 @@ def _materialize_shared_kda_group(
     kg_dtype = str(geometry.get("kg_dtype", first_meta.get("record_kg_dtype", "bf16")))
     arch_family = _resolve_arch_family(runtime, first_meta, machine=machine)
     align_mode = _is_align_mode_active(first_meta, runtime)
-    available_aivs = _available_aivs(machine)
+    phys_aivs = _available_aivs(machine)
+    available_aivs = _cap_async_commit_aivs(phys_aivs, async_commit)
+    commit_stream = ASYNC_COMMIT_STREAM if async_commit else ""
     readiness = _resolve_readiness(runtime, family_kind="kda")
     k_binding = _commit_kernel_binding(family_kind="kda", runtime=runtime, arch_family=arch_family)
 
@@ -1146,7 +1214,8 @@ def _materialize_shared_kda_group(
         verify_deps=verify_deps, num_layers=num_layers, active_count=total_active,
         heads=heads, dk=dk, dv=dv, align_mode=align_mode, arch_family=arch_family,
         readiness=readiness, metadata=first_meta, group_suffix=group_suffix,
-        boundary_count=bnd_count,
+        boundary_count=bnd_count, commit_stream=commit_stream,
+        capped_aivs=available_aivs,
     )
     out_ops: list[OpSpec] = [plan_op, conv_op]
     commit_deps = tuple(dict.fromkeys((plan_op.op_id, conv_op.op_id, *verify_deps)))
@@ -1173,6 +1242,7 @@ def _materialize_shared_kda_group(
             v_tile_width=bv_ord, v_tiles=vt_ord, head_groups=hg_ord,
             align_mode=align_mode, boundary_count=0, k_binding=k_binding,
             available_aivs=available_aivs, version_meta=ver_meta,
+            total_aivs=phys_aivs, commit_stream=commit_stream,
         )
         out_ops.append(ord_op)
         physical_ids.append(ord_op.op_id)
@@ -1186,11 +1256,13 @@ def _materialize_shared_kda_group(
             v_tile_width=bv_bnd, v_tiles=vt_bnd, head_groups=hg_bnd,
             align_mode=True, boundary_count=bnd_count, k_binding=k_binding,
             available_aivs=available_aivs, version_meta=ver_meta,
+            total_aivs=phys_aivs, commit_stream=commit_stream,
         )
         out_ops.append(bnd_op)
         physical_ids.append(bnd_op.op_id)
     out_ops.extend(_emit_layer_publish_barriers(
         layer_pub_records, family_kind="kda", phys_dep_tuple=tuple(physical_ids),
+        barrier_stream=commit_stream,
     ))
     return out_ops
 
@@ -1204,6 +1276,7 @@ def _materialize_shared_gdn_group(
     runtime: Any,
     machine: Any,
     group_suffix: str = "",
+    async_commit: bool = False,
 ) -> list[OpSpec]:
     """Upstream GDN (`gdn_recoverssm_commit.py:442`): 1 batched launch across num_layers + publish barriers."""
     first_op, first_meta, first_owner, _first_ver, first_sel = group[0]
@@ -1216,7 +1289,9 @@ def _materialize_shared_gdn_group(
     kg_dtype = str(geometry.get("kg_dtype", first_meta.get("record_kg_dtype", "bf16")))
     arch_family = _resolve_arch_family(runtime, first_meta, machine=machine)
     align_mode = _is_align_mode_active(first_meta, runtime)
-    available_aivs = _available_aivs(machine)
+    phys_aivs = _available_aivs(machine)
+    available_aivs = _cap_async_commit_aivs(phys_aivs, async_commit)
+    commit_stream = ASYNC_COMMIT_STREAM if async_commit else ""
     k_binding = _commit_kernel_binding(family_kind="gdn", runtime=runtime, arch_family=arch_family)
 
     active_selected = [(r, c) for r, c in first_sel if c > 0]
@@ -1257,7 +1332,7 @@ def _materialize_shared_gdn_group(
     owner_schedule = _commit_owner_schedule(
         active_count, heads, dk, dv, total_tokens, read, write, vector, state_dtype,
         num_layers=num_layers, v_tiles=v_tiles, head_groups=head_groups,
-        available_aivs=available_aivs,
+        available_aivs=available_aivs, total_aivs=phys_aivs,
     )
     meta: dict[str, Any] = {
         "recover_ssm_stage": "commit",
@@ -1304,6 +1379,11 @@ def _materialize_shared_gdn_group(
         "state_owner": f"stage{stage}.gdn{group_suffix}" if num_layers > 1 else first_owner,
         "acceptance_boundary": ACCEPTANCE_BOUNDARY,
     }
+    if commit_stream:
+        meta["async_recover_ssm_commit"] = True
+        if owner_schedule.active_owners > 0:
+            meta["active_aivs"] = int(owner_schedule.active_owners)
+            meta["launched_blocks"] = int(owner_schedule.launched_owners)
     commit_op = _bind_commit_native_call(
         OpSpec(
             op_id=f"s{stage}.recover_ssm_commit{group_suffix}", family="elementwise",
@@ -1317,7 +1397,7 @@ def _materialize_shared_gdn_group(
             flops=0.0, vector_ops=vector, hbm_bytes=read + write,
             mte2_bytes=read, mte3_bytes=write, deps=commit_deps,
             recipe="recover_ssm_commit", dtype=state_dtype,
-            source_boundary="kernel", kernel_binding=k_binding,
+            stream=commit_stream, source_boundary="kernel", kernel_binding=k_binding,
             owner_schedule=owner_schedule,
             metadata=tuple(sorted(meta.items(), key=lambda pair: pair[0])),
             notes=("recover_ssm_commit_after_acceptance", "gdn_cross_layer_shared_launch"),
@@ -1326,6 +1406,7 @@ def _materialize_shared_gdn_group(
     )
     return [commit_op, *_emit_layer_publish_barriers(
         layer_pub_records, family_kind="gdn", phys_dep_tuple=(commit_op.op_id,),
+        barrier_stream=commit_stream,
     )]
 
 
@@ -1414,6 +1495,7 @@ def _materialize_commit_op(
     bindings: Mapping[str, Any],
     runtime: Any,
     machine: Any = None,
+    async_commit: bool = False,
 ) -> OpSpec:
     """Materialize one acceptance-bound RecoverSSM commit OpSpec with Triton/native bindings."""
     dependencies = list(op.deps)
@@ -1528,10 +1610,18 @@ def _materialize_commit_op(
     owner_schedule = _commit_owner_schedule(
         active_count, heads, dk, dv, total, read, write, vector,
         state_dtype, v_tiles=v_tiles, head_groups=head_groups,
-        available_aivs=_available_aivs(machine),
+        available_aivs=_cap_async_commit_aivs(_available_aivs(machine), async_commit),
+        total_aivs=_available_aivs(machine),
     )
+    commit_stream = ASYNC_COMMIT_STREAM if async_commit else op.stream
+    if async_commit:
+        metadata["async_recover_ssm_commit"] = True
+        if owner_schedule.active_owners > 0:
+            metadata["active_aivs"] = int(owner_schedule.active_owners)
+            metadata["launched_blocks"] = int(owner_schedule.launched_owners)
     candidate = replace(
         op, deps=tuple(dict.fromkeys(dependencies)), recipe="recover_ssm_commit",
+        stream=commit_stream,
         source_boundary="kernel", vector_ops=vector, hbm_bytes=read + write,
         mte2_bytes=read, mte3_bytes=write, kernel_binding=k_binding,
         owner_schedule=owner_schedule,
@@ -1552,6 +1642,10 @@ def bind_recover_ssm_commits(
     active = tuple(view for view in views if _decode_speculative(view))
     if not active:
         return tuple(ops)
+    use_async_commit = bool(
+        async_recover_ssm_commit_enabled(runtime)
+        and _has_following_speculative_draft(ops, active, runtime)
+    )
     events = dict(acceptance_events or {})
     bindings = dict(state_bindings or {})
     committed_by_request = {
@@ -1640,19 +1734,20 @@ def bind_recover_ssm_commits(
                 result.extend(_materialize_shared_gdn_group(
                     group_entries, active=active, events=events,
                     bindings=bindings, runtime=runtime, machine=machine,
-                    group_suffix=suffix,
+                    group_suffix=suffix, async_commit=use_async_commit,
                 ))
             else:
                 result.extend(_materialize_shared_kda_group(
                     group_entries, active=active, events=events,
                     bindings=bindings, runtime=runtime, machine=machine,
-                    group_suffix=suffix,
+                    group_suffix=suffix, async_commit=use_async_commit,
                 ))
             continue
         result.append(_materialize_commit_op(
             op, metadata=metadata, owner=owner, version=version,
             selected=selected, active=active, events=events,
             bindings=bindings, runtime=runtime, machine=machine,
+            async_commit=use_async_commit,
         ))
     return tuple(result)
 

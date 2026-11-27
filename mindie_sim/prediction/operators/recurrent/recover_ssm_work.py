@@ -82,6 +82,19 @@ def commit_tokens_for_view(view: Any, runtime: Any = None) -> int:
     return 1
 
 
+def _runtime_wy_cube_verify(runtime: Any, b: Any = None) -> bool:
+    if runtime is None:
+        return False
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    if not bool(rt_meta.get("wy_cube_speculative_verify", False)):
+        return False
+    machine = getattr(b, "machine", None) if b is not None else None
+    dies = getattr(machine, "dies", ()) if machine is not None else ()
+    if dies:
+        return any(int(getattr(d, "compute_units", 0) or 0) > 0 for d in dies)
+    return True
+
+
 def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[Any],
                    heads: int, dk: int, dv: int, state_dtype: str, kg_dtype: str = "bf16",
                    runtime: Any = None, attention_kind: str = "kda") -> str | None:
@@ -93,7 +106,6 @@ def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[An
     ``recover_ssm_commit`` materializes the physical work at the acceptance
     boundary.
     """
-    del runtime
     spec_views = tuple(
         view for view in views
         if getattr(view, "phase", "") == "decode"
@@ -101,6 +113,7 @@ def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[An
         and not bool(getattr(view, "padding", False)))
     if not spec_views:
         return None
+    wy_verify = _runtime_wy_cube_verify(runtime, b)
     plan = getattr(b, "plan", None)
     gdn = str(attention_kind) == "gdn"
     record_head = (gdn_record_head_bytes(dk, dv) if gdn
@@ -149,8 +162,31 @@ def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[An
                 merged = dict(existing.metadata)
                 for k_item, v_item in state_stamp:
                     merged.setdefault(k_item, v_item)
+                if wy_verify and gdn:
+                    merged["wy_cube_verify"] = True
+                    merged["invocation_class"] = "mixed_aic_aiv"
+                    merged.setdefault("heads", int(heads))
+                    merged.setdefault("key_heads", int(merged.get("hk", heads)))
+                    merged.setdefault("dk", int(dk))
+                    merged.setdefault("dv", int(dv))
+                    merged.setdefault("state_dtype", str(state_dtype))
+                    merged.setdefault(
+                        "sequence_tokens",
+                        tuple(int(getattr(v, "q_len", 1)) for v in views if not getattr(v, "padding", False)),
+                    )
+                    merged["recover_ssm"] = True
                 new_deps = tuple(dict.fromkeys((*existing.deps, *pub_deps)))
-                b.ops[idx] = replace(existing, deps=new_deps, metadata=tuple(merged.items()))
+                updated_op = replace(existing, deps=new_deps, metadata=tuple(merged.items()))
+                if wy_verify and gdn:
+                    if updated_op.recipe == "decode_recurrent_scan":
+                        updated_op = replace(
+                            updated_op,
+                            recipe=GDN_ARCH35_RECOVER_SSM_RECIPE,
+                            source_boundary="kernel",
+                        )
+                    if updated_op.recipe in {GDN_ARCH35_RECOVER_SSM_RECIPE, "gdn_recurrent"}:
+                        updated_op = stamp_gdn_kernel_spec(updated_op, compact_records=True)
+                b.ops[idx] = updated_op
     geometry = {
         "heads": int(heads), "dk": int(dk), "dv": int(dv),
         "state_dtype": str(state_dtype), "kg_dtype": str(kg_dtype),
@@ -220,9 +256,9 @@ def stamp_gdn_kernel_spec(scan: Any, *, compact_records: bool) -> Any:
 
     The analytical decode scan declares ``7 * Dk * Dv`` vector work and one
     full FP32 checkpoint per token. Once the arch35 kernel (and optionally the
-    RecoverSSM compact-record variant) is selected, the executed program issues
-    ``kernel_work_terms``; the spec must carry the same work so ``L*`` derived
-    from it never exceeds the executed duration.
+    RecoverSSM compact-record or AIC+AIV WY verify variant) is selected, the
+    executed program issues ``kernel_work_terms`` / ``wy_kernel_work_terms``;
+    the spec must carry the same work so ``L*`` never exceeds executed duration.
     """
     from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
 
@@ -234,11 +270,27 @@ def stamp_gdn_kernel_spec(scan: Any, *, compact_records: bool) -> Any:
     record = None
     if compact_records:
         record = gdn_record_head_bytes(dk, dv) if _is_gdn_record(scan) else record_head_bytes(dk, dv, scan.dtype)
+    wy_verify = bool(meta.get("wy_cube_verify", False) or meta.get("wy_cube_speculative_verify", False))
+    if wy_verify and any(q >= gdn_recurrent.MIN_WY_SPECULATIVE_TOKENS for q in lengths):
+        reads, scalar, writes, vector, cube_flops = gdn_recurrent.wy_kernel_work_terms(
+            lengths, heads, dk, dv, input_bytes=int(dtype_bytes(scan.dtype)),
+            state_bytes=int(dtype_bytes(meta["state_dtype"])), record_head=record,
+        )
+        stamped = Work(
+            matrix={"bf16": cube_flops} if cube_flops else {},
+            resources={
+                "hbm": reads + scalar + writes,
+                "mte2_aiv": reads,
+                "mte3": writes,
+                "vector": vector,
+            },
+        ).apply(scan)
+        return replace(stamped, mte2_bytes=float(reads), mte3_bytes=float(writes))
     reads, scalar, writes, vector = gdn_recurrent.kernel_work_terms(
         lengths, heads, dk, dv, input_bytes=int(dtype_bytes(scan.dtype)),
         state_bytes=int(dtype_bytes(meta["state_dtype"])), record_head=record)
-    return replace(scan, hbm_bytes=float(reads + scalar + writes), mte2_bytes=float(reads),
-                   mte3_bytes=float(writes), vector_ops=float(vector))
+    return replace(scan, flops=0.0, matrix_flops=(), hbm_bytes=float(reads + scalar + writes),
+                   mte2_bytes=float(reads), mte3_bytes=float(writes), vector_ops=float(vector))
 
 
 def build_gdn_arch35_recover_ssm(
@@ -247,9 +299,20 @@ def build_gdn_arch35_recover_ssm(
     """GDN arch35_fp32 decode plan writing compact records for speculative q > 1."""
     from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
 
-    base = gdn_recurrent.build(op, geometry, compact=compact, ctx=ctx)
     meta = dict(op.metadata)
     lengths = tuple(int(v) for v in gdn_recurrent.recurrent_lengths(op, ctx))
+    if gdn_recurrent.wy_cube_verify_active(meta, geometry, ctx, lengths):
+        merged_meta = {**meta, "recover_ssm": True}
+        wy_op = replace(op, metadata=tuple(merged_meta.items()))
+        wy_plan = gdn_recurrent.build(wy_op, geometry, compact=compact, ctx=ctx)
+        meta_wy = dict(wy_plan.metadata)
+        sched_wy = dict(meta_wy.get("gdn_recurrent_schedule", {}))
+        sched_wy["state_residency"] = "one_initial_load_per_head;wy_cube_verify_compact_record"
+        meta_wy["gdn_recurrent_schedule"] = sched_wy
+        meta_wy["recover_ssm"] = True
+        meta_wy["wy_cube_verify"] = True
+        return OperatorPlan(wy_plan.work, wy_plan.program, metadata=meta_wy)
+    base = gdn_recurrent.build(op, geometry, compact=compact, ctx=ctx)
     if not any(q > 1 for q in lengths):
         return base
     heads, dk, dv = (int(meta[k]) for k in ("heads", "dk", "dv"))

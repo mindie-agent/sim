@@ -50,6 +50,15 @@ _RESIDENT_QKV_BYTES = 16384
 _STATE_TILE_ELEMENTS = 8192
 _VALUE_TILE_COLUMN_LIMIT = 256
 QK_CAST_SCALE_OPS_PER_LANE = 3
+FP32_STATE_BYTES = 4
+MIN_WY_SPECULATIVE_TOKENS = 2
+WY_GRAM_OPS_FACTOR = 4
+WY_SOLVE_OPS_PER_PAIR = 4
+WY_ROW_SCALE_OPS_FACTOR = 4
+WY_CUBE_FLOPS_PER_STATE_ELEMENT = 4
+WY_EPILOGUE_QUAD_FACTOR = 4
+WY_EPILOGUE_LINEAR_FACTOR = 4
+WY_GAMMA_PREP_OPS_PER_KEY = 3
 
 
 def head_ownership(lengths, heads, blocks):
@@ -270,6 +279,65 @@ def token_vector_ops(aligned_key: int, aligned_value: int, dv: int) -> int:
     return value_ops * dv + key_ops + aligned_value
 
 
+def wy_cube_verify_active(
+    meta: Mapping, geometry, ctx: OperatorPlanningContext | None, lengths,
+) -> bool:
+    """Return True when AIC Cube + AIV WY speculative verify applies to ``lengths``."""
+    flag = bool(meta.get("wy_cube_verify", False) or meta.get("wy_cube_speculative_verify", False))
+    if not flag or not any(MIN_WY_SPECULATIVE_TOKENS <= q <= _MAX_QUERY_ROWS for q in lengths):
+        return False
+    if ctx is not None and getattr(ctx, "datapath", None) is not None:
+        return int(ctx.datapath.aic_count) > 0
+    return int(getattr(geometry, "compute_units", 0) or 0) > 0
+
+
+def wy_head_terms(
+    q: int, dk: int, dv: int, ak: int, av: int, *, state_bytes: int,
+) -> tuple[int, int, int, int]:
+    """Closed-form ``(state_cast_ops, wy_prep_ops, cube_flops, wy_epilogue_ops)`` per GDN head."""
+    state_cast_ops = ak * dv if state_bytes == FP32_STATE_BYTES else 0
+    qk_v_prep = q * (
+        WY_GAMMA_PREP_OPS_PER_KEY * ak + QK_CAST_SCALE_OPS_PER_LANE * ak + av
+    )
+    strict_pairs = q * (q - 1) // 2
+    wy_intra_prep = (
+        WY_GRAM_OPS_FACTOR * q * q * ak
+        + WY_SOLVE_OPS_PER_PAIR * strict_pairs
+        + WY_ROW_SCALE_OPS_FACTOR * q * ak
+    )
+    cube_flops = WY_CUBE_FLOPS_PER_STATE_ELEMENT * q * dk * dv
+    wy_epilogue = (
+        WY_EPILOGUE_QUAD_FACTOR * q * q * dv
+        + WY_EPILOGUE_LINEAR_FACTOR * q * dv
+    )
+    return state_cast_ops, qk_v_prep + wy_intra_prep, cube_flops, wy_epilogue
+
+
+def wy_kernel_work_terms(
+    lengths, heads, dk, dv, *, input_bytes, state_bytes, record_head=None,
+) -> tuple[int, int, int, int, int]:
+    """Exact ``(tensor_reads, scalar_payload, writes, vector_ops, cube_flops)`` for WY verify."""
+    ak, av = align_up(dk, VECTOR_LANE_ALIGNMENT), align_up(dv, VECTOR_LANE_ALIGNMENT)
+    tensor_reads, scalar_payload, writes, _ = kernel_work_terms(
+        lengths, heads, dk, dv, input_bytes=input_bytes,
+        state_bytes=state_bytes, record_head=record_head,
+    )
+    vector = 0
+    cube_flops = 0
+    for q in lengths:
+        if q <= 0:
+            continue
+        if MIN_WY_SPECULATIVE_TOKENS <= q <= _MAX_QUERY_ROWS:
+            st_cast, wy_prep, c_flops, wy_epi = wy_head_terms(
+                q, dk, dv, ak, av, state_bytes=state_bytes,
+            )
+            vector += heads * (st_cast + wy_prep + wy_epi)
+            cube_flops += heads * c_flops
+        else:
+            vector += heads * (ak * dv + q * token_vector_ops(ak, av, dv))
+    return tensor_reads, scalar_payload, writes, vector, cube_flops
+
+
 def kernel_work_terms(lengths, heads, dk, dv, *, input_bytes, state_bytes, record_head=None):
     """Exact ``(tensor_reads, scalar_payload, writes, vector)`` of the source kernel.
 
@@ -318,7 +386,9 @@ def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = N
         raise ValueError("source_recurrent_gdn_head_dimensions_outside_host_domain")
     ak, av = align_up(dk, VECTOR_LANE_ALIGNMENT), align_up(dv, VECTOR_LANE_ALIGNMENT)
     max_query = max(lengths)
-    if op.dtype != "bf16" or meta["state_dtype"] != "fp32" or max_query > _MAX_QUERY_ROWS:
+    wy_active = wy_cube_verify_active(meta, geometry, ctx, lengths)
+    allowed_states = ("bf16", "fp32") if wy_active else ("fp32",)
+    if op.dtype != "bf16" or meta["state_dtype"] not in allowed_states or max_query > _MAX_QUERY_ROWS:
         raise ValueError("source_recurrent_gdn_requires_bf16_fp32_state_q_le8")
     state_bytes = int(dtype_bytes(meta["state_dtype"]))
     input_bytes = int(dtype_bytes(op.dtype))
@@ -329,6 +399,7 @@ def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = N
         raise ValueError("source_recurrent_gdn_state_tile_exceeds_32k_buffer")
     parts = math.ceil(dv / value_step)
     units, core_ids = recurrent_owners(geometry, ctx)
+    aic_units, aic_ids = recurrent_aic_owners(geometry, ctx)
     active_heads = sum(length > 0 for length in lengths) * heads
     blocks = min(len(core_ids), active_heads)
     if not blocks:
@@ -338,14 +409,44 @@ def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = N
                        for segments in ownership)
     read = read_role(geometry.resource_units, aiv=0)
     total = sum(lengths) * heads
-    tensor_reads, scalar_payload, writes, vector = kernel_work_terms(
-        lengths, heads, dk, dv, input_bytes=input_bytes, state_bytes=state_bytes)
-    work = Work(resources={"hbm": tensor_reads + scalar_payload + writes,
-                           read: tensor_reads, "mte3": writes, "vector": vector})
+    use_rec_ssm = bool(meta.get("recover_ssm", False)) and any(q > 1 for q in lengths)
+    rec_head = None
+    if use_rec_ssm:
+        from ..recurrent.recover_ssm_work import gdn_record_head_bytes, record_head_bytes
+        rec_head = (
+            gdn_record_head_bytes(dk, dv)
+            if str(meta.get("recurrent_attention_kind", "gdn")) == "gdn" or "gdn" in str(op.recipe)
+            else record_head_bytes(dk, dv, op.dtype)
+        )
+    if wy_active:
+        tensor_reads, scalar_payload, writes, vector, cube_flops = wy_kernel_work_terms(
+            lengths, heads, dk, dv, input_bytes=input_bytes,
+            state_bytes=state_bytes, record_head=rec_head,
+        )
+        work = Work(
+            matrix={"bf16": cube_flops} if cube_flops else {},
+            resources={
+                "hbm": tensor_reads + scalar_payload + writes,
+                read: tensor_reads, "mte3": writes, "vector": vector,
+            },
+        )
+    else:
+        tensor_reads, scalar_payload, writes, vector = kernel_work_terms(
+            lengths, heads, dk, dv, input_bytes=input_bytes,
+            state_bytes=state_bytes, record_head=rec_head,
+        )
+        work = Work(resources={"hbm": tensor_reads + scalar_payload + writes,
+                               read: tensor_reads, "mte3": writes, "vector": vector})
 
     def program(context):
-        def owner_program(owner, segments, run_count):
+        def owner_program(owner_idx, owner, segments, run_count):
             owned = context.owned(owner, units, ("vector", read, "mte3"))
+            aic_owner = aic_ids[owner_idx % len(aic_ids)] if aic_ids else 0
+            cube_owned = (
+                context.owned(aic_owner, aic_units, ("cube",))
+                if (wy_active and aic_units > 0 and "cube" in context.resource_names)
+                else None
+            )
             def head(q, repeat):
                 # This scales real repeated work, including each distinct
                 # head's QKV/state traffic; it does not scale a duration or
@@ -354,6 +455,36 @@ def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = N
                     return context.bind(Work(resources={"vector": amount}).scaled(repeat))
                 def memory(amount, role):
                     return context.bind(Work(resources={"hbm": amount, role: amount}).scaled(repeat))
+                if wy_active and cube_owned is not None and MIN_WY_SPECULATIVE_TOKENS <= q <= _MAX_QUERY_ROWS:
+                    st_cast, wy_prep, c_flops, wy_epi = wy_head_terms(
+                        q, dk, dv, ak, av, state_bytes=state_bytes,
+                    )
+                    scalar_bytes_head = q * (state_bytes + input_bytes * parts)
+                    qkv_bytes_head = q * (2 * dk + dv) * input_bytes
+                    st_in_head = dk * dv * state_bytes
+                    st_out_tok = rec_head if rec_head is not None else st_in_head
+                    out_bytes_head = q * (st_out_tok + dv * input_bytes)
+                    wy_stages = [
+                        Stage("scalar_inputs", context.bind(Work(resources={"hbm": scalar_bytes_head}).scaled(repeat))),
+                        Stage("qkv_load", memory(qkv_bytes_head, read), after=("scalar_inputs",), placement=owned),
+                        Stage("state_load", memory(st_in_head, read), after=("scalar_inputs",), placement=owned),
+                    ]
+                    prep_after = ("qkv_load", "state_load")
+                    if st_cast > 0:
+                        wy_stages.append(Stage("state_cast_bf16", v(st_cast), after=prep_after, placement=owned))
+                        prep_after = ("state_cast_bf16",)
+                    wy_stages.extend((
+                        Stage("wy_intra_prep", v(wy_prep), after=prep_after, placement=owned),
+                        Stage(
+                            "wy_cube_contract",
+                            context.bind(Work(matrix={"bf16": c_flops}).scaled(repeat)),
+                            after=("wy_intra_prep",),
+                            placement=cube_owned,
+                        ),
+                        Stage("wy_epilogue", v(wy_epi), after=("wy_cube_contract",), placement=owned),
+                        Stage("wy_store", memory(out_bytes_head, "mte3"), after=("wy_epilogue",), placement=owned),
+                    ))
+                    return tuple(wy_stages)
                 def part(part_index):
                     n = min(value_step, dv - part_index * value_step)
                     def token(t):
@@ -420,10 +551,15 @@ def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = N
         # requires every demand-carrying task of this operator to keep its own
         # single physical unit, which a summed-work cohort placement would
         # widen.  Only the boundary encoding is collapsed (see program.py).
-        return ParallelProgram(tuple(owner_program(owner, segments, count)
-                                     for owner, segments, count in zip(core_ids, ownership, run_counts)))
+        return ParallelProgram(tuple(owner_program(idx, owner, segments, count)
+                                     for idx, (owner, segments, count) in enumerate(zip(core_ids, ownership, run_counts))))
     if ctx is not None and ctx.requests:
         plan_meta["state_contraction_ops"] = 2 * total * dk * dv
+    if wy_active:
+        plan_meta["execution_class"] = "mixed_aic_aiv"
+        plan_meta["wy_cube_verify"] = True
+    if use_rec_ssm:
+        plan_meta["recover_ssm"] = True
     return OperatorPlan(work, program, metadata={**plan_meta,
         "recurrent_head_schedule": {
         "compact": compact, "logical_heads": active_heads,
@@ -440,3 +576,10 @@ def recurrent_owners(geometry, ctx: OperatorPlanningContext | None) -> tuple[int
         return ctx.datapath.aiv_count, owner_units(ctx)[1]
     units = geometry.resource_units.get("vector", geometry.compute_units)
     return units, range(units)
+
+
+def recurrent_aic_owners(geometry, ctx: OperatorPlanningContext | None) -> tuple[int, range | tuple[int, ...]]:
+    if ctx is not None and getattr(ctx, "datapath", None) is not None and ctx.datapath.aic_count > 0:
+        return ctx.datapath.aic_count, owner_units(ctx)[0]
+    aic_units = int(getattr(geometry, "compute_units", 0) or 0)
+    return aic_units, range(aic_units)

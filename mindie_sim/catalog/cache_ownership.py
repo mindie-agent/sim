@@ -403,7 +403,39 @@ def _effective_draft_sequence_tokens(
     return min(seq, cap) if cap > 0 else seq
 
 
-def _draft_cache_model(model: Any, draft_kind: str) -> Any:
+def _resolve_runtime_arch_family(runtime: Any) -> str:
+    meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    raw_arch = str(meta.get("arch_family") or meta.get("device_arch") or "").strip().lower()
+    if raw_arch in {"a3", "a5", "a2"}:
+        return raw_arch
+    spine = meta.get("single_spine")
+    if isinstance(spine, Mapping):
+        sp_arch = str(spine.get("arch_family") or spine.get("hw_family") or "").strip().lower()
+        if sp_arch in {"a3", "a5", "a2"}:
+            return sp_arch
+    return ""
+
+
+def _draft_c8_mla_override(draft: Any, draft_kind: str, runtime: Any) -> tuple[str, dict[str, Any] | None] | None:
+    if runtime is None or draft_kind != "dspark":
+        return None
+    if str(getattr(draft, "attention_kind", "") or "").strip().lower() != "mla":
+        return None
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    if not bool(meta.get("latent_moe_dspark_c8_mla", False)) or bool(meta.get("raw_eager", False)):
+        return None
+    dq_explicit = getattr(draft, "quant", None)
+    if dq_explicit is not None and str(getattr(dq_explicit, "kv_dtype", "") or "").strip():
+        return None
+    arch = _resolve_runtime_arch_family(runtime)
+    if arch == "a5":
+        return "fp8_e4m3", {"mla_kv": {"dtype": "fp8_e4m3"}}
+    if arch == "a3":
+        return "int8", None
+    return None
+
+
+def _draft_cache_model(model: Any, draft_kind: str, runtime: Any = None) -> Any:
     """Model view carrying the draft's own resolved KV quantization contract."""
     from mindie_sim.catalog.draft import draft_quant, optional_draft_spec
 
@@ -411,6 +443,16 @@ def _draft_cache_model(model: Any, draft_kind: str) -> Any:
         return model
     draft = optional_draft_spec(model, draft_kind)
     dq = draft_quant(model, draft)
+    c8_override = _draft_c8_mla_override(draft, draft_kind, runtime)
+    if c8_override is not None:
+        c8_dt, c8_reps = c8_override
+        dq = replace(dq, kv_dtype=c8_dt)
+        meta = dict(getattr(model, "metadata", ()) or ())
+        for key in _TARGET_ONLY_KV_META_KEYS:
+            meta.pop(key, None)
+        if c8_reps is not None:
+            meta["cache_representations"] = c8_reps
+        return replace(model, quant=dq, kv_dtype=dq.kv_dtype, metadata=tuple(meta.items()))
     target_kv = getattr(getattr(model, "quant", None), "kv_dtype", "")
     differs = dq.kv_dtype != target_kv
     if not draft.independent_context and dq == getattr(model, "quant", None) and not differs:
@@ -471,7 +513,7 @@ def draft_cache_components(
         ONE, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
     interleave = max(ONE, int(cp_interleave(runtime))) if runtime is not None else page_block
     eff_seq = _effective_draft_sequence_tokens(model, draft_kind, sequence_tokens, runtime)
-    draft_model = _draft_cache_model(model, draft_kind)
+    draft_model = _draft_cache_model(model, draft_kind, runtime=runtime)
     draft_parallel = _draft_cache_parallel(
         model, parallel, draft_kind, interleave=interleave, block_size=page_block,
     )

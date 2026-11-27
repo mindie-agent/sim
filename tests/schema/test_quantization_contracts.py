@@ -710,8 +710,24 @@ def test_before_baseline_honesty_mc2_megamoe_and_a3_int8_kv_mlapo() -> None:
         va_profile, track="target", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
     )
     ideal_ids = {entry["id"] for entry in res_ideal["active_mechanisms"]}
-    assert "cann_megamoe_fusion" in ideal_ids
+    # Latent-MoE + shared-expert models suppress routed-only cann_megamoe_fusion unless
+    # enable_fused_mc2 is caller-explicit, preserving multistream_overlap_shared_expert.
+    assert "cann_megamoe_fusion" not in ideal_ids
     assert "tp_mc2_overlap" in ideal_ids
+    assert "wy_cube_speculative_verify" in ideal_ids
+
+    no_shared_situ = replace(
+        situ_model,
+        num_shared_experts=0,
+        layer_plans=tuple(replace(lp, num_shared_experts=0) for lp in situ_model.layer_plans),
+    )
+    res_ideal_no_shared = resolve_stack_track(
+        va_profile,
+        track="target",
+        model_key="kimi-k3.1",
+        ctx=replace(ctx_profile_disabled, model=no_shared_situ),
+    )
+    assert "cann_megamoe_fusion" in {entry["id"] for entry in res_ideal_no_shared["active_mechanisms"]}
 
     ctx_caller_disabled = replace(
         ctx_profile_disabled, caller_explicit=frozenset({"enable_fused_mc2"}),
