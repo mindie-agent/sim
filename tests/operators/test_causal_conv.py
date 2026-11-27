@@ -437,3 +437,28 @@ def test_causal_conv_and_state_copy_stamp_nonzero_compulsory_work():
     convs = [op for op in u_ops if op.recipe == "ascend_causal_conv1d_update"]
     assert convs and all(op.hbm_bytes > 0 and op.mte2_bytes > 0 and op.mte3_bytes > 0 and op.vector_ops > 0 for op in convs)
     assert conv_state_copy.IMPLEMENTATION == "triton_noncontiguous_conv_state_copy"
+
+
+@pytest.mark.parametrize("bias", (False, True))
+def test_native_causal_conv_prefill_periodic_compaction_matches_literal_exactly(bias: bool):
+    """4-token periodic compaction preserves exact duration, conservation, and input dependency."""
+    from mindie_sim.prediction.operators.causal_conv import native_causal_conv_prefill, native_causal_conv_spec
+
+    parsed_a5 = parse_case(compose_case(
+        "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], dp=1, tp=2, ep=2,
+        prompt_tokens=16384, output_tokens=1024, ttft_slo_ms=10000.0, role="pd_prefill",
+    ))
+    op = native_causal_conv_spec.make_op({
+        "lengths": (200,), "dim": 256, "width": 4, "dtype": "bf16", "bias": bias, "activation": "silu",
+    })
+    rep_verify = verify_operator(parsed_a5, op, native_causal_conv_prefill.build, input_ready_ms=7.0)
+    assert rep_verify["status"] == "passed" and rep_verify["input_dependency_obeyed"]
+    assert rep_verify["buffers_released"] and rep_verify["work_mismatches"] == {}
+    t_comp = float(operator_costs(parsed_a5, (op,), input_ready_ms=7.0)["operators"][0]["duration_ms"])
+    orig_min = native_causal_conv_prefill.CONV_COMPACT_MIN_LEN
+    native_causal_conv_prefill.CONV_COMPACT_MIN_LEN = 10**9
+    try:
+        t_lit = float(operator_costs(parsed_a5, (op,), input_ready_ms=7.0)["operators"][0]["duration_ms"])
+    finally:
+        native_causal_conv_prefill.CONV_COMPACT_MIN_LEN = orig_min
+    assert t_comp > 0.0 and t_comp == pytest.approx(t_lit, rel=1e-11, abs=0.0)

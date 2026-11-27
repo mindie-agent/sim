@@ -55,6 +55,7 @@ PIECEWISE_CAPTURE_BASE_KEYS = (
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
 )
 MIN_DEFAULT_MAX_SEQS = 16
+PD_DECODE_DEFAULT_MAX_SEQS = 256
 TRACKED_KERNEL_SECTIONS = ("families", "recipes", "lowerings", "programs")
 FULL_DECODE_CUDAGRAPH_MODE = "FULL_DECODE_ONLY"
 FULL_CUDAGRAPH_MODES = frozenset({"FULL", FULL_DECODE_CUDAGRAPH_MODE})
@@ -912,7 +913,10 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         rt["graph_mode"] = "full"
         rt["graph_capture_mode"] = "full"
         rt.setdefault("compilation_config", {"cudagraph_mode": FULL_DECODE_CUDAGRAPH_MODE})
-        max_seqs = int(rt.get("max_num_seqs", MIN_DEFAULT_MAX_SEQS))
+        default_max_seqs = (
+            PD_DECODE_DEFAULT_MAX_SEQS if role_norm == "pd_decode" else MIN_DEFAULT_MAX_SEQS
+        )
+        max_seqs = int(rt.get("max_num_seqs", default_max_seqs))
         rt["graph_capture_keys"] = capture_keys(
             max_seqs, int(rt.get("mtp_proposal_tokens", 0) or 0))
     meta["va_recommended"] = True

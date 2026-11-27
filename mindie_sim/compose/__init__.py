@@ -109,6 +109,7 @@ BYTES_PER_GB = 1_000_000_000.0
 DEFAULT_RANKS_PER_NODE = 8
 DEFAULT_MAX_MODEL_LEN = 32768
 MIN_DEFAULT_MAX_SEQS = 16
+PD_DECODE_DEFAULT_MAX_SEQS = 256
 MIN_DEFAULT_MAX_BATCHED_TOKENS = 8192
 PD_DECODE_MIN_BATCHED_TOKENS = 768
 DEFAULT_PARALLEL = 1
@@ -557,8 +558,12 @@ def _resolve_scenario_and_slo(
     else:
         resolved_max_model_len = max(DEFAULT_MAX_MODEL_LEN, required_len)
 
+    verify_width = 1 + max(0, mtp_tokens)
+    default_max_seqs = (
+        PD_DECODE_DEFAULT_MAX_SEQS if role == "pd_decode" else MIN_DEFAULT_MAX_SEQS
+    )
     resolved_max_seqs = (
-        int(max_num_seqs) if max_num_seqs is not None else max(eff_conc, MIN_DEFAULT_MAX_SEQS)
+        int(max_num_seqs) if max_num_seqs is not None else max(eff_conc, default_max_seqs)
     )
     if max_num_batched_tokens is not None:
         resolved_max_batched = int(max_num_batched_tokens)
@@ -566,7 +571,7 @@ def _resolve_scenario_and_slo(
         # Decode instances never batch full prompt_tokens * concurrency; size by
         # decode verification rows so 128K-context PD decode does not OOM HBM.
         resolved_max_batched = max(
-            resolved_max_seqs * (1 + max(0, mtp_tokens)),
+            resolved_max_seqs * verify_width,
             PD_DECODE_MIN_BATCHED_TOKENS,
         )
     else:

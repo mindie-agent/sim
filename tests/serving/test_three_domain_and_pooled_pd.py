@@ -325,7 +325,8 @@ def test_kimi_k31_a5_fp8_canonicalization_pd_decode_workspace_and_scope_provenan
     assert raw["model"]["quant"]["expert_weight_format"] == "mxfp4"
     assert raw["model"]["quant"]["kv_dtype"] == "fp8_e4m3"
     assert raw["model"]["quant"]["index_dtype"] == "fp8_e4m3"
-    assert raw["runtime"]["max_num_batched_tokens"] <= 768
+    assert raw["runtime"]["max_num_batched_tokens"] == raw["runtime"]["max_num_seqs"] * 6
+    assert raw["runtime"]["max_num_batched_tokens"] < 4096
     mem = Memory(parse_case(raw))
     assert max(mem.workspace) < 16 * (1024 ** 3)
     assert all(cap > 0 for row in mem.capacity for cap in row)

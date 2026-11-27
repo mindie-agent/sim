@@ -757,3 +757,23 @@ def test_structural_linear_attention_dispatch_projected_draft_width_and_explicit
     cfg_lt["compress_rates"] = {names[4]: 4, names[128]: 128}
     m_lt = build_model_spec("v4-layer-types", cfg_lt)
     assert [p.compress_ratio for p in m_lt.layer_plans] == [p.compress_ratio for p in v4_model.layer_plans]
+
+
+def test_pd_decode_compose_defaults_unclamp_max_num_seqs_while_preserving_colocated() -> None:
+    """``role='pd_decode'`` unclamps default ``max_num_seqs`` to 256 while preserving ``colocated``."""
+    from mindie_sim.compose import MIN_DEFAULT_MAX_SEQS, PD_DECODE_DEFAULT_MAX_SEQS
+
+    pd_raw = compose_case(
+        "qwen3.8-flash-next", hardware="950dt-96g-pod", dp=4, tp=2, ep=8,
+        prompt_tokens=16384, output_tokens=1024, concurrency=1, tpot_slo_ms=30.0,
+        mtp_proposal_tokens=3, mtp_acceptance_length=3.0, role="pd_decode", quant="auto_va",
+    )
+    assert pd_raw["runtime"]["max_num_seqs"] == PD_DECODE_DEFAULT_MAX_SEQS == 256
+    assert pd_raw["runtime"]["max_num_batched_tokens"] == 256 * 4 == 1024
+
+    coloc_raw = compose_case(
+        "qwen3.8-flash-next", hardware="950dt-96g-pod", dp=4, tp=2, ep=8,
+        prompt_tokens=16384, output_tokens=1024, concurrency=1, tpot_slo_ms=30.0,
+        mtp_proposal_tokens=3, mtp_acceptance_length=3.0, role="colocated", quant="auto_va",
+    )
+    assert coloc_raw["runtime"]["max_num_seqs"] == MIN_DEFAULT_MAX_SEQS == 16

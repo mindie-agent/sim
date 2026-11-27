@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 
@@ -166,96 +167,123 @@ def _fold_kernel_stages(
     protected_names: AbstractSet[str] = frozenset(),
     fair_resources: AbstractSet[str] | None = None,
 ) -> tuple[Stage, ...]:
-    """Fold zero-work acquire/free wrappers and verified-fair serial integer compute chains."""
+    """Fold zero-work acquire/free wrappers and verified-fair serial integer compute chains in O(S)."""
     if len(stages) < 2 or any(s.previous or s.previous_lags or s.keep_empty or s.fragment is not None for s in stages):
         return stages
-    cur = list(stages)
-    while len(cur) >= 2:
-        consumers: dict[str, list[int]] = {s.name: [] for s in cur}
-        by_name: dict[str, int] = {}
-        for idx, s in enumerate(cur):
-            if s.name in by_name:
-                return tuple(cur)
-            by_name[s.name] = idx
-            for dep in s.after:
-                if dep in consumers:
-                    consumers[dep].append(idx)
-        changed = False
-        for idx, s in enumerate(cur):
-            empty_ctrl = (
-                s.program is None and not any(s.work.values()) and not any(s.caps.values())
-                and s.latency <= 0.0 and not s.coupled and s.priority == 0
-                and not s.metadata and not s.deliveries
-            )
+    if fair_resources is None and not any(s.acquire or s.free for s in stages):
+        return stages
+    cur: list[Stage | None] = list(stages)
+    consumers: dict[str, list[int]] = {}
+    by_name: dict[str, int] = {}
+    for idx, s in enumerate(stages):
+        if s.name in by_name:
+            return stages
+        by_name[s.name] = idx
+        consumers[s.name] = []
+    for idx, s in enumerate(stages):
+        for dep in s.after:
+            if dep in consumers:
+                consumers[dep].append(idx)
+    worklist: deque[int] = deque(range(len(cur)))
+    in_queue: set[int] = set(worklist)
+
+    def _enqueue(i: int) -> None:
+        if cur[i] is not None and i not in in_queue:
+            in_queue.add(i)
+            worklist.append(i)
+
+    while worklist:
+        idx = worklist.popleft()
+        in_queue.discard(idx)
+        s = cur[idx]
+        if s is None:
+            continue
+        empty_ctrl = (
+            s.program is None and not any(s.work.values()) and not any(s.caps.values())
+            and s.latency <= 0.0 and not s.coupled and s.priority == 0
+            and not s.metadata and not s.deliveries
+        )
+        s_cons = consumers[s.name]
+        if (
+            empty_ctrl and s.name not in protected_names
+            and s.acquire and not s.free and len(s_cons) == 1
+        ):
+            succ_idx = s_cons[0]
+            succ = cur[succ_idx]
+            if succ is not None and succ.program is None and succ.after == (s.name,) and not succ.acquire:
+                cur[succ_idx] = replace(succ, after=s.after, acquire=s.acquire)
+                cur[idx] = None
+                for dep in s.after:
+                    if dep in consumers:
+                        consumers[dep] = [succ_idx if c == idx else c for c in consumers[dep]]
+                        _enqueue(by_name[dep])
+                consumers.pop(s.name, None)
+                _enqueue(succ_idx)
+                continue
+        if (
+            empty_ctrl and s.name not in protected_names
+            and s.free and not s.acquire and not s_cons
+            and len(s.after) == 1 and s.after[0] in by_name
+        ):
+            pred_idx = by_name[s.after[0]]
+            pred = cur[pred_idx]
             if (
-                empty_ctrl and s.name not in protected_names
-                and s.acquire and not s.free and len(consumers[s.name]) == 1
+                pred is not None and pred.program is None
+                and consumers[pred.name] == [idx]
+                and not any(x.name in {y.name for y in pred.free} for x in s.free)
             ):
-                succ_idx = consumers[s.name][0]
-                succ = cur[succ_idx]
-                if succ.program is None and succ.after == (s.name,) and not succ.acquire:
-                    cur[succ_idx] = replace(succ, after=s.after, acquire=s.acquire)
-                    del cur[idx]
-                    changed = True
-                    break
+                cur[pred_idx] = replace(pred, free=pred.free + s.free)
+                cur[idx] = None
+                consumers[pred.name] = []
+                consumers.pop(s.name, None)
+                _enqueue(pred_idx)
+                continue
+        if (
+            fair_resources is not None
+            and s.program is None and not s.coupled and s.latency <= 0.0
+            and not s.acquire and not s.free and len(s.work) == 1
+            and len(s_cons) == 1
+        ):
+            succ_idx = s_cons[0]
+            succ = cur[succ_idx]
+            rname = next(iter(s.work))
             if (
-                empty_ctrl and s.name not in protected_names
-                and s.free and not s.acquire and not consumers[s.name]
-                and len(s.after) == 1 and s.after[0] in by_name
+                succ is not None
+                and rname in fair_resources
+                and succ.name not in protected_names
+                and succ.program is None and not succ.coupled and succ.latency <= 0.0
+                and not succ.acquire and not succ.free and succ.after == (s.name,)
+                and len(succ.work) == 1 and s.work.keys() == succ.work.keys()
+                and s.caps == succ.caps and s.placement == succ.placement
+                and s.priority == succ.priority and s.work_units == succ.work_units
+                and s.cohort_size <= 1 and succ.cohort_size <= 1
+                and not s.cohort_widened and not succ.cohort_widened
+                and not s.cohort_members and not succ.cohort_members
+                and s.metadata == succ.metadata
+                and not s.deliveries and not succ.deliveries
+                and not s.latency_from_first_service and not succ.latency_from_first_service
             ):
-                pred_idx = by_name[s.after[0]]
-                pred = cur[pred_idx]
+                w1, w2 = s.work[rname], succ.work[rname]
                 if (
-                    pred.program is None and consumers[pred.name] == [idx]
-                    and not any(x.name in {y.name for y in pred.free} for x in s.free)
+                    w1 == int(w1) and w2 == int(w2)
+                    and abs(w1) + abs(w2) < _EXACT_INT_SUM_LIMIT
                 ):
-                    cur[pred_idx] = replace(pred, free=pred.free + s.free)
-                    del cur[idx]
-                    changed = True
-                    break
-            if (
-                fair_resources is not None
-                and s.program is None and not s.coupled and s.latency <= 0.0
-                and not s.acquire and not s.free and len(s.work) == 1
-                and len(consumers[s.name]) == 1
-            ):
-                succ_idx = consumers[s.name][0]
-                succ = cur[succ_idx]
-                rname = next(iter(s.work))
-                if (
-                    rname in fair_resources
-                    and succ.name not in protected_names
-                    and succ.program is None and not succ.coupled and succ.latency <= 0.0
-                    and not succ.acquire and not succ.free and succ.after == (s.name,)
-                    and len(succ.work) == 1 and s.work.keys() == succ.work.keys()
-                    and s.caps == succ.caps and s.placement == succ.placement
-                    and s.priority == succ.priority and s.work_units == succ.work_units
-                    and s.cohort_size <= 1 and succ.cohort_size <= 1
-                    and not s.cohort_widened and not succ.cohort_widened
-                    and not s.cohort_members and not succ.cohort_members
-                    and s.metadata == succ.metadata
-                    and not s.deliveries and not succ.deliveries
-                    and not s.latency_from_first_service and not succ.latency_from_first_service
-                ):
-                    w1, w2 = s.work[rname], succ.work[rname]
-                    if (
-                        w1 == int(w1) and w2 == int(w2)
-                        and abs(w1) + abs(w2) < _EXACT_INT_SUM_LIMIT
-                    ):
-                        merged_name = s.name
-                        cur[idx] = replace(s, work={rname: w1 + w2})
-                        for c_idx in consumers[succ.name]:
-                            c_stage = cur[c_idx]
+                    merged_name = s.name
+                    cur[idx] = replace(s, work={rname: w1 + w2})
+                    succ_cons = consumers.pop(succ.name)
+                    for c_idx in succ_cons:
+                        c_stage = cur[c_idx]
+                        if c_stage is not None:
                             cur[c_idx] = replace(
                                 c_stage,
                                 after=tuple(merged_name if d == succ.name else d for d in c_stage.after),
                             )
-                        del cur[succ_idx]
-                        changed = True
-                        break
-        if not changed:
-            break
-    return tuple(cur)
+                    consumers[merged_name] = succ_cons
+                    cur[succ_idx] = None
+                    _enqueue(idx)
+                    for c_idx in succ_cons:
+                        _enqueue(c_idx)
+    return tuple(s for s in cur if s is not None)
 
 
 def is_pure_static_program(program) -> bool:
@@ -512,8 +540,16 @@ def _coalesce_pipeline(
         )
         protected = cross_tile_refs | {s.name for tile in raw_tiles for s in tile}
         allow_inline = cross_tile_refs if program.slots == 1 else protected
-        new_tiles = tuple(
-            _fold_kernel_stages(
+        deduped_tiles: list[tuple[Stage, ...]] = []
+        prev_raw: tuple[Stage, ...] | None = None
+        prev_folded: tuple[Stage, ...] | None = None
+        for tile in raw_tiles:
+            if prev_raw is not None and tile == prev_raw:
+                assert prev_folded is not None
+                deduped_tiles.append(prev_folded)
+                continue
+            prev_raw = tile
+            prev_folded = _fold_kernel_stages(
                 _inline_wrapper_stages(
                     tuple(
                         _unwrap_stage(
@@ -526,8 +562,8 @@ def _coalesce_pipeline(
                 protected_names=allow_inline,
                 fair_resources=fair_resources,
             )
-            for tile in raw_tiles
-        )
+            deduped_tiles.append(prev_folded)
+        new_tiles = tuple(deduped_tiles)
         return PipelineProgram(
             program.count, program.slots, lambda idx, tiles=new_tiles: tiles[idx],
             program.minimum_ms, program.setup_ms,

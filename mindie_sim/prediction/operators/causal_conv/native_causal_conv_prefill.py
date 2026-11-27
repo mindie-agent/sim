@@ -10,11 +10,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Literal, Mapping
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.prediction.engine import Engine as _ConvEngine, Resource as _ConvResource
 from mindie_sim.prediction.instructions import REGISTER_WORK_ROLES
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
 from mindie_sim.prediction.ownership import unit_group
@@ -32,6 +34,14 @@ TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 
 SILU_OPS_PER_ELEMENT = 4
 GENERIC_TAP_OPS_PER_ELEMENT = 3
+CONV_COMPACT_MIN_LEN = 32
+CONV_COMPACT_HEAD_TOKENS = 9
+CONV_COMPACT_TAIL_MIN_TOKENS = 7
+CONV_COMPACT_PERIOD = 4
+CONV_COMPACT_MIN_PERIODS = 2
+CONV_PROBE_LENGTHS = (20, 24, 28)
+CONV_PERIOD_CACHE_MAX = 512
+CONV_PERIOD_REL_TOL = 1e-12
 
 __all__ = ["make_op", "build", "host_tiling", "source_ledger", "IMPLEMENTATION"]
 
@@ -353,16 +363,132 @@ def _bind(context, work):
     return context.bind(split_reads(work, 0, context.resource_names))
 
 
+def _scale_demand(base: Mapping[str, float], count: int = 1) -> dict[str, float]:
+    if count == 1:
+        return dict(base)
+    return {key: value * count for key, value in base.items()}
+
+
+def _emit_token_stages(
+    pipeline: _TokenPipeline,
+    engine,
+    name: str,
+    ready,
+    owner: str,
+    latest: dict[str, object],
+    t: int,
+    *,
+    on_retire=None,
+) -> list[object]:
+    """Emit all stages for token index ``t`` preserving rolling/generic slot dependencies."""
+    def sub(label, work, after, on_complete=None, key=None):
+        event = engine.submit(
+            f"{name}:tile{t}:{label}", work, after=tuple(after),
+            placement=pipeline.placement, owner=owner, on_complete=on_complete,
+        )
+        latest[label if key is None else key] = event
+        return event
+
+    if pipeline.rolling:
+        if t == 0:
+            compute = sub("compute", _scale_demand(pipeline.compute), (ready,), key="compute_even")
+            store = sub("store", _scale_demand(pipeline.store), (compute,), on_retire, key="store_even")
+            ring = sub("ringp", {}, (compute,))
+            return [compute, store, ring]
+        if t % 2:
+            k = (t - 1) // 2
+            deps = (ready,) if t == 1 else (latest["load"],)
+            if k == 1:
+                deps += (latest["ringp"],)
+            elif k >= 2:
+                deps += (latest["ring%u" % (k % 2)],)
+            tokens = min(PAIR_TOKENS, pipeline.length - t)
+            load = sub("load", _scale_demand(pipeline.load, tokens), deps)
+            cdeps = (load, latest["compute_even"])
+            if t > PAIR_TOKENS:
+                cdeps += (latest["store_odd"],)
+            compute = sub("compute", _scale_demand(pipeline.compute), cdeps, key="compute_odd")
+            store = sub("store", _scale_demand(pipeline.store), (compute, latest["store_even"]),
+                        on_retire, key="store_odd")
+            return [load, compute, store]
+        k = (t - 2) // 2
+        compute = sub(
+            "compute", _scale_demand(pipeline.compute),
+            (latest["load"], latest["compute_odd"], latest["store_even"]),
+            key="compute_even",
+        )
+        store = sub("store", _scale_demand(pipeline.store), (compute, latest["store_odd"]),
+                    on_retire, key="store_even")
+        ring = sub("ring%u" % (k % 2), {}, (compute,))
+        return [compute, store, ring]
+
+    parity = "odd" if t % 2 else "even"
+    prior = "even" if t % 2 else "odd"
+    local: list[object] = []
+    inputs = (ready,)
+    if t:
+        deps = (ready,) + ((latest["load"],) if t > 1 else ())
+        if t >= 2:
+            deps += (latest["cast_" + parity],)
+        load = sub("load", _scale_demand(pipeline.load), deps)
+        inputs = (load, latest["cast_" + prior])
+        local.append(load)
+    compute = sub("compute", _scale_demand(pipeline.compute), inputs)
+    out_ready = (compute,) + ((latest["store_" + parity],) if t >= 2 else ())
+    cast = sub("cast", _scale_demand(pipeline.cast), out_ready, key="cast_" + parity)
+    store_ready = (cast,) + ((latest["store_" + prior],) if t else ())
+    store = sub("store", _scale_demand(pipeline.store), store_ready, on_retire, key="store_" + parity)
+    local.extend((compute, cast, store))
+    return local
+
+
+@lru_cache(maxsize=CONV_PERIOD_CACHE_MAX)
+def _cached_conv_period4(
+    rolling: bool,
+    slots: int,
+    load_t: tuple[tuple[str, float], ...],
+    comp_t: tuple[tuple[str, float], ...],
+    store_t: tuple[tuple[str, float], ...],
+    cast_t: tuple[tuple[str, float], ...],
+    res_spec: tuple[tuple[str, float, int, str, int], ...],
+) -> float | None:
+    """Measure and verify the exact 4-token steady-state period on a standalone probe engine."""
+    resources = tuple(
+        _ConvResource(rname, rate, units=units, policy=pol)
+        for rname, rate, units, pol, _ in res_spec
+    )
+    placement = {
+        rname: tuple(range(owned))
+        for rname, _, units, _, owned in res_spec
+        if owned > 0 and units > 1
+    }
+    d_load, d_comp, d_store, d_cast = dict(load_t), dict(comp_t), dict(store_t), dict(cast_t)
+    times: list[float] = []
+    for probe_len in CONV_PROBE_LENGTHS:
+        eng = _ConvEngine(resources)
+        pipe = _TokenPipeline(
+            length=probe_len, rolling=rolling, load=d_load, compute=d_comp,
+            store=d_store, cast=d_cast, placement=placement, slots=slots,
+        )
+        ev = pipe._start_literal(eng, "probe", eng.submit("r"), owner="")
+        eng.advance(until=(ev,))
+        times.append(float(ev.time))
+    p1 = times[1] - times[0]
+    p2 = times[2] - times[1]
+    if p1 <= 0.0 or abs(p2 - p1) > CONV_PERIOD_REL_TOL * max(1.0, p1):
+        return None
+    return p1
+
+
 @dataclass(frozen=True)
 class _TokenPipeline:
     """Bounded lazy per-token schedule for RunSeqFnRolling / generic RunSeq.
 
     ``PipelineProgram`` chains only same-named stages, which cannot express
     "token t waits store t-2 while overlapping store t-1".  This small Program
-    keeps the same bounded-issue discipline but passes explicit event handles,
-    so the source's double-buffered output and pair-ring reuse are structural.
-    It submits at most ``slots`` token tiles ahead and never materializes the
-    whole sequence during planning.
+    keeps the same bounded-issue discipline while compacting long periodic
+    chunks (``length >= CONV_COMPACT_MIN_LEN``) into a callback-free static DAG
+    of literal head/tail tokens plus one coupled steady-state stage.
     """
 
     length: int
@@ -374,32 +500,11 @@ class _TokenPipeline:
     cast: Mapping[str, float] = field(default_factory=dict)
     slots: int = TOKEN_PIPELINE_SLOTS
 
-    def start(self, engine, name, ready, *, owner=""):
+    def _start_literal(self, engine, name, ready, *, owner=""):
         complete = engine.future(name + ":complete")
-        if self.length < 0 or self.slots < 1:
-            raise ValueError(
-                "token_pipeline_requires_nonnegative_length_and_positive_slots")
-        if not self.length:
-            engine.submit(
-                f"{name}:empty", {}, after=(ready,),
-                placement=self.placement, owner=owner,
-                on_complete=lambda _: engine.resolve(complete))
-            return complete
-        latest = {}
+        latest: dict[str, object] = {}
         next_tile = 0
         finished = 0
-
-        def demand(base, count=1):
-            if count == 1:
-                return dict(base)
-            return {key: value * count for key, value in base.items()}
-
-        def submit(t, label, work, after, on_complete=None, key=None):
-            event = engine.submit(
-                f"{name}:tile{t}:{label}", work, after=tuple(after),
-                placement=self.placement, owner=owner, on_complete=on_complete)
-            latest[label if key is None else key] = event
-            return event
 
         def retire(_):
             nonlocal finished
@@ -409,81 +514,10 @@ class _TokenPipeline:
         def issue(t):
             nonlocal next_tile
             next_tile += 1
-            local = []
-            if self.rolling:
-                if t == 0:
-                    compute = submit(t, "compute", demand(self.compute),
-                                     (ready,), key="compute_even")
-                    store = submit(t, "store", demand(self.store),
-                                   (compute,), retire, key="store_even")
-                    ring = submit(t, "ringp", {}, (compute,))
-                    local.extend((compute, store, ring))
-                elif t % 2:
-                    # CopyFnRollingInputBatch: tokens (t, t+1] are one MTE2
-                    # pair copy.  A pair-ring slot is reused only after the
-                    # matching earlier pair's vector compute consumed it.
-                    k = (t - 1) // 2
-                    deps = ()
-                    if t > 1:
-                        deps += (latest["load"],)
-                    if k == 1:
-                        deps += (latest["ringp"],)
-                    elif k >= 2:
-                        deps += (latest["ring%u" % (k % 2)],)
-                    tokens = min(PAIR_TOKENS, self.length - t)
-                    load = submit(t, "load", demand(self.load, tokens), deps)
-                    cdeps = (load, latest["compute_even"])
-                    if t > PAIR_TOKENS:
-                        # Same-parity output slot last used by token t-2.
-                        cdeps += (latest["store_odd"],)
-                    compute = submit(t, "compute", demand(self.compute),
-                                     cdeps, key="compute_odd")
-                    store = submit(t, "store", demand(self.store),
-                                   (compute, latest["store_even"]), retire,
-                                   key="store_odd")
-                    local.extend((load, compute, store))
-                else:
-                    # Second token of a pair: the compute waits for the store
-                    # that released its output slot (token t-2) but not for
-                    # the immediately preceding store in the other slot.
-                    k = (t - 2) // 2
-                    compute = submit(
-                        t, "compute", demand(self.compute),
-                        (latest["load"], latest["compute_odd"],
-                         latest["store_even"]), key="compute_even")
-                    store = submit(t, "store", demand(self.store),
-                                   (compute, latest["store_odd"]), retire,
-                                   key="store_even")
-                    ring = submit(t, "ring%u" % (k % 2), {}, (compute,))
-                    local.extend((compute, store, ring))
-            else:
-                parity = "odd" if t % 2 else "even"
-                prior = "even" if t % 2 else "odd"
-                inputs = (ready,)
-                if t:
-                    # Input ring release follows cast(t-2). Arithmetic(t)
-                    # is independent of the old output occupying this slot.
-                    deps = (ready,) + ((latest["load"],) if t > 1 else ())
-                    if t >= 2:
-                        deps += (latest["cast_" + parity],)
-                    load = submit(t, "load", demand(self.load), deps)
-                    inputs = (load, latest["cast_" + prior])
-                    local.append(load)
-                compute = submit(t, "compute", demand(self.compute), inputs)
-                out_ready = (compute,)
-                if t >= 2:
-                    out_ready += (latest["store_" + parity],)
-                cast = submit(t, "cast", demand(self.cast), out_ready,
-                              key="cast_" + parity)
-                store_ready = (cast,)
-                if t:
-                    store_ready += (latest["store_" + prior],)
-                store = submit(t, "store", demand(self.store), store_ready,
-                               retire, key="store_" + parity)
-                local.extend((compute, cast, store))
+            local = _emit_token_stages(
+                self, engine, name, ready, owner, latest, t, on_retire=retire,
+            )
             if t == self.length - 1:
-                # Wait for every last-tile stage, including the ring marker,
-                # so completion never leaves a task behind.
                 engine.submit(f"{name}:finish", {}, after=tuple(local),
                               placement=self.placement, owner=owner,
                               on_complete=lambda _: engine.resolve(complete))
@@ -493,12 +527,80 @@ class _TokenPipeline:
                    and next_tile - finished < self.slots):
                 issue(next_tile)
 
-        # A nested Program is constructed before its parent's event completes.
-        # Issuing through a callback makes every otherwise independent prefetch
-        # inherit that boundary, including weights, state sync and allocations.
         engine.submit(name + ":begin", after=(ready,), owner=owner,
                       on_complete=lambda _: pump())
         return complete
+
+    def _start_compacted(self, engine, name, ready, *, owner="", mid_periods: int, period4: float):
+        mid_tokens = CONV_COMPACT_PERIOD * mid_periods
+        tail_start = CONV_COMPACT_HEAD_TOKENS + mid_tokens
+        span_ms = mid_periods * period4
+        mid_work: dict[str, float] = {}
+        sources = (self.load, self.compute, self.store) + (() if self.rolling else (self.cast,))
+        for src in sources:
+            for key, value in src.items():
+                if value:
+                    mid_work[key] = mid_work.get(key, 0.0) + float(value) * mid_tokens
+        caps = {key: (val / span_ms) for key, val in mid_work.items()} if span_ms > 0.0 else {}
+
+        latest: dict[str, object] = {}
+        for t in range(CONV_COMPACT_HEAD_TOKENS):
+            _emit_token_stages(self, engine, name, ready, owner, latest, t)
+        frontier = tuple(dict.fromkeys(latest.values()))
+        mid_ev = engine.submit(
+            f"{name}:steady_mid", mid_work, after=frontier,
+            placement=self.placement, caps=caps, coupled=True, owner=owner,
+        )
+        for key in list(latest):
+            latest[key] = mid_ev
+        last_local: list[object] = [mid_ev]
+        for t in range(tail_start, self.length):
+            last_local = _emit_token_stages(self, engine, name, ready, owner, latest, t)
+        return engine.submit(
+            f"{name}:finish", {}, after=tuple(last_local),
+            placement=self.placement, owner=owner,
+        )
+
+    def start(self, engine, name, ready, *, owner=""):
+        if self.length < 0 or self.slots < 1:
+            raise ValueError(
+                "token_pipeline_requires_nonnegative_length_and_positive_slots")
+        if not self.length:
+            return engine.submit(
+                f"{name}:empty", {}, after=(ready,),
+                placement=self.placement, owner=owner,
+            )
+        if self.length >= CONV_COMPACT_MIN_LEN and self.slots >= TOKEN_PIPELINE_SLOTS:
+            mid_periods = (
+                self.length - (CONV_COMPACT_HEAD_TOKENS + CONV_COMPACT_TAIL_MIN_TOKENS)
+            ) // CONV_COMPACT_PERIOD
+            if mid_periods >= CONV_COMPACT_MIN_PERIODS:
+                used_keys = sorted(set(self.load) | set(self.compute) | set(self.store) | set(self.cast))
+                res_spec = tuple(
+                    (
+                        k,
+                        float(engine.resources[k].rate),
+                        int(engine.resources[k].units),
+                        str(engine.resources[k].policy),
+                        len(self.placement.get(k, ())),
+                    )
+                    for k in used_keys if k in engine.resources
+                )
+                period4 = _cached_conv_period4(
+                    self.rolling,
+                    self.slots,
+                    tuple(sorted(self.load.items())),
+                    tuple(sorted(self.compute.items())),
+                    tuple(sorted(self.store.items())),
+                    tuple(sorted(self.cast.items())),
+                    res_spec,
+                )
+                if period4 is not None and period4 > 0.0:
+                    return self._start_compacted(
+                        engine, name, ready, owner=owner,
+                        mid_periods=mid_periods, period4=period4,
+                    )
+        return self._start_literal(engine, name, ready, owner=owner)
 
 
 def _chunk_kernel(context, chunk, placement):
