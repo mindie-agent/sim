@@ -49,12 +49,15 @@ from .common import (
     verify_native_gdn_abi,
 )
 from .gdn_recurrent import (
+    MIN_WY_SPECULATIVE_TOKENS,
     QK_CAST_SCALE_OPS_PER_LANE,
     VECTOR_LANE_ALIGNMENT,
     head_ownership,
     head_runs,
     kernel_work_terms,
     state_value_step,
+    wy_head_terms,
+    wy_kernel_work_terms,
 )
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
@@ -414,7 +417,7 @@ def build_native_recurrent_gdn(
 ) -> OperatorPlan:
     """Lower native CANN aclnnRecurrentGatedDeltaRule (BF16 or FP32 state, Arch22/Arch35)."""
     verify_native_gdn_abi(c, ctx, abi_id=RECURRENT_GDN_ABI)
-    _, aivs = owner_units(ctx)
+    aics, aivs = owner_units(ctx)
     if not aivs:
         raise missing("linear_attention_no_physical_owner", "Recurrent GDN requires AIV owners")
 
@@ -453,11 +456,32 @@ def build_native_recurrent_gdn(
     v_tiles = ceil_div(c.dv, v_step)
 
     slot_bytes = c.dk * c.dv * state_elem
-    # recurrent_gated_delta_rule_arch{22,35}.h: every value-head owner copies Q, K, V and
-    # unconditionally reads/writes in-place state, sharing gdn_recurrent.kernel_work_terms.
-    mte2_base, _, mte3_total, vec_ops = kernel_work_terms(
-        c.lengths, c.hv, c.dk, c.dv, input_bytes=elem, state_bytes=state_elem,
+    wy_flag = bool(
+        c.metadata.get("wy_cube_verify", False)
+        or c.metadata.get("wy_cube_speculative_verify", False)
     )
+    wy_active = bool(
+        wy_flag
+        and len(aics) > 0
+        and any(MIN_WY_SPECULATIVE_TOKENS <= q <= ARCH22_MAX_MTP for q in c.lengths)
+    )
+    rec_head = None
+    if bool(c.metadata.get("recover_ssm", False)) and any(q > 1 for q in c.lengths):
+        from ..recurrent.recover_ssm_work import gdn_record_head_bytes
+        rec_head = gdn_record_head_bytes(c.dk, c.dv)
+    if wy_active:
+        mte2_base, _, mte3_total, vec_ops, cube_flops = wy_kernel_work_terms(
+            c.lengths, c.hv, c.dk, c.dv, input_bytes=elem,
+            state_bytes=state_elem, record_head=rec_head,
+        )
+    else:
+        cube_flops = 0
+        # recurrent_gated_delta_rule_arch{22,35}.h: every value-head owner copies Q, K, V and
+        # unconditionally reads/writes in-place state, sharing gdn_recurrent.kernel_work_terms.
+        mte2_base, _, mte3_total, vec_ops = kernel_work_terms(
+            c.lengths, c.hv, c.dk, c.dv, input_bytes=elem,
+            state_bytes=state_elem, record_head=rec_head,
+        )
     if is_arch22:
         # arch22.h:165-170,333-354: one whole-sequence gamma/beta MTE2 copy per participating (owner, seq).
         gb_mte2_total = sum(
@@ -481,12 +505,59 @@ def build_native_recurrent_gdn(
 
     read_work = transfer(ctx, read=mte2_total) + (Work(resources={"hbm": scalar_total}) if scalar_total else Work())
     read_phase = Phase("rgdr_read", read_work)
-    vec_phase = Phase("rgdr_compute", Work(resources={"vector": vec_ops}), ("rgdr_read",))
-    write_phase = Phase("rgdr_write", transfer(ctx, write=mte3_total), ("rgdr_compute",))
-    totals = (read_phase, vec_phase, write_phase)
+    if wy_active:
+        cube_phase = Phase("rgdr_wy_cube", Work(matrix={"bf16": cube_flops}), ("rgdr_read",))
+        vec_phase = Phase("rgdr_compute", Work(resources={"vector": vec_ops}), ("rgdr_wy_cube",))
+        write_phase = Phase("rgdr_write", transfer(ctx, write=mte3_total), ("rgdr_compute",))
+        totals: tuple[Phase, ...] = (read_phase, cube_phase, vec_phase, write_phase)
+    else:
+        vec_phase = Phase("rgdr_compute", Work(resources={"vector": vec_ops}), ("rgdr_read",))
+        write_phase = Phase("rgdr_write", transfer(ctx, write=mte3_total), ("rgdr_compute",))
+        totals = (read_phase, vec_phase, write_phase)
     report = analyze_state_residency(c, ctx, persistent=True)
 
     def lower(rc: RecipeContext) -> KernelProgram | ParallelProgram:
+        if wy_active:
+            def _wy_owner(idx: int, aiv_id: int, segments: tuple[tuple[int, int], ...]) -> KernelProgram:
+                aic_id = aics[idx % len(aics)]
+                runs = _owner_compacted_runs(c.lengths, segments)
+                st_list: list[Stage] = []
+                prev_tail: tuple[str, ...] = ()
+                for r_idx, (q_i, h_i, s_i) in enumerate(runs):
+                    gb_m = s_i * q_i * c.hv * (gate_elem + beta_elem) if is_arch22 else 0
+                    r_mte2 = h_i * (slot_bytes + q_i * (2 * c.dk + c.dv) * elem) + gb_m
+                    r_scal = 0 if is_arch22 else h_i * q_i * (gate_elem + beta_elem * v_tiles)
+                    r_read = transfer(ctx, read=r_mte2) + (Work(resources={"hbm": r_scal}) if r_scal else Work())
+                    out_st = rec_head if (rec_head is not None and q_i > 1) else slot_bytes
+                    r_mte3 = h_i * q_i * (out_st + c.dv * elem)
+                    rd_n = f"wy_read_{r_idx}"
+                    st_list.append(bind_phase(Phase(rd_n, r_read, prev_tail), rc, ctx, (), (aiv_id,)))
+                    if MIN_WY_SPECULATIVE_TOKENS <= q_i <= ARCH22_MAX_MTP:
+                        st_c, wy_p, c_fl, wy_e = wy_head_terms(
+                            q_i, c.dk, c.dv, ak, av, state_bytes=state_elem,
+                        )
+                        pr_n, cb_n, ep_n, wr_n = (
+                            f"wy_prep_{r_idx}", f"wy_cube_{r_idx}", f"wy_epi_{r_idx}", f"wy_write_{r_idx}",
+                        )
+                        st_list.extend((
+                            bind_phase(Phase(pr_n, Work(resources={"vector": h_i * (st_c + wy_p)}), (rd_n,)), rc, ctx, (), (aiv_id,)),
+                            bind_phase(Phase(cb_n, Work(matrix={"bf16": h_i * c_fl}), (pr_n,)), rc, ctx, (aic_id,), ()),
+                            bind_phase(Phase(ep_n, Work(resources={"vector": h_i * wy_e}), (cb_n,)), rc, ctx, (), (aiv_id,)),
+                            bind_phase(Phase(wr_n, transfer(ctx, write=r_mte3), (ep_n,)), rc, ctx, (), (aiv_id,)),
+                        ))
+                        prev_tail = (wr_n,)
+                    else:
+                        one_vec = h_i * (init_vec_head + q_i * (prek_vec_tok + redk_vec_tok + upd_core_vec_tok + state_copy_vec_tok + qalu_vec_tok + redq_vec_tok))
+                        vc_n, wr_n = f"wy_vec_{r_idx}", f"wy_write_{r_idx}"
+                        st_list.extend((
+                            bind_phase(Phase(vc_n, Work(resources={"vector": one_vec}), (rd_n,)), rc, ctx, (), (aiv_id,)),
+                            bind_phase(Phase(wr_n, transfer(ctx, write=r_mte3), (vc_n,)), rc, ctx, (), (aiv_id,)),
+                        ))
+                        prev_tail = (wr_n,)
+                return KernelProgram(tuple(st_list))
+
+            wy_progs = tuple(_wy_owner(idx, aivs[idx], segs) for idx, segs in enumerate(ownership))
+            return wy_progs[0] if len(wy_progs) == 1 else ParallelProgram(wy_progs)
         red_ratio = _rgdr_reduce_ratio(rc)
         cast_ratio = _rgdr_cast_ratio(rc) if needs_state_cast else 1.0
         pipe_v_ms = p12_pipe_v_ms(rc)
@@ -528,6 +599,7 @@ def build_native_recurrent_gdn(
             "state_tile_bytes": report.state_tile_bytes, "owner_ub_bytes": report.owner_ub_bytes,
             "state_contraction_ops": 2 * total_tokens * c.hv * c.dk * c.dv,
             "persistent_ub_resident": True,
+            **({"execution_class": "mixed_aic_aiv", "wy_cube_verify": True} if wy_active else {}),
             "recurrent_head_schedule": {
                 "logical_heads": total_heads,
                 "active_aivs": active_aivs,

@@ -56,6 +56,7 @@ _MMRS_PRODUCER_FAMILIES = frozenset({
 })
 _FLOAT_DTYPES = frozenset({"bf16", "fp16"})
 _FLOAT_DTYPE_ALIASES = {"bfloat16": "bf16", "float16": "fp16"}
+_MC2_OVERLAP_GROUP_AXES = frozenset({"tp", "local_tp"})
 _GEMM_SHAPE_RANK = 3
 _SINGLE_CHUNK = 1
 _MIN_TP_WORLD = 2
@@ -118,6 +119,9 @@ def _tp_world_size(comm_meta: dict, m_dim: int) -> int:
     steps = int(comm_meta.get("steps") or 0)
     if steps > 0 and m_dim % (steps + 1) == 0:
         return steps + 1
+    local_w = int(comm_meta.get("local_tp_width") or comm_meta.get("comm_group_size") or 0)
+    if local_w >= _MIN_TP_WORLD and m_dim % local_w == 0:
+        return local_w
     return 0
 
 
@@ -133,9 +137,9 @@ def _gemm_dims(op) -> tuple[int, int, int] | None:
 
 def _build_mc2_contract(
     *, abi: str, world: int, m_dim: int, k_dim: int, n_dim: int,
-    compute_dtype: str, output_dtype: str,
+    compute_dtype: str, output_dtype: str, ranks: tuple[int, ...] = (),
 ) -> dict:
-    return {
+    contract: dict = {
         "abi": abi,
         "world_size": world,
         "m": m_dim,
@@ -148,21 +152,25 @@ def _build_mc2_contract(
         "independent_buffers": True,
         "independent_handles": True,
     }
+    if ranks:
+        contract["ranks"] = ranks
+    return contract
 
 
 def tp_mc2_overlap_fusion(ops, source_dtype):
-    """Fuse TP ``allgather -> gemm`` and ``gemm -> reduce_scatter`` into MC2 ops."""
+    """Fuse TP or Local-TP ``allgather -> gemm`` and ``gemm -> reduce_scatter`` into MC2 ops."""
     del source_dtype
     by_id = {op.op_id: op for op in ops}
     users = users_map(ops)
     replacements, removed, aliases = {}, set(), {}
 
-    # Pass 1: Fuse TP AllGather -> GEMM into all_gather_matmul.
+    # Pass 1: Fuse TP / Local-TP AllGather -> GEMM into all_gather_matmul.
     for ag in ops:
         if ag.plan_required or ag.family != "allgather" or ag.op_id in removed:
             continue
         ag_meta = dict(ag.metadata)
-        if ag_meta.get("group_axis") != "tp":
+        comm_axis = str(ag_meta.get("group_axis") or "")
+        if comm_axis not in _MC2_OVERLAP_GROUP_AXES:
             continue
         ag_users = users.get(ag.op_id, [])
         if len(ag_users) != 1:
@@ -187,15 +195,16 @@ def tp_mc2_overlap_fusion(ops, source_dtype):
         new_deps = tuple(dict.fromkeys(
             dep for d in gemm.deps for dep in (ag.deps if d == ag.op_id else (d,))
         ))
+        ag_ranks = tuple(int(r) for r in (ag_meta.get("group_ranks") or ()))
         contract = _build_mc2_contract(
             abi="all_gather_matmul", world=world, m_dim=m_dim, k_dim=k_dim, n_dim=n_dim,
-            compute_dtype=comp_dt, output_dtype=out_dt,
+            compute_dtype=comp_dt, output_dtype=out_dt, ranks=ag_ranks,
         )
         fused_meta = fold_region_metadata(
             (ag, gemm),
             primary_anchor_id=gemm.op_id,
             extra=(
-                ("group_axis", "tp"),
+                ("group_axis", comm_axis),
                 ("mc2_contract", contract),
                 ("fused_from", (ag.op_id, gemm.op_id)),
                 ("absorbed_source_ops", (ag.op_id, gemm.op_id)),
@@ -213,12 +222,13 @@ def tp_mc2_overlap_fusion(ops, source_dtype):
         removed.add(ag.op_id)
         aliases[ag.op_id] = gemm.op_id
 
-    # Pass 2: Fuse GEMM -> TP ReduceScatter into matmul_reduce_scatter.
+    # Pass 2: Fuse GEMM -> TP / Local-TP ReduceScatter into matmul_reduce_scatter.
     for rs in ops:
         if rs.plan_required or rs.family != "reduce_scatter" or rs.op_id in removed:
             continue
         rs_meta = dict(rs.metadata)
-        if rs_meta.get("group_axis") != "tp" or len(rs.deps) != 1:
+        comm_axis = str(rs_meta.get("group_axis") or "")
+        if comm_axis not in _MC2_OVERLAP_GROUP_AXES or len(rs.deps) != 1:
             continue
         gemm = by_id.get(rs.deps[0])
         if (gemm is None or gemm.plan_required or gemm.op_id in replacements
@@ -240,15 +250,16 @@ def tp_mc2_overlap_fusion(ops, source_dtype):
         if dtypes is None:
             continue
         comp_dt, out_dt = dtypes
+        rs_ranks = tuple(int(r) for r in (rs_meta.get("group_ranks") or ()))
         contract = _build_mc2_contract(
             abi="matmul_reduce_scatter", world=world, m_dim=m_dim, k_dim=k_dim, n_dim=n_dim,
-            compute_dtype=comp_dt, output_dtype=out_dt,
+            compute_dtype=comp_dt, output_dtype=out_dt, ranks=rs_ranks,
         )
         fused_meta = fold_region_metadata(
             (gemm, rs),
             primary_anchor_id=gemm.op_id,
             extra=(
-                ("group_axis", "tp"),
+                ("group_axis", comm_axis),
                 ("mc2_contract", contract),
                 ("fused_from", (gemm.op_id, rs.op_id)),
                 ("absorbed_source_ops", (gemm.op_id, rs.op_id)),

@@ -169,7 +169,9 @@ def _apply_tp_mc2_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if _fused_mc2_explicitly_disabled(rt, ctx):
         return
     _update_meta(rt, tp_mc2_overlap=True)
-    if ctx.arch == "a5" and int(ctx.parallel.get("tp", 1) or 1) > 1:
+    if ctx.arch == "a5" and (
+        int(ctx.parallel.get("tp", 1) or 1) > 1 or _has_any_local_tp(ctx.parallel)
+    ):
         _append_passes(rt, "tp_mc2_overlap")
 
 
@@ -269,6 +271,40 @@ def _ep_within_ub_domain(ctx: MechanismContext) -> bool:
     return ep > 1 and (rpn <= 0 or ep <= rpn)
 
 
+def _cann_megamoe_routed_only(model: ModelSpec) -> bool:
+    return any(
+        p.ffn == "moe"
+        and (
+            p.expert_latent_size > 0
+            or p.ffn_activation == "situ"
+            or bool(getattr(p, "shared_expert_gate", False))
+            or int(getattr(p, "num_shared_experts", 0) or 0) <= 0
+        )
+        for p in model.layer_plans
+    )
+
+
+def _cann_megamoe_sacrifices_shared_expert_mso(ctx: MechanismContext) -> bool:
+    if "enable_fused_mc2" in ctx.caller_explicit or "moe_comm_mode" in ctx.caller_explicit:
+        return False
+    if int(ctx.parallel.get("ep", 1) or 1) <= 1:
+        return False
+    has_moe_shared_expert = any(
+        p.ffn == "moe" and int(getattr(p, "num_shared_experts", 0) or 0) > 0
+        for p in ctx.model.layer_plans
+    )
+    return has_moe_shared_expert and _cann_megamoe_routed_only(ctx.model)
+
+
+def _has_dspark_mla_draft(model: ModelSpec) -> bool:
+    aux = getattr(model, "auxiliary", None)
+    dspark = getattr(aux, "dspark", None) if aux is not None else None
+    return (
+        dspark is not None
+        and str(getattr(dspark, "attention_kind", "") or "").strip().lower() == "mla"
+    )
+
+
 def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "moe_comm_mode" in ctx.caller_explicit or "enable_fused_mc2" in ctx.caller_explicit:
         return
@@ -280,16 +316,9 @@ def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
         return
     if int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) > 0:
         return
-    routed_only = any(
-        p.ffn == "moe"
-        and (
-            p.expert_latent_size > 0
-            or p.ffn_activation == "situ"
-            or bool(getattr(p, "shared_expert_gate", False))
-            or int(getattr(p, "num_shared_experts", 0) or 0) <= 0
-        )
-        for p in ctx.model.layer_plans
-    )
+    if _cann_megamoe_sacrifices_shared_expert_mso(ctx):
+        return
+    routed_only = _cann_megamoe_routed_only(ctx.model)
     default_mode = FUSED_MC2_ROUTED_MODE if routed_only else FUSED_MC2_SHARED_MODE
     raw_level = int(ctx.options.get("enable_fused_mc2", default_mode))
     level = min(raw_level, FUSED_MC2_ROUTED_MODE) if routed_only else raw_level
@@ -531,7 +560,10 @@ def _source_attention_and_moe_mechanisms() -> tuple[OptimizationMechanism, ...]:
         OptimizationMechanism(
             id="tp_mc2_overlap", category="parallelism", phases=("prefill", "decode"),
             summary="AllGatherMatmulV2 + MatmulReduceScatterV2 overlapping TP collectives with Cube GEMMs",
-            eligible=lambda ctx: int(ctx.parallel.get("tp", 1)) > 1 and not _fused_mc2_disabled(ctx),
+            eligible=lambda ctx: (
+                (int(ctx.parallel.get("tp", 1) or 1) > 1 or _has_any_local_tp(ctx.parallel))
+                and not _fused_mc2_disabled(ctx)
+            ),
             apply=_apply_tp_mc2_overlap,
         ),
         OptimizationMechanism(
@@ -602,8 +634,11 @@ def _source_attention_and_moe_mechanisms() -> tuple[OptimizationMechanism, ...]:
             id="latent_moe_dspark_c8_mla", category="moe_overlap", phases=("prefill", "decode"),
             summary="5L MLA DSpark C8 QuantFlashMLA + Latent-MoE norm/quant & shared expert overlap",
             eligible=lambda ctx: (
-                ctx.arch == "a5"
-                and any(p.expert_latent_size > 0 for p in ctx.model.layer_plans)
+                ctx.arch in {"a3", "a5"}
+                and (
+                    _has_dspark_mla_draft(ctx.model)
+                    or any(p.expert_latent_size > 0 for p in ctx.model.layer_plans)
+                )
             ),
             apply=_apply_latent_moe_dspark_c8,
         ),
@@ -655,10 +690,22 @@ def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
                 and any(p.ffn == "moe" for p in ctx.model.layer_plans)
                 and _is_mxfp_moe(ctx)
                 and _model_supports_shipping_megamoe_activation(ctx)
+                and not _cann_megamoe_sacrifices_shared_expert_mso(ctx)
             ),
             apply=_apply_cann_megamoe,
         ),
         *_source_attention_and_moe_mechanisms(),
+        OptimizationMechanism(
+            id="wy_cube_speculative_verify", category="recurrent", phases=("decode",),
+            summary="Algebraic WY AIC-Cube speculative multi-token verification and async RecoverSSM commit overlap",
+            eligible=lambda ctx: (
+                ctx.arch in {"a3", "a5"}
+                and any(p.attention in {"kda", "gdn"} for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(
+                rt, wy_cube_speculative_verify=True, async_recover_ssm_commit=True,
+            ),
+        ),
         *_parallel_cp_mechanisms(),
     )
 

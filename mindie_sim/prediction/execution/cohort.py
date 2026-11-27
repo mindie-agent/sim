@@ -97,6 +97,8 @@ class _CohortMixin(_CohortNativeMixin):
         graphs = lower_local_projection_tp_cohort(
             graphs, model=self.case.model, runtime=self.case.runtime,
             machine=self.case.machine)
+        if self.case.runtime.parallel.has_local_tp:
+            graphs = {r: self._post_local_tp_transform(ops) for r, ops in graphs.items()}
         works = {r: replace(work, ops=graphs[r]) for r, work in works.items()}
         self._collectives = {}
         self._cohort_views = {

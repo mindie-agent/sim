@@ -133,6 +133,15 @@ _LOCAL_TP_AXES = (
     "shared_expert_tp",
     "lm_head_tp",
 )
+_AUTO_LOCAL_TP_AXES = (
+    "q_proj_tp",
+    "o_proj_tp",
+    "linear_proj_tp",
+    "mlp_tp",
+    "shared_expert_tp",
+    "lm_head_tp",
+)
+_AUTO_LOCAL_TP_WIDTHS = (8, 16)
 _PREFILL_PCP_WIDTHS = (1, 2, 4)
 PREFILL_PCP_MIN_PROMPT_TOKENS = 1024
 DEFAULT_CHUNKED_PREFILL_TOKENS = 8192
@@ -2618,6 +2627,50 @@ def _linear_state_heads_divisible_by_tp(model_spec: Any, tp: int) -> bool:
     return True
 
 
+def _attention_heads_compatible_with_tp(model_spec: Any, tp: int) -> bool:
+    """True when every attention layer satisfies linear, Q-head, and KV-head divisibility."""
+    tp_i = max(1, int(tp))
+    if tp_i <= 1:
+        return True
+    if not _linear_state_heads_divisible_by_tp(model_spec, tp_i):
+        return False
+    for plan in getattr(model_spec, "layer_plans", ()) or ():
+        attn = str(getattr(plan, "attention", "") or "")
+        if attn not in _DENSE_KV_ATTENTION_KINDS:
+            continue
+        q_heads = int(getattr(plan, "num_heads", 0) or getattr(model_spec, "num_heads", 0) or 0)
+        if q_heads > 0 and q_heads % tp_i != 0:
+            return False
+        if attn == "gqa":
+            kv_heads = int(getattr(plan, "num_kv_heads", 0) or getattr(model_spec, "num_kv_heads", 0) or 0)
+            if kv_heads > 0 and kv_heads % tp_i != 0 and tp_i % kv_heads != 0:
+                return False
+    return True
+
+
+def _emit_auto_local_tp_candidates(
+    add_fn: Any,
+    *,
+    dp: int,
+    pp: int,
+    pcp: int,
+    ep: int,
+    dcp_choices: Sequence[int],
+    pinned: Mapping[str, int],
+) -> None:
+    """Append intra-node ``TP=1 + Local-TP`` high-DP MoE candidates when unpinned."""
+    if any(k in pinned for k in _LOCAL_TP_AXES):
+        return
+    if int(pinned.get("tp", 1)) != 1:
+        return
+    for ltp in _AUTO_LOCAL_TP_WIDTHS:
+        if dp < ltp or dp % ltp != 0:
+            continue
+        ltp_map = {axis: ltp for axis in _AUTO_LOCAL_TP_AXES}
+        for dcp in dcp_choices:
+            add_fn({"dp": dp, "tp": 1, "ep": ep, "pp": pp, "pcp": pcp, "dcp": dcp, **ltp_map})
+
+
 def _build_colocated_candidates(
     *,
     num_devices: int,
@@ -2645,7 +2698,7 @@ def _build_colocated_candidates(
         if not _matches_pinned(cand, pinned):
             return
         if model_spec is not None:
-            if "tp" not in pinned and not _linear_state_heads_divisible_by_tp(model_spec, tp):
+            if "tp" not in pinned and not _attention_heads_compatible_with_tp(model_spec, tp):
                 return
             dcp_ok, _ = validate_vllm_ascend_dcp_codomain(
                 model_spec, ParallelSpec(dp=dp, tp=tp, ep=ep, pp=pp, pcp=pcp, cp=dcp),
@@ -2684,9 +2737,13 @@ def _build_colocated_candidates(
                 for dp in dp_choices:
                     if dp * unit > num_devices or dp < 1:
                         continue
+                    ep_val = pinned["ep"] if "ep" in pinned else (dp * tp * pcp if is_moe else 1)
                     for dcp in dcp_choices:
-                        ep_val = pinned["ep"] if "ep" in pinned else (dp * tp * pcp if is_moe else 1)
                         add({"dp": dp, "tp": tp, "ep": ep_val, "pp": pp, "pcp": pcp, "dcp": dcp, **local_pins})
+                    if is_moe and tp == 1:
+                        _emit_auto_local_tp_candidates(
+                            add, dp=dp, pp=pp, pcp=pcp, ep=ep_val, dcp_choices=dcp_choices, pinned=pinned,
+                        )
     return out
 
 
@@ -2717,7 +2774,7 @@ def _build_pd_stage_candidates(
         if not _matches_pinned(cand, pinned):
             return
         if model_spec is not None:
-            if "tp" not in pinned and not _linear_state_heads_divisible_by_tp(model_spec, tp):
+            if "tp" not in pinned and not _attention_heads_compatible_with_tp(model_spec, tp):
                 return
             dcp_ok, _ = validate_vllm_ascend_dcp_codomain(
                 model_spec, ParallelSpec(dp=dp, tp=tp, ep=ep, pp=pp, pcp=pcp, cp=dcp),
@@ -2778,6 +2835,10 @@ def _build_pd_stage_candidates(
                     )
                     for dcp in dcp_choices:
                         add({"dp": dp, "tp": tp, "ep": ep, "pp": pp, "pcp": pcp, "dcp": dcp, **local_pins})
+                    if is_moe and tp == 1:
+                        _emit_auto_local_tp_candidates(
+                            add, dp=dp, pp=pp, pcp=pcp, ep=ep, dcp_choices=dcp_choices, pinned=pinned,
+                        )
     return out
 
 

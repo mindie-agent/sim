@@ -37,6 +37,7 @@ from mindie_sim.catalog.context_parallel import (
     layer_dcp_factors,
     owned_positions,
 )
+from mindie_sim.schema.common import dtype_bytes
 
 _DCP_KV_SHARDED_COMPONENTS = frozenset({
     "gqa_kv", "mla_kv", "window", "compressed_kv",
@@ -68,6 +69,56 @@ class _MemoryCacheMixin:
         # ``self.query_tokens`` already carries the shared DSpark ``[K+1]`` verify width.
         return self.query_tokens if query_tokens is None else max(1, int(query_tokens))
 
+    def _dspark_c8_mla_kv_dtype(self, model) -> str | None:
+        if self.draft_kind != "dspark" or getattr(model, "auxiliary", None) is None:
+            return None
+        dspark = getattr(model.auxiliary, "dspark", None)
+        if dspark is None or str(getattr(dspark, "attention_kind", "") or "").strip().lower() != "mla":
+            return None
+        dq_explicit = getattr(dspark, "quant", None)
+        if dq_explicit is not None and str(getattr(dq_explicit, "kv_dtype", "") or "").strip():
+            return None
+        meta = dict(getattr(self.case.runtime, "metadata", ()) or ())
+        if not bool(meta.get("latent_moe_dspark_c8_mla", False)) or bool(meta.get("raw_eager", False)):
+            return None
+        arch = str(
+            getattr(self.case.machine, "arch_family", "")
+            or meta.get("arch_family")
+            or meta.get("device_arch")
+            or ""
+        ).strip().lower()
+        if arch == "a5":
+            return "fp8_e4m3"
+        if arch == "a3":
+            return "int8"
+        return None
+
+    def _model_with_effective_draft_kv(self, model):
+        c8_dt = self._dspark_c8_mla_kv_dtype(model)
+        if c8_dt is None:
+            return model
+        from dataclasses import replace as _replace
+        dspark = model.auxiliary.dspark
+        src = dict(getattr(dspark, "source", ()) or ())
+        if str(src.get("kv_dtype") or "").strip():
+            return model
+        src["kv_dtype"] = c8_dt
+        return _replace(
+            model,
+            auxiliary=_replace(model.auxiliary, dspark=_replace(dspark, source=tuple(src.items()))),
+        )
+
+    def _effective_draft_row_bytes(self, model, draft, *, tp: int) -> int:
+        c8_dt = self._dspark_c8_mla_kv_dtype(model)
+        if c8_dt == "fp8_e4m3":
+            latent = int(getattr(draft, "kv_lora_rank", 0) or 0)
+            rope = int(getattr(draft, "qk_rope_head_dim", 0) or 0)
+            width = int(getattr(draft, "kv_cache_elements", 0) or (latent + rope))
+            return width * int(dtype_bytes("fp8_e4m3"))
+        eff_model = self._model_with_effective_draft_kv(model)
+        eff_draft = getattr(eff_model.auxiliary, "dspark", draft) if c8_dt else draft
+        return _draft_row_bytes_int(eff_model, eff_draft, tp=tp)
+
     def _hybrid_pool_receipt(
         self,
         tokens: int,
@@ -86,8 +137,9 @@ class _MemoryCacheMixin:
         ):
             return None
         q_tok = self._effective_cache_query_tokens(query_tokens)
+        eff_model = self._model_with_effective_draft_kv(self.case.model)
         receipt = evaluate_hybrid_pool_receipt(
-            self.case.model,
+            eff_model,
             self.case.runtime.parallel,
             int(tokens),
             num_requests=int(num_requests),
@@ -403,7 +455,7 @@ class _MemoryCacheMixin:
         interleave = max(1, int(cp_interleave(case.runtime)))
         page_block = max(1, int(getattr(case.runtime, "kv_block_size", 0) or interleave))
         draft_tp = self._resolve_draft_tp()
-        row_bytes = _draft_row_bytes_int(model, draft, tp=draft_tp)
+        row_bytes = self._effective_draft_row_bytes(model, draft, tp=draft_tp)
         draft_sharded = _draft_is_dcp_sharded(
             model, p, self.draft_kind,
             dcp=int(getattr(p, "cp", 1) or 1),
@@ -589,7 +641,12 @@ class _MemoryCacheMixin:
         eff_tokens = min(int(tokens), max_len) if max_len > 0 else int(tokens)
         eff_tokens = min(eff_tokens, draft_cap) if draft_cap > 0 else eff_tokens
         draft_tp = self._resolve_draft_tp()
-        row_bytes = int(draft_row(self.case.model, draft, tp=draft_tp))
+        c8_dt = self._dspark_c8_mla_kv_dtype(self.case.model)
+        row_bytes = (
+            self._effective_draft_row_bytes(self.case.model, draft, tp=draft_tp)
+            if c8_dt is not None
+            else int(draft_row(self.case.model, draft, tp=draft_tp))
+        )
         interleave = max(1, int(cp_interleave(self.case.runtime)))
         block = max(1, int(self.case.runtime.kv_block_size or interleave))
         sharded = _draft_is_dcp_sharded(
