@@ -1224,3 +1224,60 @@ def test_fia_tiler_honors_pcp_query_spans_for_causal_and_windowed_tiles():
     )
     p_pbhsd = governed.build(governed.make_attention_op(c_pbhsd, op_id="fia_pbhsd"), g_a5)
     assert p_pbhsd.program.rectangle(0).tile_count == 1
+
+
+@pytest.mark.parametrize("context_len", [16384, 16448])
+def test_gqa_decode_falls_back_to_pipeline_template_when_peer_compaction_declines(
+    monkeypatch, context_len,
+):
+    """When fluid peer compaction declines, GQA decode uses PipelineTemplateProgram for exact periodic skips."""
+    from _support.operator_cases import gqa_decode_hardware, gqa_decode_op
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.operators.attention import attention_decode as ad
+    from mindie_sim.prediction.operators.attention import attention_pipeline as ap
+    from mindie_sim.prediction.program import PipelineProgram, PipelineTemplateProgram
+
+    op = gqa_decode_op([(4, context_len)] * 4, heads=6, kv_heads=1, dim=128)
+    recipe = ad.StagedGQADecode(key_tile=64, query_tile=64, slots=2)
+    case = parse_case(gqa_decode_hardware(units=4))
+
+    def _run_zero_trace():
+        ex = Execution(case, CostModel(case), recipes=RecipeBook({ad.RECIPE_ID: recipe}), trace_limit=0)
+        prep, _ = ex.prepare(op)
+        ctx = ex._context(prep, 0, "none")
+        start = ex.engine.submit("input_ready", release=0.0)
+        end = recipe.lower(ctx).start(ex.engine, "gqa", start)
+        ex.engine.advance(until=(end,))
+        return ex.engine, end
+
+    def _decline_compact(context, count, slots, tile_fn, **kwargs):
+        del context, kwargs
+        return PipelineProgram(count, slots, tile_fn)
+
+    monkeypatch.setattr(ap, "compact_periodic_pipeline", _decline_compact)
+    monkeypatch.setattr(ad, "compact_periodic_pipeline", _decline_compact)
+
+    seen_programs: list[object] = []
+    orig_producer = ap._producer_program
+
+    def _spy_producer(*args, **kwargs):
+        prog = orig_producer(*args, **kwargs)
+        if kwargs.get("periodic_specs") is None:
+            for st in prog.stages:
+                if st.name == "key_tiles":
+                    seen_programs.append(st.program)
+        return prog
+
+    monkeypatch.setattr(ap, "_producer_program", _spy_producer)
+    monkeypatch.setattr(ad, "_producer_program", _spy_producer)
+    eng_tpl, end_tpl = _run_zero_trace()
+    assert seen_programs and all(isinstance(p, PipelineTemplateProgram) for p in seen_programs)
+
+    monkeypatch.setattr(ap, "_attention_pipeline_template", lambda *a, **kw: None)
+    eng_lit, end_lit = _run_zero_trace()
+    assert end_tpl.time == pytest.approx(end_lit.time, rel=1e-12)
+    assert eng_tpl.serviced == pytest.approx(eng_lit.serviced, rel=1e-12)
+    assert eng_tpl.peak_allocated == pytest.approx(eng_lit.peak_allocated, rel=1e-12)
+    assert eng_tpl.advance_steps < eng_lit.advance_steps
+    assert eng_tpl._periodic_detector.stats()["skipped_cycles"] > 0

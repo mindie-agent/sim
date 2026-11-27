@@ -324,7 +324,11 @@ def _attention_pipeline_template(tile, key_of, count, *, rows, key_tile,
         return None
     full_end = tail_start
     full_count = full_end - full_start
-    if full_count < slots or full_count % slots:
+    rem = full_count % slots
+    if rem:
+        full_start += rem
+        full_count -= rem
+    if full_count < slots:
         return None
     base_stages = tuple(tile(full_start))
     for offset in range(1, slots):
@@ -501,6 +505,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     # A head, the actual causal tail, and two complete slot periods are the
     # structural minimum. The compactor verifies convergence before folding.
     min_periodic_tiles = 1 + tail_count + 2 * max(2, recipe.slots)
+    key_program = None
     if use_compact and contribution.tile_count >= min_periodic_tiles:
         if periodic_specs is not None:
             periodic_specs.append(PeriodicPipelineSpec(
@@ -511,11 +516,13 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
             key_program = PipelineProgram(contribution.tile_count, recipe.slots, tile)
         else:
             peer_tails = _decode_peer_tails(spec, recipe) if peer_counts is not None else None
-            key_program = compact_periodic_pipeline(
+            compacted = compact_periodic_pipeline(
                 context, contribution.tile_count, recipe.slots, tile,
                 head=1, tail=tail_count, threshold=min_periodic_tiles - 1,
                 resident=persistent, peer_counts=peer_counts, peer_tails=peer_tails)
-    else:
+            if not isinstance(compacted, PipelineProgram):
+                key_program = compacted
+    if key_program is None:
         finite_template = _attention_pipeline_template(
             tile, key_of, contribution.tile_count,
             rows=rows, key_tile=recipe.key_tile, slots=recipe.slots, core=core)
