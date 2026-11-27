@@ -1,0 +1,1119 @@
+"""Explicit stateful causal-convolution update on the shared native program.
+
+[Role] Connect typed KDA producers to one native decode/verify call.
+[Invariants] Graph/SP padding rows execute without owning a state slot.
+  Speculative verification writes an accepted prefix and rejects later
+  candidates; every candidate still performs its real query/history work.
+  Prepared weights coexist with original checkpoint weights. Input aliases
+  stay views, while separate producers require a real row pack. A state
+  history capacity smaller than the source ABI is an error, never a silent
+  non-speculative fallback.
+[Timeouts & Locks] O(sequence/projection descriptors); no locks or external I/O.
+[Side-Effect Policy] Creates model metadata, weight terms and graph operators.
+"""
+from collections.abc import Mapping
+from dataclasses import replace
+import math
+from typing import Literal
+
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.operators import (
+    ProgramFragment as ProgramFragment, SemanticAttr as SemanticAttr,
+    StateEffect as StateEffect,
+)
+from mindie_sim.schema.subgraphs import PortSet as PortSet
+from mindie_sim.schema.tensors import TensorLayout as TensorLayout, TensorValue
+
+from .family_causal_conv_state import (
+    _conv_bindings, _decision_name as _decision_name, _fragment as _fragment,
+    _narrow_window, _per_sequence, _slot_storage as _slot_storage,
+    _state_contract, state_accesses as state_accesses,
+    state_fragments as state_fragments,
+)
+from mindie_sim.prediction.engine import Allocation
+from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
+from mindie_sim.prediction.operators.kda.kda_state_selection import (
+    bind_state_value, binding_record, binding_value, decision_ports as decision_ports,
+    state_ports as state_ports, state_records as state_records, state_value as state_value,
+)
+from mindie_sim.prediction.ownership import read_role, unit_group
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+
+CONV = "ascend_causal_conv1d_update"
+BF16_BYTES = int(dtype_bytes("bf16"))
+FP32_BYTES = int(dtype_bytes("fp32"))
+CONV_TILE_CHANNELS = (4096, 2048, 1024, 512, 384, 192)
+CONV_MAX_TILE_CHANNELS = CONV_TILE_CHANNELS[0]
+CONV_SPECULATIVE_WIDTH = 4
+CONV_SUPPORTED_WIDTHS = frozenset({2, 3, CONV_SPECULATIVE_WIDTH})
+CONV_RING_SLOTS = 5
+CONV_FP32_SCRATCH_SLOTS = 8
+#: A rolling state ring is single-buffered: token i+1 reads what token i wrote.
+CONV_TOKEN_SLOTS = 1
+#: Per-token vector expression: three window taps, the Silu/bias fixed term and
+#: the optional two-op bias add, each over the owned channel width.
+CONV_TOKEN_TAP_OPS = 3
+CONV_TOKEN_FIXED_OPS = 5
+CONV_TOKEN_BIAS_OPS = 2
+NS_TO_MS = 1e-6
+
+CONV_SOURCE = {
+    "path": "data/observations/sources/native-causal-conv-a4a7958",
+    "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
+    "kernel": "op_kernel/causal_conv1d.h",
+    "ranges": ((310, 405), (463, 548), (888, 910), (1008, 1097), (1216, 1288)),
+    "dispatch": "op_host/causal_conv1d_tiling_planner.h:25-73",
+}
+
+
+def _primitive_latency_ms(context, primitive_id: str, metric: str) -> float:
+    """Read a calibrated primitive latency in ms from ``context.primitive_table``."""
+    table = getattr(context, "primitive_table", None)
+    if table is None or primitive_id not in getattr(table, "primitives", ()):
+        return 0.0
+    cell = table.cell(primitive_id)
+    band = cell.metrics.get(metric)
+    if band is None or band.p50 is None or band.p50 <= 0.0:
+        return 0.0
+    return float(band.p50) * NS_TO_MS
+
+
+def update_geometry(batch, dim, units):
+    """Exact-divisor candidates take precedence over candidates with a tail."""
+    for exact in (True, False):
+        choices = [(tile, math.ceil(dim / tile)) for tile in CONV_TILE_CHANNELS
+                   if not exact or dim % tile == 0]
+        if choices:
+            over = [item for item in choices if batch * item[1] >= units]
+            tile, columns = (min(over, key=lambda item: batch * item[1] - units)
+                             if over else max(choices, key=lambda item: (batch * item[1], -item[0])))
+            return tile, columns, min(units, batch * columns)
+
+
+def _state_slots(lengths, padding_slots):
+    slots = set(padding_slots)
+    return tuple(slot not in slots for slot in range(len(lengths)))
+
+
+def _conv_traffic(q, width, bias, speculative, has_state):
+    """Payload descriptors for one physical sequence slot.
+
+    A graph-padded slot retains its physical query rows (the captured graph
+    still executes them) but owns no state row, so it neither reloads prior
+    history nor writes a checkpoint.  The source CacheSkipped branch removes
+    exactly those history descriptors, not the convolution itself.
+    """
+    history = width - 1 if has_state else 0
+    spec_read = (2 + q) if (speculative and has_state) else 0
+    spec_write = (2 + q) if (speculative and has_state) else history
+    return width + int(bias) + history + q + spec_read, q + spec_write
+
+
+def _conv_runs(lengths, dim, tile_width, columns, blocks, owner, *, compact,
+               has_state):
+    """Yield (query rows, channel width, repetitions, state_owned)."""
+    count = (len(lengths) * columns - 1 - owner) // blocks + 1
+    if compact and (columns == 1 or dim % tile_width == 0) and all(
+            q == lengths[0] for q in lengths) and all(has_state):
+        yield lengths[0], min(tile_width, dim), count, True
+        return
+    previous, repeat = None, 0
+    for task in range(owner, len(lengths) * columns, blocks):
+        seq, col = divmod(task, columns)
+        # Source ResolveSeqTaskWindow rejects repeated offsets and
+        # ResolveSeqCacheIndex rejects null/pad slots before LoadWeight, RunSeq
+        # and writeback. The slot still participates in the host grid only.
+        if lengths[seq] == 0 or not has_state[seq]:
+            continue
+        descriptor = (lengths[seq], min(tile_width, dim - col * tile_width),
+                      has_state[seq])
+        if previous is not None and (not compact or descriptor != previous):
+            yield previous[0], previous[1], repeat, previous[2]
+            repeat = 0
+        previous = descriptor
+        repeat += 1
+    if previous is not None:
+        yield previous[0], previous[1], repeat, previous[2]
+
+
+def conv_task_runs(lengths, dim, tile_width, columns, blocks, owner, *, compact=True):
+    """Yield (query rows, channel width, repetitions) in this owner's order.
+
+    Repetitions retain distinct weights, input and state addresses. Only their
+    equal resource cycles are compacted; no cache reuse or DMA coalescing follows
+    from equal geometry. Ragged/tail runs stay bounded to one pending descriptor.
+    ``conv_plan`` retains the per-slot state flag through the private
+    ``_conv_runs`` iterator; this public diagnostic keeps its published shape.
+    """
+    for q, n, repeat, _ in _conv_runs(
+            lengths, dim, tile_width, columns, blocks, owner, compact=compact,
+            has_state=(True,) * len(lengths)):
+        yield q, n, repeat
+
+
+def conv_schedule(lengths, dim, units, *, width, bias, speculative, compact=True,
+                  padding_slots=()):
+    """Source task/transfer diagnostics; descriptor counts are not latencies."""
+    tile_width, columns, blocks = update_geometry(len(lengths), dim, units)
+    has_state = _state_slots(lengths, padding_slots)
+    counts = tuple(sum(1 for _ in _conv_runs(
+        lengths, dim, tile_width, columns, blocks, owner, compact=compact,
+        has_state=has_state)) for owner in range(blocks))
+    traffic = [_conv_traffic(q, width, bias, speculative, own)
+               for q, own in zip(lengths, has_state) if q > 0 and own]
+    return {
+        "kind": "causal_conv1d_serial_runs", "compact": compact,
+        "logical_tasks": len(lengths) * columns, "resource_cycles": sum(counts),
+        "owner_cycles": counts, "active_aiv": blocks, "tile_channels": tile_width,
+        "channel_tiles": columns,
+        "padding_slots": tuple(sorted(int(slot) for slot in padding_slots)),
+        "read_descriptors": columns * sum(read for read, _ in traffic),
+        "write_descriptors": columns * sum(write for _, write in traffic),
+        "contention_approximation": "serial_cycle_fluid_rephasing" if compact else "none",
+    }
+
+
+def conv_token_ops(width, bias):
+    # Source recasts each window tap before the multiply/add; SiLU is
+    # neg/exp/add/div/multiply.
+    return CONV_TOKEN_TAP_OPS * width + CONV_TOKEN_FIXED_OPS + CONV_TOKEN_BIAS_OPS * int(bias)
+
+
+def conv_spec_terms(lengths, padding_slots, width, dim, bias, speculative):
+    """Geometry-free ``(external_hbm, reads, writes, vector)`` of the update kernel.
+
+    Shared by ``conv_plan`` and the lowering so the declared ``OpSpec`` carries
+    exactly the executed descriptors (never a zero-work placeholder).
+    """
+    has_state = _state_slots(lengths, padding_slots)
+    traffic = [_conv_traffic(q, width, bias, speculative, own)
+               for q, own in zip(lengths, has_state) if q > 0 and own]
+    reads = sum(amount for amount, _ in traffic) * dim * 2
+    writes = sum(amount for _, amount in traffic) * dim * 2
+    # Externally observed envelope of `causal_conv1d_update` on the paired
+    # `#62` SKUs: `q` current tokens plus `width - 1` prior history rows are
+    # read cold, and `q` outputs plus `state_write` (`2 + q` speculative via
+    # `WriteBackStateSpec`, `width - 1` non-speculative) dirty rows are written
+    # back. The `width` weight taps stay L2-resident across per-sequence
+    # repetitions, and speculative reload re-reads already-fetched rows.
+    external = sum(
+        ((q + width - 1) + (q + (2 + q if speculative else width - 1))) * dim * BF16_BYTES
+        for q, own in zip(lengths, has_state) if q > 0 and own
+    )
+    vector = sum((width + 1 + q * conv_token_ops(width, bias)) * dim
+                 for q, own in zip(lengths, has_state) if q > 0 and own)
+    return external, reads, writes, vector
+
+
+def _conv_work(lengths, padding_slots, width, dim, bias, speculative, read):
+    external, reads, writes, vector = conv_spec_terms(lengths, padding_slots, width, dim, bias, speculative)
+    work = Work(resources={"hbm": external, read: reads, "mte3": writes, "vector": vector})
+    return work, conv_token_ops(width, bias)
+
+
+def conv_plan(op, geometry, *, compact=True):
+    meta = dict(op.metadata)
+    lengths = tuple(meta.get("physical_sequence_tokens", meta["sequence_tokens"]))
+    width = meta["kernel_width"]
+    dim, dtype = op.local_shape[1], op.dtype
+    if dtype not in {"bf16", "fp16"} or width not in CONV_SUPPORTED_WIDTHS:
+        raise ValueError("gdn_decode_convolution_requires_16bit_width2to4")
+    padding_slots = tuple(int(slot) for slot in meta.get("padding_slots", ()))
+    if len(set(padding_slots)) != len(padding_slots) or any(
+            slot < 0 or slot >= len(lengths) for slot in padding_slots):
+        raise ValueError("gdn_decode_convolution_padding_slot_outside_partition")
+    has_state = _state_slots(lengths, padding_slots)
+    speculative = bool(meta["speculative"])
+    bias = meta.get("bias", False)
+    if not any(q > 0 and own for q, own in zip(lengths, has_state)):
+        # A capacity/padding probe can retain physical buffer descriptors with
+        # zero active rows.  The UPDATE source skips null/pad slots before
+        # RunSeq, so no convolution or state work executes; the host grid and
+        # tensor extents remain with an explicit empty program.
+        return OperatorPlan(Work(), lambda context: KernelProgram(()),
+                            metadata={"empty_active_sequences": True})
+    max_query = max((q for q, own in zip(lengths, has_state) if q > 0 and own),
+                    default=1)
+    if speculative and (width != CONV_SPECULATIVE_WIDTH or meta["state_history_slots"] < 2 + max_query):
+        raise ValueError("gdn_decode_speculative_convolution_requires_width4_history")
+    if not speculative and meta["state_history_slots"] < width - 1:
+        raise ValueError("gdn_decode_convolution_requires_history_width_minus_one")
+    units = geometry.resource_units.get("vector", geometry.compute_units)
+    schedule = conv_schedule(lengths, dim, units, width=width, bias=bias,
+                             speculative=speculative, compact=compact,
+                             padding_slots=padding_slots)
+    tile_width, columns, blocks = schedule["tile_channels"], schedule["channel_tiles"], schedule["active_aiv"]
+
+    def runs(owner):
+        return _conv_runs(lengths, dim, tile_width, columns, blocks, owner,
+                          compact=compact, has_state=has_state)
+    run_counts = schedule["owner_cycles"]
+    read = read_role(geometry.resource_units, aiv=0)
+    work, token_ops = _conv_work(lengths, padding_slots, width, dim, bias, speculative, read)
+
+    def program(context):
+        def task(q, n, repeat, owns_state, owner):
+            owned = context.owned(owner, units, ("vector", read, "mte3"))
+            def memory(amount, role):
+                return context.bind(Work(resources={role: amount}).scaled(repeat))
+            def token(index):
+                stages = [
+                    Stage("input", memory(n * 2, read), placement=owned),
+                    Stage("convolution", context.bind(Work(resources={"vector": n * token_ops}).scaled(repeat)),
+                          after=("input",), previous=("convolution",), placement=owned),
+                    Stage("output", memory(n * 2, "mte3"),
+                          after=("convolution",), placement=owned),
+                ]
+                if speculative and owns_state:
+                    stages.append(Stage("state_write",
+                                        memory(n * 2, "mte3"),
+                                        after=("input",), placement=owned))
+                elif state_write and index == q - 1:
+                    # ``causal_conv1d.h`` writes the last ``W-1`` history rows
+                    # from the ring updated by the final token input, so the
+                    # write follows that input load; it still overlaps the last
+                    # token's convolution/output instead of extending the task.
+                    stages.append(Stage("state_write",
+                                        memory(state_write * n * 2, "mte3"),
+                                        after=("input",), placement=owned))
+                return tuple(stages)
+            history = width - 1 if owns_state else 0
+            state_write = (2 + q) if (speculative and owns_state) else history
+            state_resolve_ms = _primitive_latency_ms(context, "P12_intracore_flag", "flag_v_mte3_ns")
+            stages = [
+                # `ResolveSeqCacheIndex` + `ResolveSeqTaskWindow` run once per
+                # task on this owner before any tap is issued, so the resolve
+                # latency repeats with every equal-geometry compaction step.
+                Stage("state_resolve", placement=owned,
+                      latency=state_resolve_ms * repeat),
+                Stage("weights_history",
+                      memory((width + int(bias) + history) * n * 2, read),
+                      after=("state_resolve",), placement=owned),
+                Stage("weights_cast", context.bind(Work(resources={"vector": (width + 1) * n}).scaled(repeat)),
+                      after=("weights_history",), placement=owned),
+                Stage("tokens", after=("weights_cast",),
+                      program=PipelineProgram(q, CONV_TOKEN_SLOTS, token)),
+            ]
+            # The streamed token/history rows leave the core through the
+            # shared HBM bus as one address stream, double-buffered against the
+            # token convolution rather than extending the token-critical path.
+            if owns_state:
+                stream_rows = (q + history) + (q + state_write)
+                stages.append(Stage("external_stream", context.bind(Work(
+                    resources={"hbm": stream_rows * n * BF16_BYTES}).scaled(repeat)),
+                    after=("weights_cast",), placement=owned))
+            # The retained-history reload is a prefetch for the speculative
+            # restore; it may double-buffer against the token convolution.
+            if speculative and owns_state:
+                stages.append(Stage("state_reload",
+                                    memory((2 + q) * n * 2, read),
+                                    after=("weights_cast",), placement=owned))
+                stages.append(Stage("state_retained_write",
+                                    memory(2 * n * 2, "mte3"),
+                                    after=("weights_cast",), placement=owned))
+            return (Stage("sequence", program=KernelProgram(tuple(stages))),)
+        def owner_program(owner):
+            # Source drains MTE3 between tasks. Equal cycles on one owner are a
+            # time-dilated serial run, not overlapping sequences. Work and each
+            # owner's fixed buffers remain exact; external contention can be
+            # rephased by compaction. compact=False is the detailed oracle.
+            pending = tuple(runs(owner))
+            tiles = PipelineProgram(run_counts[owner], 1,
+                                    lambda index, pending=pending: task(*pending[index], owner))
+            pool = context.pool_names.get("ub")
+            if pool is None:
+                return tiles
+            # InitSharedBuffersAndEvents reserves the fixed ring, two outputs,
+            # and eight FP32 calculation slots once per executing AIV.
+            storage = CONV_MAX_TILE_CHANNELS * (
+                (CONV_RING_SLOTS + 2) * BF16_BYTES + CONV_FP32_SCRATCH_SLOTS * FP32_BYTES
+            )
+            owned_pool = unit_group(owner, units, context.pool_units.get("ub", units))
+            allocation = (Allocation("conv_buffers", pool, storage, owned_pool),)
+            return KernelProgram((Stage("buffers", acquire=allocation),
+                                  Stage("tasks", after=("buffers",), program=tiles),
+                                  Stage("release", after=("tasks",), free=allocation)))
+        # One program per physical AIV owner, as the convolution contract
+        # requires: each demand-carrying task keeps its own single unit. The
+        # launch-level setup is finite and precedes every owner's first task.
+        call_setup_ms = _primitive_latency_ms(context, "P15_rts_stars", "aiv_first_issue_ns")
+        return KernelProgram((
+            Stage("descriptor_setup", latency=call_setup_ms),
+            Stage("owners", after=("descriptor_setup",), program=ParallelProgram(
+                tuple(owner_program(owner) for owner in range(blocks)))),
+        ))
+    plan_meta = {
+        "padding_slots": padding_slots,
+        "state_slots": tuple(slot for slot, own in enumerate(has_state) if own),
+        "free_state_slots": tuple(slot for slot, own in enumerate(has_state) if not own),
+        "state_write_bytes": sum(
+            (2 + q if speculative else width - 1) * dim * 2
+            for q, own in zip(lengths, has_state) if q > 0 and own),
+    }
+    if "gdn_state_contract" in meta:
+        plan_meta["state_contract"] = meta["gdn_state_contract"]
+    if "gdn_state_effects" in meta:
+        plan_meta["state_effects"] = meta["gdn_state_effects"]
+    return OperatorPlan(work, program, metadata=plan_meta)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/ops/kimi_kda.py",
+        "af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10",
+    ),
+)
+
+IMPLEMENTATION = CONV
+SOURCE = {
+    "caller": {"path": "vllm_ascend/ops/kimi_kda.py",
+               "sha256": "35365b3b353fc492b4dc5d75b88916431f6802c21bf51b61b4893d39d54f11f3",
+               "lines": "233-255,386-430,544-555,635-648"},
+    "kernel": CONV_SOURCE,
+    "scope": "source_compatible_update_program; capture_binary_identity_unverified",
+    "autocontiguous": "csrc/moe/causal_conv1d/op_host/causal_conv1d_def.cpp:24-28",
+    "upstream_projection": {
+        "path": "vllm/models/kimi_k3/nvidia/kda.py", "lines": "470-499",
+        "sha256": "3663c3b273abf41e9727e2b1724e87628b64b6a9dc048a2c48d002b1f9085420"},
+}
+
+
+def recipes():
+    return {CONV: PlannedRecipe(_planned)}
+
+
+def prepare_model(model, runtime):
+    prepared = {}
+    for layer in model.layer_plans:
+        if layer.attention != "kda":
+            continue
+        heads = (layer.linear_key_heads or layer.linear_heads,
+                 layer.linear_value_heads or layer.linear_heads)
+        if any(count <= 0 or count % runtime.parallel.tp for count in heads):
+            # The retained KDA producer asserts integral head shards. A
+            # channel-wise ceil would undercount replicated whole heads.
+            raise ModelingError("causal_conv_update_source_requires_integral_local_heads")
+        if model.activation_dtype not in {"bf16", "fp16"}:
+            raise ModelingError("causal_conv_update_requires_16bit_activation")
+        if layer.conv_state_dtype != model.activation_dtype:
+            raise ModelingError("causal_conv_update_state_dtype_must_match_activation")
+        if layer.conv_kernel not in CONV_SUPPORTED_WIDTHS:
+            raise ModelingError("causal_conv_update_requires_width2to4")
+        conv_width = int(getattr(layer, "conv_width", 0) or 0)
+        state_elements = int(getattr(layer, "conv_state_elements", 0) or 0)
+        if conv_width < 1 or state_elements < 0 or state_elements % conv_width:
+            raise ModelingError(
+                "causal_conv_update_state_capacity_not_a_whole_history_row")
+        history_slots = state_elements // conv_width
+        if history_slots < layer.conv_kernel - 1:
+            raise ModelingError("causal_conv_update_state_history_below_kernel_width")
+        prepared[str(layer.index)] = {
+            "dtype": model.activation_dtype,
+            "prepared_weight_policy": "retain_original_fp32_checkpoint_weight",
+            "state_layout": "slots_history_channels",
+            "state_history_slots": history_slots,
+            "conv_width": conv_width,
+        }
+        declared_history = dict(model.metadata).get(
+            "causal_conv_history_acceptance", {})
+        if str(layer.index) in declared_history:
+            prepared[str(layer.index)]["history_acceptance"] = tuple(
+                declared_history[str(layer.index)])
+    metadata = {**dict(model.metadata), "causal_conv_update": {
+        "implementation": IMPLEMENTATION, "layers": prepared, "source": SOURCE}}
+    return replace(model, metadata=tuple(sorted(metadata.items())))
+
+
+def _history_slots(model, plan):
+    """Declared whole history rows for this rank's state allocation."""
+    prepared = dict(dict(model.metadata).get("causal_conv_update", {}))
+    entry = dict(prepared.get("layers", {})).get(str(plan.index), {})
+    slots = entry.get("state_history_slots")
+    if slots is None:
+        width = int(getattr(plan, "conv_width", 0) or 0)
+        elements = int(getattr(plan, "conv_state_elements", 0) or 0)
+        if width < 1 or elements < 0 or elements % width:
+            raise ModelingError(
+                "causal_conv_update_state_capacity_not_a_whole_history_row")
+        slots = elements // width
+    if type(slots) is not int or slots < plan.conv_kernel - 1:
+        raise ModelingError("causal_conv_update_state_history_below_kernel_width")
+    return slots
+
+
+def _planned(op, geometry, *, compact=True):
+    """Turn the shared conv program into a plan that carries state semantics.
+
+    The physical program remains ``conv_plan``.  Only
+    zero-work read/write boundary stages and plan metadata are added; no
+    convolution or state work is duplicated.
+    """
+    plan = conv_plan(op, geometry, compact=compact)
+    contract = dict(op.metadata).get("conv_state_contract")
+    if contract is None:
+        return plan
+    fragments = state_fragments(op)
+
+    def program(context):
+        inner = plan.program(context)
+        stages = []
+        if fragments["read"] is not None and fragments["read"].state_effects:
+            stages.append(Stage("state_read", fragment=fragments["read"]))
+            stages.append(Stage("conv_owners", after=("state_read",),
+                                program=inner))
+        else:
+            stages.append(Stage("conv_owners", program=inner))
+        if fragments["write"] is not None and fragments["write"].state_effects:
+            stages.append(Stage("state_publish", after=("conv_owners",),
+                                fragment=fragments["write"]))
+        return KernelProgram(tuple(stages))
+
+    metadata = dict(plan.metadata)
+    metadata.update({
+        "state_contract": contract,
+        "state_accesses": state_accesses(op),
+        "state_effects": dict(op.metadata).get("conv_state_effects", ()),
+        "conv_state_contract": contract,
+        "conv_state_effects": dict(op.metadata).get("conv_state_effects", ()),
+        "state_fragment_counts": {
+            "read": 1 if fragments["read"] is not None else 0,
+            "write": 1 if fragments["write"] is not None else 0,
+            "commits": len(fragments["commits"]),
+            "rollbacks": len(fragments["rollbacks"]),
+        },
+    })
+    return OperatorPlan(plan.work, program, metadata=metadata)
+
+
+def _attach_rebase_accesses(b, *, index, view, plan, width, context, target,
+                            layer_target, binding, staged, staging_id, staging_grant,
+                            rebase_id, source_offset, copy_rows, copy_bytes, hold_grant,
+                            state_ready, hold_event, protected, source_view, dest_view):
+    source_producer = binding["producer"]
+    source_ready = binding.get("ready") or source_producer
+    staging_accesses = ()
+    if staged:
+        staging_read = {
+            "occurrence": f"{staging_id}:read:{index}",
+            "producer": source_producer, "request": str(
+                getattr(view, "request_id", index)),
+            "stage": b.common["stage"], "layer": plan.index,
+            "direction": "read", "position": "state",
+            "output": target,
+            "storage": binding["storage"],
+            "owner": layer_target, "representation": "history",
+            "persistent": False, "temporary": True,
+            "state_version": context,
+            "span": ((source_offset, source_offset + copy_rows),
+                     (0, width)), "bytes": float(copy_bytes),
+            "source": source_ready, "reader": "",
+            "grant": staging_grant,
+            "decision": None, "last_use": "before_staging_write",
+            "rank": None, "scope": "target",
+            "generation": context, "slot": binding.get("slot"),
+            "offset": binding.get("offset"),
+            "physical_key": f"{binding['storage']}:staging",
+            "request_slot": binding.get("slot"), "rows": copy_rows,
+            "row_stride": width, "tier": "hbm",
+            "source_ready": source_ready,
+            "grant_ready": staging_grant,
+            "decision_event": None,
+            "last_use_event": "before_staging_write",
+        }
+        staging_write = {
+            **staging_read,
+            "occurrence": f"{staging_id}:write:{index}",
+            "producer": staging_id, "direction": "write",
+            "position": "state", "temporary": True,
+            "storage": f"{binding['storage']}:staging",
+            "span": ((0, copy_rows), (0, width)),
+            "window": (0, copy_rows),
+            "source": staging_id, "decision": "staging_complete",
+            "last_use": "before_rebase_write",
+        }
+        staging_accesses = (staging_read, staging_write)
+        for position, staged_op in enumerate(b.ops):
+            if staged_op.op_id == staging_id:
+                b.ops[position] = replace(
+                    staged_op,
+                    metadata=staged_op.metadata + (
+                        ("state_accesses", staging_accesses),))
+                break
+    rebase_read_span = (
+        ((0, copy_rows), (0, width)) if staged
+        else ((source_offset, source_offset + copy_rows), (0, width))
+    )
+    rebase_read = {
+        "occurrence": f"{rebase_id}:read:{index}",
+        "producer": (staging_id if staged else source_producer),
+        "request": str(getattr(view, "request_id", index)),
+        "stage": b.common["stage"], "layer": plan.index,
+        "direction": "read", "position": "state",
+        "output": target,
+        "storage": (f"{binding['storage']}:staging" if staged
+                    else binding["storage"]),
+        "owner": layer_target, "representation": "history",
+        "persistent": True, "temporary": False,
+        "state_version": context,
+        "span": rebase_read_span,
+        "window": (0, copy_rows) if staged else (source_offset, source_offset + copy_rows),
+        "bytes": float(copy_bytes),
+        "source": (staging_id if staged else source_ready),
+        "reader": "", "grant": hold_grant, "decision": None,
+        "last_use": "before_short_convolution", "rank": None,
+        "scope": "target", "generation": context,
+        "slot": binding.get("slot"), "offset": binding.get("offset"),
+        "physical_key": binding["storage"],
+        "request_slot": binding.get("slot"), "rows": copy_rows,
+        "row_stride": width, "tier": "hbm",
+        "source_ready": (staging_id if staged else source_ready),
+        "grant_ready": hold_grant, "decision_event": None,
+        "last_use_event": "before_short_convolution",
+    }
+    rebase_write = {
+        **rebase_read,
+        "occurrence": f"{rebase_id}:write:{index}",
+        "producer": rebase_id, "direction": "write",
+        "storage": binding["storage"], "source": rebase_id,
+        "span": ((0, copy_rows), (0, width)),
+        "window": (0, copy_rows),
+        "decision": "copy_complete",
+        "last_use": "before_short_convolution",
+    }
+    b.ops[-1] = replace(b.ops[-1], metadata=b.ops[-1].metadata + (
+        ("state_accesses", (rebase_read, rebase_write)),
+        ("state_ready", tuple(state_ready)),
+        ("reader_hold", hold_event),
+        ("grant", hold_grant),
+        ("protected_rows", protected),
+        ("copy_source_value", source_view.to_dict()),
+        ("copy_dest_value", dest_view.to_dict()),
+    ))
+
+
+def _rebase_history(b, *, index, view, plan, dtype, history_slots, width, byte,
+                    accepted, binding, hold, state_staging, state_ready,
+                    context, target, layer_target,
+                    rebase_outputs, rebase_records, op_suffix=""):
+    if plan.conv_kernel != CONV_SPECULATIVE_WIDTH:
+        raise ModelingError(
+            "causal_conv_update_history_rebase_requires_width4")
+    if accepted - 1 + plan.conv_kernel - 1 > history_slots:
+        raise ModelingError(
+            "causal_conv_update_history_rebase_exceeds_state")
+    source_value = binding_value(binding)
+    source_offset = accepted - 1
+    copy_rows = plan.conv_kernel - 1
+    source_view = _narrow_window(source_value, source_offset, copy_rows)
+    dest_view = _narrow_window(source_value, 0, copy_rows)
+    hold_window = None
+    hold_event = None
+    hold_grant = None
+    if isinstance(hold, Mapping):
+        window = hold.get("window", hold.get("rows"))
+        if window is not None:
+            hold_window = tuple(int(item) for item in window)
+        hold_event = hold.get("event", hold.get("last_use"))
+        hold_grant = hold.get("grant")
+    protected = ()
+    if hold_window is not None:
+        start = max(hold_window[0], 0)
+        end = min(hold_window[1], copy_rows)
+        if end > start:
+            protected = (start, end)
+    staged = bool(state_staging or (protected and not hold_event))
+    # Backing-scoped copy elision: elide ONLY when (backing_pool, version, byte_span)
+    # are identical in-place; separate staging/destination pools keep physical service.
+    same_backing = (source_view.storage == dest_view.storage) and not staged
+    same_version = (source_view.state_version == dest_view.state_version == context)
+    same_span = (source_offset == 0 and source_view.layout == dest_view.layout)
+    if same_backing and same_version and same_span:
+        return None, ((hold_event,) if hold_event else ())
+    copy_bytes = copy_rows * width * byte
+    copy_deps = tuple(state_ready)
+    if hold_event:
+        copy_deps = tuple(dict.fromkeys((*copy_deps, hold_event)))
+    staging_id = None
+    staging_value = None
+    staging_grant = hold_grant or f"{b.prefix}.rebase_grant"
+    req_name = str(getattr(view, "request_id", index))
+    if staged:
+        staging_id = b.work(
+            f"conv_history_staging{op_suffix}", copy_deps, (copy_rows, width),
+            read=copy_bytes, write=copy_bytes, family="tensor_copy",
+            dtype=dtype,
+            metadata=(("materialization_reason",
+                       "independent_overlap_staging"),
+                      ("source_offset_rows", (source_offset,)),
+                      ("dest_offset_rows", (0,)),
+                      ("history_rows", copy_rows),
+                      ("allocation_bytes", copy_bytes),
+                      ("grant", staging_grant),
+                      ("temporary", True),
+                      ("caller_boundary", "old_reader_may_overlap_destination")))
+        b.ops[-1] = replace(b.ops[-1], requests=(req_name,))
+        staging_value = replace(
+            source_view, producer=staging_id, output=0,
+            storage=f"{binding['storage']}:staging",
+            state_version=context, binding="static",
+            binding_name="")
+        copy_deps = (staging_id,)
+    rebase_id = b.work(
+        f"conv_history_rebase{op_suffix}", copy_deps, (copy_rows, width),
+        read=copy_bytes, write=copy_bytes, family="tensor_copy", dtype=dtype,
+        metadata=(("materialization_reason",
+                   "committed_history_window_normalize"),
+                  ("source_offset_rows", (source_offset,)),
+                  ("dest_offset_rows", (0,)),
+                  ("history_rows", copy_rows),
+                  ("copy_order", ("staged_then_write" if staged
+                                  else "descending_overlap_in_place")),
+                  ("state_alias", "same_conv_state_buffer"),
+                  ("allocation", ("independent_staging" if staged
+                                  else "in_place_no_new_slot")),
+                  ("staging_bytes", copy_bytes if staged else 0),
+                  ("last_use", "before_short_convolution"),
+                  ("state_layout", "slots_history_channels"),
+                  ("state_dtype", plan.conv_state_dtype),
+                  ("caller_boundary", "before_ordinary_q1_update"),
+                  ("invocation_class", "vector")))
+    b.ops[-1] = replace(b.ops[-1], requests=(req_name,))
+    copy_value = TensorValue(
+        rebase_id, plan.conv_state_dtype, dest_view.layout, output=0,
+        storage=binding["storage"], alias_of=(source_value.alias_of
+                                               or binding["storage"]),
+        state_version=context, binding="static", binding_name="")
+    copy_binding = bind_state_value(
+        copy_value, target=target, owner=layer_target,
+        slot=binding.get("slot"), version=context,
+        ready=rebase_id, grant=hold_grant, generation=context,
+        required=True, representation="history",
+        window=(0, copy_rows),
+        span=((0, copy_rows), (0, width)),
+        readiness="producer_complete",
+        last_use="before_short_convolution")
+    rebase_outputs[index] = copy_binding
+    _attach_rebase_accesses(
+        b, index=index, view=view, plan=plan, width=width, context=context,
+        target=target, layer_target=layer_target, binding=binding,
+        staged=staged, staging_id=staging_id, staging_grant=staging_grant, rebase_id=rebase_id,
+        source_offset=source_offset, copy_rows=copy_rows, copy_bytes=copy_bytes,
+        hold_grant=hold_grant, state_ready=state_ready, hold_event=hold_event,
+        protected=protected, source_view=source_view, dest_view=dest_view)
+    rebase_records.append({
+        "sequence": index,
+        "request": str(getattr(view, "request_id", index)),
+        "accepted_tokens": accepted,
+        "source_context": context,
+        "source_version": context,
+        "dest_version": context,
+        "source_offset": source_offset,
+        "dest_offset": 0,
+        "rows": copy_rows,
+        "bytes": copy_bytes,
+        "source_window": (source_offset, source_offset + copy_rows),
+        "dest_window": (0, copy_rows),
+        "storage": binding["storage"],
+        "slot": binding.get("slot"),
+        "copy_op": rebase_id,
+        "copy_output": copy_value.to_dict(),
+        "staging_op": staging_id,
+        "staging_bytes": copy_bytes if staged else 0,
+        "order": ("staged_then_write" if staged
+                  else "descending_overlap_in_place"),
+        "allocation": ("independent_staging" if staged
+                       else "in_place_no_new_slot"),
+        "last_use": "before_short_convolution",
+        "reader_hold": hold_event,
+        "grant": hold_grant,
+        "held_rows": hold_window,
+        "protected_rows": protected,
+    })
+    return rebase_id, ()
+
+
+def _prepare_conv_input(b, tensors, *, sources, tokens, rows, width, key_width,
+                        value_width, dtype, byte):
+    by_id = {op.op_id: op for op in b.ops}
+    producers = tuple(dict.fromkeys(sources))
+    if any(dict(by_id[name].metadata).get("output_format", dtype) != dtype
+           for name in producers):
+        raise ModelingError("causal_conv_update_projection_dtype_mismatch")
+    if len(producers) == 1:
+        projection = by_id[producers[0]]
+        slices = dict(projection.metadata).get("packed_projection_slices", ())
+        qkv = [item for item in slices if item["role"] in {"q", "k", "v"}]
+        if (tuple(item["role"] for item in qkv) != ("q", "k", "v")
+                or tuple(item["offset_elements"] for item in qkv) != (0, key_width, 2 * key_width)):
+            raise ModelingError("causal_conv_update_requires_declared_contiguous_qkv_slice")
+        value = tensors.result(producers[0], (tokens, projection.local_shape[1]), dtype)
+        value = value.narrow(0, 0, rows).narrow(1, 0, width)
+        incoming = tensors.contiguous(value, "convolution_input_contiguous",
+                                      reason="CausalConv1d.x.AutoContiguous").producer
+        adaptation = "packed_projection_qkv_slice; AutoContiguous_if_strided"
+    else:
+        if len(sources) != 3 or len(producers) != 3:
+            raise ModelingError("causal_conv_update_requires_three_qkv_producers_or_one_packed")
+        incoming = b.work(
+            "convolution_input_pack", producers, (rows, width),
+            read=rows * width * byte, write=rows * width * byte,
+            family="tensor_copy", dtype=dtype,
+            metadata=(("materialization_reason", "rowwise_qkv_concatenation"),
+                      ("source_row_widths", (key_width, key_width, value_width)),
+                      ("caller_boundary", "declared_separate_producer_adapter_not_native_projection_claim"),
+                      ("invocation_class", "vector")))
+        adaptation = "explicit_row_pack_of_separate_semantic_producers"
+    return incoming, adaptation
+
+
+def _validate_update_window(model, plan, *, views, q_lens, active, history_slots,
+                            history_acceptance):
+    if any(q_lens[index] == 1 and (
+            int(getattr(views[index], "draft_proposal_tokens", 0) or 0)
+            or int(getattr(views[index], "draft_accepted_tokens", 0) or 0)
+            or int(getattr(views[index], "draft_advanced_tokens", 0) or 0) > 1)
+           for index in active):
+        raise ModelingError("causal_conv_update_requires_q1_non_speculative_decode")
+    for index in active:
+        q = q_lens[index]
+        if q <= 1:
+            continue
+        accepted = int(getattr(views[index], "draft_accepted_tokens", 0) or 0)
+        advance = int(getattr(views[index], "draft_advanced_tokens", 0) or 0)
+        if advance > 0:
+            if not 1 <= advance <= q:
+                raise ModelingError("causal_conv_update_advance_outside_query")
+            if accepted not in (0, advance - 1):
+                raise ModelingError("causal_conv_update_accepted_advance_mismatch")
+    if history_acceptance is None:
+        prepared = dict(dict(model.metadata).get(
+            "causal_conv_update", {})).get("layers", {})
+        history_acceptance = dict(prepared.get(str(plan.index), {})).get(
+            "history_acceptance")
+    if history_acceptance is None:
+        history_acceptance = dict(
+            dict(model.metadata).get("causal_conv_history_acceptance", {})
+        ).get(str(plan.index))
+    if history_acceptance is not None:
+        history_acceptance = tuple(int(value) for value in history_acceptance)
+        if len(history_acceptance) != len(views) or any(
+                value < 0 for value in history_acceptance):
+            raise ModelingError(
+                "causal_conv_update_history_acceptance_invalid")
+    speculative = any(
+        q_lens[index] > 1
+        or int(getattr(views[index], "draft_proposal_tokens", 0) or 0) > 0
+        or int(getattr(views[index], "draft_advanced_tokens", 0) or 0) > 1
+        for index in active)
+    if speculative:
+        if plan.conv_kernel != CONV_SPECULATIVE_WIDTH:
+            raise ModelingError(
+                "causal_conv_update_speculative_requires_width4_history")
+        max_query = max((q_lens[index] for index in active), default=1)
+        if history_slots < 2 + max_query:
+            raise ModelingError(
+                "causal_conv_update_speculative_requires_extended_history:"
+                f"{history_slots}<{2 + max_query}")
+        if history_acceptance is None:
+            raise ModelingError(
+                "causal_conv_update_history_acceptance_required")
+    return history_acceptance, speculative
+
+
+def _resolve_conv_targets(views, padding_slots, layer_target, state_targets):
+    padded = set(padding_slots)
+    if state_targets is None:
+        return tuple(
+            None if index in padded
+            else f"{layer_target}.conv_state[{getattr(views[index], 'request_id', index)}]"
+            for index in range(len(views))
+        )
+    resolved = tuple(state_targets)
+    if len(resolved) != len(views):
+        raise ModelingError("causal_conv_update_targets_must_match_views")
+    return tuple(None if index in padded else resolved[index] for index in range(len(views)))
+
+
+def _is_speculative_view(view) -> bool:
+    return (
+        int(view.q_len) > 1
+        or int(getattr(view, "draft_proposal_tokens", 0) or 0) > 0
+        or int(getattr(view, "draft_advanced_tokens", 0) or 0) > 1
+    )
+
+
+def _slice_partition_arg(value, indices, total_count):
+    if value is None or value == () or value == []:
+        return value
+    if isinstance(value, TensorValue):
+        return value
+    if isinstance(value, Mapping):
+        remapped = {k: v for k, v in value.items() if not isinstance(k, int)}
+        for pos, orig in enumerate(indices):
+            if orig in value:
+                remapped[pos] = value[orig]
+        return remapped
+    seq = tuple(value)
+    if len(seq) == 1 and total_count > 1:
+        return seq
+    if len(seq) == total_count:
+        return tuple(seq[index] for index in indices)
+    return seq
+
+
+def _emit_conv_partition(
+    b, *, plan, views, incoming, adaptation, width, dtype, byte, history_slots,
+    speculative, history_acceptance, state_ready, state_values, slots,
+    state_grants, reader_holds, targets_by_view, state_staging, state_decisions,
+    layer_target, op_name="short_convolution",
+):
+    q_lens = tuple(int(view.q_len) for view in views)
+    rows = sum(q_lens)
+    padding_slots = tuple(index for index, view in enumerate(views)
+                          if getattr(view, "padding", False))
+    active = tuple(index for index in range(len(views))
+                   if index not in set(padding_slots))
+    contexts = tuple(int(getattr(view, "context", 0)) for view in views)
+    bindings = _conv_bindings(
+        views=views, active=active, targets=targets_by_view,
+        contexts=contexts, history_slots=history_slots, width=width,
+        dtype=plan.conv_state_dtype, values=state_values, slots=slots,
+        owner=layer_target, ready=state_ready, grants=state_grants)
+    # A q1 following a speculative q4 has no source numAcceptedTokens branch
+    # for its own one-row query. The committed window is normalized by an
+    # ordered history copy before the ordinary UPDATE unless backing, version,
+    # and span are already identical in place.
+    rebase = tuple(
+        index for index in active
+        if not speculative and q_lens[index] == 1
+        and history_acceptance is not None
+        and history_acceptance[index] > 0)
+    rebase_records = []
+    rebase_outputs = {}
+    rebase_ids = ()
+    elided_deps = ()
+    for index in rebase:
+        req_ready = (
+            (state_ready[index],)
+            if len(state_ready) == len(views)
+            else state_ready
+        )
+        suffix = "" if len(rebase) == 1 else f"_{index}"
+        rebase_id, extra_deps = _rebase_history(
+            b, index=index, view=views[index], plan=plan, dtype=dtype, history_slots=history_slots,
+            width=width, byte=byte, accepted=history_acceptance[index], binding=bindings[index],
+            hold=reader_holds[index], state_staging=state_staging, state_ready=req_ready,
+            context=contexts[index], target=targets_by_view[index], layer_target=layer_target,
+            rebase_outputs=rebase_outputs, rebase_records=rebase_records, op_suffix=suffix)
+        if rebase_id is not None:
+            rebase_ids = (*rebase_ids, rebase_id)
+        if extra_deps:
+            elided_deps = tuple(dict.fromkeys((*elided_deps, *extra_deps)))
+    contract, effects, state_read, state_write = _state_contract(
+        views=views, q_lens=q_lens, padding_slots=padding_slots, width=width,
+        byte=byte, kernel_width=plan.conv_kernel, history_slots=history_slots,
+        speculative=speculative, layer=plan.index, bindings=bindings,
+        history_acceptance=history_acceptance, reader_holds=reader_holds,
+        slots=slots, targets=targets_by_view, rebase_outputs=rebase_outputs,
+        state_decisions=state_decisions)
+    contract = {**contract, "state_dtype": plan.conv_state_dtype,
+                "conv_width": width, "state_ready": tuple(state_ready),
+                "state_grants": tuple(state_grants),
+                "slots": tuple(slots),
+                "reader_holds": tuple(reader_holds)}
+    num_accepted_values = history_acceptance if speculative else None
+    metadata = (
+        ("sequence_tokens", q_lens), ("physical_sequence_tokens", q_lens),
+        ("padding_slots", padding_slots),
+        ("kernel_width", plan.conv_kernel),
+        ("speculative", speculative), ("state_history_slots", history_slots),
+        ("state_dtype", plan.conv_state_dtype), ("state_layout", "slots_history_channels"),
+        ("state_mutation", "inplace_history_writeback"),
+        ("state_read_bytes", state_read), ("state_write_bytes", state_write),
+        ("state_read_versions", contract["read_versions"]),
+        ("state_commit_versions", contract["commit_versions"]),
+        ("state_checkpoint_versions", contract["checkpoint_versions"]),
+        ("conv_state_contract", contract), ("conv_state_effects", effects),
+        ("state_bindings", tuple(
+            binding_record(binding) for binding in bindings if binding)),
+        ("num_accepted_tokens_present", speculative),
+        ("num_accepted_tokens_dtype", "int32"),
+        ("num_accepted_tokens_shape", (len(views),)),
+        ("num_accepted_tokens_values", tuple(num_accepted_values or ())),
+        ("state_token_offsets", tuple(
+            max(0, value - 1) for value in (num_accepted_values or ()))),
+        ("history_acceptance_basis",
+         "caller_declared" if history_acceptance is not None else "absent"),
+        ("has_initial_state", True), ("has_conv_states", bool(active)),
+        ("cache_index_dtype", "int32"), ("cache_indices", "one_valid_slot_per_active_sequence"),
+        ("query_start_loc_dtype", "int32"), ("bias", False),
+        ("activation", "silu"), ("run_mode", 1), ("source", SOURCE),
+        ("speculative_source_selector",
+         "num_accepted_tokens_presence_width4" if speculative else "none"),
+        ("history_rebase", tuple(rebase_records)),
+        ("history_rebase_bytes", sum(record["bytes"]
+                                     for record in rebase_records)),
+        ("history_rebase_op", rebase_ids[0] if rebase_ids else None),
+        ("state_ready", tuple(state_ready)),
+        ("state_slots", tuple(slots)),
+        ("state_decisions", tuple(state_decisions)),
+        ("state_grants", tuple(state_grants)),
+        ("reader_holds", tuple(reader_holds)),
+        ("input_adaptation", adaptation), ("prepared_weight_dtype", dtype),
+        ("prepared_weight_layout", "kernel_width_channels"),
+        ("native_kind", "CausalConv1d"), ("invocation_class", "vector"),
+        ("implementation", IMPLEMENTATION),
+        ("limitations", ("scalar_metadata_issue_and_cache_latency_unmodeled",
+                          "source_update_kernel_revision_not_capture_binary_identity",
+                          "same_shape_owner_runs_use_existing_fluid_compaction",
+                          "speculative_history_requires_declared_state_capacity")),
+    )
+    conv_hbm, conv_reads, conv_writes, conv_vec = conv_spec_terms(
+        q_lens, padding_slots, plan.conv_kernel, width, False, speculative,
+    )
+    deps = tuple(dict.fromkeys((incoming, *state_ready, *rebase_ids, *elided_deps)))
+    op_id = b.work(op_name, deps, (rows, width),
+                   vector=conv_vec, read=conv_reads, write=conv_writes,
+                   family="short_convolution", dtype=dtype, metadata=metadata)
+    part_requests = tuple(str(getattr(view, "request_id", index))
+                          for index, view in enumerate(views))
+    op = replace(
+        b.ops[-1], hbm_bytes=float(conv_hbm), recipe=CONV,
+        source_boundary="kernel", requests=part_requests,
+    )
+    b.ops[-1] = replace(
+        op, metadata=op.metadata + (("state_accesses", state_accesses(op)),))
+    return op_id
+
+
+def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
+          history_acceptance=None, state_ready=(), state_values=None,
+          state_slots=None, state_grants=(), state_reader_holds=None,
+          state_targets=None, state_staging=False, state_decisions=()):
+    """Bind native decode/verify update(s); split mixed speculative/ordinary batches."""
+    if not views:
+        raise ModelingError("causal_conv_update_requires_decode_views")
+    if any(view.phase != "decode" for view in views):
+        raise ModelingError("causal_conv_update_requires_decode_only_views")
+    q_lens = tuple(int(view.q_len) for view in views)
+    if any(q < 1 for q in q_lens):
+        raise ModelingError("causal_conv_update_requires_positive_query_rows")
+    rows = sum(q_lens)
+    if tokens < rows:
+        raise ModelingError(
+            "causal_conv_update_tokens_must_equal_sequence_partition_rows")
+    width = 2 * key_width + value_width
+    dtype = b.model.activation_dtype
+    byte = dtype_bytes(dtype)
+    history_slots = _history_slots(b.model, plan)
+    padding_slots = tuple(index for index, view in enumerate(views)
+                          if getattr(view, "padding", False))
+    active = tuple(index for index in range(len(views))
+                   if index not in set(padding_slots))
+    history_acceptance, speculative = _validate_update_window(
+        b.model, plan, views=views, q_lens=q_lens, active=active, history_slots=history_slots,
+        history_acceptance=history_acceptance)
+    state_ready = ((state_ready,) if isinstance(state_ready, str)
+                   else tuple(state_ready))
+    state_grants = tuple(state_grants) if state_grants else ()
+    layer_target = (f"kda.layer[{plan.index}]" if plan.index >= 0
+                    else "kda.call")
+    targets_by_view = _resolve_conv_targets(views, padding_slots, layer_target, state_targets)
+    slots = _per_sequence(state_slots, len(views))
+    if all(slot is None for slot in slots):
+        slots = tuple(index for index in range(len(views)))
+    reader_holds = _per_sequence(state_reader_holds, len(views))
+    incoming, adaptation = _prepare_conv_input(
+        b, tensors, sources=sources, tokens=tokens, rows=rows, width=width, key_width=key_width,
+        value_width=value_width, dtype=dtype, byte=byte)
+    spec_indices = tuple(index for index in active if _is_speculative_view(views[index]))
+    ord_indices = tuple(index for index in active if not _is_speculative_view(views[index]))
+    if spec_indices and ord_indices:
+        # Upstream vllm_ascend/ops/kimi_kda.py:709-716 gathers per-partition
+        # QKV rows before launching speculative and ordinary UPDATE separately,
+        # then restores token order.
+        ord_part = tuple(index for index in range(len(views)) if index not in set(spec_indices))
+        total_views = len(views)
+        row_offsets = []
+        cursor = 0
+        for q_len in q_lens:
+            row_offsets.append((cursor, cursor + q_len))
+            cursor += q_len
+
+        def _gather_partition(part_indices, gather_name):
+            part_rows = sum(q_lens[i] for i in part_indices)
+            part_ranges = tuple(row_offsets[i] for i in part_indices)
+            gather_id = b.work(
+                gather_name, (incoming,), (part_rows, width),
+                read=part_rows * width * byte, write=part_rows * width * byte,
+                family="tensor_copy", dtype=dtype,
+                metadata=(
+                    ("materialization_reason", "speculative_ordinary_conv_input_gather"),
+                    ("partition_view_indices", part_indices),
+                    ("partition_row_ranges", part_ranges),
+                    ("invocation_class", "vector"),
+                ),
+            )
+            b.ops[-1] = replace(
+                b.ops[-1],
+                requests=tuple(str(getattr(views[i], "request_id", i)) for i in part_indices),
+            )
+            return gather_id
+
+        spec_in = _gather_partition(spec_indices, "conv_partition_gather_spec")
+        spec_id = _emit_conv_partition(
+            b, plan=plan, views=tuple(views[i] for i in spec_indices),
+            incoming=spec_in, adaptation=adaptation, width=width, dtype=dtype, byte=byte,
+            history_slots=history_slots, speculative=True,
+            history_acceptance=(None if history_acceptance is None
+                                else tuple(history_acceptance[i] for i in spec_indices)),
+            state_ready=_slice_partition_arg(state_ready, spec_indices, total_views),
+            state_values=_slice_partition_arg(state_values, spec_indices, total_views),
+            slots=tuple(slots[i] for i in spec_indices),
+            state_grants=_slice_partition_arg(state_grants, spec_indices, total_views),
+            reader_holds=tuple(reader_holds[i] for i in spec_indices),
+            targets_by_view=tuple(targets_by_view[i] for i in spec_indices),
+            state_staging=state_staging,
+            state_decisions=_slice_partition_arg(state_decisions, spec_indices, total_views),
+            layer_target=layer_target, op_name="short_convolution",
+        )
+        ord_in = _gather_partition(ord_part, "conv_partition_gather_ordinary")
+        ord_id = _emit_conv_partition(
+            b, plan=plan, views=tuple(views[i] for i in ord_part),
+            incoming=ord_in, adaptation=adaptation, width=width, dtype=dtype, byte=byte,
+            history_slots=history_slots, speculative=False,
+            history_acceptance=(None if history_acceptance is None
+                                else tuple(history_acceptance[i] for i in ord_part)),
+            state_ready=_slice_partition_arg(state_ready, ord_part, total_views),
+            state_values=_slice_partition_arg(state_values, ord_part, total_views),
+            slots=tuple(slots[i] for i in ord_part),
+            state_grants=_slice_partition_arg(state_grants, ord_part, total_views),
+            reader_holds=tuple(reader_holds[i] for i in ord_part),
+            targets_by_view=tuple(targets_by_view[i] for i in ord_part),
+            state_staging=state_staging,
+            state_decisions=_slice_partition_arg(state_decisions, ord_part, total_views),
+            layer_target=layer_target, op_name="short_convolution_ordinary",
+        )
+        return b.work(
+            "conv_partition_restore", (spec_id, ord_id), (rows, width),
+            read=rows * width * byte, write=rows * width * byte,
+            family="tensor_copy", dtype=dtype,
+            metadata=(
+                ("materialization_reason", "speculative_ordinary_conv_order_restore"),
+                ("partition_ops", (spec_id, ord_id)),
+                ("invocation_class", "vector"),
+            ),
+        )
+    return _emit_conv_partition(
+        b, plan=plan, views=views, incoming=incoming, adaptation=adaptation,
+        width=width, dtype=dtype, byte=byte, history_slots=history_slots,
+        speculative=speculative, history_acceptance=history_acceptance,
+        state_ready=state_ready, state_values=state_values, slots=slots,
+        state_grants=state_grants, reader_holds=reader_holds,
+        targets_by_view=targets_by_view, state_staging=state_staging,
+        state_decisions=state_decisions, layer_target=layer_target,
+        op_name="short_convolution",
+    )

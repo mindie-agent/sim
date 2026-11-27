@@ -14,54 +14,12 @@ from typing import Mapping
 import json
 from collections import OrderedDict
 
-from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.schema.model import LayerPlan, ModelSpec, SloSpec, WorkloadSpec
+from mindie_sim.model_catalog import normalize_model
+from mindie_sim.schema.model import ModelSpec, SloSpec, WorkloadSpec
 from mindie_sim.schema.common import ModelingError, _unknown
-from mindie_sim.schema.case import Case, Software
+from mindie_sim.schema.case import Case, Software, _decode_raw_case, register_case_normalizer
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema import runtime_features
-
-ONE = 1
-
-
-def normalize_model(model: ModelSpec) -> ModelSpec:
-    quant = model.quant or QuantSpec(
-        name=model.quantization, weight_format=model.weight_dtype,
-        expert_weight_format=model.weight_dtype, activation_format=model.activation_dtype,
-        kv_dtype=model.kv_dtype,
-    )
-    if model.layer_plans:
-        if len(model.layer_plans) != model.layers:
-            raise ModelingError("layer_plan_count_differs_from_layers")
-        from mindie_sim.catalog.paired_sfa import normalize_formats
-        return normalize_formats(replace(model, quant=quant))
-    dimensions = {
-        "num_heads": model.num_heads, "num_kv_heads": model.num_kv_heads or model.num_heads,
-        "head_dim": model.head_dim, "intermediate_size": model.intermediate_size,
-        "num_experts": model.num_experts, "top_k": model.top_k,
-        "moe_intermediate_size": model.moe_intermediate_size,
-        "num_shared_experts": model.num_shared_experts,
-    }
-    if model.mla:
-        dimensions.update({
-            name: getattr(model.mla, name) for name in
-            ("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim",
-             "o_lora_rank", "o_groups")
-        })
-        dimensions.update(mla_variant="latent_mla", index_heads=model.mla.index_n_heads,
-                          index_dim=model.mla.index_head_dim, index_topk=model.mla.index_topk,
-                          indexer=bool(model.mla.index_topk), owns_index_k=bool(model.mla.index_topk),
-                          index_query_per_layer=bool(model.mla.index_topk))
-        dimensions.update(compress_ratio=model.mla.compress_ratio, window=model.mla.sliding_window,
-                          cache_kind="window_compressed" if model.mla.compress_ratio else "dense",
-                          compressor_kind="weighted_pool" if model.mla.compress_ratio else "none",
-                          compressor_state_rows=model.mla.compress_ratio)
-    attention = {"mha": "gqa", "dsa": "mla", "csa": "mla"}.get(model.attention, model.attention)
-    plans = tuple(LayerPlan(
-        index=index, attention=attention, ffn=model.ffn, architecture=attention,
-        kv_owner_layer_id=index, index_k_owner_layer_id=index, owns_long_kv=True, **dimensions,
-    ) for index in range(model.layers))
-    return replace(model, quant=quant, layer_plans=plans)
 
 
 #: Bounded identity memo of already-parsed declarations.  ``Case`` is frozen and
@@ -92,29 +50,7 @@ def _memoized_parse(value: Case) -> Case:
 
 
 def _parse_case_uncached(value: Case | Mapping) -> Case:
-    if not isinstance(value, Mapping):
-        case = value
-        if not isinstance(case.machine, Hardware):
-            case = Case(Hardware.from_mapping(case.machine.to_dict()), case.model, case.workload,
-                        Software.from_mapping(case.runtime.to_dict()), case.slo)
-    else:
-        value = runtime_features.normalize_case_runtime(value)
-        _unknown(value, {"machine", "model", "workload", "runtime", "slo",
-                         "schema", "structure_variant", "software"}, "case")
-        missing = {"machine", "model", "workload"} - value.keys()
-        if missing:
-            raise ModelingError("case_missing_fields:" + ",".join(sorted(missing)))
-        raw_model = value["model"]
-        model = ModelSpec.from_mapping(raw_model)
-        if value.get("structure_variant"):
-            raise ModelingError("structure_variant_retired:use_model_layer_plans_or_layer_overrides")
-        case = Case(
-            machine=Hardware.from_mapping(value["machine"]), model=model,
-            workload=WorkloadSpec.from_mapping(value["workload"]),
-            runtime=Software.from_mapping(value.get("runtime", {})),
-            slo=SloSpec.from_mapping(value.get("slo")),
-        )
-    return _normalize_parsed_case(case)
+    return _normalize_parsed_case(_decode_raw_case(value))
 
 
 def parse_case(value: Case | Mapping) -> Case:
@@ -219,7 +155,7 @@ def _normalize_parsed_case(case: Case) -> Case:
         model, runtime = sparse_offload.module.prepare_case(
             model, runtime, case.machine, case.workload, sparse_offload)
     elif "sparse_kv_offload" in dict(model.metadata) or "sparse_kv_offload" in dict(runtime.metadata):
-        from .sparse_kv_offload import strip_case
+        from mindie_sim.prediction.operators.sparse_indexer.sparse_kv_offload import strip_case
         model, runtime = strip_case(model, runtime)
     for index, layer in enumerate(model.layer_plans):
         if layer.index != index:
@@ -247,19 +183,43 @@ def _normalize_parsed_case(case: Case) -> Case:
                         degraded_submodules=tuple(sorted(degraded)))
         model = replace(model, metadata=tuple(sorted(metadata.items())))
     case.machine.validate_placement(p)
-    if max(int(p.o_proj_tp), int(p.linear_proj_tp), int(p.lm_head_tp)) > ONE:
-        from .local_tp_groups import validate_local_projection_tp
+    if p.has_local_tp:
+        from .sharding.local_tp import validate_local_projection_tp
         validate_local_projection_tp(case)
     case.workload.validate_model(model, runtime)
     metadata = dict(runtime.metadata)
+    aux = getattr(model, "auxiliary", None)
+    if aux is not None and any(
+        bool(getattr(d, "is_synthetic", False)) for d in (aux.mtp, aux.dspark) if d is not None
+    ):
+        spine = metadata.get("single_spine")
+        if isinstance(spine, Mapping) and (
+            spine.get("optimization_mode") == "simulation"
+            or spine.get("stack_track") in {"eager", "shipping", "proposed"}
+        ):
+            raise ModelingError(
+                "simulation_mode_forbids_synthetic_gqa_draft:"
+                "actual_deployment_requires_real_speculative_checkpoint"
+            )
     # Carry the unaltered case machine/model identity with the parsed runtime so
     # every ordinary FeatureConfig/compiled feature record receives it.  This is
     # the deployment identity, not a measured supply or model-label branch.
-    from .frontend_features import _identity_metadata
+    from .frontend.features import _identity_metadata
     metadata.update(_identity_metadata(case.machine, model))
-    media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
-    if media:
-        metadata["media_tokens_by_request"] = media
+    from .sharding.context_parallel import validate_quantized_allreduce_runtime
+    validate_quantized_allreduce_runtime(
+        metadata, arch=str(case.machine.arch_family or ""), tp=int(p.tp),
+    )
+    if case.workload.requests:
+        media = {
+            request.request_id: request.media_tokens
+            for request in case.workload.requests
+            if request.media_tokens and not getattr(request, "media_encoded", False)
+        }
+        if media:
+            metadata["media_tokens_by_request"] = media
+        else:
+            metadata.pop("media_tokens_by_request", None)
     moe_cfg = case.runtime.kernels.get("moe_transport")
     deepep_enabled = (
         (isinstance(moe_cfg, Mapping) and moe_cfg.get("mode") == "deepep")
@@ -289,6 +249,9 @@ def _normalize_parsed_case(case: Case) -> Case:
         case = replace(case, machine=replace(case.machine, assumptions=tuple(sorted(assumptions.items()))))
     return replace(case, model=model, runtime=replace(
         runtime, pp_layer_partition=counts, metadata=tuple(sorted(metadata.items()))))
+
+
+register_case_normalizer(_normalize_parsed_case)
 
 
 def stage_map(model, runtime) -> tuple[int, ...]:

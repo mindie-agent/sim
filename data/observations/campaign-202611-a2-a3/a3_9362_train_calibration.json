@@ -1,0 +1,64 @@
+{
+  "schema": "mindie-sim.sku-train-calibration/1",
+  "sku": "Ascend910_9362",
+  "architecture": "A3",
+  "npu_arch": "DAV_2201",
+  "split": "train",
+  "provenance": {
+    "domain1_to_5": "capture://campaign-202611-a2-a3/a3_9362/domain1_to_5_train.jsonl",
+    "cann930_delta": "capture://campaign-202611-a2-a3/a3_9362/cann930_kernel_delta_train.jsonl",
+    "fabric_intra": "capture://campaign-202611-a2-a3/a3_9362/fabric_intra_train.jsonl",
+    "fabric_superpod": "capture://campaign-202611-a2-a3/a3_9362/fabric_superpod_2node_train.jsonl"
+  },
+  "geometry": {
+    "aic_count": 20,
+    "aiv_count": 40,
+    "active_clock_mhz": 1650.0,
+    "dies_per_package": 2,
+    "memory_bytes": 68719476736,
+    "l2_capacity_bytes": 176160768,
+    "hbm_peak_bw_gbps": 1600.0
+  },
+  "service_rates_bytes_per_s": {
+    "mte2_aic_l2": 1915500000000.0,
+    "mte2_aic_dram": 1346530000000.0,
+    "mte2_aiv_l2": 1294540000000.0,
+    "mte2_aiv_dram": 1195060000000.0,
+    "hbm_atomic_rmw": 767460000000.0,
+    "grouped_mte2_dram": 1300000000000.0
+  },
+  "matrix_ceilings_flops_per_s": {
+    "bf16_sustained": 237882000000000.0,
+    "w8a8_fractal_nz": 465968000000000.0,
+    "w4a8_unpack_fractal_nz": 289973000000000.0
+  },
+  "kernel_invocations_ms": {
+    "empty_aic": 0.0022,
+    "vector": 0.00203,
+    "cube": 0.00264,
+    "norm": 0.00452,
+    "w8a8_nd_bf16": 0.0068
+  },
+  "samples": [
+    {
+      "resource": "mte2_aiv_dram",
+      "work": 150994944,
+      "work_bytes": 150994944,
+      "duration_ms": 0.12635,
+      "run_id": "train-aiv-read-144m",
+      "repeat_index": 0,
+      "source": "capture://campaign-202611-a2-a3/a3_9362/cann930_kernel_delta_train.jsonl",
+      "split": "train"
+    },
+    {
+      "resource": "mte2_aiv_dram",
+      "work": 234881024,
+      "work_bytes": 234881024,
+      "duration_ms": 0.19654,
+      "run_id": "train-aiv-read-224m",
+      "repeat_index": 0,
+      "source": "capture://campaign-202611-a2-a3/a3_9362/cann930_kernel_delta_train.jsonl",
+      "split": "train"
+    }
+  ]
+}

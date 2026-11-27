@@ -34,8 +34,6 @@ from typing import Any
 from mindie_sim.schema.common import ModelingError
 
 
-ZERO: int = 0
-ONE: int = 1
 EMPTY_PREFIX_CACHE_KEY: str = ""
 DEFAULT_PREFIX_CACHE_KEY: str = "default-prefix"
 
@@ -60,11 +58,24 @@ EXPERT_SLOT_POLICY_KEY = "expert_slot_policy"
 EXPERT_SLOT_MAP_KEY = "expert_slot_map"
 EXPERT_SLOT_SCOPE_KEY = "expert_slot_scope"
 REDUNDANT_EXPERTS_KEY = "redundant_experts_per_rank"
+LOCAL_TP_AXIS_NAMES = (
+    "q_proj_tp",
+    "o_proj_tp",
+    "dcp_linear_tp",
+    "mlp_tp",
+    "shared_expert_tp",
+    "linear_proj_tp",
+    "lm_head_tp",
+)
 LOCAL_PARALLEL_DEFAULTS = MappingProxyType({
-    "o_proj_tp": ONE,
-    "linear_proj_tp": ONE,
-    "lm_head_tp": ONE,
-    REDUNDANT_EXPERTS_KEY: ZERO,
+    "q_proj_tp": 1,
+    "o_proj_tp": 1,
+    "dcp_linear_tp": 1,
+    "mlp_tp": 1,
+    "shared_expert_tp": 1,
+    "linear_proj_tp": 1,
+    "lm_head_tp": 1,
+    REDUNDANT_EXPERTS_KEY: 0,
 })
 RUNTIME_MODE_DEFAULTS = MappingProxyType({
     "collective_startup_mode": "legacy",
@@ -96,7 +107,7 @@ SLOT_KEYS = (EXPERT_SLOT_POLICY_KEY, EXPERT_SLOT_MAP_KEY, EXPERT_SLOT_SCOPE_KEY,
              REDUNDANT_EXPERTS_KEY)
 
 
-def _feature_int(value: Any, name: str, *, minimum: int = ZERO) -> int:
+def _feature_int(value: Any, name: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool):
         raise ModelingError(f"runtime_feature_invalid:{name}:{value!r}")
     if isinstance(value, float):
@@ -183,11 +194,24 @@ def normalize_runtime_features(raw: Mapping[str, Any]) -> dict[str, Any]:
     overlap_aliases = ("enable_shared_expert_overlap", "overlap_shared_expert")
     for alias in overlap_aliases:
         if alias in result:
-            result["multistream_overlap_shared_expert"] = _feature_bool(result.pop(alias), alias)
+            alias_val = _feature_bool(result.pop(alias), alias)
+            if "multistream_overlap_shared_expert" in result:
+                existing = _feature_bool(
+                    result["multistream_overlap_shared_expert"],
+                    "multistream_overlap_shared_expert",
+                )
+                if existing != alias_val:
+                    raise ModelingError("runtime_feature_conflict:multistream_overlap_shared_expert")
+            result["multistream_overlap_shared_expert"] = alias_val
     dbo_aliases = ("dbo", "dual_batch_overlap", "enable_dual_batch_overlap")
     for alias in dbo_aliases:
         if alias in result:
-            result["enable_dbo"] = _feature_bool(result.pop(alias), alias)
+            alias_val = _feature_bool(result.pop(alias), alias)
+            if "enable_dbo" in result:
+                existing = _feature_bool(result["enable_dbo"], "enable_dbo")
+                if existing != alias_val:
+                    raise ModelingError("runtime_feature_conflict:enable_dbo")
+            result["enable_dbo"] = alias_val
     for name in RUNTIME_MODE_DEFAULTS:
         if name in result:
             result[name] = _feature_mode(result[name], name, _MODES[name])
@@ -279,9 +303,9 @@ def split_routing_features(
 def validate_runtime_features(runtime: Any) -> None:
     """Validate an already constructed ``Software`` instance."""
     parallel = runtime.parallel
-    for name in ("o_proj_tp", "linear_proj_tp", "lm_head_tp"):
-        _feature_int(getattr(parallel, name, LOCAL_PARALLEL_DEFAULTS[name]), name, minimum=ONE)
-    _feature_int(getattr(parallel, REDUNDANT_EXPERTS_KEY, ZERO), REDUNDANT_EXPERTS_KEY)
+    for name in LOCAL_TP_AXIS_NAMES:
+        _feature_int(getattr(parallel, name, LOCAL_PARALLEL_DEFAULTS[name]), name, minimum=1)
+    _feature_int(getattr(parallel, REDUNDANT_EXPERTS_KEY, 0), REDUNDANT_EXPERTS_KEY)
     for name, allowed in _MODES.items():
         _feature_mode(getattr(runtime, name), name, allowed)
     _feature_bool(getattr(runtime, "recover_ssm", False), "recover_ssm")

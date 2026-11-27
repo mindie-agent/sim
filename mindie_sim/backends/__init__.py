@@ -8,26 +8,24 @@ from functools import lru_cache
 from mindie_sim.schema.common import ModelingError
 from .ascend import materialize as ascend, normalize_ascend_machine
 from .ascend import profiles as ascend_profiles
-from .nvidia import materialize as nvidia, normalize_nvidia_machine
-from .nvidia import profiles as nvidia_profiles
 
-ADAPTERS = {"ascend": normalize_ascend_machine, "nvidia": normalize_nvidia_machine}
+ADAPTERS = {"ascend": normalize_ascend_machine}
+_PRESET_CACHE_MAXSIZE = 64
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=_PRESET_CACHE_MAXSIZE)
 def _registered_preset(sku: str, arch_family: str) -> str | None:
-    for loader in (ascend_profiles, nvidia_profiles):
-        try:
-            profile = loader().get(sku)
-        except (OSError, ValueError, KeyError):
-            continue
-        if not isinstance(profile, dict) or profile.get("architecture") != arch_family:
-            continue
-        declared = (profile.get("device") or {}).get("compute_arch") or {}
-        preset = declared.get("preset") if isinstance(declared, dict) else None
-        if preset:
-            return str(preset)
-    return None
+    try:
+        profile = ascend_profiles().get(sku)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, KeyError):
+        return None
+    if not isinstance(profile, dict) or profile.get("architecture") != arch_family:
+        return None
+    declared = (profile.get("device") or {}).get("compute_arch") or {}
+    preset = declared.get("preset") if isinstance(declared, dict) else None
+    return str(preset) if preset else None
 
 
 def registered_capability(sku: str, arch_family: str):

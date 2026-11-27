@@ -29,16 +29,18 @@ _EMPTY_FROZENSET: frozenset = frozenset()
 #: opt-in task trace: disabling the verbose ``trace`` must never change what
 #: allocation evidence a settled run reports.
 ALLOCATION_TRACE_CAPACITY = 8192
+DEFAULT_ZERO_PROGRESS_LIMIT = 100_000
 
 
 class _LazyTraceDeque:
     """Bounded ring buffer materializing task trace dicts only when read."""
 
-    __slots__ = ("_dq", "maxlen")
+    __slots__ = ("_dq", "maxlen", "_ext_mut")
 
     def __init__(self, iterable=(), maxlen: int | None = None):
         self.maxlen = maxlen
         self._dq = deque(iterable, maxlen=maxlen)
+        self._ext_mut = 0
 
     @staticmethod
     def _to_dict(row):
@@ -57,19 +59,13 @@ class _LazyTraceDeque:
             "coupled": coupled,
         }
 
-    def _materialize_all(self):
-        dq = self._dq
-        for i in range(len(dq)):
-            r = dq[i]
-            if r.__class__ is not dict:
-                dq[i] = self._to_dict(r)
-        return dq
-
     def append(self, item) -> None:
         self._dq.append(item)
+        self._ext_mut += 1
 
     def clear(self) -> None:
         self._dq.clear()
+        self._ext_mut += 1
 
     def __len__(self) -> int:
         return len(self._dq)
@@ -78,18 +74,13 @@ class _LazyTraceDeque:
         return bool(self._dq)
 
     def __iter__(self):
-        return iter(self._materialize_all())
+        return (self._to_dict(r) for r in self._dq)
 
     def __reversed__(self):
-        return reversed(self._materialize_all())
+        return (self._to_dict(r) for r in reversed(self._dq))
 
     def __getitem__(self, index):
-        dq = self._dq
-        r = dq[index]
-        if r.__class__ is not dict:
-            r = self._to_dict(r)
-            dq[index] = r
-        return r
+        return self._to_dict(self._dq[index])
 
     def __eq__(self, other):
         if isinstance(other, (_LazyTraceDeque, deque, list)):
@@ -97,17 +88,18 @@ class _LazyTraceDeque:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return repr(self._materialize_all())
+        return repr(deque((self._to_dict(r) for r in self._dq), maxlen=self.maxlen))
 
 
 class _LazyAllocTraceDeque:
     """Bounded ring buffer materializing allocation audit dicts only when read."""
 
-    __slots__ = ("_dq", "maxlen")
+    __slots__ = ("_dq", "maxlen", "_ext_mut")
 
     def __init__(self, iterable=(), maxlen: int | None = None):
         self.maxlen = maxlen
         self._dq = deque(iterable, maxlen=maxlen)
+        self._ext_mut = 0
 
     @staticmethod
     def _to_dict(row):
@@ -124,19 +116,13 @@ class _LazyAllocTraceDeque:
             "task": tname,
         }
 
-    def _materialize_all(self):
-        dq = self._dq
-        for i in range(len(dq)):
-            r = dq[i]
-            if r.__class__ is not dict:
-                dq[i] = self._to_dict(r)
-        return dq
-
     def append(self, item) -> None:
         self._dq.append(item)
+        self._ext_mut += 1
 
     def clear(self) -> None:
         self._dq.clear()
+        self._ext_mut += 1
 
     def __len__(self) -> int:
         return len(self._dq)
@@ -145,18 +131,13 @@ class _LazyAllocTraceDeque:
         return bool(self._dq)
 
     def __iter__(self):
-        return iter(self._materialize_all())
+        return (self._to_dict(r) for r in self._dq)
 
     def __reversed__(self):
-        return reversed(self._materialize_all())
+        return (self._to_dict(r) for r in reversed(self._dq))
 
     def __getitem__(self, index):
-        dq = self._dq
-        r = dq[index]
-        if r.__class__ is not dict:
-            r = self._to_dict(r)
-            dq[index] = r
-        return r
+        return self._to_dict(self._dq[index])
 
     def __eq__(self, other):
         if isinstance(other, (_LazyAllocTraceDeque, deque, list)):
@@ -164,13 +145,13 @@ class _LazyAllocTraceDeque:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return repr(self._materialize_all())
+        return repr(deque((self._to_dict(r) for r in self._dq), maxlen=self.maxlen))
 
 
 class RuntimeState:
     def __init__(
         self, *, resources: Mapping[str, Any], pools=None, trace_limit: int = 0,
-        pool_units=None, zero_progress_limit: int = 100_000,
+        pool_units=None, zero_progress_limit: int = DEFAULT_ZERO_PROGRESS_LIMIT,
     ):
         self.uid = uuid4().hex
         self.capacity_domains: dict[str, CapacityDomainState] = {}
@@ -192,6 +173,9 @@ class RuntimeState:
         self.memory_pools: set[str] = set()
         #: Frozen view of ``memory_pools``; rebuilt only when the set changes.
         self._memory_pools_frozen: frozenset[str] = _EMPTY_FROZENSET
+        #: Interned Engine-owned pool sets created by ``memory_scope``.
+        self._engine_pool_sets: dict[tuple[str, ...], frozenset[str]] = {}
+        self._engine_pool_set_ids: set[int] = set()
         # Actual granted allocation name -> binding/replica/ledger. The grant
         # stays live until the allocation's real free boundary, not when the
         # acquiring task happens to complete.
@@ -208,6 +192,7 @@ class RuntimeState:
         self.allocations: dict[str, Allocation] = {}
         self.now = 0.0
         self.serviced = dict.fromkeys(self.resources, 0.0)
+        self.delivered: dict[str, float] = {}
         self.busy_ms = dict.fromkeys(self.resources, 0.0)
         self._tasks: dict[int, _Task] = {}
         self._promises: dict[int, Event] = {}
@@ -233,12 +218,14 @@ class RuntimeState:
         #: skips per-resource pinned partitions.
         self._coupled_active = 0
         self._placed_active = 0
+        self._delivery_live = 0
         #: Structural cache of validated immutable Stage declarations.  Only
         #: static work/caps/placement validation is shared; every occurrence
         #: still binds and validates its own scoped allocations.
         self._stage_prepared: dict[tuple, Any] = {}
         self._stage_prepared_id: dict[int, tuple] = {}
         self._releases: list[tuple[float, int]] = []
+        self._max_release: float = 0.0
         self._sequence = 0
         self._next_launch = 0
         # Periodic acceleration registries are populated by the template
@@ -248,6 +235,10 @@ class RuntimeState:
         self._periodic_tasks: dict[int, tuple] = {}
         self._periodic_detector = None
         self._periodic_last = None
+        self._periodic_stall_epoch: tuple | None = None
+        self._periodic_stall_obs = 0
+        self._periodic_last_next_sum = -1
+        self._periodic_no_issue_streak = 0
         #: Monotone mutation counter for the allocation/grant frontier.  Every
         #: acquire/release of a live buffer or memory grant bumps it, so the
         #: periodic observer can reuse its previous structural view instead of
@@ -263,7 +254,10 @@ class RuntimeState:
         self._trace_view = _LazyTraceDeque(maxlen=trace_limit)
         self._trace_dq = self._trace_view._dq
         self._trace_maxlen = 0 if trace_limit is None else int(trace_limit)
+        self._trace_appends = 0
+        self._trace_gen = 0
         self.trace_dropped = 0
+        self._evicted_service_spans: dict[str, list[tuple[float, float]]] = {}
         # One authoritative typed state ledger. FragmentConductor and
         # Execution hold views of this object, never a second version map.
         self.state_ledger = None
@@ -320,7 +314,9 @@ class RuntimeState:
                 value, maxlen=getattr(value, "maxlen", None))
         self._trace_dq = self._trace_view._dq
         ml = self._trace_view.maxlen
-        self._trace_maxlen = 0 if ml is None else int(ml)
+        self._trace_maxlen = -1 if ml is None else int(ml)
+        self._trace_appends = 0
+        self._trace_gen += 1
 
     @property
     def allocation_trace(self):

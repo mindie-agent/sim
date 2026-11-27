@@ -22,49 +22,79 @@
 """
 from __future__ import annotations
 
-from .abi import (
+import sys
+
+from . import attention as _attention
+from . import fusion as _fusion
+from . import matrix as _matrix
+from . import moe as _moe
+from . import signatures as _signatures
+from . import vocabulary as _vocabulary
+
+for _alias_name, _alias_mod in (
+    ("abi", _vocabulary),
+    ("attention_contracts", _attention),
+    ("carriers", _vocabulary),
+    ("errors", _vocabulary),
+    ("fused_contracts", _fusion),
+    ("fusion_contracts", _fusion),
+    ("layout_contracts", _vocabulary),
+    ("matrix_contracts", _matrix),
+    ("moe_contracts", _moe),
+    ("native_signature", _signatures),
+    ("quant_contracts", _moe),
+    ("router_contracts", _matrix),
+    ("signature_matching", _signatures),
+    ("signature_vocabulary", _vocabulary),
+    ("subgraph_contracts", _fusion),
+    ("targets", _vocabulary),
+    ("tensor_contracts", _signatures),
+):
+    sys.modules.setdefault(f"{__name__}.{_alias_name}", _alias_mod)
+
+from .vocabulary import (
     ABI_SCHEMA, DTYPES, native_abi_digest, native_abi_from_contract,
     native_abi_from_slots, native_abi_identity, native_abi_record,
     native_contract_issue, native_tensor_contract, native_tensor_diagnostic,
 )
-from .attention_contracts import (
+from .attention import (
     ATTENTION_CACHE_TYPES, MQSMLA_KINDS, attention_contract_diagnostic,
     attention_contract_scope, fia_block_table_slot, observed_attention_contract,
 )
-from .carriers import _snapshot_structure_carrier
-from .errors import StructureTargetError
-from .fused_contracts import (
+from .vocabulary import _snapshot_structure_carrier
+from .vocabulary import StructureTargetError
+from .fusion import (
     FUSED_TYPES, fused_contract_diagnostic, fused_contract_scope,
     observed_fused_contract,
 )
-from .fusion_contracts import (
+from .fusion import (
     FUSION_TYPES, QWEN4_HC_KINDS, fusion_contract_diagnostic, fusion_contract_scope,
     observed_fusion_contract,
 )
-from .layout_contracts import (
+from .vocabulary import (
     LAYOUT_BODY_TYPES, layout_contract_diagnostic, layout_contract_scope,
     observed_layout_contract,
 )
-from .matrix_contracts import (
+from .matrix import (
     MATRIX_BODY_TYPES, matrix_contract_diagnostic, matrix_contract_scope,
     observed_matrix_contract,
 )
-from .moe_contracts import MOE_FUSION_TYPES, moe_fusion_contract, moe_fusion_scope
-from .native_signature import (
+from .moe import MOE_FUSION_TYPES, moe_fusion_contract, moe_fusion_scope
+from .signatures import (
     event_signature, native_call_signature_match, parse_paired_lanes,
 )
-from .quant_contracts import (
+from .moe import (
     QUANT_FUSION_TYPES, quant_fusion_contract, quant_fusion_scope,
 )
-from .router_contracts import (
+from .matrix import (
     ROUTER_TYPES, observed_router_contract, router_contract_diagnostic,
     router_contract_scope,
 )
-from .subgraph_contracts import (
+from .fusion import (
     SUBGRAPH_TYPES, subgraph_contract, subgraph_contract_scope,
 )
-from .targets import StructureTargets
-from .tensor_contracts import (
+from .vocabulary import StructureTargets
+from .signatures import (
     NATIVE_BODY_TYPES, SUPPORTED_TYPES, observed_contract,
     observed_contract_diagnostic, observed_contract_scope,
 )

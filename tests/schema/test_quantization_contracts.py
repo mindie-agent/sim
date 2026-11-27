@@ -1,0 +1,1406 @@
+"""Quantization roles, resident formats, and native execution precision.
+
+[Role] Check named presets and role precedence from parsing through lowering,
+  matrix service, and weight residency.
+[Invariants] Packing and scales follow placed shapes. Format overrides preserve
+  logical matrix work and select only supported native execution precision.
+[Timeouts & Locks] Bounded component graphs and local pricing. No locks.
+[Side-Effect Policy] Read retained case JSON and build cases in memory.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import replace
+import json
+from pathlib import Path
+
+import pytest
+
+from _support.axes import REPRESENTATIVE_SKUS
+from _support.builders import hardware, quant
+from _support.memory_cases import SPARSE_OFFLOAD_SKU, case as memory_case
+from mindie_sim import Case, compose_case, graph_costs, operator_costs, target_graphs
+from mindie_sim.catalog.ops import compute_dtype_for, gemm_op
+from mindie_sim.catalog.quant import quant_preset, resolve_auto_va_quant
+from mindie_sim.model_catalog import load_model
+from mindie_sim.catalog.types import EngramSpec, EngramTableSpec, QuantSpec
+from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes, term_payload_bytes
+from mindie_sim.catalog.weights import layer_weight_terms, stage_weight_bytes, stage_weight_decomposition
+from mindie_sim.prediction.operators.attention.attention import gqa
+from mindie_sim.prediction.capacity import Memory
+from mindie_sim.prediction.operators.matrix.matrix_epilogue import MatrixEpilogue
+from mindie_sim.prediction.operators.matrix.matrix_precision import execution_compute_peaks, resolve_matrix_precision
+from mindie_sim.prediction.operator_analysis import target_operators
+from mindie_sim.prediction.operators.attention.partial_attention import projection_only
+from mindie_sim.prediction.structure import parse_case
+from mindie_sim.prediction.transforms import activation_quantization
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.compute_peak_aliases import (
+    native_compute_peak_items, resolve_compute_peak_name, validate_compute_peak_aliases,
+)
+from mindie_sim.schema.hardware import Hardware
+from mindie_sim.schema.parallel import ParallelSpec
+from mindie_sim.schema.workload import RequestView
+
+pytestmark = pytest.mark.tier0
+
+ROOT = Path(__file__).resolve().parents[2]
+EXAMPLES = ROOT / "examples/cases"
+LEGACY_FP8_LIMITED_SKU = "Ascend910B2"
+
+ROLES = {
+    "linear_qkvz": ("gdn.qkvz", "gdn_qkvz"),
+    "linear_beta_alpha": ("gdn.beta_alpha", "gdn_ba"),
+    "linear_output": ("gdn.o", "gdn_o"),
+}
+
+BF16 = {"weight_format": "bf16", "activation_format": "bf16"}
+INT8 = {"weight_format": "int8", "activation_format": "int8"}
+
+def gdn_case(*, quantization="w8a8", overrides=None, source_prefill=False):
+    path = EXAMPLES / "qwen36-a3-tp4.json"
+    raw = json.loads(path.read_text())
+    raw["model"].update(layers=1, quantization=quantization)
+    raw["runtime"]["kernels"] = {"programs": {"matmul": {"kind": "steady_matmul"}}}
+    if quantization == "w8a8_mxfp8" or source_prefill:
+        raw["machine"] = {"backend": "ascend", "sku": SPARSE_OFFLOAD_SKU, "num_devices": 4}
+    if source_prefill:
+        raw["runtime"]["kernels"]["lowerings"] = {"gdn_prefill": "gdn_prefill_arch35"}
+    case = parse_case(raw)
+    if overrides:
+        raw["model"]["quant"] = replace(case.model.quant, category_overrides=overrides).to_dict()
+        case = parse_case(raw)
+    return case
+
+def projections(case, phase):
+    graphs = target_graphs(case, phase=phase, tokens=4, context=4096, scope="body")
+    ops = graphs[0]
+    selected = {op.recipe: op for op in ops if op.recipe in ROLES}
+    assert len(selected) == 3
+    return graphs, selected
+
+def assert_native_matrix_service(case, ops, input_ready_ms):
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    nominal = EvaluationContext.create(case, primitive_table=False)
+    priced = operator_costs(case, tuple(ops), input_ready_ms=input_ready_ms, evaluation=nominal)
+    peaks = dict(case.machine.dies[0].compute_peaks)
+    by_recipe = {op.recipe: op for op in ops}
+    for row in priced["operators"]:
+        op = by_recipe[row["operator"]["recipe"]]
+        matrix = sum(value for role, value in row["declared_service"].items()
+                     if role.startswith("matrix@"))
+        assert matrix == pytest.approx(1000 * op.flops / peaks[op.dtype])
+        assert not row["service_before_input"] and not row["live_tasks"]
+
+def check_formats_and_producers(case, graphs, selected, expected):
+    by_id = {op.op_id: op for op in graphs[0]}
+    terms = {term.name: term for term in layer_weight_terms(case.model.layer_plans[0], case.model)}
+    for recipe, op in selected.items():
+        category, term = ROLES[recipe]
+        metadata = dict(op.metadata)
+        rows, n, k = op.local_shape
+        fmt = expected[recipe]
+        assert metadata["quant_category"] == category
+        assert metadata["weight_format"] == metadata["activation_format"] == op.dtype == fmt
+        assert metadata["packed_weight_bytes"] == term_bytes(
+            terms[term], case.model.quant, case.runtime.parallel)
+        assert op.flops == 2 * rows * n * k
+        if fmt == "bf16":
+            assert metadata["packed_weight_bytes"] == 2 * n * k
+            assert not metadata.get("activation_scale_bytes")
+            assert metadata.get("activation_producer") != "explicit_quantization"
+            assert all(by_id[dep].family not in {"quantize", "rmsnorm_quant"}
+                       for dep in op.deps if dep in by_id)
+        else:
+            producer = by_id[op.deps[0]]
+            assert producer.family in {"quantize", "rmsnorm_quant"}
+            assert metadata["activation_producer"] == "explicit_quantization"
+            assert metadata["activation_scale_bytes"] == 4 * rows
+            assert producer.mte3_bytes == rows * k + 4 * rows
+    assert_native_matrix_service(case, selected.values(), 3)
+
+GDN_FRONTENDS = (("decode", False), ("prefill", False), ("prefill", True))
+GDN_SHAPES = {
+    "linear_qkvz": (4, 4096, 5120), "linear_beta_alpha": (4, 24, 5120),
+    "linear_output": (4, 5120, 1536),
+}
+
+@pytest.mark.parametrize("phase,source", GDN_FRONTENDS)
+@pytest.mark.parametrize("weight_policy", ("mixed", "excluded"))
+def test_gdn_roles_preserve_shapes_and_representation(phase, source, weight_policy):
+    mixed = weight_policy == "mixed"
+    case = gdn_case(overrides={"gdn.beta_alpha": BF16, "gdn.o": BF16} if mixed else None,
+                    quantization="w8a8" if mixed else "w8a8_mxfp8", source_prefill=source)
+    if not mixed:
+        case = parse_case({**case.to_dict(), "model": {
+            "preset": "qwen3.8-27b", "layers": 1, "quantization": "w8a8_mxfp8"}})
+    graphs, selected = projections(case, phase)
+    expected = dict.fromkeys(ROLES, "bf16")
+    if mixed:
+        expected["linear_qkvz"] = "int8"
+        assert {name: op.local_shape for name, op in selected.items()} == GDN_SHAPES
+        result = graph_costs(case, graphs, external_inputs={"analysis_input": 0}, isolated=False)
+        assert result["duration_ms"] > 0
+        assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
+    check_formats_and_producers(case, graphs, selected, expected)
+
+def test_gdn_child_override_takes_precedence_over_parent():
+    case = gdn_case(overrides={"gdn": BF16, "gdn.qkvz": INT8})
+    graphs, selected = projections(case, "decode")
+    check_formats_and_producers(case, graphs, selected, {
+        "linear_qkvz": "int8", "linear_beta_alpha": "bf16", "linear_output": "bf16"})
+
+def assert_parent_matrix_work(op, quant, category):
+    m, n, k = op.local_shape
+    original = gemm_op(op_id=op.op_id, deps=(), stage=op.stage, layer=op.layer,
+                       requests=op.requests, m=m, n=n, k=k, quant=quant,
+                       category=category, phase=op.phase, recipe=op.recipe, family=op.family)
+    for field in ("dtype", "flops", "vector_ops", "hbm_bytes", "mte2_bytes", "mte3_bytes"):
+        assert getattr(op, field) == getattr(original, field)
+    return dict(original.metadata)
+
+@pytest.mark.parametrize("quantization", ("w8a8", "w8a8_mxfp8"))
+def test_undeclared_gdn_roles_keep_parent_category_physical_work(quantization):
+    case = gdn_case(quantization=quantization)
+    _, selected = projections(case, "decode")
+    for op in selected.values():
+        previous = assert_parent_matrix_work(op, case.model.quant, "gdn")
+        metadata = dict(op.metadata)
+        for field in ("packed_weight_bytes", "weight_format", "activation_format",
+                      "activation_scale_bytes", "matrix_epilogue"):
+            assert metadata.get(field) == previous.get(field)
+
+CASES = (
+    ("new9/qwen35-35b-a5-tp4-c64-graph", (256, 2560, 2048), (256, 2048, 1024), 10),
+    ("new17/qwen35-397b-a3-tp16-c48", (256, 1536, 4096), (256, 4096, 512), 15),
+)
+
+def component(name, overrides=None, *, partial=False):
+    path = EXAMPLES / "high-concurrency-20261030" / (name + ".json")
+    case = parse_case(json.loads(path.read_text()))
+    if overrides:
+        quant = replace(case.model.quant, category_overrides={
+            **dict(case.model.quant.category_overrides), **overrides})
+        case = replace(case, model=replace(case.model, quant=quant))
+    case = replace(case, runtime=replace(case.runtime,
+        kernels={"programs": {"matmul": {"kind": "steady_matmul"}}}))
+    plan = next(plan for plan in case.model.layer_plans if plan.attention == "gqa")
+    builder = projection_only if partial else gqa
+    result = builder(prefix="gqa", plan=plan, model=case.model, quant=case.model.quant,
+        parallel=case.runtime.parallel, views=(RequestView("r", 256, 4096, True, "decode"),),
+        stage=0, deps="analysis_input", mode="decode", padded_tokens=256,
+        cache_ids={}, stage_of=lambda _: 0, machine=case.machine)
+    ops = activation_quantization(result.ops, case.model.activation_dtype)
+    return case, plan, ops, {op.recipe: op for op in ops
+                            if op.recipe in {"qkv_projection", "attention_output"}}
+
+@pytest.mark.parametrize("name,qkv_shape,out_shape,occurrences", CASES)
+@pytest.mark.parametrize("partial", (False, True))
+def test_native_output_preserves_int8_qkv_producer_and_matching_residency(
+        name, qkv_shape, out_shape, occurrences, partial):
+    case, plan, ops, selected = component(name, {"attn.o": BF16}, partial=partial)
+    qkv, output = selected["qkv_projection"], selected["attention_output"]
+    assert qkv.local_shape == qkv_shape and output.local_shape == out_shape
+    assert sum(p.attention == "gqa" for p in case.model.layer_plans) == occurrences
+    assert qkv.dtype == "int8" and output.dtype == "bf16"
+    by_id = {op.op_id: op for op in ops}
+    producer = by_id[qkv.deps[0]]
+    assert producer.family == "quantize"
+    assert producer.mte3_bytes == qkv_shape[0] * qkv_shape[2] + qkv_shape[0] * 4
+    assert all(by_id[dep].family != "quantize" for dep in output.deps)
+    output_meta = dict(output.metadata)
+    assert output_meta["weight_format"] == output_meta["activation_format"] == "bf16"
+    assert output_meta["quant_category"] == "attn.o" and not output_meta.get("activation_scale_bytes")
+    terms = {term.name: term for term in layer_weight_terms(plan, case.model)}
+    assert output_meta["packed_weight_bytes"] == out_shape[1] * out_shape[2] * 2
+    assert term_bytes(terms["o_proj"], case.model.quant, case.runtime.parallel) == output_meta["packed_weight_bytes"]
+    assert sum(term_bytes(terms[name], case.model.quant, case.runtime.parallel)
+               for name in ("q_proj", "k_proj", "v_proj")) == dict(qkv.metadata)["packed_weight_bytes"]
+    assert_native_matrix_service(case, (qkv, output), 7)
+
+def test_parent_and_child_precision_inherit_without_model_dispatch():
+    _, _, ops, selected = component(CASES[0][0], {"attn": BF16, "attn.qkv": INT8})
+    assert selected["qkv_projection"].dtype == "int8"
+    assert selected["attention_output"].dtype == "bf16"
+    quantized = [op for op in ops if op.family == "quantize"]
+    assert len(quantized) == 1 and selected["qkv_projection"].deps == (quantized[0].op_id,)
+
+@pytest.mark.parametrize("name", [row[0] for row in CASES])
+def test_undeclared_roles_keep_parent_work_and_explicit_bf16_changes_only_output(name):
+    case, _, _, selected = component(name)
+    for op in selected.values():
+        assert_parent_matrix_work(op, case.model.quant, "attn")
+    _, _, _, mixed = component(name, {"attn.o": BF16})
+    qkv, output = selected["qkv_projection"], selected["attention_output"]
+    assert mixed["qkv_projection"] == qkv
+    assert mixed["attention_output"].flops == output.flops
+    assert mixed["attention_output"].local_shape == output.local_shape
+    assert mixed["attention_output"].mte3_bytes == output.mte3_bytes
+
+def matrix(quant, *, category='dense_mlp', rows=5, columns=7, width=11, groups=1):
+    return gemm_op(op_id='projection', deps=('input',), stage=0, layer=0,
+                   requests=(), m=rows, n=columns, k=width, weight_count=groups,
+                   quant=quant, category=category, phase='prefill')
+
+def test_bf16_scale_only_is_one_column_input_and_fp32_row_scales_stay_separate():
+    quant = QuantSpec('declared-native', weight_format='int8', scale_format='bf16',
+                      scale_bytes=2, int8_weight_metadata='scale_only')
+    op = matrix(quant)
+    meta = dict(op.metadata)
+    epilogue = MatrixEpilogue.from_op(op)
+    assert quant.matrix_payload_bytes(7, 11, 'dense_mlp') == 77
+    assert quant.matrix_bytes(7, 11, 'dense_mlp') == 77 + 14
+    assert epilogue.column_scale_bytes == 14
+    assert epilogue.row_scale_bytes == 5 * 4
+    assert epilogue.operands(op) == (5 * 11, 7 * 11)
+    assert (op.mte2_bytes, op.mte3_bytes, op.hbm_bytes) == (166, 70, 236)
+    assert op.flops == 2 * 5 * 7 * 11
+    assert op.vector_ops == 4 * 5 * 7
+    assert meta['weight_scale_format'] == 'bf16'
+    producer, consumer = activation_quantization((op,), 'bf16')
+    assert producer.mte3_bytes == 5 * 11 + 5 * 4
+    assert consumer.deps == (producer.op_id,)
+    assert epilogue.scales(5, 7, 5, 7, 1, reuse_inputs=True, reuse_weights=True) == (34, 34)
+
+def test_explicit_scale_only_does_not_change_other_quantization_categories():
+    legacy = QuantSpec('int8', weight_format='int8')
+    selected = replace(legacy, category_overrides={
+        'dense_mlp': {'scale_format': 'bf16', 'scale_bytes': 2,
+                      'int8_weight_metadata': 'scale_only'}})
+    restored = QuantSpec(**json.loads(json.dumps(selected.to_dict())))
+    for current in (selected, restored):
+        assert matrix(current, category='mla.q_b') == matrix(legacy, category='mla.q_b')
+        assert matrix(current).mte2_bytes == 166
+        assert current.matrix_bytes(7, 11, 'dense_mlp') == 91
+        assert current.matrix_bytes(7, 11, 'mla.q_b') == 77 + 7 * 8
+    assert MatrixEpilogue.from_op(matrix(legacy)).column_scale_bytes == 7 * 8
+
+@pytest.mark.parametrize('groups', [1, 3])
+def test_grouped_scale_inputs_and_partial_tiles_do_not_duplicate_column_metadata(groups):
+    quant = QuantSpec('native', weight_format='int8', scale_bytes=2,
+                      scale_format='bf16', int8_weight_metadata='scale_only')
+    op = matrix(quant, rows=5 * groups, groups=groups)
+    epilogue = MatrixEpilogue.from_op(op)
+    assert epilogue.column_scale_bytes == groups * 7 * 2
+    assert epilogue.operands(op) == (groups * 5 * 11, groups * 7 * 11)
+    tiles = [(5, 3), (5, 4)] * groups
+    traffic = sum(epilogue.scales(a, b, 5 * groups, 7, groups,
+                                 reuse_inputs=True, reuse_weights=True)[1]
+                  for a, b in tiles)
+    assert traffic == pytest.approx(epilogue.row_scale_bytes + epilogue.column_scale_bytes)
+
+def test_unknown_column_metadata_cannot_silently_choose_scale_offset():
+    with pytest.raises(ModelingError, match='int8_weight_metadata'):
+        QuantSpec('invalid', int8_weight_metadata='infer_from_name')
+
+def ascend_dies(sku=SPARSE_OFFLOAD_SKU):
+    return Hardware.from_mapping({"backend": "ascend", "sku": sku, "num_devices": 1}).dies
+
+def mxa8w4(activation="fp8_e4m3", *, category="moe.routed"):
+    return gemm_op(
+        op_id="mx", deps=("x",), stage=0, layer=0, requests=("r",),
+        m=4, n=64, k=128, quant=quant(
+            weight_format="mxfp4", activation_format=activation),
+        category=category, phase="decode")
+
+def test_structural_identity_and_two_argument_dtype_contract():
+    op = mxa8w4()
+    metadata = dict(op.metadata)
+    assert op.dtype == "fp8_e4m3"
+    assert tuple(metadata[key] for key in ("weight_format", "activation_format", "output_format")) == (
+        "mxfp4", "fp8_e4m3", "bf16")
+    assert compute_dtype_for(quant(weight_format="mxfp4",
+                                   activation_format="fp8_e4m3"),
+                             "moe.routed") == ("fp8_e4m3", "fp8_e4m3")
+    assert metadata["compute_format_origin"] == "catalog_default"
+
+def test_eligible_generic_work_resolves_to_native_fp8():
+    op = mxa8w4()
+    resolved = resolve_matrix_precision(op, devices=ascend_dies(), policy="auto",
+                                        recipe=None)
+    metadata = dict(resolved.metadata)
+    assert resolved.dtype == "fp8_e4m3"
+    assert resolve_matrix_precision(resolved, devices=ascend_dies(), policy="auto", recipe=None) == resolved
+    assert metadata["declared_compute_format"] == "fp8_e4m3"
+    assert metadata["execution_compute_format"] == "fp8_e4m3"
+    assert metadata["weight_format"] == "mxfp4"
+    assert metadata["activation_format"] == "fp8_e4m3"
+    assert (resolved.local_shape, resolved.flops) == (op.local_shape, op.flops)
+    peaks = execution_compute_peaks(
+        resolved, devices=ascend_dies(),
+        base_peaks={"bf16": ascend_dies()[0].peak("bf16")})
+    assert peaks["fp8_e4m3"] == pytest.approx(2 * peaks["bf16"])
+
+PRECISION_CAPABILITIES = (
+    ("bf16", "fp8_e4m3", "bf16"), ("generic_fp8", "fp8_e4m3", "fp8_e4m3"),
+    ("mixed", "fp8_e4m3", "bf16"), ("native_fp8", "fp8_e5m2", "fp8_e5m2"),
+    ("simulated", "fp8_e5m2", "bf16"),
+)
+
+@pytest.mark.parametrize("capability,activation,dtype", PRECISION_CAPABILITIES)
+def test_operator_precision_requires_support_on_every_die(capability, activation, dtype):
+    devices = {
+        "bf16": hardware(1, peaks=(("bf16", 1e12),)).dies,
+        "generic_fp8": hardware(1, peaks=(("bf16", 1e12), ("fp8", 2e12))).dies,
+        "mixed": (*ascend_dies(), replace(ascend_dies(LEGACY_FP8_LIMITED_SKU)[0], rank=1)),
+        "native_fp8": ascend_dies(),
+        "simulated": hardware(1).dies,
+    }[capability]
+    resolved = resolve_matrix_precision(mxa8w4(activation), devices=devices, policy="auto", recipe=None)
+    assert resolved.dtype == dtype
+    if capability == "bf16":
+        assert dict(resolved.metadata)["precision_resolution_reason"] == "fp8_unavailable"
+
+def test_declared_policy_and_source_bound_identity_are_preserved():
+    op = mxa8w4()
+    assert resolve_matrix_precision(op, devices=ascend_dies(), policy="declared",
+                                    recipe=None) == op
+    source = replace(op, source_boundary="kernel")
+    kept = resolve_matrix_precision(source, devices=ascend_dies(), policy="auto",
+                                    recipe=None)
+    assert kept.dtype == "fp8_e4m3"
+    assert dict(kept.metadata)["precision_resolution_reason"] == "explicit_compute_identity"
+    explicit = gemm_op(
+        op_id="e", deps=(), stage=0, layer=0, requests=(), m=2, n=8, k=8,
+        quant=quant(weight_format="mxfp4", activation_format="fp8_e4m3"),
+        category="moe.routed", phase="decode",
+        metadata=(("compute_format", "bf16"),))
+    assert dict(explicit.metadata)["compute_format_origin"] == "explicit"
+    assert resolve_matrix_precision(explicit, devices=ascend_dies(), policy="auto",
+                                    recipe=None).dtype == "bf16"
+
+def test_supply_alias_is_validated_and_never_a_native_operand():
+    base = hardware(1, peaks=(("bf16", 1e12), ("fp8_e4m3", 2e12),
+                              ("mxfp4", 2e12)))
+    die = replace(base.dies[0], compute_peak_aliases=(("mxfp4", "fp8_e4m3"),))
+    peaks = dict(die.compute_peaks)
+    validate_compute_peak_aliases(peaks, dict(die.compute_peak_aliases), die.compute_arch)
+    assert resolve_compute_peak_name("mxfp4", peaks,
+                                     dict(die.compute_peak_aliases)) == "fp8_e4m3"
+    assert "mxfp4" not in dict(native_compute_peak_items(
+        peaks, dict(die.compute_peak_aliases)))
+    assert die.peak("mxfp4") == pytest.approx(die.peak("fp8_e4m3"))
+    with pytest.raises(ModelingError, match="matrix_precision_not_native"):
+        execution_compute_peaks(replace(mxa8w4(), dtype="mxfp4"),
+                                devices=(die,), base_peaks={})
+
+@pytest.mark.parametrize("peaks,aliases,reason", [
+    ({"bf16": 1, "fp8_e4m3": 2, "mxfp4": 3}, {"mxfp4": "fp8_e4m3"}, "value_mismatch"),
+    ({"bf16": 1, "mxfp4": 1}, {"mxfp4": "fp8_e5m2"}, "unknown_target"),
+    ({"a": 1, "b": 1}, {"a": "b", "b": "a"}, "cycle"),
+])
+def test_compute_supply_aliases_reject_inconsistent_bindings(peaks, aliases, reason):
+    with pytest.raises(ModelingError, match=f"compute_peak_alias_{reason}"):
+        validate_compute_peak_aliases(peaks, aliases, hardware(1).dies[0].compute_arch)
+
+def quant_plan():
+    return QuantSpec(
+        "mixed", weight_block=(1, 32), expert_block=32,
+        scale_format="fp8_e8m0", scale_bytes=1,
+        activation_group_size=32, activation_scale_format="fp8_e8m0",
+        activation_scale_pack=2,
+        category_overrides={
+            "projection": {"weight_format": "fp8_e4m3", "activation_format": "fp8_e4m3"},
+            "projection.gate": {"weight_format": "bf16", "activation_format": "bf16"},
+            "shared_expert": {"weight_format": "mxfp4", "activation_format": "fp8_e4m3"},
+        },
+    )
+
+def test_role_inheritance_retains_independent_scale_geometry_after_json_roundtrip():
+    quant = quant_plan()
+    restored = QuantSpec(**json.loads(json.dumps(quant.to_dict())))
+    for plan in (quant, restored):
+        assert plan.matrix_payload_bytes(5, 65, "projection.q") == 325
+        assert plan.matrix_bytes(5, 65, "projection.q") == 340
+        assert plan.matrix_bytes(5, 65, "projection.gate") == 650
+        assert plan.matrix_payload_bytes(5, 65, "shared_expert") == 165
+        assert plan.matrix_bytes(5, 65, "shared_expert") == 180
+        assert plan.matrix_bytes(5, 65, "shared_expert", source=True) == 180
+    assert quant == restored
+    assert replace(quant, exclusions=("projection",)).matrix_bytes(5, 65, "projection.q") == 650
+
+def test_fp4_preserves_declared_fp8_payload_and_real_mx_quantization_producer():
+    op = gemm_op(
+        op_id="shared", deps=(), stage=0, layer=0, requests=(),
+        m=3, n=5, k=65, quant=quant_plan(), category="shared_expert", phase="prefill",
+    )
+    meta = dict(op.metadata)
+    assert op.dtype == "fp8_e4m3"
+    assert op.flops == 1950
+    assert (meta["weight_format"], meta["activation_format"]) == ("mxfp4", "fp8_e4m3")
+    assert (meta["activation_scale_shape"], meta["activation_scale_bytes"]) == ((3, 2, 2), 12)
+    assert (op.mte2_bytes, op.mte3_bytes, op.hbm_bytes) == (195 + 12 + 180, 30, 417)
+    quantize, matrix = activation_quantization((op,), "bf16")
+    assert matrix.deps == (quantize.op_id,)
+    assert (quantize.mte2_bytes, quantize.mte3_bytes, quantize.vector_ops) == (390, 207, 798)
+    assert dict(quantize.metadata)["activation_scale_format"] == "fp8_e8m0"
+
+def test_checkpoint_roles_use_the_same_representation_in_ops_and_weight_terms():
+    path = EXAMPLES / "kimi-k3-a5-current-checkpoint-conditional.json"
+    raw = json.loads(path.read_text())
+    raw["model"]["layers"] = 4  # KDA+dense, KDA+MoE and MLA+MoE.
+    case = parse_case(raw)
+    restored = parse_case({**raw, "model": case.model.to_dict()})
+    assert case.model.quant == restored.model.quant
+    ops = target_operators(restored, phase="decode", tokens=1, context=32)
+    expected = {
+        "kda.q": ("kda_q", "fp8_e4m3"), "kda.k": ("kda_k", "fp8_e4m3"),
+        "kda.v": ("kda_v", "fp8_e4m3"), "kda.g": ("kda_g", "bf16"),
+        "kda.b": ("kda_b", "bf16"), "kda.f_a": ("kda_f_a", "bf16"),
+        "kda.f_b": ("kda_f_b", "bf16"), "kda.o": ("kda_o", "bf16"),
+        "mla.q_a": ("q_a", "fp8_e4m3"), "mla.q_b": ("q_b", "fp8_e4m3"),
+        "mla.kv_a": ("kv_a", "fp8_e4m3"), "mla.g": ("mla_g", "bf16"),
+        "mla.o": ("o_proj", "bf16"),
+    }
+    seen = set()
+    for op in ops:
+        meta = dict(op.metadata)
+        category = meta.get("quant_category")
+        slices = meta.get("packed_projection_slices") or ()
+        categories = ([str(row["category"]) for row in slices] if slices else [category])
+        if not set(categories) & set(expected):
+            continue
+        term_name, fmt = expected[category]
+        terms = layer_weight_terms(case.model.layer_plans[op.layer], case.model)
+        by_category = {term.category: term for term in terms}
+        assert meta["weight_format"] == fmt
+        if slices:
+            frame = sum(term_bytes(by_category[str(row["category"])],
+                                   case.model.quant, case.runtime.parallel)
+                        for row in slices)
+            for row in slices:
+                assert expected[str(row["category"])][1] == meta["activation_format"]
+        else:
+            frame = term_bytes(next(term for term in terms if term.name == term_name),
+                               case.model.quant, case.runtime.parallel)
+        assert meta["packed_weight_bytes"] == frame
+        if fmt == "fp8_e4m3":
+            assert meta["activation_producer"] == "explicit_quantization"
+        seen.update(categories)
+    assert seen == expected.keys()
+    matrices = [op for op in ops if dict(op.metadata).get("quant_category") == "shared_expert"]
+    assert matrices
+    assert all(dict(op.metadata)["weight_format"] == "mxfp4" for op in matrices)
+    assert all(dict(op.metadata)["activation_format"] == "fp8_e4m3" for op in matrices)
+
+def model_case(preset='w8a8_mxfp8'):
+    raw = json.loads((ROOT/'examples/quickstart.json').read_text())
+    raw['model'].update(layers=1, ffn='moe', num_experts=8, top_k=2,
+                        moe_intermediate_size=256, num_shared_experts=1, quantization=preset)
+    raw['machine'] = {'backend': 'ascend', 'sku': 'Ascend950DT_9582', 'num_devices': 4}
+    raw['runtime'].update(tp=2, ep=4, dp=2, graph_mode='none', routing={'policy': 'balanced'})
+    raw['runtime']['kernels'] = {'programs': {'matmul': {'kind': 'steady_matmul'}},
+        'recipes': {'balanced_grouped_down': {'kind': 'ascend_mxfp8_grouped_nz'}}}
+    return raw
+
+@pytest.mark.parametrize('preset', ['w8a8_mxfp8', 'w8a8-mxfp8', 'mxfp8', 'fp8_mxfp8', 'fp8'])
+def test_registered_mx_presets_equal_explicit_operands_but_keep_residuals_bf16(preset):
+    raw = model_case(preset)
+    explicit = deepcopy(raw)
+    explicit['model'].pop('quantization')
+    explicit['model']['quant'] = quant_preset(preset).to_dict()
+    case, reference = parse_case(raw), parse_case(explicit)
+    assert case.model.quant == reference.model.quant
+    assert case.model.activation_dtype == case.model.compute_dtype == 'bf16'
+    assert case.model.weight_dtype == 'fp8_e4m3'
+    kwargs = dict(phase='decode', tokens=1, sequences=2, context=128, scope='body')
+    graphs = target_graphs(case, **kwargs)
+    assert graphs == target_graphs(reference, **kwargs)
+    ops = graphs[0]
+    norms = [op for op in ops if op.family == 'rmsnorm']
+    assert norms and all(op.dtype == 'bf16' for op in norms)
+    matrices = [op for op in ops if dict(op.metadata).get('weight_format') == 'fp8_e4m3']
+    assert matrices and all(op.dtype == 'fp8_e4m3' for op in matrices)
+    assert all(dict(op.metadata)['activation_scale_format'] == 'fp8_e8m0' for op in matrices)
+    assert any(op.family == 'quantize' for op in ops)
+    if preset == 'w8a8_mxfp8':
+        result = graph_costs(case, graphs, input_ready_ms=7, external_inputs={"analysis_input": 7})
+        assert result['duration_ms'] > 0
+        assert result['execution']['live_tasks'] == result['execution']['live_programs'] == 0
+        assert not any(result['execution']['live_allocated'].values())
+        selected = [row for row in result['isolated']['operators']
+                    if row['operator']['recipe'] == 'balanced_grouped_down']
+        assert selected and all(row['program'] == 'OperatorPlan' for row in selected)
+
+def test_explicit_storage_and_residual_dtypes_keep_precedence_over_preset_defaults():
+    raw = model_case()
+    raw['model'].update(weight_dtype='fp16', activation_dtype='fp32',
+                        compute_dtype='fp32', kv_dtype='fp16')
+    model = parse_case(raw).model
+    assert model.weight_dtype == model.quant.weight_format == model.quant.expert_weight_format == "fp16"
+    assert model.kv_dtype == model.quant.kv_dtype == "fp16" and model.activation_dtype == model.compute_dtype == "fp32"
+    explicit = quant_preset('bf16')
+    raw['model']['quant'] = explicit.to_dict()
+    assert parse_case(raw).model.quant == explicit
+
+@pytest.mark.parametrize('name', ['w8a8_fp8', 'fp8_e4m3', 'custom_fp8_unblocked'])
+def test_unregistered_fp8_format_still_requires_a_full_representation(name):
+    raw = model_case(name)
+    with pytest.raises(ModelingError, match='explicit_quant_block_and_scale_geometry'):
+        parse_case(raw)
+    raw['model']['quant'] = quant_preset('w8a8_mxfp8').to_dict()
+    assert parse_case(raw).model.quant.weight_block == (1, 32)
+
+def test_odd_width_packing_and_scale_tails_are_recomputed_after_tensor_sharding():
+    quant = QuantSpec("declared-fp4", expert_weight_format="mxfp4", expert_block=32)
+    term = WeightTerm("expert", 3, 65, "routed_expert", "expert_down")
+    whole = ParallelSpec()
+    shard = ParallelSpec(tp=2)
+    assert term_payload_bytes(term, quant, whole) == 3 * 33
+    assert term_bytes(term, quant, whole) == 3 * 33 + 3 * 3
+    assert term_payload_bytes(term, quant, shard) == 3 * 17
+    assert term_bytes(term, quant, shard) == 3 * 17 + 3 * 2
+    assert term_bytes(term, quant, shard) * 2 > term_bytes(term, quant, whole)
+    grouped_int4 = replace(quant, expert_weight_format="int4", activation_format="int8", scale_bytes=4)
+    assert term_bytes(term, grouped_int4, whole) == 3 * 33 + 3 * 3 * 4
+    w4a16_int4 = replace(quant, expert_weight_format="int4", activation_format="bf16", scale_bytes=2)
+    assert term_bytes(term, w4a16_int4, whole) == 3 * 33 + 2 * 3 * 3 * 2
+    channel_int4 = replace(grouped_int4, expert_block=1)
+    assert term_bytes(term, channel_int4, whole) == 3 * 33 + 3 * 4
+
+def test_fp8_block_scale_grid_drives_gemm_traffic_without_a_compression_multiplier():
+    quant = QuantSpec("declared-fp8", weight_format="fp8_e4m3",
+                      weight_block=(2, 32), scale_bytes=4)
+    op = gemm_op(op_id="m", deps=(), stage=0, layer=0, requests=(), m=2, n=3, k=65,
+                 quant=quant, category="attn", phase="prefill")
+    assert dict(op.metadata)["packed_weight_bytes"] == 3 * 65 + 2 * 3 * 4
+    assert quant.matrix_payload_bytes(3, 65, "attn") == 3 * 65
+    assert op.flops == 2 * 2 * 3 * 65
+
+def test_engram_source_and_runtime_payloads_decompose_resident_capacity():
+    parsed = Case.from_mapping(memory_case())
+    model = replace(
+        parsed.model, layer_plans=tuple(replace(layer, hc_mult=1) for layer in parsed.model.layer_plans),
+        engram=EngramSpec(tables=(EngramTableSpec(0, 0, 3, 65),), max_ngram=2, heads=1, width=65))
+    for mode, payload, metadata in (
+        ("device_bf16", 3 * 65 * 2, 0),
+        ("device_int8_fp32", 3 * 65, 3 * 3 * 4),
+        ("host_fp8_e8m0", 3 * 65, 3 * 3),
+    ):
+        quant = QuantSpec("declared-table", engram_table_mode=mode)
+        selected = replace(model, quant=quant)
+        included = stage_weight_decomposition(selected, parsed.runtime.parallel)[0]
+        excluded = stage_weight_decomposition(
+            selected, parsed.runtime.parallel, include_engram_tables=False)[0]
+        assert included["payload_bytes"] - excluded["payload_bytes"] == payload
+        assert included["quant_metadata_bytes"] - excluded["quant_metadata_bytes"] == metadata
+        assert included["total_bytes"] == included["payload_bytes"] + included["quant_metadata_bytes"]
+        assert included["total_bytes"] == stage_weight_bytes(selected, parsed.runtime.parallel)[0]
+        assert Memory(replace(parsed, model=selected)).weights[0] == included["total_bytes"]
+        assert quant.matrix_payload_bytes(3, 65, "engram_table", source=True) == 3 * 65
+        assert quant.matrix_bytes(3, 65, "engram_table", source=True) == 3 * 65 + 3 * 3
+
+def test_named_dtype_preset_controls_each_cache_and_weight_format():
+    case = parse_case(compose_case(
+        "gemma-4-31b", hardware=SPARSE_OFFLOAD_SKU, layers=4, tp=4, ep=1,
+        quant="fp16", prompt_tokens=8, output_tokens=1,
+        graph_capture_mode="none"))
+    quant = case.model.quant
+    assert quant.weight_format == quant.kv_dtype == quant.index_dtype == "fp16"
+    graph = target_graphs(case, phase="decode", tokens=1, context=8, scope="model")
+    assert graph[0]
+
+
+def test_routed_mxfp4_preset_keeps_attn_res_bf16_and_mxfp8_mxfp4_quantizes_latent_moe():
+    q = quant_preset("mxfp4_routed_only")
+    assert q.format_for("routed_expert") == "mxfp4"
+    assert q.linear_method("routed_expert") == "mx_fp4"
+    assert q.format_for("latent_moe") == "bf16"
+    assert q.linear_method("latent_moe") == "dense"
+    assert q.format_for("attn_res_proj") == "bf16"
+    assert q.linear_method("attn_res_proj") == "dense"
+    for excluded in ("attn", "mla", "kda", "shared_expert", "dense_mlp", "router", "norm", "lm_head", "embedding", "vision", "attn_res_proj", "latent_moe"):
+        assert q.format_for(excluded) == "bf16"
+        assert q.linear_method(excluded) == "dense"
+
+    case = parse_case(compose_case(
+        "kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=4, tp=8, ep=32, dcp=8, prompt_tokens=1024, output_tokens=16, concurrency=2,
+    ))
+    terms = layer_weight_terms(case.model.layer_plans[1], case.model)
+    by_name = {t.name: t for t in terms}
+    assert by_name["attn_res_proj"].category == "attn_res_proj"
+    assert by_name["mlp_res_proj"].category == "attn_res_proj"
+    assert by_name["latent_down"].category == "latent_moe"
+    assert by_name["latent_up"].category == "latent_moe"
+    assert term_bytes(by_name["attn_res_proj"], case.model.quant, case.runtime.parallel) == 14336
+    assert term_bytes(by_name["latent_down"], case.model.quant, case.runtime.parallel) == 2 * 3584 * 7168
+    q_prod = quant_preset("mxfp8_mxfp4")
+    assert term_bytes(by_name["attn_res_proj"], q_prod, case.runtime.parallel) == 14336
+    assert term_bytes(by_name["latent_down"], q_prod, case.runtime.parallel) == 26492928
+
+
+def test_production_mxfp8_mxfp4_preset_and_hardware_aware_quant_selection():
+    q = quant_preset("mxfp8_mxfp4")
+    assert q.format_for("attn") == "fp8_e4m3"
+    assert q.format_for("shared_expert") == "fp8_e4m3"
+    assert q.format_for("routed_expert") == "mxfp4"
+    assert q.format_for("latent_moe") == "fp8_e4m3"
+    assert q.linear_method("latent_moe") == "mx_fp8"
+    assert q.format_for("attn_res_proj") == "bf16"
+    assert q.linear_method("attn_res_proj") == "dense"
+    assert q.format_for("norm") == "bf16" and q.format_for("router") == "bf16"
+
+    moe_spec = load_model("kimi-k3.1")
+    dense_spec = load_model("qwen3-32b")
+    for legacy_key in ("a2", "a3"):
+        wq_m, kv_m, _ = resolve_auto_va_quant(moe_spec, REPRESENTATIVE_SKUS[legacy_key], context_tokens=65536)
+        wq_d, kv_d, _ = resolve_auto_va_quant(dense_spec, REPRESENTATIVE_SKUS[legacy_key], context_tokens=65536)
+        assert wq_m == "w4a8" and kv_m == "int8"
+        assert wq_d == "w8a8" and kv_d == "int8"
+    wq_a5_m, kv_a5_m, _ = resolve_auto_va_quant(moe_spec, REPRESENTATIVE_SKUS["a5"], context_tokens=65536)
+    wq_a5_d, kv_a5_d, _ = resolve_auto_va_quant(dense_spec, REPRESENTATIVE_SKUS["a5"], context_tokens=65536)
+    assert wq_a5_m == "mxfp8_mxfp4" and kv_a5_m == "fp8_e4m3"
+    assert wq_a5_d == "mxfp8" and kv_a5_d == "fp8_e4m3"
+
+
+def test_dynamic_quant_exclusions_mxfp4_all_and_a5_recommended_profiles() -> None:
+    from mindie_sim.stacks.vllm_ascend import profiles
+
+    for preset_name in ("w8a8", "w4a8"):
+        q = quant_preset(preset_name)
+        for excluded in ("router", "mhc", "compressor"):
+            assert excluded in q.exclusions, (preset_name, excluded)
+        assert q.format_for("router") == "bf16"
+        assert q.format_for("compressor") == "bf16"
+        assert q.format_for("mhc") == "fp32"
+
+    assert quant_preset("mxfp4_all").exclusions == ()
+    assert not hasattr(profiles, "VA_RECOMMENDED_PROFILES")
+
+
+def test_before_baseline_honesty_mc2_megamoe_and_a3_int8_kv_mlapo() -> None:
+    from mindie_sim.feature_mechanisms import (
+        MECHANISM_CATALOG,
+        MechanismContext,
+        resolve_runtime_stack,
+        resolve_stack_track,
+    )
+
+    # A3 INT8-KV MLA enables packed-layout mla_prolog_v3.
+    a3_case = compose_case(
+        "deepseek-v3", hardware=REPRESENTATIVE_SKUS["a3"], layers=4,
+        dp=1, tp=8, ep=8, quant="w8a8", kv_cache_dtype="int8",
+        prompt_tokens=32, output_tokens=2,
+    )
+    a3_prolog = a3_case["runtime"]["kernels"]["lowerings"]["mla_prolog"]
+    assert a3_prolog["implementation"] == "vllm_ascend_mla_prolog_v3"
+    assert a3_prolog["options"]["cache_layout"] == "packed_int8_bf16_rope_fp32_scale"
+
+    # enable_fused_mc2=0 suppresses MC2 & MegaMoE on Before, while expected_ideal
+    # unlocks profile workarounds (yet still respects caller-explicit disable).
+    va_profile = resolve_runtime_stack("vllm-ascend")
+    situ_model = replace(load_model("kimi-k3.1"), quant=quant_preset("mxfp8_mxfp4"))
+    ctx_profile_disabled = MechanismContext(
+        model=situ_model, sku=REPRESENTATIVE_SKUS["a5"], arch="a5",
+        parallel={"dp": 2, "tp": 8, "ep": 16, "pcp": 1, "dcp": 8},
+        caller_explicit=frozenset(), options={"enable_fused_mc2": 0},
+    )
+    for mech_id in ("cann_megamoe_fusion", "tp_mc2_overlap", "dynamic_mc2_dispatch"):
+        assert MECHANISM_CATALOG[mech_id].eligible(ctx_profile_disabled) is False
+
+    res_merged = resolve_stack_track(
+        va_profile, track="shipping", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
+    )
+    merged_ids = {entry["id"] for entry in res_merged["active_mechanisms"]}
+    assert "cann_megamoe_fusion" not in merged_ids
+    assert "tp_mc2_overlap" not in merged_ids
+
+    res_ideal = resolve_stack_track(
+        va_profile, track="target", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
+    )
+    ideal_ids = {entry["id"] for entry in res_ideal["active_mechanisms"]}
+    assert "cann_megamoe_fusion" in ideal_ids
+    assert "tp_mc2_overlap" in ideal_ids
+    assert "wy_cube_speculative_verify" in ideal_ids
+
+    ctx_caller_disabled = replace(
+        ctx_profile_disabled, caller_explicit=frozenset({"enable_fused_mc2"}),
+    )
+    res_ideal_locked = resolve_stack_track(
+        va_profile, track="target", model_key="kimi-k3.1", ctx=ctx_caller_disabled,
+    )
+    locked_ids = {entry["id"] for entry in res_ideal_locked["active_mechanisms"]}
+    assert "cann_megamoe_fusion" not in locked_ids
+    assert "tp_mc2_overlap" not in locked_ids
+
+
+def test_dict_and_quantspec_mixed_dense_expert_and_explicit_kv_dtype_parity() -> None:
+    """Mapping quant preserves dense vs expert weight distinction and explicit kv_dtype across stacks."""
+    from math import prod
+    from mindie_sim.compose.runtime import resolve_case_contracts
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.common import dtype_bytes
+
+    mixed_fields = dict(
+        name="mixed",
+        weight_format="bf16",
+        expert_weight_format="int4",
+        activation_format="bf16",
+    )
+    for quant in (QuantSpec(**mixed_fields), mixed_fields):
+        case = parse_case(compose_case("qwen3-30b-a3b", hardware="a3", tp=1, layers=2, quant=quant))
+        ports = dict(resolve_case_contracts(case)[1].port_abis)
+        assert ports[("target", 0, "q_proj")].weight_dtype == "bf16", type(quant).__name__
+        assert ports[("target", 0, "mlp.experts.w13")].weight_dtype == "int4", type(quant).__name__
+        elements = case.model.hidden_size * case.model.num_heads * case.model.head_dim
+        assert int(elements * dtype_bytes(ports[("target", 0, "q_proj")].weight_dtype)) == 2 * elements
+
+    kv_quant = dict(name="bf16", weight_format="bf16", kv_dtype="int8")
+    for stack in ("raw-eager", "ideal-target", "vllm-ascend"):
+        case = parse_case(compose_case(
+            "qwen3-32b", hardware="a3", tp=1, layers=1, quant=kv_quant, runtime_stack=stack,
+        ))
+        page = resolve_case_contracts(case)[1].kv_cache_abi[0]
+        payload_planes = [p for p in page.planes if p.plane_kind == "payload"]
+        expected = 2 * case.model.num_kv_heads * case.model.head_dim * page.kv_block_size
+        assert payload_planes[0].dtype == "int8", stack
+        assert sum(p.exact_bytes() for p in payload_planes) == expected, stack
+
+        ov_case = parse_case(compose_case(
+            "qwen3-32b", hardware="a3", tp=1, layers=1,
+            quant=kv_quant, kv_cache_dtype="bf16", runtime_stack=stack,
+        ))
+        ov_page = resolve_case_contracts(ov_case)[1].kv_cache_abi[0]
+        assert ov_page.planes[0].dtype == "bf16", stack
+
+        curated_ov = parse_case(compose_case(
+            "qwen3.8-27b", hardware="a5", tp=1, layers=4,
+            quant="auto", kv_cache_dtype="bf16", runtime_stack=stack,
+        ))
+        sc_ov, q_ov, _ = resolve_case_contracts(curated_ov)
+        pl_ov = [p for p in q_ov.kv_cache_abi[0].planes if p.plane_kind == "payload"]
+        assert sc_ov.model.kv_dtype == "bf16" and pl_ov[0].dtype == "bf16", stack
+        assert sum(p.exact_bytes() for p in pl_ov) == 2 * prod(pl_ov[0].logical_shape), stack
+
+    uniform_int4 = QuantSpec(
+        name="uniform-int4", weight_format="int4", expert_weight_format="int4",
+        activation_format="int8", expert_block=1, weight_block=(1, 1),
+    )
+    inv_w_only = QuantSpec(
+        name="inv-w-only", weight_format="int4", expert_weight_format="int8", activation_format="bf16",
+    )
+    for stack in ("raw-eager", "ideal-target"):
+        c_u4 = parse_case(compose_case(
+            "qwen3-30b-a3b", hardware="a3", tp=1, layers=1, quant=uniform_int4, runtime_stack=stack,
+        ))
+        p_u4 = dict(resolve_case_contracts(c_u4)[1].port_abis)
+        assert p_u4[("target", 0, "self_attn.q_proj")].weight_dtype == "int4", stack
+        assert p_u4[("target", 0, "mlp.experts.0.gate_proj")].weight_dtype == "int4", stack
+
+        c_inv = parse_case(compose_case(
+            "qwen3-30b-a3b", hardware="a3", tp=1, layers=1, quant=inv_w_only, runtime_stack=stack,
+        ))
+        p_inv = dict(resolve_case_contracts(c_inv)[1].port_abis)
+        assert p_inv[("target", 0, "self_attn.q_proj")].weight_dtype == "int4", stack
+        assert p_inv[("target", 0, "mlp.experts.0.gate_proj")].weight_dtype == "int8", stack
+
+
+def test_checkpoint_cache_scope_tie_break_inline_quant_and_draft_isolation() -> None:
+    """Checkpoint reader keeps draft/target cache scopes isolated, honors defaults, ties, inline tags, and draft isolation."""
+    from mindie_sim.catalog.checkpoint_reader import quant_spec_from_checkpoint_map, read_checkpoint_quant_map
+    from mindie_sim.catalog.draft import draft_quant
+    from mindie_sim.catalog.quant import projection_quant
+    from mindie_sim.schema.common import dtype_bytes
+    from mindie_sim.schema.model import LayerPlan
+    from mindie_sim.schema.stack import resolve_checkpoint_cache_abis
+
+    # Draft layer 0 cache tag never overwrites target layer 0 regardless of insertion order.
+    items = [("model.layers.0.self_attn.quant_type", "C8"), ("mtp.layers.0.self_attn.quant_type", "FLOAT")]
+    lp0 = LayerPlan(index=0, native_layer_id=0, attention="gqa", ffn="dense", num_heads=2, num_kv_heads=1, head_dim=64)
+    for order in (items, items[::-1]):
+        abis, _, _ = resolve_checkpoint_cache_abis(
+            (lp0,), read_checkpoint_quant_map(dict(order)), ParallelSpec(), "bf16",
+            role="colocated", phase="decode", kv_block_size=16,
+        )
+        assert sum(p.exact_bytes() for p in abis[0].planes if p.plane_kind == "payload") == 2 * 16 * 64
+
+    # Single layer exception preserves checkpoint-wide KV default on untouched layers.
+    qmap_def = read_checkpoint_quant_map({"kv_cache_type": "C8", "model.layers.1.self_attn.quant_type": "FLOAT"})
+    lps = tuple(
+        LayerPlan(index=i, native_layer_id=i, attention="gqa", ffn="dense",
+                  num_heads=2, num_kv_heads=1, head_dim=64, kv_owner_layer_id=i)
+        for i in range(2)
+    )
+    abis_def, _, _ = resolve_checkpoint_cache_abis(
+        lps, qmap_def, ParallelSpec(), "bf16", role="colocated", phase="decode", kv_block_size=16,
+    )
+    assert [sum(p.exact_bytes() for p in abi.planes if p.plane_kind == "payload") for abi in abis_def] == [2048, 4096]
+
+    # Equal-frequency BF16 vs INT8 projections preserve both layers without dropping BF16 on tie.
+    tie_desc = {f"model.layers.{i}.self_attn.o_proj.weight": tag for i, tag in enumerate(("FLOAT", "W8A8_DYNAMIC"))}
+    q_tie = quant_spec_from_checkpoint_map(read_checkpoint_quant_map(tie_desc, base_config={"torch_dtype": "bfloat16"}))
+    plans_tie = [
+        LayerPlan(index=i, native_layer_id=i, attention="gqa", ffn="dense", num_heads=4, num_kv_heads=2, head_dim=16)
+        for i in range(2)
+    ]
+    assert [int(projection_quant(q_tie, p).matrix_payload_bytes(64, 64, "attn.o")) for p in plans_tie] == [8192, 4096]
+
+    # Inline and metadata-only quant_method="ascend" resolve INT8 instead of degrading to BF16.
+    for qc in (
+        {"quant_method": "ascend", "model_quant_type": "W8A8_DYNAMIC", "model.layers.0.mlp.down_proj.weight": "W8A8_DYNAMIC"},
+        {"quant_method": "ascend", "model_quant_type": "W8A8_DYNAMIC"},
+    ):
+        q_asc = quant_spec_from_checkpoint_map(read_checkpoint_quant_map({"torch_dtype": "bfloat16", "quantization_config": qc}))
+        assert q_asc.weight_format == "int8"
+        assert int(q_asc.matrix_payload_bytes(128, 128, "dense_mlp", source=True)) == 128 * 128
+
+    # W4A4_DYNAMIC publishes packed 4-bit activation ABI.
+    q_w4a4 = quant_spec_from_checkpoint_map(
+        read_checkpoint_quant_map({"model.layers.0.self_attn.o_proj.weight": "W4A4_DYNAMIC"})
+    ).for_category("attn.o")
+    assert q_w4a4.activation_format == "int4" and int(128 * dtype_bytes(q_w4a4.activation_format)) == 64
+
+    # Weight-only compressed-tensors FP8 preserves native BF16 activations and resolves tensor ABI cleanly.
+    from mindie_sim.schema.stack import resolve_checkpoint_tensor_abi
+    w8a16_cfg = dict(
+        quant_method="compressed-tensors",
+        format="float-quantized",
+        config_groups={"g": dict(
+            targets=["Linear"],
+            weights=dict(type="float", num_bits=8, strategy="channel", dynamic=False, symmetric=True),
+            input_activations=None,
+        )},
+    )
+    qmap_w8a16 = read_checkpoint_quant_map(w8a16_cfg, base_config={"torch_dtype": "bfloat16"})
+    q_w8a16 = quant_spec_from_checkpoint_map(qmap_w8a16)
+    assert q_w8a16.activation_format == "bf16" and int(128 * dtype_bytes(q_w8a16.activation_format)) == 256
+    abi_w8a16 = resolve_checkpoint_tensor_abi(qmap_w8a16.rules[0].raw_tag, "bf16", qmap_w8a16.rules[0])
+    assert abi_w8a16.weight_dtype == "fp8_e4m3" and abi_w8a16.input_dtype == "bf16"
+
+    # Layer-scoped FLOAT KV exception projects onto QuantSpec so capacity matches ABI, inline Ascend keeps
+    # modules_to_not_convert, and minority FLOAT inside QKV does not downgrade majority-INT8 attn.qkv.
+    from mindie_sim.catalog.cache import layer_cache_components
+    from mindie_sim.schema.model import ModelSpec
+    qmap_mix_kv = read_checkpoint_quant_map({
+        "kv_cache_type": "C8", "model.layers.1.self_attn.quant_type": "FLOAT",
+    })
+    m_mix_kv = ModelSpec("mix", 2, 256, 2, 128, 256, 128, num_kv_heads=1,
+                         quant=quant_spec_from_checkpoint_map(qmap_mix_kv))
+    p_l1 = LayerPlan(index=1, native_layer_id=1, num_heads=2, num_kv_heads=1, head_dim=128, kv_owner_layer_id=1)
+    assert layer_cache_components(m_mix_kv, p_l1, ParallelSpec(), 16, capacity_padded=False)["gqa_kv"] == 8192.0
+
+    qmap_ign = read_checkpoint_quant_map({"torch_dtype": "bfloat16", "quantization_config": {
+        "quant_method": "ascend", "model_quant_type": "W8A8_DYNAMIC",
+        "model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+        "modules_to_not_convert": ["model.layers.0.self_attn.o_proj"],
+    }})
+    p_l0 = LayerPlan(index=0, native_layer_id=0, num_heads=1, num_kv_heads=1, head_dim=64)
+    assert qmap_ign.ignored_modules == ("model.layers.0.self_attn.o_proj",)
+    assert int(projection_quant(quant_spec_from_checkpoint_map(qmap_ign), p_l0).matrix_payload_bytes(64, 64, "attn.o")) == 8192
+
+    qmap_qkv = read_checkpoint_quant_map({
+        "model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.self_attn.k_proj.weight": "FLOAT",
+        "model.layers.0.self_attn.v_proj.weight": "W8A8_DYNAMIC",
+    })
+    assert int(projection_quant(quant_spec_from_checkpoint_map(qmap_qkv), p_l0).matrix_payload_bytes(192, 64, "attn.qkv")) == 192 * 64
+
+    # Target-layer quantization overrides do not cross into an independent BF16 draft by layer index.
+    raw_draft = compose_case("kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], tp=8, ep=8, layers=4, quant="bf16")
+    raw_draft["model"]["quant"]["layer_quant_overrides"] = {
+        "layers": {"0": {"weight_format": "int8", "activation_format": "int8"}}
+    }
+    m_draft = parse_case(raw_draft).model
+    d_spec = m_draft.auxiliary.dspark
+    qd = projection_quant(draft_quant(m_draft, d_spec), d_spec.layer_plans[0])
+    assert qd.format_for("dense_mlp") == "bf16"
+    assert int(qd.matrix_payload_bytes(d_spec.intermediate_size, d_spec.hidden_size, "dense_mlp")) == (
+        2 * d_spec.intermediate_size * d_spec.hidden_size
+    )
+
+    # Explicitly quantized lm_head is not silently dropped via default unquantized exclusions.
+    q_lm = quant_spec_from_checkpoint_map(read_checkpoint_quant_map(
+        {"model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC", "lm_head.weight": "W8A8_DYNAMIC"},
+        base_config={"torch_dtype": "bfloat16"},
+    ))
+    assert "lm_head" not in q_lm.exclusions
+    assert "lm_head" in dict(q_lm.category_overrides)
+    assert q_lm.for_category("lm_head").weight_format == "int8"
+
+    q_lm_float = quant_spec_from_checkpoint_map(read_checkpoint_quant_map(
+        {"model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC", "lm_head.weight": "FLOAT"},
+        base_config={"torch_dtype": "bfloat16"},
+    ))
+    assert "lm_head" in q_lm_float.exclusions and "lm_head" not in dict(q_lm_float.category_overrides)
+
+    q_lm_hf = quant_spec_from_checkpoint_map(read_checkpoint_quant_map({
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            "quant_method": "ascend",
+            "model_quant_type": "W8A8_DYNAMIC",
+            "model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+            "lm_head.weight": "W8A8_DYNAMIC",
+        },
+    }))
+    assert "lm_head" not in q_lm_hf.exclusions and q_lm_hf.for_category("lm_head").weight_format == "int8"
+
+
+def test_dense_mlp_projection_exclusions_and_expert_dtype_aliases() -> None:
+    """Excluding mlp.down_proj exempts only down_proj while preserving flat dense_mlp compat and expert_dtype aliases."""
+    from mindie_sim.catalog.checkpoint_reader import (
+        lookup_curated_checkpoint,
+        quant_spec_from_checkpoint_map,
+        read_checkpoint_quant_map,
+    )
+    from mindie_sim.catalog.hf_config import resolve_quant, resolve_role_exclusions
+    from mindie_sim.catalog.weight_layer_terms import _layer_resolved_quant
+    from mindie_sim.prediction.feedforward import dense
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+
+    roles_down, unres_down = resolve_role_exclusions((r"re:.*mlp\.down_proj.*",))
+    assert roles_down == ("dense_mlp.down",) and unres_down == ()
+    roles_gu, unres_gu = resolve_role_exclusions((r"re:.*mlp\.(gate|up)_proj.*",))
+    assert roles_gu == ("dense_mlp.gate", "dense_mlp.up") and unres_gu == ()
+    roles_all, unres_all = resolve_role_exclusions((r"re:.*mlp\.(gate|up|down)_proj.*",))
+    assert roles_all == ("dense_mlp",) and unres_all == ()
+
+    int4_cfg = {
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "ignore": ["lm_head", r"re:.*mlp\.down_proj.*"],
+            "config_groups": {
+                "g0": {
+                    "targets": ["Linear"],
+                    "format": "pack-quantized",
+                    "weights": {
+                        "num_bits": 4, "type": "int", "strategy": "group",
+                        "group_size": 128, "symmetric": True, "dynamic": False,
+                    },
+                    "input_activations": None,
+                },
+            },
+        },
+    }
+    q_int4, gaps = resolve_quant(int4_cfg)
+    assert gaps == []
+    assert q_int4.format_for("dense_mlp.gate") == "int4"
+    assert q_int4.format_for("dense_mlp.up") == "int4"
+    assert q_int4.format_for("dense_mlp.down") == "bf16"
+    assert q_int4.format_for("dense_mlp") == "int4"
+
+    q_hf_reader = quant_spec_from_checkpoint_map(read_checkpoint_quant_map(int4_cfg))
+    assert q_hf_reader.format_for("dense_mlp.gate") == "int4"
+    assert q_hf_reader.format_for("dense_mlp.up") == "int4"
+    assert q_hf_reader.format_for("dense_mlp.down") == "bf16"
+
+    plan0 = LayerPlan(
+        index=0, native_layer_id=0, attention="gqa", ffn="dense",
+        num_heads=4, num_kv_heads=2, head_dim=64, intermediate_size=512,
+    )
+    model_int4 = ModelSpec(
+        "synth-dense-split", 1, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(plan0,), quant=q_int4,
+    )
+    par1 = ParallelSpec(tp=1)
+    terms = {term.name: term for term in layer_weight_terms(plan0, model_int4)}
+    assert int(term_payload_bytes(terms["dense_gate"], q_int4, par1)) == 512 * 256 // 2
+    assert int(term_payload_bytes(terms["dense_up"], q_int4, par1)) == 512 * 256 // 2
+    assert int(term_payload_bytes(terms["dense_down"], q_int4, par1)) == 256 * 512 * 2
+
+    ops, _ = dense(
+        prefix="s0.l0", plan=plan0, deps="in", stage=0, requests=("r0",),
+        tokens=8, model=model_int4, parallel=par1, mode="prefill",
+    )
+    by_id = {op.op_id: op for op in ops}
+    assert dict(by_id["s0.l0.gate_up"].metadata)["weight_format"] == "int4"
+    assert dict(by_id["s0.l0.down"].metadata)["weight_format"] == "bf16"
+
+    # Asymmetric gate vs up precision splits gate and up GEMMs with exact FLOP conservation.
+    q_gate_only = QuantSpec("w4", weight_format="int4", activation_format="bf16", exclusions=("dense_mlp.gate",))
+    m_gate_only = ModelSpec(
+        "synth-gate-split", 1, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(plan0,), quant=q_gate_only,
+    )
+    split_ops, _ = dense(
+        prefix="s0.l0", plan=plan0, deps="in", stage=0, requests=("r0",),
+        tokens=8, model=m_gate_only, parallel=par1, mode="prefill",
+    )
+    split_by_id = {op.op_id: op for op in split_ops}
+    assert dict(split_by_id["s0.l0.gate"].metadata)["weight_format"] == "bf16"
+    assert dict(split_by_id["s0.l0.up"].metadata)["weight_format"] == "int4"
+    assert dict(split_by_id["s0.l0.down"].metadata)["weight_format"] == "int4"
+    assert split_by_id["s0.l0.gate"].flops + split_by_id["s0.l0.up"].flops == by_id["s0.l0.gate_up"].flops
+
+    # Flat dense_mlp exclusion/override remains backward-compatible across all three sub-projections.
+    q_flat = QuantSpec("w4", weight_format="int4", activation_format="bf16", exclusions=("dense_mlp",))
+    assert (
+        q_flat.format_for("dense_mlp.gate")
+        == q_flat.format_for("dense_mlp.up")
+        == q_flat.format_for("dense_mlp.down")
+        == "bf16"
+    )
+
+    # ModelSlim per-layer down_proj exception isolates down_proj while whole-MLP exceptions coalesce.
+    q_mix_layer = quant_spec_from_checkpoint_map(read_checkpoint_quant_map({
+        "model.layers.0.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.up_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.down_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.1.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.1.mlp.up_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.1.mlp.down_proj.weight": "FLOAT",
+    }, base_config={"torch_dtype": "bfloat16"}))
+    plan1 = replace(plan0, index=1, native_layer_id=1)
+    m_mix = ModelSpec(
+        "synth-mix", 2, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(plan0, plan1), quant=q_mix_layer,
+    )
+    q_l1 = _layer_resolved_quant(m_mix, plan1)
+    assert q_l1.format_for("dense_mlp.gate") == "int8"
+    assert q_l1.format_for("dense_mlp.up") == "int8"
+    assert q_l1.format_for("dense_mlp.down") == "bf16"
+
+    g4_spec = quant_spec_from_checkpoint_map(lookup_curated_checkpoint("Eco-Tech/gemma-4-31B-it-w4a4-mxfp4"))
+    plan9 = replace(plan0, index=9, native_layer_id=9)
+    m_g4 = ModelSpec(
+        "synth-g4", 10, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(plan9,), quant=g4_spec,
+    )
+    assert g4_spec.format_for("dense_mlp") == "mxfp4"
+    assert _layer_resolved_quant(m_g4, plan9).format_for("dense_mlp") == "bf16"
+
+    # HF FP8 expert_dtype aliases normalize cleanly without rejecting canonical dtype spellings.
+    for raw_exp, expected in (
+        ("bfloat16", "bf16"), ("float16", "fp16"), ("fp32", "fp32"), ("fp8_e5m2", "fp8_e5m2"),
+    ):
+        qm_exp = read_checkpoint_quant_map({
+            "torch_dtype": "bfloat16",
+            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3", "expert_dtype": raw_exp},
+        })
+        assert quant_spec_from_checkpoint_map(qm_exp).format_for("routed_expert") == expected
+
+    # Regex ignore matches runtime tensor lookup and preserves anchored layer coordinates.
+    qm_re_down = read_checkpoint_quant_map(int4_cfg)
+    assert qm_re_down.resolve_exception_or_ignored("model.layers.0.mlp.down_proj.weight", source_native_layer_id=0) == "FLOAT"
+    assert qm_re_down.resolve_exception_or_ignored("model.layers.0.mlp.gate_proj.weight", source_native_layer_id=0) is None
+    anchored_cfg = {
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            **int4_cfg["quantization_config"],
+            "ignore": ["lm_head", r"re:^model\.layers\.0\.mlp\.down_proj$"],
+        },
+    }
+    qm_anc = read_checkpoint_quant_map(anchored_cfg)
+    assert qm_anc.resolve_exception_or_ignored("model.layers.0.mlp.down_proj.weight", source_native_layer_id=0) == "FLOAT"
+    assert qm_anc.resolve_exception_or_ignored("model.layers.1.mlp.down_proj.weight", source_native_layer_id=1) is None
+    q_anc = quant_spec_from_checkpoint_map(qm_anc)
+    m_anc = ModelSpec("synth-anc", 2, 256, 4, 64, 512, 1024, num_kv_heads=2, layer_plans=(plan0, plan1), quant=q_anc)
+    assert _layer_resolved_quant(m_anc, plan0).format_for("dense_mlp.down") == "bf16"
+    assert _layer_resolved_quant(m_anc, plan1).format_for("dense_mlp.down") == "int4"
+
+    # Three equal child exclusions do not collapse to an INT4 parent; asymmetric output dtypes emit an explicit cast.
+    q_three = QuantSpec(
+        "w4", weight_format="int4", activation_format="bf16",
+        exclusions=("dense_mlp.gate", "dense_mlp.up", "dense_mlp.down"),
+    )
+    m_three = ModelSpec("synth-three", 1, 64, 2, 32, 64, 512, num_kv_heads=1, layer_plans=(
+        LayerPlan(index=0, native_layer_id=0, attention="gqa", ffn="dense", num_heads=2, num_kv_heads=1, head_dim=32, intermediate_size=64),
+    ), quant=q_three)
+    three_ops, _ = dense(
+        prefix="s0.l0", plan=m_three.layer_plans[0], deps="in", stage=0, requests=("r0",),
+        tokens=1, model=m_three, parallel=par1, mode="decode",
+    )
+    assert all(dict(op.metadata).get("weight_format") == "bf16" for op in three_ops if op.family in {"gate_up_projection", "down_projection"})
+
+    q_fp32_gate = QuantSpec(
+        "bf16", weight_format="bf16", activation_format="bf16",
+        category_overrides=(("dense_mlp.gate", (("output_format", "fp32"),)),),
+    )
+    m_cast = replace(m_three, quant=q_fp32_gate)
+    cast_ops, _ = dense(
+        prefix="s0.l0", plan=m_cast.layer_plans[0], deps="in", stage=0, requests=("r0",),
+        tokens=1, model=m_cast, parallel=par1, mode="decode",
+    )
+    cast_by_id = {op.op_id: op for op in cast_ops}
+    assert "s0.l0.gate.cast" in cast_by_id
+    assert cast_by_id["s0.l0.gate.cast"].mte2_bytes == 64 * 4
+    assert cast_by_id["s0.l0.gate.cast"].mte3_bytes == 64 * 2
+    assert cast_by_id["s0.l0.swiglu"].mte2_bytes == 2 * 64 * 2
+
+    # Expert ignore wins over expert_dtype default; W4A4_DYNAMIC ops emit w4a4_laos + int32 accum + act scales.
+    qm_exp_ign = read_checkpoint_quant_map({
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            "quant_method": "fp8", "fmt": "e4m3", "expert_dtype": "fp8_e5m2",
+            "ignore": ["model.layers.*.mlp.experts"],
+        },
+    })
+    assert quant_spec_from_checkpoint_map(qm_exp_ign).format_for("routed_expert") == "bf16"
+
+    from types import SimpleNamespace
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.catalog.draft_weights import draft_terms
+    from mindie_sim.catalog.ops import gemm_op
+    from mindie_sim.export.memory_ledger import _weight_group_label
+    from mindie_sim.prediction.sharding.local_tp import lower_local_projection_tp
+
+    q_w4a4 = QuantSpec("w4a4_dynamic", weight_format="int4", activation_format="int4", scale_format="fp32")
+    w4_op = gemm_op(
+        op_id="t.w4", deps=(), stage=0, layer=0, requests=("r0",), m=4, n=64, k=64,
+        quant=q_w4a4, category="dense_mlp.down", phase="decode",
+    )
+    assert w4_op.precision_abi is not None and w4_op.precision_abi.linear_method == "w4a4_laos"
+    assert w4_op.precision_abi.accum_dtype == "int32"
+    assert w4_op.precision_abi.activation_quant_mode == "dynamic_per_token"
+    assert dict(w4_op.metadata)["activation_scale_bytes"] > 0.0
+
+    # Draft dense FFN terms and memory ledger honor per-projection dense_mlp.{gate,up,down}.
+    d_spec = DraftSpec(
+        kind="mtp", layers=1, hidden_size=64, intermediate_size=64,
+        num_heads=2, num_kv_heads=1, head_dim=32, q_width=64, kv_width=32,
+    )
+    m_d = replace(m_three, quant=QuantSpec("w4", weight_format="int4", activation_format="bf16", exclusions=("dense_mlp.down",)))
+    d_terms = {t.name: t for t in draft_terms(d_spec, m_d)}
+    assert int(term_payload_bytes(d_terms["draft_down"], m_d.quant, par1)) == 64 * 64 * 2
+    assert int(term_payload_bytes(d_terms["draft_gate"], m_d.quant, par1)) == 64 * 64 // 2
+    assert _weight_group_label("dense_mlp.down") == "Dense FFN"
+
+    # Local-TP rewrites an asymmetric split (gate, up) dense FFN once without duplicating down.
+    lp_moe = LayerPlan(
+        index=1, native_layer_id=1, attention="gqa", ffn="moe", num_heads=4, num_kv_heads=2,
+        head_dim=64, intermediate_size=512, moe_intermediate_size=128, num_experts=4, top_k=2,
+    )
+    m_ltp = ModelSpec(
+        "synth-ltp-split", 2, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, num_experts=4, top_k=2, moe_intermediate_size=128,
+        layer_plans=(plan0, lp_moe), quant=q_gate_only,
+    )
+    par_ltp = ParallelSpec(tp=1, dp=2, mlp_tp=2)
+    rt_ltp = SimpleNamespace(parallel=par_ltp, metadata=())
+    mach_ltp = hardware(2)
+    rew = lower_local_projection_tp(
+        split_ops, model=m_ltp, runtime=rt_ltp, machine=mach_ltp, replica=0, cohort_views={}, scope="target",
+    )
+    rew_ids = [op.op_id for op in rew]
+    assert len(rew_ids) == len(set(rew_ids))
+    assert sum(1 for op in rew if op.family == "allgather") == 1
+    assert sum(1 for op in rew if op.family == "reduce_scatter") == 1
+    assert sum(1 for op in rew if op.family == "down_projection") == 1
+    assert [op.local_shape[1] for op in rew if op.family == "gate_up_projection"] == [256, 256]
+
+
+def test_cache_rule_scope_mxfp8_scale_and_catalog_composition_followups(tmp_path: Path) -> None:
+    """Draft cache scope, per-layer MXFP8 e8m0 scales, phase forwarding, fused vision workspace, draft validation, and standalone quantize_config."""
+    from types import SimpleNamespace
+    from mindie_sim.catalog import paired_sfa as psfa
+    from mindie_sim.catalog.cache_ownership import _paired_sfa_batch_footprint
+    from mindie_sim.catalog.checkpoint_reader import read_checkpoint_quant_map
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.catalog.media import media_geometry
+    from mindie_sim.catalog.types import VisionSpec
+    from mindie_sim.compose.runtime import resolve_case_contracts
+    from mindie_sim.prediction.capacity.residency import _MemoryWorkspaceMixin
+    from mindie_sim.schema.checkpoint import CacheQuantRule, CheckpointProvenance, CheckpointQuantMap
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+    from mindie_sim.schema.stack import resolve_checkpoint_cache_abis
+
+    # 1. CacheQuantRule scope keeps target/draft layer overrides isolated regardless of key order.
+    par1 = ParallelSpec(tp=1)
+    lp_target = LayerPlan(
+        index=0, native_layer_id=0, scope="target", attention="gqa", ffn="dense",
+        num_heads=2, num_kv_heads=1, head_dim=64, kv_owner_layer_id=0,
+    )
+    lp_draft = replace(lp_target, scope="draft")
+    items = [
+        ("kv_cache_type", "C8"),
+        ("model.layers.0.self_attn.quant_type", "C8"),
+        ("mtp.layers.0.self_attn.quant_type", "FLOAT"),
+    ]
+    for ordered in (items, items[::-1]):
+        qmap_sc = read_checkpoint_quant_map(dict(ordered))
+        abis, _, _ = resolve_checkpoint_cache_abis(
+            (lp_target, lp_draft), qmap_sc, par1, "bf16",
+            role="colocated", phase="decode", kv_block_size=16,
+        )
+        assert abis[0].scope == "target" and abis[0].planes[0].dtype == "int8"
+        assert abis[1].scope == "draft" and abis[1].planes[0].dtype == "bf16"
+
+    # Target-only FLOAT override never bleeds onto draft scope.
+    qmap_target_only = read_checkpoint_quant_map({
+        "kv_cache_type": "C8", "model.layers.0.self_attn.quant_type": "FLOAT",
+    })
+    abis_to, _, _ = resolve_checkpoint_cache_abis(
+        (lp_target, lp_draft), qmap_target_only, par1, "bf16",
+        role="colocated", phase="decode", kv_block_size=16,
+    )
+    assert abis_to[0].planes[0].dtype == "bf16" and abis_to[1].planes[0].dtype == "int8"
+
+    # 2. Per-layer MXFP8_DYNAMIC uses e8m0 scales instead of inheriting global fp32/fp16.
+    lp_g0 = replace(lp_target, index=0, native_layer_id=0, kv_owner_layer_id=0)
+    lp_g1 = replace(lp_target, index=1, native_layer_id=1, kv_owner_layer_id=1)
+    qmap_mx = CheckpointQuantMap(
+        provenance=CheckpointProvenance("synthetic/mixed-mxfp8-kv", "modelslim_description"),
+        native_float_dtype="bf16",
+        cache_rule=CacheQuantRule(
+            kv_tag="C8", kv_scale_dtype="fp32", index_tag="INT8", index_scale_dtype="fp16",
+            layer_scoped_kv=((1, "MXFP8_DYNAMIC"),), layer_scoped_index=((1, "MXFP8_DYNAMIC"),),
+            provenance="checkpoint",
+        ),
+    )
+    mx_kv, _, _ = resolve_checkpoint_cache_abis(
+        (lp_g0, lp_g1), qmap_mx, par1, "bf16", role="colocated", phase="decode", kv_block_size=16,
+    )
+    assert [p.dtype for p in mx_kv[1].planes if p.plane_kind == "scale"] == ["e8m0", "e8m0"]
+    lp_mla1 = LayerPlan(
+        index=1, native_layer_id=1, attention="mla", ffn="dense",
+        num_heads=4, num_kv_heads=1, head_dim=128, kv_lora_rank=512,
+        qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+        kv_cache_elements=576, kv_owner_layer_id=1, indexer=True,
+        owns_index_k=True, index_k_owner_layer_id=1, index_heads=4, index_dim=128,
+    )
+    mla_kv, mla_idx, _ = resolve_checkpoint_cache_abis(
+        (lp_mla1,), qmap_mx, par1, "bf16", role="colocated", phase="decode", kv_block_size=16,
+    )
+    assert [p.dtype for p in mla_kv[0].planes if p.plane_kind == "scale"] == ["e8m0"]
+    assert [p.dtype for p in mla_idx[0].planes if p.plane_kind == "scale"] == ["e8m0"]
+
+    # 3. _paired_sfa_batch_footprint forwards explicit phase to page_groups.
+    seen_phases: list[str | None] = []
+    orig_page_groups = psfa.page_groups
+
+    def _spy_page_groups(case, ls, qt, *, phase=None):
+        seen_phases.append(phase)
+        return orig_page_groups(case, ls, qt, phase=phase)
+
+    psfa.page_groups = _spy_page_groups
+    try:
+        c_psfa = parse_case(compose_case(
+            "kimi-k3", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4, layers=4,
+            prompt_tokens=32, output_tokens=8,
+        ))
+        _paired_sfa_batch_footprint(
+            c_psfa,
+            requests=(SimpleNamespace(request_id="r0", kv_len=32, q_len=32, prefix_tokens=0, generation=0),),
+            phase="prefill", padded=True, layer_stages={i: 0 for i in range(4)},
+            stages=1, shared_mode=False,
+        )
+        assert seen_phases == ["prefill"]
+    finally:
+        psfa.page_groups = orig_page_groups
+
+    # 4. Vision workspace omits stale materialized FP32 score bytes (matches fused media.py).
+    vis = VisionSpec(
+        kind="qwen_vl", layers=2, hidden_size=256, intermediate_size=512,
+        num_heads=8, qkv_width=768, patch_size=14, merge_area=4, out_hidden_size=256,
+    )
+    m_vis = ModelSpec(
+        "synth-vis-ws", 1, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(lp_g0,), vision=vis,
+    )
+    vis_case = SimpleNamespace(
+        model=m_vis,
+        runtime=SimpleNamespace(
+            parallel=ParallelSpec(tp=1, pp=1), max_num_batched_tokens=64,
+            max_num_input_tokens=0, max_num_seqs=1, metadata=(), mtp_acceptance_length=1.0,
+        ),
+        workload=SimpleNamespace(
+            requests=(SimpleNamespace(prompt_tokens=16, output_tokens=1, media_tokens=64, media_encoded=False),),
+        ),
+    )
+
+    class _WorkspaceProbe(_MemoryWorkspaceMixin):
+        def __init__(self, target_case):
+            self.case = target_case
+            self.draft_kind = ""
+            self.layer_stage = (0,)
+            self.async_workspace_buffer_multiplier = 1.0
+
+    patches, *_ = media_geometry(vis_case.runtime, vis, 64)
+    expected_tensors = patches * (vis.qkv_width + 2 * vis.hidden_size + 2 * vis.intermediate_size) * 2
+    assert _WorkspaceProbe(vis_case)._workspace(16)[0] == expected_tensors
+
+    # 5. DraftSpec.validate() admits hidden_size and DSpark lowering uses confidence_input_width.
+    d_conf = DraftSpec(
+        kind="dspark", layers=1, hidden_size=256, intermediate_size=512,
+        num_heads=4, num_kv_heads=2, head_dim=64, q_width=256, kv_width=128,
+        block_size=4, markov_rank=64, confidence_enabled=True, confidence_executes=True,
+        confidence_input_width=256, vocab_size=1024,
+    )
+    d_conf.validate()
+    from mindie_sim.prediction.frontend.speculation import _append_dspark_decode_head
+
+    conf_ops: list = []
+    stub_fe = SimpleNamespace(logits=lambda *a, **kw: ([], "logits"))
+    stub_rt = SimpleNamespace(parallel=par1, metadata=(), dspark=None)
+    m_dconf = replace(m_vis, quant=QuantSpec("bf16"))
+    _append_dspark_decode_head(
+        conf_ops, stub_fe, m_dconf, d_conf, m_dconf, m_dconf, stub_rt, stub_rt,
+        (SimpleNamespace(q_len=1),), "prev", prefix="d.", stage=0, requests=("r0",),
+        body_input_rows=1, k_steps=1, spec_method="dspark", hc_collapsed=False,
+    )
+    conf_op = next(op for op in conf_ops if op.family == "confidence")
+    assert conf_op.local_shape == (256,) and conf_op.vector_ops == 512.0
+    with pytest.raises(ModelingError, match="catalog_dspark_confidence_width_invalid"):
+        DraftSpec(
+            kind="dspark", layers=1, hidden_size=256, intermediate_size=512,
+            num_heads=4, num_kv_heads=2, head_dim=64, q_width=256, kv_width=128,
+            block_size=4, markov_rank=64, confidence_enabled=True, confidence_input_width=128,
+        ).validate()
+
+    # 6. Local composition & public reader both read standalone quantize_config.json;
+    #    draft cache metadata survives compose_case -> resolve_case_contracts rehydration;
+    #    explicit SDK QuantSpec exclusions emit runtime down_proj FLOAT exceptions.
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "llama", "num_hidden_layers": 1, "hidden_size": 256,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": 512,
+        "vocab_size": 1024, "torch_dtype": "bfloat16",
+    }), encoding="utf-8")
+    (tmp_path / "quantize_config.json").write_text(
+        json.dumps({"w_bit": 4, "q_group_size": 32, "zero_point": True}), encoding="utf-8",
+    )
+    qmap_dir = read_checkpoint_quant_map(tmp_path)
+    assert qmap_dir.rules[0].weight_dtype == "int4" and qmap_dir.rules[0].group_size == (1, 32)
+    for model_ref in (tmp_path, tmp_path / "config.json"):
+        composed = parse_case(compose_case(
+            model_ref, hardware=REPRESENTATIVE_SKUS["a3"], tp=1, prompt_tokens=16, output_tokens=4,
+        ))
+        assert composed.model.quant.weight_format == "int4"
+        assert composed.model.quant.weight_block == (1, 32)
+        _, q_plan, _ = resolve_case_contracts(composed)
+        ports = dict(q_plan.port_abis)
+        assert ports[("target", 0, "mlp.down_proj")].weight_dtype == "int4"
+        assert ports[("target", 0, "mlp.down_proj")].weight_block == (1, 32)
+
+    ms_dir = tmp_path / "ms_draft_cache"
+    ms_dir.mkdir()
+    (ms_dir / "config.json").write_text((tmp_path / "config.json").read_text(encoding="utf-8"), encoding="utf-8")
+    (ms_dir / "quant_model_description.json").write_text(json.dumps({
+        "model_quant_type": "W8A8_DYNAMIC",
+        "kv_cache_type": "C8",
+        "model.layers.0.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.up_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.down_proj.weight": "W8A8_DYNAMIC",
+        "mtp.layers.0.self_attn.quant_type": "FLOAT",
+        "mtp.layers.0.self_attn.fa_q.scale": "FAQuant",
+    }), encoding="utf-8")
+    qmap_ms = read_checkpoint_quant_map(ms_dir)
+    assert "fa_q.scale" not in qmap_ms.auxiliary_buffers
+    rehyd_case = parse_case(compose_case(
+        ms_dir, hardware=REPRESENTATIVE_SKUS["a3"], tp=1, prompt_tokens=16, output_tokens=4,
+    ))
+    _, rehyd_plan, _ = resolve_case_contracts(rehyd_case)
+    assert rehyd_plan.kv_cache_abi[0].planes[0].dtype == "int8"
+
+    sdk_down_ex = QuantSpec(
+        name="w8a8_dynamic", weight_format="int8", expert_weight_format="int8",
+        activation_format="int8", exclusions=("dense_mlp.down",),
+    )
+    sdk_case = parse_case(compose_case(
+        "qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], tp=1, layers=1,
+        quant=sdk_down_ex, prompt_tokens=16, output_tokens=4,
+    ))
+    _, sdk_plan, _ = resolve_case_contracts(sdk_case)
+    sdk_ports = dict(sdk_plan.port_abis)
+    assert sdk_ports[("target", 0, "mlp.gate_proj")].weight_dtype == "int8"
+    assert sdk_ports[("target", 0, "mlp.down_proj")].weight_dtype == "bf16"
+
+    # Draft-scoped CacheQuantRule never leaks kv_dtype into target QuantSpec.
+    qmap_d_only = CheckpointQuantMap(
+        provenance=CheckpointProvenance("synthetic/draft-only-cache", "modelslim_description"),
+        native_float_dtype="bf16",
+        cache_rule=CacheQuantRule(scope="draft", kv_tag="FLOAT", layer_scoped_kv=((0, "C8"),), provenance="checkpoint"),
+    )
+    from mindie_sim.catalog.checkpoint_reader import quant_spec_from_checkpoint_map
+    assert quant_spec_from_checkpoint_map(qmap_d_only).layer_quant_overrides == ()

@@ -33,7 +33,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mindie_sim.stack_tracks import resolve_runtime_stack  # noqa: E402
+from mindie_sim.feature_mechanisms import resolve_runtime_stack  # noqa: E402
 
 GH_TIMEOUT_SECONDS = 30
 GH_OPEN_LIMIT = 100
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
 
     stack_arg = args.stack
     if str(stack_arg).strip().lower() in {"cann93", "vllm-ascend-cann93"}:
-        from mindie_sim.va_stack_bindings import MANIFEST_PATH
+        from mindie_sim.feature_mechanisms import VLLM_ASCEND_MANIFEST_PATH as MANIFEST_PATH
         stack_arg = MANIFEST_PATH
     profile = resolve_runtime_stack(stack_arg)
     repo = args.repo or profile.repository

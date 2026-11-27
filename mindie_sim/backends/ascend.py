@@ -5,76 +5,147 @@
   assumptions are exposed and can be overridden; they are never measurements.
   Machine transfer declarations merge by channel over the registered profile;
   explicit machine links replace generated links. Transfer-channel ``*_bw_gbps``
-  values retain the historical GB/s meaning. The convenience
-  ``inter_node_bw_gbps``/``intra_node_bw_gbps`` fields are decimal Gb/s unless a
-  ``topology_preset`` is active, in which case they are GB/s like the preset.
+  and convenience ``inter_node_bw_gbps``/``intra_node_bw_gbps`` fields use a
+  single canonical GB/s unit regardless of whether a ``topology_preset`` is set.
   Multi-tier 4P/8P and SuperPod links preserve every declared boundary; a
-  unity bandwidth utilization emits exactly the historical link key set.
+  measured channel rate resolves each generated tier once and a unity
+  bandwidth utilization emits exactly the historical link key set.
 [Timeouts & Locks] Bounded local metadata reads; no device context.
 [Side-Effect Policy] No external writes or probes.
 """
+from __future__ import annotations
+
 from copy import deepcopy
 from functools import lru_cache
 import json
-import math
 from pathlib import Path
-from collections.abc import Mapping
 
 from mindie_sim.schema.common import ModelingError, _positive_float
-from mindie_sim.schema.device_input import machine_device_defaults, merge_device_inputs
+from mindie_sim.schema.device_input import (
+    _deep_merge as _merge_nested, machine_device_defaults, merge_device_inputs,
+)
+from .ascend_channels import (
+    DIRECT_MESH_RANKS,
+    _CONVENIENCE_FIELDS,
+    _apply_convenience,
+    _caller_bandwidth_channels,
+    _generated_links,
+    _merge_channels,
+    _merge_mapping,
+    default_ranks_per_node,
+)
 from .instruction_presets import expand_instruction_presets
 
+# Named topology preset constants (preserving public preset contract).
+# Utilization factors below are explicit nominal preset deratings applied ONLY
+# to uncalibrated nominal peaks when no effective/calibrated channel bandwidth
+# is supplied in ``profiles/ascend.json`` or L0 ``P18_hccl_collective_band``
+# (see ``_ASSUMPTIONS["transfer_bandwidth_precedence"]``).
+A2_STD_RANKS_PER_NODE = 8
+A2_ROCE_PEAK_GBPS = 25.0
+#: Nominal 200GbE RoCE wire-framing derating when uncalibrated (profiles/ascend.json).
+A2_ROCE_UTIL = 0.80
+A2_INTER_LATENCY_US = 10.0
 
-DIRECT_MESH_RANKS = 8
+A3_DIES_PER_PACKAGE = 2
+A3_NODE_RANKS_COMPACT = 8
+A3_NODE_RANKS_FULL = 16
+A3_SUPERPOD_PACKAGES = 384
+A3_SUPERPOD_RANKS = A3_SUPERPOD_PACKAGES * A3_DIES_PER_PACKAGE
+A3_INTRA_PEAK_GBPS = 196.0
+A3_INTRA_BI_PEAK_GBPS = 2 * A3_INTRA_PEAK_GBPS
+#: Nominal A3 intra-node HCCS protocol framing derating when uncalibrated.
+A3_INTRA_UTIL = 0.80
+#: Nominal A3 multi-tier SuperPod UB/HCCS fabric derating when uncalibrated.
+A3_SUPERPOD_UTIL = 0.70
+A3_ROCE_PEAK_GBPS = 25.0
+#: Nominal A3 inter-node RoCE wire-framing derating when uncalibrated.
+A3_ROCE_UTIL = 0.80
+A3_INTRA_LATENCY_US = 1.5
+A3_INTER_NODE_LATENCY_US = 5.0
+A3_SUPERPOD_LATENCY_US = 3.5
+A3_INTER_POD_LATENCY_US = 10.0
 
-_LINK_FIELDS = ("transaction_bytes", "alignment_bytes", "protocol_overhead_bytes",
-                "latency_us", "semantics", "switch_hops", "switch_hop_latency_us",
-                "switch_capacity_bytes_per_ms")
-_BW_FIELDS = ("effective_uni_bw_gbps", "calibrated_uni_bw_gbps",
-              "derived_uni_bw_gbps", "uni_peak_bw_gbps")
-_UTIL_FIELDS = ("bw_utilization", "bw_ratio", "utilization")
-_GENERATED_CHANNELS = {"d2d_intra_4p", "d2d_intra_8p", "d2d_inter_pod"}
-_LINK_SEMANTICS = {"shared", "per_port", "per_pair", "direct", "fully_connected",
-                   "mesh", "switched"}
-_CONVENIENCE = {
-    "inter_node": ("d2d_inter_node", "inter_node_bw_bytes_per_s",
-                   "inter_node_bw_gbps", "inter_node_bw_util",
-                   "inter_node_latency_us"),
-    "intra_node": ("d2d_intra_node", "intra_node_bw_bytes_per_s",
-                   "intra_node_bw_gbps", "intra_node_bw_util",
-                   "intra_node_latency_us"),
-    "intra_package": ("d2d_intra_package", "intra_package_bw_bytes_per_s",
-                      "intra_package_bw_gbps", "intra_package_bw_util",
-                      "intra_package_latency_us"),
+A5_POD_RANKS_PER_NODE = 64
+A5_POD_SUPERPOD_RANKS = 8192
+A5_POD_INTRA_BW_GBPS = 800.0
+#: Nominal A5 Pod intra-domain UB-Direct framing derating when uncalibrated.
+A5_POD_INTRA_UTIL = 0.85
+A5_POD_INTER_POD_BW_GBPS = 100.0
+#: Nominal A5 inter-pod fabric derating when uncalibrated.
+A5_POD_INTER_UTIL = 0.80
+A5_POD_INTER_LATENCY_US = 4.5
+
+A5_SERVER_RANKS_PER_NODE = 8
+A5_SERVER_SUBGROUP_BW_GBPS = 560.0
+A5_SERVER_NODE_BW_GBPS = 640.0
+#: Nominal A5 Server intra-node UB-Direct framing derating when uncalibrated.
+A5_SERVER_INTRA_UTIL = 0.85
+A5_SERVER_INTER_BW_GBPS = 200.0
+#: Nominal A5 Server inter-node RoCE/UB derating when uncalibrated.
+A5_SERVER_INTER_UTIL = 0.80
+
+A5_PCIE_RANKS_PER_NODE = 16
+A5_PCIE_QUAD_BW_GBPS = 288.0
+A5_PCIE_OCTA_BW_GBPS = 128.0
+
+_BYTES_PER_GIB = 1024 ** 3
+A5_DT_425_AIC_CORES = 28
+A5_DT_486_AIC_CORES = 32
+A5_DT_547_AIC_CORES = 36
+A5_DT_96_GIB = 96
+A5_DT_144_GIB = 144
+
+DERIVED_ASCEND_SKUS: dict[str, dict[str, object]] = {
+    "Ascend950DT_425_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_425_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * _BYTES_PER_GIB,
+    },
+    "Ascend950DT_486_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_486_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * _BYTES_PER_GIB,
+    },
+    "Ascend950DT_547_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_547_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * _BYTES_PER_GIB,
+    },
+    "Ascend950DT_547_144": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_547_AIC_CORES,
+        "memory_bytes": A5_DT_144_GIB * _BYTES_PER_GIB,
+    },
 }
-_CONVENIENCE_FIELDS = {
-    "inter_node_bw_gbps", "intra_node_bw_gbps", "intra_package_bw_gbps",
-    "inter_node_bw_util", "intra_node_bw_util", "intra_package_bw_util",
-    "inter_node_latency_us", "intra_node_latency_us", "intra_package_latency_us",
-    "inter_node_bw_bytes_per_s", "intra_node_bw_bytes_per_s",
-    "intra_package_bw_bytes_per_s",
-}
+A5_PCIE_NODE_BW_GBPS = 116.0
+A5_PCIE_ROCE_PEAK_GBPS = 50.0
+A5_PCIE_INTRA_LATENCY_US = 2.0
+A5_PCIE_INTER_LATENCY_US = 8.0
+
 _PRESERVED_TOPOLOGY_FIELDS = (
     "intra_bw_4p_gbps", "intra_bw_8p_gbps", "superpod_size", "max_dies",
     "superpod_bw_gbps", "inter_pod_bw_gbps", "superpod_latency_us",
     "inter_pod_latency_us", "topology_preset",
 )
 _TOPOLOGY_FIELDS = _CONVENIENCE_FIELDS | set(_PRESERVED_TOPOLOGY_FIELDS)
+_PRESET_ARCH_PREFIXES = {"a2": "a2_", "a3": "a3_", "a5": "a5_"}
+
+
 _ASSUMPTIONS = {
     "transfer_bandwidth_units": (
-        "inter_node_bw_gbps/intra_node_bw_gbps are decimal Gb/s and divided by 8 "
-        "unless a topology_preset is selected; preset bandwidths, "
-        "intra_package_bw_gbps, intra_bw_4p/8p_gbps, superpod_bw_gbps and "
-        "inter_pod_bw_gbps are GB/s; inter_node_bw_bytes_per_s/ "
-        "intra_node_bw_bytes_per_s are B/s and win over same-layer Gb/s; "
-        "transfer_channels.*_bw_gbps and Link.capacity_gbps keep the historical "
-        "GB/s meaning"
+        "All *_bw_gbps convenience, preset, transfer_channels, and "
+        "Link.capacity_gbps fields use canonical GB/s; *_bw_bytes_per_s fields "
+        "use B/s and win over same-layer GB/s"
     ),
     "transfer_bandwidth_precedence": (
         "explicit machine.links > explicit transfer_channels channel bandwidth > "
         "convenience bytes_per_s > same-layer Gb/s > profile effective; within a "
         "channel explicit effective > explicit calibrated > explicit derived > "
-        "explicit uni_peak, and null preserves unknown/disabled semantics"
+        "explicit uni_peak, and null preserves unknown/disabled semantics. An "
+        "effective/calibrated value resolves the tier's service capacity once: "
+        "preset utilization derates only a nominal peak, and 4P/8P links inherit "
+        "the measured node capacity"
     ),
     "transfer_channel_scope": (
         "Only d2d_intra_package, d2d_intra_node and d2d_inter_node generate "
@@ -91,55 +162,81 @@ _ASSUMPTIONS = {
 
 ASCEND_TOPOLOGY_PRESETS: dict[str, dict[str, object]] = {
     "a2_standard": {
-        "ranks_per_node": 8, "dies_per_package": 1,
-        "intra_node_bw_gbps": 196.0, "intra_node_bw_util": 0.70,
-        "inter_node_bw_gbps": 25.0, "inter_node_bw_util": 0.80,
-        "intra_node_latency_us": 2.0, "inter_node_latency_us": 10.0,
+        "ranks_per_node": A2_STD_RANKS_PER_NODE, "dies_per_package": 1,
+        "inter_node_bw_gbps": A2_ROCE_PEAK_GBPS,
+        "inter_node_bw_util": A2_ROCE_UTIL,
+        "inter_node_latency_us": A2_INTER_LATENCY_US,
     },
     "a3_8p": {
-        "ranks_per_node": 8, "dies_per_package": 2,
-        "intra_bw_4p_gbps": 392.0,
-        "intra_node_bw_gbps": 392.0, "intra_node_bw_util": 0.80,
-        "inter_node_bw_gbps": 50.0, "inter_node_bw_util": 0.80,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
+        "ranks_per_node": A3_NODE_RANKS_COMPACT,
+        "dies_per_package": A3_DIES_PER_PACKAGE,
+        "intra_bw_4p_gbps": A3_INTRA_PEAK_GBPS,
+        "intra_node_bw_gbps": A3_INTRA_PEAK_GBPS,
+        "intra_node_bw_util": A3_INTRA_UTIL,
+        "inter_node_bw_gbps": A3_ROCE_PEAK_GBPS,
+        "inter_node_bw_util": A3_ROCE_UTIL,
+        "intra_node_latency_us": A3_INTRA_LATENCY_US,
+        "inter_node_latency_us": A3_INTER_NODE_LATENCY_US,
     },
     "a3_16p": {
-        "ranks_per_node": 16, "dies_per_package": 2,
-        "intra_bw_4p_gbps": 392.0, "intra_bw_8p_gbps": 392.0,
-        "intra_node_bw_gbps": 392.0, "intra_node_bw_util": 0.80,
-        "inter_node_bw_gbps": 50.0, "inter_node_bw_util": 0.80,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
+        "ranks_per_node": A3_NODE_RANKS_FULL,
+        "dies_per_package": A3_DIES_PER_PACKAGE,
+        "intra_bw_4p_gbps": A3_INTRA_PEAK_GBPS,
+        "intra_bw_8p_gbps": A3_INTRA_PEAK_GBPS,
+        "intra_node_bw_gbps": A3_INTRA_PEAK_GBPS,
+        "intra_node_bw_util": A3_INTRA_UTIL,
+        "inter_node_bw_gbps": A3_ROCE_PEAK_GBPS,
+        "inter_node_bw_util": A3_ROCE_UTIL,
+        "intra_node_latency_us": A3_INTRA_LATENCY_US,
+        "inter_node_latency_us": A3_INTER_NODE_LATENCY_US,
     },
     "a3_superpod": {
-        "ranks_per_node": 16, "dies_per_package": 2, "superpod_size": 384,
-        "intra_node_bw_gbps": 392.0, "intra_node_bw_util": 0.80,
-        "superpod_bw_gbps": 392.0, "inter_pod_bw_gbps": 50.0,
-        "inter_node_bw_util": 0.70,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 3.5,
-        "inter_pod_latency_us": 10.0,
+        "ranks_per_node": A3_NODE_RANKS_FULL,
+        "dies_per_package": A3_DIES_PER_PACKAGE,
+        "superpod_size": A3_SUPERPOD_RANKS,
+        "intra_node_bw_gbps": A3_INTRA_PEAK_GBPS,
+        "intra_node_bw_util": A3_INTRA_UTIL,
+        "superpod_bw_gbps": A3_INTRA_PEAK_GBPS,
+        "inter_pod_bw_gbps": A3_ROCE_PEAK_GBPS,
+        "inter_node_bw_util": A3_SUPERPOD_UTIL,
+        "intra_node_latency_us": A3_INTRA_LATENCY_US,
+        "inter_node_latency_us": A3_SUPERPOD_LATENCY_US,
+        "inter_pod_latency_us": A3_INTER_POD_LATENCY_US,
     },
     "a5_pod": {
         "collective_protocols": {"alltoall": "concurrent", "alltoallv": "concurrent"},
-        "ranks_per_node": 64, "dies_per_package": 1, "superpod_size": 8192,
-        "intra_node_bw_gbps": 800.0, "intra_node_bw_util": 0.85,
-        "superpod_bw_gbps": 800.0, "inter_pod_bw_gbps": 100.0,
-        "inter_node_bw_util": 0.80,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 4.5,
-        "inter_pod_latency_us": 10.0,
+        "ranks_per_node": A5_POD_RANKS_PER_NODE, "dies_per_package": 1,
+        "superpod_size": A5_POD_SUPERPOD_RANKS,
+        "intra_node_bw_gbps": A5_POD_INTRA_BW_GBPS,
+        "intra_node_bw_util": A5_POD_INTRA_UTIL,
+        "superpod_bw_gbps": A5_POD_INTRA_BW_GBPS,
+        "inter_pod_bw_gbps": A5_POD_INTER_POD_BW_GBPS,
+        "inter_node_bw_util": A5_POD_INTER_UTIL,
+        "intra_node_latency_us": A3_INTRA_LATENCY_US,
+        "inter_node_latency_us": A5_POD_INTER_LATENCY_US,
+        "inter_pod_latency_us": A3_INTER_POD_LATENCY_US,
     },
     "a5_server": {
-        "ranks_per_node": 8, "dies_per_package": 1,
-        "intra_bw_4p_gbps": 560.0, "intra_bw_8p_gbps": 640.0,
-        "intra_node_bw_gbps": 640.0, "intra_node_bw_util": 0.85,
-        "inter_node_bw_gbps": 200.0, "inter_node_bw_util": 0.80,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
+        "ranks_per_node": A5_SERVER_RANKS_PER_NODE, "dies_per_package": 1,
+        "intra_bw_4p_gbps": A5_SERVER_SUBGROUP_BW_GBPS,
+        "intra_bw_8p_gbps": A5_SERVER_NODE_BW_GBPS,
+        "intra_node_bw_gbps": A5_SERVER_NODE_BW_GBPS,
+        "intra_node_bw_util": A5_SERVER_INTRA_UTIL,
+        "inter_node_bw_gbps": A5_SERVER_INTER_BW_GBPS,
+        "inter_node_bw_util": A5_SERVER_INTER_UTIL,
+        "intra_node_latency_us": A3_INTRA_LATENCY_US,
+        "inter_node_latency_us": A3_INTER_NODE_LATENCY_US,
     },
     "a5_pcie_16p": {
-        "ranks_per_node": 16, "dies_per_package": 1,
-        "intra_bw_4p_gbps": 288.0, "intra_bw_8p_gbps": 128.0,
-        "intra_node_bw_gbps": 116.0, "intra_node_bw_util": 0.85,
-        "inter_node_bw_gbps": 50.0, "inter_node_bw_util": 0.80,
-        "intra_node_latency_us": 2.0, "inter_node_latency_us": 8.0,
+        "ranks_per_node": A5_PCIE_RANKS_PER_NODE, "dies_per_package": 1,
+        "intra_bw_4p_gbps": A5_PCIE_QUAD_BW_GBPS,
+        "intra_bw_8p_gbps": A5_PCIE_OCTA_BW_GBPS,
+        "intra_node_bw_gbps": A5_PCIE_NODE_BW_GBPS,
+        "intra_node_bw_util": A5_SERVER_INTRA_UTIL,
+        "inter_node_bw_gbps": A5_PCIE_ROCE_PEAK_GBPS,
+        "inter_node_bw_util": A3_ROCE_UTIL,
+        "intra_node_latency_us": A5_PCIE_INTRA_LATENCY_US,
+        "inter_node_latency_us": A5_PCIE_INTER_LATENCY_US,
     },
 }
 
@@ -150,11 +247,16 @@ def profiles():
         return json.load(stream)
 
 
-def _number(name, value):
-    if (not isinstance(value, (int, float)) or isinstance(value, bool)
-            or not math.isfinite(value) or value < 0):
-        raise ModelingError(f"transfer_bandwidth_invalid:{name}:{value}")
-    return float(value)
+def registered_matrix_capability(sku, arch_family, declared):
+    """Recover SKU-specific matrix modes for a neutral profile declaration."""
+    profile = profiles().get(sku)
+    if profile is None or profile["architecture"] != arch_family:
+        return {}
+    arch = profile["device"]["compute_arch"]
+    if declared.get("preset") not in (None, "", arch["preset"]):
+        return {}
+    return {key: arch[key] for key in ("preset", "representations", "native_compute")
+            if key in arch}
 
 
 def _preset(raw):
@@ -170,367 +272,77 @@ def _preset(raw):
     return merged, preset
 
 
-def _channel_entries(raw):
-    declaration = raw.get("transfer_channels")
-    if declaration is None:
-        return ()
-    if isinstance(declaration, Mapping):
-        entries = list(declaration.items())
-    elif isinstance(declaration, list):
-        entries, seen = [], set()
-        for item in declaration:
-            if not isinstance(item, Mapping) or "channel" not in item:
-                raise ModelingError("transfer_channel_record_requires_channel")
-            name = item["channel"]
-            if not isinstance(name, str):
-                raise ModelingError(f"transfer_channel_name_invalid:{name}")
-            if name in seen:
-                raise ModelingError(f"transfer_channel_duplicate:{name}")
-            seen.add(name)
-            entries.append((name, {key: value for key, value in item.items()
-                                   if key != "channel"}))
-    else:
-        raise ModelingError("transfer_channels_requires_mapping_or_list")
-    for name, patch in entries:
-        if not isinstance(name, str):
-            raise ModelingError(f"transfer_channel_name_invalid:{name}")
-        if not isinstance(patch, Mapping):
-            raise ModelingError(f"transfer_channel_record_invalid:{name}")
-    return entries
+_MHZ_TO_HZ = 1_000_000.0
 
 
-def _merge_channels(raw, profile):
-    base = profile["transfer_channels"]
-    allowed = {"channel", *_LINK_FIELDS, *_UTIL_FIELDS,
-               "peak_capacity_bytes_per_ms", "channel_semantics"}
-    for channel in base.values():
-        allowed.update(channel)
-    patches, explicit, declared = [], set(), {}
-    for name, declaration in _channel_entries(raw):
-        if name not in base:
-            if name in _GENERATED_CHANNELS:
-                # A materialized or resized machine recreates these structural links.
-                continue
-            raise ModelingError(f"transfer_channel_unknown:{name}")
-        patch = dict(declaration)
-        if "channel" in patch and patch["channel"] != name:
-            raise ModelingError(f"transfer_channel_name_mismatch:{name}")
-        unknown = set(patch) - allowed
-        if unknown:
-            field = sorted(unknown)[0]
-            raise ModelingError(f"transfer_channel_field_unknown:{name}:{field}")
-        # A resized/materialized profile may carry a placeholder provenance
-        # value beside an explicitly resolved semantic.  Drop only the
-        # placeholder; a genuinely invalid standalone user value still fails
-        # the validation below.
-        for field in ("channel_semantics", "semantics"):
-            if patch.get(field) in {"unknown", "none"}:
-                patch.pop(field)
-            elif field in patch and patch[field] not in _LINK_SEMANTICS:
-                raise ModelingError(
-                    f"transfer_channel_semantics_unsupported:{name}:{patch[field]}")
-        if set(patch) & set(_BW_FIELDS):
-            explicit.add(name)
-        declared[name] = set(patch)
-        patches.append((name, patch))
-
-    channels = deepcopy(base)
-    # Per-port service includes independent full-duplex transmit and receive
-    # ports. Optional switch-plane supply is a separate shared constraint.
-    for declaration in channels.values():
-        profile_sem = (declaration.get("semantics")
-                       or declaration.get("channel_semantics"))
-        declaration["semantics"] = ("per_pair" if profile_sem == "per_pair"
-                                    else "per_port")
-    for name, patch in patches:
-        channels[name] = _merge_mapping(channels[name], patch)
-        if "semantics" in patch or "channel_semantics" in patch:
-            channels[name]["semantics"] = patch.get("semantics", patch.get("channel_semantics"))
-        if name in explicit:
-            if "effective_uni_bw_gbps" in patch:
-                value, provenance = patch["effective_uni_bw_gbps"], "explicit_effective"
-            else:
-                value, provenance = None, "explicit_unknown"
-                for field, label in (
-                        ("calibrated_uni_bw_gbps", "explicit_calibrated"),
-                        ("derived_uni_bw_gbps", "explicit_derived"),
-                        ("uni_peak_bw_gbps", "explicit_peak")):
-                    if patch.get(field) is not None:
-                        value, provenance = patch[field], label
-                        break
-            if value is not None:
-                value = _number(f"{name}:{provenance}", value)
-            channels[name]["effective_uni_bw_gbps"] = value
-            channels[name]["bandwidth_provenance"] = provenance
-    # A node wider than the K8 direct mesh has no complete pairwise fabric:
-    # treating it as per-pair would multiply one port by the peer count.  The
-    # node width selects per-port service unless the caller explicitly declared
-    # the channel's semantics (a preset is only a default, not an override).
-    node_ranks = int(raw.get("ranks_per_node", DIRECT_MESH_RANKS)
-                     or DIRECT_MESH_RANKS)
-    if node_ranks > DIRECT_MESH_RANKS:
-        declared_semantics = declared.get("d2d_intra_node", set())
-        if not ({"semantics", "channel_semantics"} & declared_semantics):
-            channels["d2d_intra_node"].update(
-                channel_semantics="per_port", semantics="per_port")
-    return channels, explicit, declared
-
-
-def _merge_mapping(base, patch):
-    result = deepcopy(base)
-    for key, value in patch.items():
-        result[key] = (_merge_mapping(result[key], value)
-                       if isinstance(result.get(key), Mapping) and isinstance(value, Mapping)
-                       else deepcopy(value))
-    return result
-
-
-def _channel_util(declaration):
-    for alias in _UTIL_FIELDS:
-        if alias in declaration and declaration[alias] is not None:
-            util = _positive_float(declaration[alias],
-                                   "transfer_channel_bw_utilization_invalid",
-                                   allow_zero=False)
-            if util > 1.0:
-                raise ModelingError("transfer_channel_bw_utilization_invalid")
-            return util
-    return 1.0
-
-
-def _finalize_channel_utilization(channels):
-    for channel, declaration in channels.items():
-        util = _channel_util(declaration)
-        if math.isclose(util, 1.0):
-            declaration.pop("bw_utilization", None)
-            declaration.pop("bw_ratio", None)
-            declaration.pop("utilization", None)
-            declaration.pop("peak_capacity_bytes_per_ms", None)
+def apply_observed_aicore_clock(device, profile, *, reference_mhz=None, explicit=None):
+    """Convert clock-bound rates from their declared clock to an observed clock."""
+    observed = device.get("observed_aicore_freq_mhz")
+    if observed is None:
+        return device
+    observed = _positive_float(observed, "observed_aicore_freq_mhz_invalid")
+    nominal = (reference_mhz if reference_mhz is not None
+               else profile["source"]["declaration"]["configured_clock_mhz"])
+    reference = (nominal if explicit is not None
+                 else device.get("aicore_freq_mhz", nominal))
+    reference = _positive_float(reference, "aicore_freq_mhz_invalid")
+    ratio = observed / reference
+    clock = {"observed_aicore_freq_mhz": observed, "aicore_freq_mhz": observed}
+    explicit = explicit or {}
+    explicit_arch = explicit.get("compute_arch", {})
+    if ratio == 1:
+        if "clock_hz" not in explicit_arch:
+            data = deepcopy(device)
+            data.update(clock)
+            data.setdefault("compute_arch", {})["clock_hz"] = observed * _MHZ_TO_HZ
+            return data
+        return {**device, **clock}
+    data = deepcopy(device)
+    data.update(clock)
+    if "clock_hz" not in explicit_arch:
+        data.setdefault("compute_arch", {})["clock_hz"] = observed * _MHZ_TO_HZ
+    explicit_rates = explicit.get("rates", {})
+    clock_rates = set(profile["device"]["rates"]) - {
+        "hbm", "scalar_store_issue",
+    }
+    for name, peak in data.get("compute_peaks", {}).items():
+        if name not in explicit.get("compute_peaks", {}):
+            data["compute_peaks"][name] = peak * ratio
+    for name, rate in data.get("rates", {}).items():
+        if name in clock_rates and name not in explicit_rates:
+            data["rates"][name] = rate * ratio
+    for name, mode in data.get("service_modes", {}).items():
+        resource = mode.get("resource")
+        if (resource in clock_rates and resource not in explicit_rates
+                and name not in {"mte2_aic_dram", "mte2_aiv_dram"}
+                and "rate" not in explicit.get("service_modes", {}).get(name, {})):
+            mode["rate"] *= ratio
+    explicit_services = explicit_arch.get("instruction_services", {})
+    for name, service in data.get("compute_arch", {}).get("instruction_services", {}).items():
+        if (name == "gm_hbm_cacheline_128b"
+                or (name == "vbitsort32" and "clock_hz" in explicit_arch)):
             continue
-        peak_bytes = declaration.get("peak_capacity_bytes_per_ms")
-        if peak_bytes is not None:
-            peak = _positive_float(
-                peak_bytes, f"transfer_channel_requires_positive_gbps:{channel}") / 1e6
-        else:
-            if declaration.get("bandwidth_provenance") == "explicit_effective":
-                # A channel patch's effective value is the peak for its own
-                # utilization declaration; the inherited profile peak is stale.
-                peak = declaration.get("effective_uni_bw_gbps")
-            else:
-                peak = declaration.get("uni_peak_bw_gbps")
-            if peak is None:
-                peak = declaration.get("effective_uni_bw_gbps")
-            if peak is None:
-                raise ModelingError(f"transfer_channel_requires_positive_gbps:{channel}")
-            peak = _positive_float(peak, f"transfer_channel_requires_positive_gbps:{channel}")
-        declaration["bw_utilization"] = util
-        declaration["uni_peak_bw_gbps"] = peak
-        declaration["peak_capacity_bytes_per_ms"] = peak * 1e6
-        declaration["effective_uni_bw_gbps"] = peak * util
-
-
-def _topology_bandwidth(raw, kind, preset_active):
-    channel, bytes_field, gbps_field, util_field, latency_field = _CONVENIENCE[kind]
-    peak = None
-    if raw.get(bytes_field) is not None:
-        peak = _number(bytes_field, raw[bytes_field]) / 1e9
-    elif raw.get(gbps_field) is not None:
-        value = _number(gbps_field, raw[gbps_field])
-        # The historical convenience fields are decimal Gb/s. Preset values
-        # and the newer package field are declared GB/s.
-        peak = value if (preset_active or kind == "intra_package") else value / 8
-    util = None
-    if raw.get(util_field) is not None:
-        util = _positive_float(raw[util_field], f"{util_field}_invalid",
-                               allow_zero=False)
-        if util > 1.0:
-            raise ModelingError("link_bw_utilization_exceeds_unity")
-    latency = None
-    if raw.get(latency_field) is not None:
-        latency = _positive_float(raw[latency_field], f"{latency_field}_invalid",
-                                  allow_zero=True)
-    return channel, peak, util, latency
-
-
-def _apply_convenience(raw, channels, explicit, declared, preset_active):
-    for kind in _CONVENIENCE:
-        channel, peak, util, latency = _topology_bandwidth(raw, kind, preset_active)
-        declaration = channels[channel]
-        fields = declared.get(channel, set())
-        if peak is not None and channel not in explicit:
-            declaration["uni_peak_bw_gbps"] = peak
-            declaration["effective_uni_bw_gbps"] = peak
-            declaration["bandwidth_provenance"] = (
-                "explicit_bytes_per_s" if raw.get(_CONVENIENCE[kind][1]) is not None
-                else "explicit_gbps")
-        if util is not None and not (set(_UTIL_FIELDS) & fields):
-            declaration["bw_utilization"] = util
-            if "effective_uni_bw_gbps" in fields:
-                # An explicit effective channel value is the peak for this
-                # utilization override; the profile's older peak is stale.
-                peak_value = declaration.get("effective_uni_bw_gbps")
-            else:
-                peak_value = (declaration.get("uni_peak_bw_gbps")
-                              or declaration.get("effective_uni_bw_gbps"))
-            if peak_value is not None:
-                declaration["uni_peak_bw_gbps"] = float(peak_value)
-                declaration["peak_capacity_bytes_per_ms"] = float(peak_value) * 1e6
-        if latency is not None and "latency_us" not in fields and "alpha_us" not in fields:
-            declaration["latency_us"] = latency
-    _finalize_channel_utilization(channels)
-
-
-def _tier_bandwidth(channels, channel):
-    declaration = channels[channel]
-    util = _channel_util(declaration)
-    capacity = declaration.get("effective_uni_bw_gbps")
-    if not capacity:
-        return None
-    if math.isclose(util, 1.0):
-        # Explicit effective channel values win over an inherited profile peak.
-        return float(capacity), util, float(capacity)
-    peak = declaration.get("uni_peak_bw_gbps")
-    if peak is None and declaration.get("peak_capacity_bytes_per_ms") is not None:
-        peak = float(declaration["peak_capacity_bytes_per_ms"]) / 1e6
-    if peak is None:
-        peak = float(capacity) / util
-    return float(peak), util, float(capacity)
-
-
-def _link_record(name, members, channel, declaration, peak, util, latency):
-    capacity = float(peak) * 1e6 * float(util)
-    link = {"name": name, "members": list(members),
-            "capacity_bytes_per_ms": capacity,
-            "latency_us": latency, "channel": channel,
-            "semantics": declaration["semantics"]}
-    if not math.isclose(util, 1.0):
-        link["bw_utilization"] = util
-        link["peak_capacity_bytes_per_ms"] = float(peak) * 1e6
-    for field in ("transaction_bytes", "alignment_bytes",
-                  "protocol_overhead_bytes", "switch_hops",
-                  "switch_hop_latency_us", "switch_capacity_bytes_per_ms"):
-        if declaration.get(field) is not None:
-            link[field] = declaration[field]
-    return link
-
-
-def _group_links(channels, channel, groups, peak=None, util=None, latency=None):
-    declaration = channels[channel]
-    if peak is None:
-        tier = _tier_bandwidth(channels, channel)
-        if tier is None:
-            return []
-        peak, util, _ = tier
-    if util is None:
-        util = _channel_util(declaration)
-    if latency is None:
-        latency = declaration.get("latency_us", declaration.get("alpha_us", 0.0))
-    links = []
-    for first, members in groups:
-        if len(members) <= 1:
+        explicit_svc = explicit_services.get(name) if isinstance(explicit_services, dict) else None
+        explicit_svc = explicit_svc if isinstance(explicit_svc, dict) else {}
+        if "per_owner_rate" in explicit_svc or "issue_ns" in explicit_svc:
             continue
-        links.append(_link_record(f"{channel}:{first}", members, channel,
-                                  declaration, peak, util, latency))
-    return links
+        if "clock_hz" in service:
+            if "clock_hz" not in explicit_svc:
+                service["clock_hz"] *= ratio
+        elif "per_owner_rate" in service and "scale_with" not in service:
+            service["per_owner_rate"] *= ratio
+    return data
 
 
-def _generated_links(raw, channels, count, per_package, per_node):
-    links = []
-    if per_package > 1 and count > 1:
-        groups = [(first, list(range(first, min(first + per_package, count))))
-                  for first in range(0, count, per_package)]
-        links.extend(_group_links(channels, "d2d_intra_package", groups))
-
-    four = raw.get("intra_bw_4p_gbps")
-    eight = raw.get("intra_bw_8p_gbps")
-    four = _number("intra_bw_4p_gbps", four) if four is not None else None
-    eight = _number("intra_bw_8p_gbps", eight) if eight is not None else None
-    node_tier = _tier_bandwidth(channels, "d2d_intra_node")
-    if per_node > 1 and node_tier is not None:
-        node_peak, node_util, _ = node_tier
-        node_decl = channels["d2d_intra_node"]
-        node_latency = node_decl.get("latency_us", node_decl.get("alpha_us", 0.0))
-        if four is not None and per_node > 4:
-            groups = [(first + offset, list(range(first + offset,
-                                                  min(first + offset + 4, first + per_node, count))))
-                      for first in range(0, count, per_node)
-                      for offset in range(0, per_node, 4)]
-            channels["d2d_intra_4p"] = {**channels["d2d_intra_node"]}
-            links.extend(_group_links(channels, "d2d_intra_4p", groups,
-                                      peak=four, util=node_util,
-                                      latency=node_latency))
-        if eight is not None and per_node > 8:
-            groups = [(first + offset, list(range(first + offset,
-                                                  min(first + offset + 8, first + per_node, count))))
-                      for first in range(0, count, per_node)
-                      for offset in range(0, per_node, 8)]
-            # The 8P tier is a distinct channel label so routing can prefer it
-            # over the full node while sharing the same physical declaration.
-            eight_channel = "d2d_intra_8p"
-            channel_decl = {**channels["d2d_intra_node"]}
-            channels[eight_channel] = channel_decl
-            links.extend(_group_links(channels, eight_channel, groups,
-                                      peak=eight, util=node_util,
-                                      latency=node_latency))
-        node_peak_eff = node_peak
-        if per_node <= 4 and four is not None:
-            node_peak_eff = four
-        elif per_node <= 8 and eight is not None:
-            node_peak_eff = eight
-        groups = [(first, list(range(first, min(first + per_node, count))))
-                  for first in range(0, count, per_node)]
-        links.extend(_group_links(channels, "d2d_intra_node", groups,
-                                  peak=node_peak_eff,
-                                  util=node_util,
-                                  latency=node_latency))
-
-    superpod_size = raw.get("superpod_size", raw.get("max_dies"))
-    if superpod_size is not None:
-        if isinstance(superpod_size, bool):
-            raise ModelingError("ascend_superpod_size_invalid")
-        superpod_size = int(superpod_size)
-        if superpod_size <= 0:
-            raise ModelingError("ascend_superpod_size_invalid")
-        if superpod_size < per_node:
-            raise ModelingError("ascend_superpod_size_smaller_than_node")
-    inter_tier = _tier_bandwidth(channels, "d2d_inter_node")
-    if per_node > 0 and count > per_node and inter_tier is not None:
-        inter_peak, util, _ = inter_tier
-        inter_decl = channels["d2d_inter_node"]
-        latency = inter_decl.get("latency_us", inter_decl.get("alpha_us", 0.0))
-        if superpod_size is not None:
-            same_peak = raw.get("superpod_bw_gbps")
-            same_peak = (_number("superpod_bw_gbps", same_peak)
-                         if same_peak is not None else inter_peak)
-            same_latency = raw.get("superpod_latency_us")
-            same_latency = (_positive_float(same_latency,
-                                            "superpod_latency_us_invalid",
-                                            allow_zero=True)
-                            if same_latency is not None else latency)
-            groups = [(first, list(range(first, min(first + superpod_size, count))))
-                      for first in range(0, count, superpod_size)]
-            links.extend(_group_links(channels, "d2d_inter_node", groups,
-                                      peak=same_peak, util=util,
-                                      latency=same_latency))
-            if superpod_size < count:
-                pod_peak = raw.get("inter_pod_bw_gbps")
-                pod_peak = (_number("inter_pod_bw_gbps", pod_peak)
-                            if pod_peak is not None else inter_peak)
-                pod_latency = raw.get("inter_pod_latency_us")
-                pod_latency = (_positive_float(pod_latency,
-                                               "inter_pod_latency_us_invalid",
-                                               allow_zero=True)
-                               if pod_latency is not None else latency)
-                channels["d2d_inter_pod"] = {**inter_decl}
-                links.extend(_group_links(channels, "d2d_inter_pod",
-                                          [(0, list(range(count)))],
-                                          peak=pod_peak, util=util,
-                                          latency=pod_latency))
-        else:
-            links.extend(_group_links(channels, "d2d_inter_node",
-                                      [(0, list(range(count)))],
-                                      peak=inter_peak, util=util,
-                                      latency=latency))
-    return links
+def _materialize_device(device, profile, sku, explicit):
+    materialized = expand_instruction_presets(device, profile, sku)
+    decl_mhz = profile.get("source", {}).get("declaration", {}).get("configured_clock_mhz")
+    if decl_mhz is not None:
+        materialized = deepcopy(materialized)
+        arch = materialized.setdefault("compute_arch", {})
+        if arch.get("clock_hz") is None:
+            arch["clock_hz"] = float(decl_mhz) * _MHZ_TO_HZ
+    return apply_observed_aicore_clock(materialized, profile, explicit=explicit)
 
 
 def materialize(raw):
@@ -541,44 +353,99 @@ def materialize(raw):
     merged, preset = _preset(raw)
     preset_active = bool(preset)
     profile = profiles()[raw["sku"]]
-    machine_defaults = machine_device_defaults(merged)
-    device = merge_device_inputs(profile["device"], machine_defaults, merged.get("device", {}))
+    arch_low = str(profile.get("architecture") or "").strip().lower()
+    preset_name = merged.get("topology_preset")
+    if preset_name and arch_low in _PRESET_ARCH_PREFIXES:
+        if not str(preset_name).startswith(_PRESET_ARCH_PREFIXES[arch_low]):
+            raise ModelingError(
+                f"ascend_topology_preset_incompatible:{raw['sku']}:{preset_name}"
+            )
+    explicit_device = merge_device_inputs(machine_device_defaults(merged), merged.get("device", {}))
+    device = merge_device_inputs(profile["device"], explicit_device)
     channels, explicit, declared = _merge_channels(merged, profile)
-    _apply_convenience(merged, channels, explicit, declared, preset_active)
-    data = {**merged, "device": expand_instruction_presets(device, profile, raw["sku"]),
+    bw_caller = _caller_bandwidth_channels(raw)
+    _apply_convenience(raw, preset, channels, explicit, declared, preset_active)
+    data = {**merged, "device": _materialize_device(device, profile, raw["sku"], explicit_device),
             "transfer_channels": channels,
             "architecture": profile["architecture"]}
-    for field in ("devices", "dies"):
-        if field in merged:
-            # Each record expands after inheritance, including an explicit []
-            # that disables a preset. An expanded default would restore it.
-            data["device"] = device
-            data[field] = [expand_instruction_presets(
-                merge_device_inputs(device, record), profile, raw["sku"])
-                for record in merged[field]]
-    count = int(merged.get("num_devices", 1))
-    per_node = int(merged.get("ranks_per_node", count))
+    for field_name in ("devices", "dies"):
+        if field_name in merged:
+            data[field_name] = [_materialize_device(
+                merge_device_inputs(device, record), profile, raw["sku"],
+                merge_device_inputs(explicit_device, record))
+                for record in merged[field_name]]
+    count = int(merged.get("num_devices", len(merged.get(
+        "devices", merged.get("dies", ()))) or 1))
+    phys_rpn = int(
+        raw.get("physical_ranks_per_node")
+        or preset.get("ranks_per_node")
+        or profile.get("physical_ranks_per_node")
+        or profile.get("ranks_per_node")
+        or default_ranks_per_node(raw["sku"])
+    )
+    per_node = int(merged.get("ranks_per_node", min(count, phys_rpn)))
+    phys_rpn = max(phys_rpn, per_node)
     per_package = int(merged.get("dies_per_package", profile["dies_per_package"]))
-    data.update(ranks_per_node=per_node, dies_per_package=per_package)
+    data.update(
+        ranks_per_node=per_node,
+        physical_ranks_per_node=phys_rpn,
+        ranks_per_node_explicit=bool(raw.get("ranks_per_node_explicit", "ranks_per_node" in raw)),
+        dies_per_package=per_package,
+    )
     if "collective_protocols" not in raw:
-        domain = int(merged.get("superpod_size", DIRECT_MESH_RANKS))
-        if "links" in raw or count > domain:
+        is_ub_domain = (
+            preset_name == "a5_pod"
+            or (not preset and per_node <= DIRECT_MESH_RANKS and count <= per_node)
+        )
+        if "links" in raw or not is_ub_domain:
             data.pop("collective_protocols", None)
-        elif (raw["sku"].startswith("Ascend950") and not preset
-              and per_node <= DIRECT_MESH_RANKS and count <= per_node):
+        elif raw["sku"].startswith("Ascend950"):
             data["collective_protocols"] = {
                 "alltoall": "concurrent", "alltoallv": "concurrent"}
     if "links" not in raw:
-        data["links"] = _generated_links(merged, channels, count, per_package, per_node)
-    data["assumptions"] = {**profile["assumptions"],
-                           **raw.get("assumptions", {}), **_ASSUMPTIONS}
-    # The adapter has resolved convenience bandwidths into transfer_channels and
-    # generated links. Dropping convenience fields when links were generated
-    # keeps a neutral re-parse from applying a second unit conversion, while
-    # preserving explicit convenience overrides on pre-materialized link lists.
-    if "links" not in raw:
-        for field in _CONVENIENCE_FIELDS:
-            data.pop(field, None)
+        data["links"] = _generated_links(
+            merged, raw, preset, channels, count, per_package, per_node,
+            explicit, bw_caller, declared)
+        optical = channels["d2d_inter_node"]
+        if (merged.get("topology_preset") == "a3_superpod"
+                and optical["protocol"] == "HCCS_OPTICAL_SUPERPOD"
+                and "bi_peak_bw_gbps" not in declared.get("d2d_inter_node", ())):
+            optical["bi_peak_bw_gbps"] = max(
+                A3_INTRA_BI_PEAK_GBPS, optical["uni_peak_bw_gbps"])
+            optical["effective_bi_bw_gbps"] = (
+                optical["bi_peak_bw_gbps"] * optical["bw_utilization"])
+        for tier, key in (("d2d_intra_4p", "intra_bw_4p_gbps"),
+                          ("d2d_intra_8p", "intra_bw_8p_gbps")):
+            if tier in explicit and raw.get(key) is None:
+                data[key] = channels[tier].get("uni_peak_bw_gbps")
+    profile_source = deepcopy(profile.get("source") or {})
+    caller_source = dict(raw.get("source") or {})
+    caller_cal = dict(caller_source.get("calibration") or {})
+    calibration = dict(profile_source.get("calibration") or {})
+    calibrated = bool(calibration.get("calibrated", False))
+    rate_provenance = calibration.get("rate_provenance") or (
+        "silicon_calibrated" if calibrated else "declared_nominal")
+    source_sku = str(calibration.get("source_sku") or raw["sku"])
+    anchor_sku = str(calibration.get("anchor_sku") or source_sku)
+    calibration.update(calibrated=bool(calibrated),
+                       rate_provenance=rate_provenance,
+                       source_sku=source_sku,
+                       anchor_sku=anchor_sku)
+    calibration = _merge_nested(calibration, caller_cal)
+    if (caller_cal.get("calibrated") is not None
+            and "rate_provenance" not in caller_cal):
+        calibration["rate_provenance"] = (
+            "silicon_calibrated" if bool(caller_cal["calibrated"])
+            else "declared_nominal")
+    if "anchor_sku" not in caller_cal and "source_sku" in caller_cal:
+        calibration["anchor_sku"] = str(caller_cal["source_sku"])
+    data["source"] = _merge_mapping(
+        profile_source, {**caller_source, "calibration": calibration})
+    data["assumptions"] = {
+        **profile["assumptions"], **raw.get("assumptions", {}), **_ASSUMPTIONS}
+    for field_name in _CONVENIENCE_FIELDS:
+        if "links" not in raw or field_name not in raw:
+            data.pop(field_name, None)
     return data
 
 

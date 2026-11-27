@@ -1,0 +1,40 @@
+{
+  "schema": "mindie-sim.stack-manifest/1",
+  "protocol_version": "mindie-sim.stack-adapter/1",
+  "stack_id": "raw-eager",
+  "manifest_revision": "1.0.0",
+  "description": "Pure eager baseline stack adapter with graph capture disabled and zero optional fusions or rewrite tracks.",
+  "supported_domains": ["llm", "vlm", "diffusion"],
+  "supported_work_units": [
+    "prefill_decode_step",
+    "vision_encode",
+    "denoise_timestep",
+    "vae_decode",
+    "text_encode"
+  ],
+  "supported_hardware_backends": ["ascend", "nvidia", "generic"],
+  "supported_phases": [
+    "prefill",
+    "decode",
+    "mixed",
+    "denoise_step",
+    "vae_decode",
+    "text_encode"
+  ],
+  "supported_checkpoint_formats": [
+    "modelslim_description",
+    "hf_quantization_config",
+    "unquantized_native",
+    "explicit_synthetic_preset"
+  ],
+  "supported_tracks": ["eager"],
+  "default_track": "eager",
+  "capture_mode": "eager",
+  "allowed_rewrite_tracks": [],
+  "allowed_rewrite_classes": ["shipping"],
+  "allowed_framework_rewrites": [],
+  "supported_recipe_ids": [],
+  "lowering_passes": [],
+  "recipe_bindings": [],
+  "has_launch_codec": false
+}

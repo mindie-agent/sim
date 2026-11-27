@@ -1,0 +1,857 @@
+"""Arch35 MC2 direct peer, MTE window, and nonblocking CCU strategies.
+
+[Role] Bind declared Arch35 transport and topology to the shared MC2 ledger.
+[Invariants] Peer credits bound live windows and injection. Window publication
+  follows payload completion; CCU completion gates its consuming core.
+[Timeouts & Locks] Finite group and cohort planning; no I/O or locks.
+[Side-Effect Policy] Produces analytical declarations only.
+
+Upstream-ABI: aclnnMoeDistributeDispatchV2
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+import math
+
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import ArchId, SourceRef
+from mindie_sim.schema.operators import OpSpec
+from . import megamoe as mc2_megamoe
+from mindie_sim.prediction.operators.mc2.mc2_phase import (
+    RECIPE, build as build_fullmesh, contract, declared_floor_work,
+)
+from ...mechanism import OperatorPlan, PlannedRecipe
+from mindie_sim.prediction.operators.mc2.moe_comm_selection import FUSED_MC2
+from ..contracts import ArchStrategy, OperatorPlanningContext
+from mindie_sim.prediction.operators.mc2.mc2_fullmesh import SOURCE, combine_layout, dispatch_layout
+from mindie_sim.prediction.operators.mc2.mc2_mx_quant import mx32_work
+from .common import (
+    A5_AI_CPU, COLLECTIVES, COMBINE, FLOAT_ROWS, FP4_ROWS, FP8_ROWS, MMAR, MMRS, Mc2Contract,
+    PeerRoute, Transport, build_transport_stages, capability_gap, contract_fields,
+    geometry_has_l2, make_plan, native_protocol_peer_transport, topology_hops,
+    validate_contract, validate_native_dispatch_quant,
+)
+from .lowering import A5_ROCE, CCU, SHMEM, declared_incoming_routes
+
+TARGET_BACKEND = "ascend"
+SCALE_BYTES_MATCH_TOL = 1e-9
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+_SKILLS_REVISION = "750045df251d031bf708de9dc1614c2202eed6dd"
+_XLLM_REVISION = "c77a313bfdd59c0f6e312558808c0de7d2a8d019"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/all_gather_matmul_v2/op_kernel/arch35/all_gather_matmul_fp16_bf16.h",
+        source_sha256="fe27d0c153368f57396c14bcab681e7a12c8a8b5f732bc45be4c393eb74d82a7",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/matmul_reduce_scatter_v2/op_kernel/arch35/matmul_reduce_scatter_fp16_bf16.h",
+        source_sha256="121ad9870776e27c1986e612b047817267e0de8976236df7eac748ef1643eff3",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/matmul_all_reduce/op_api/aclnn_matmul_all_reduce.cpp",
+        source_sha256="b31deb6900ce4a750aecfdb446188ab0b7780ea6b4116b4e9085dbe0a04c8425",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/matmul_all_reduce/op_kernel/arch35/matmul_all_reduce_based_all_reduce.h",
+        source_sha256="2af6e2f75f0fdf99778730665c5ad0d217b8f9910358fa324c25171500879c6e",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_dispatch_v2/op_kernel/arch35/moe_distribute_dispatch_v2_a5_full_mesh.h",
+        source_sha256="3194ed49e10aab74976053840a5e771051be946d0945664fd5a3ca34a32bdb6b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_mte.h",
+        source_sha256="4e2a3f571df2e0e3718c8e61145638483be15445383ed77c3873381874ffb5a9",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_dispatch_v2/op_kernel/arch35/moe_distribute_dispatch_v2_a5_ccu.h",
+        source_sha256="e34bbda26c14fc7b9b8767568541f72d7e67a89dc8dd0d4b9a324add0aba417a",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_ccu.h",
+        source_sha256="2b4d5fde8c865e54017949ae7618b7c28b40a92ef725253e847fc04113a6cf81",
+    ),
+    SourceRef(
+        repository="cann/ascendc-mc2-best-practice",
+        revision=_SKILLS_REVISION,
+        relative_path="ops/ascendc-mc2-best-practice/references/requirement-analysis/comm-path-decision.md",
+        source_sha256="05a9e0df5d30d32096454a7fa0cdcab23596254ecdf1639f441657ca9a2f9b25",
+    ),
+    SourceRef(
+        repository="xllm",
+        revision=_XLLM_REVISION,
+        relative_path="xllm/core/kernels/npu/npu_moe_distribute_dispatch_v2.cpp",
+        source_sha256="f4eb13448064c7987efb2bb72ffa2cda3e0b89ef0986f293c8ff98978096e05d",
+    ),
+    SourceRef(
+        repository="xllm",
+        revision=_XLLM_REVISION,
+        relative_path="xllm/core/kernels/npu/npu_moe_distribute_combine_v2.cpp",
+        source_sha256="5ffa8553993325dac3d9ff04ccfb999a25f5b6987b71964ce301b71ed679f418",
+    ),
+)
+
+
+MTE_WINDOW = "a5_mte"
+URMA_ALIGN_BYTES = 512
+MESH_RANK_LIMIT = 8
+ARCH_TRANSPORTS = frozenset({SHMEM, MTE_WINDOW, CCU, A5_ROCE, A5_AI_CPU})
+_ARCH35_COLLECTIVE_WORLD_SIZES = frozenset({1, 2, 4, 8, 16, 32, 64})
+_ARCH35_COLLECTIVE_DTYPES = FLOAT_ROWS | FP8_ROWS | FP4_ROWS | {"hifloat8"}
+
+NATIVE_PROTOCOL_KIND = "arch35_fullmesh"
+NETWORK = "arch35_fullmesh_peer_channel"
+NO_ASSIGNMENTS = 0
+MX_DISPATCH_GROUP = 32
+FUSED_MC2_ROUTED_MODE = 2
+FUSED_MC2_SHARED_MODE = 3
+
+
+def _validate_arch35_contract(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) -> None:
+    if contract.abi in COLLECTIVES:
+        if contract.world_size not in _ARCH35_COLLECTIVE_WORLD_SIZES:
+            raise capability_gap(op, ctx, f"arch35_collective_world_size_unsupported:{contract.world_size}")
+        if contract.dtype not in _ARCH35_COLLECTIVE_DTYPES:
+            raise capability_gap(op, ctx, f"arch35_collective_dtype_unsupported:{contract.dtype}")
+
+
+def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) -> Transport:
+    fields = contract_fields(op)
+    group = dict(fields.get("group", ()))
+    raw_binding = fields.get("transport_binding", {})
+    binding = dict(raw_binding) if not isinstance(raw_binding, str) else {"caller_abi": raw_binding}
+    caller = str(binding.get("caller_abi", fields.get("caller_abi", ""))).lower()
+    abi = contract.transport_abi
+    if abi == "auto":
+        if caller in {"shmem", "aclshmem", SHMEM}:
+            abi = SHMEM
+        elif contract.abi == MMAR or (caller in {"ai_cpu", "aicpu", A5_AI_CPU} and contract.abi in COLLECTIVES):
+            abi = A5_AI_CPU
+        elif caller in {"ccu", "hcomm", CCU} or contract.abi in COLLECTIVES:
+            abi = CCU
+        else:
+            abi = MTE_WINDOW
+    if abi not in ARCH_TRANSPORTS or op.recipe == "arch22_v2_caller_local":
+        raise capability_gap(op, ctx, f"transport_unsupported:{abi}")
+    if contract.abi == MMAR and abi != A5_AI_CPU:
+        raise capability_gap(op, ctx, "matmul_all_reduce_requires_ai_cpu_transport")
+    algorithm = contract.topology_algorithm or ("direct_peer" if abi == SHMEM else "fullmesh")
+    rank = contract.rank
+    peers = tuple(peer for peer in contract.ranks if peer != rank)
+    hops = topology_hops(fields, group)
+    offset = binding.get("window_offset_bytes", fields.get("window_offset_bytes", 0))
+    if type(offset) is not int or offset < 0:
+        raise capability_gap(op, ctx, "invalid_window_offset")
+    if abi == SHMEM:
+        if caller not in {"shmem", "aclshmem", SHMEM}:
+            raise capability_gap(op, ctx, "shmem_requires_shmem_caller")
+        if algorithm not in {"fullmesh", "direct_peer"} or contract.world_size > MESH_RANK_LIMIT:
+            raise capability_gap(op, ctx, "shmem_requires_direct_mesh")
+        edges = set(ctx.datapath.ub_peer_edges)
+        edges.update(tuple(edge) for edge in group.get("peer_edges", fields.get("peer_edges", ())))
+        direct = {"UB", "UBMEM", "URMA", "DIRECT_PEER"}
+        for peer in peers:
+            path = hops.get((rank, peer))
+            if path is None:
+                valid = (rank, peer) in edges
+            else:
+                valid = len(path) == 1 and path[0].upper() in direct
+            if not valid:
+                raise capability_gap(op, ctx, "shmem_peer_capability_required")
+        if offset % URMA_ALIGN_BYTES:
+            raise capability_gap(op, ctx, "shmem_requires_512_byte_aligned_window")
+    if abi != SHMEM and caller in {"shmem", "aclshmem", SHMEM}:
+        raise capability_gap(op, ctx, "shmem_caller_transport_mismatch")
+    if abi == MTE_WINDOW and contract.abi in COLLECTIVES:
+        raise capability_gap(op, ctx, "mte_window_requires_moe_dispatch_or_combine")
+    if abi == MTE_WINDOW and peers and not (
+        ctx.datapath.has_path("gm", "ub") and ctx.datapath.has_path("ub", "gm")
+    ):
+        raise capability_gap(op, ctx, "mte_window_requires_gm_ub_paths")
+    if algorithm in {"ring", "two_tier"} and any((rank, peer) not in hops for peer in peers):
+        raise capability_gap(op, ctx, "algorithm_requires_group_hops")
+    native_chunking = abi in {CCU, A5_AI_CPU} and contract.abi in COLLECTIVES
+    if contract.internal_chunks >= 2 and not all(
+        binding.get(key, fields.get(key, native_chunking)) is True
+        for key in ("independent_buffers", "independent_handles")
+    ):
+        raise capability_gap(op, ctx, "two_chunks_require_independent_buffers_and_handles")
+
+    route_kind = "ROCE" if abi == A5_ROCE else ("UB_WINDOW" if abi == MTE_WINDOW else "URMA")
+    routes = tuple(PeerRoute(rank, peer, hops.get((rank, peer), (route_kind,))) for peer in peers)
+    credits = binding.get("peer_credits", fields.get("peer_credits", max(1, len(peers))))
+    if type(credits) is not int or credits < 1:
+        raise capability_gap(op, ctx, "invalid_peer_credit_limit")
+    depth = min(contract.internal_chunks, 2) if contract.abi in COLLECTIVES else (2 if (
+        contract.independent_buffers and contract.independent_handles
+    ) else 1)
+    return Transport(
+        abi, algorithm, routes, wire_alignment=URMA_ALIGN_BYTES if abi == SHMEM else 1,
+        window_alignment=URMA_ALIGN_BYTES if abi == SHMEM else 1, window_offset=offset,
+        credits=1 if algorithm == "ring" else min(credits, max(1, len(peers))),
+        slot_depth=depth, peer_limit=len(peers),
+        ccu=abi == CCU, aiv_staging=abi == MTE_WINDOW,
+        direct_remote_gm=abi == MTE_WINDOW and contract.abi == COMBINE,
+        gm_bounce_hbm=False,
+        incoming_routes=declared_incoming_routes(rank, peers, hops),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Strategy:
+    arch_id: ArchId = ArchId("npu_arch_3510")
+    abi: str = "aclnnMoeDistributeDispatchV2"
+    sources: tuple[SourceRef, ...] = SOURCES
+
+    def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
+        if ctx.compute_arch.arch_id != self.arch_id:
+            return False
+        try:
+            contract = validate_contract(op, ctx)
+            _validate_arch35_contract(contract, op, ctx)
+            _transport(contract, op, ctx)
+        except ModelingError:
+            return False
+        return True
+
+    def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:
+        if ctx.compute_arch.arch_id != self.arch_id:
+            raise capability_gap(op, ctx, "unsupported_compute_architecture")
+        contract = validate_contract(op, ctx)
+        _validate_arch35_contract(contract, op, ctx)
+        transport = _transport(contract, op, ctx)
+        scatter = contract.abi in {MMRS, MMAR} and contract.world_size > 1
+        temp_gm = scatter and contract.dtype in FLOAT_ROWS
+        ub_output = contract.abi == MMRS and scatter and not temp_gm and ctx.datapath.has_l0c_to_ub
+        phases = build_transport_stages(
+            contract, transport, ub_output=ub_output, temp_gm=temp_gm, has_l2=geometry_has_l2(ctx.geometry),
+        )
+        return make_plan(contract, transport, phases, self.sources, arch_id=self.arch_id)
+
+
+STRATEGY: ArchStrategy = _Strategy()
+
+
+def validate_native_protocol(raw):
+    if "global_bs" in raw and (type(raw["global_bs"]) is not int or raw["global_bs"] < 0):
+        raise ModelingError("arch35_fullmesh_global_bs_requires_nonnegative_integer")
+    if "enable_group_send" in raw and type(raw["enable_group_send"]) is not bool:
+        raise ModelingError("arch35_fullmesh_enable_group_send_requires_bool")
+    validate_native_dispatch_quant(raw)
+    native_protocol_peer_transport(raw)
+
+
+def native_protocol_recipes(selected):
+    # Common MoE communication selection can use the planner without an
+    # explicit kernel declaration. Only explicit declarations bind a window.
+    result = {RECIPE: PlannedRecipe(build_fullmesh), **mc2_megamoe.recipes()}
+    if selected is not None:
+        result[NETWORK] = native_protocol_peer_transport(selected)
+    return result
+
+
+def common_native_protocol(chosen, fused_level, moe_comm):
+    return {"kind": NATIVE_PROTOCOL_KIND, "max_inflight_per_rank": None,
+            "chunk_bytes": None, "hop_startup_us": 0.0,
+            "receive_capacity_bytes_per_peer": None,
+            "selection": "moe_comm_config", "selected_method": chosen,
+            "fused_mc2_level": fused_level, "moe_comm": moe_comm}
+
+
+_ARCH35_MEGAMOE_SUPPORTED_WEIGHT_DTYPES = frozenset({
+    "bf16", "fp16", "int8", "w8a8", "fp8", "fp8_e4m3", "fp8_e4m3fn",
+    "mxfp8", "mx_fp8", "fp4", "fp4_e2m1", "mxfp4", "mx_fp4", "int4", "w4a8", "w4a16",
+})
+
+
+def fused_mc2_native_binding(weight_dtype: str = "bf16", *, fused_level: int = FUSED_MC2_ROUTED_MODE) -> dict:
+    """Resolve the Arch35 (A5) fused MoE MC2 identity and ACLNN symbol (modes 2 & 3 only)."""
+    level = int(fused_level)
+    if level not in {FUSED_MC2_ROUTED_MODE, FUSED_MC2_SHARED_MODE}:
+        raise ModelingError(f"arch35_fused_mc2_level_unsupported:{level}")
+    w_norm = str(weight_dtype or "").strip().lower().replace("-", "_")
+    if not w_norm:
+        raise ModelingError("arch35_fused_mc2_weight_dtype_required")
+    if w_norm not in _ARCH35_MEGAMOE_SUPPORTED_WEIGHT_DTYPES:
+        raise ModelingError(f"arch35_fused_mc2_weight_dtype_unsupported:{weight_dtype!r}")
+    return {
+        "public_name": "aclnnMegaMoe",
+        "api": {
+            "namespace": "aclnn",
+            "entry": "cann_ops_transformer.ops.mega_moe",
+            "aclnn_symbol": "aclnnMegaMoe",
+        },
+        "fused_level": level,
+        "shared_expert_fused": level == FUSED_MC2_SHARED_MODE,
+        "source": SOURCE,
+        "execution_core": "mix",
+    }
+
+
+def _absorbed_quant_mode(routing):
+    """Dispatch payload mode declared by one absorbed init-routing pack."""
+    payload = str(routing.get("payload_format") or "")
+    scale_format = str(routing.get("scale_format") or "")
+    if payload in {"fp8_e4m3", "fp8_e5m2"} and scale_format in {"fp8_e8m0", "e8m0"}:
+        return "mx"
+    if payload == "int8":
+        return "per_token_int8"
+    raise ModelingError("mc2_init_routing_absorption_requires_mx_or_per_token_int8_payload")
+
+
+def _received_quantizer(pack_quant, gate, dispatch_id, rows, width):
+    """Keep receiver conversion when native dispatch publishes float rows."""
+    from mindie_sim.catalog.ops import vector_op
+
+    meta = dict(pack_quant.metadata)
+    source_rows = float(meta.get("source_rows") or NO_ASSIGNMENTS)
+    if source_rows <= NO_ASSIGNMENTS:
+        raise ModelingError("mc2_pack_quantizer_requires_source_rows")
+    scale = float(rows) / source_rows
+    scale_shape = tuple(meta["activation_scale_shape"])
+    _, *scale_tail = scale_shape
+    meta.update(
+        source_rows=rows,
+        activation_scale_shape=(math.ceil(rows), *scale_tail),
+        activation_scale_bytes=float(meta["activation_scale_bytes"]) * scale,
+        quantization_scope="moe_received_expert_input",
+    )
+    quantizer = vector_op(
+        op_id=dispatch_id + ".received_quantize", deps=(dispatch_id,),
+        stage=pack_quant.stage, layer=pack_quant.layer,
+        requests=pack_quant.requests, phase=pack_quant.phase,
+        family=pack_quant.family, recipe=pack_quant.recipe,
+        dtype=pack_quant.dtype,
+        elements=math.ceil(rows) * width, ops_per_element=NO_ASSIGNMENTS,
+        vector_ops_override=pack_quant.vector_ops * scale,
+        read_bytes_override=pack_quant.mte2_bytes * scale,
+        write_bytes_override=pack_quant.mte3_bytes * scale,
+        shape=(math.ceil(rows), width), returns=pack_quant.returns,
+        metadata=tuple(meta.items()),
+    )
+    gate_meta = dict(gate.metadata)
+    if gate_meta.get("activation_format") != meta["output_format"]:
+        raise ModelingError("mc2_received_quantizer_format_mismatch")
+    gate_meta.update(
+        activation_producer="explicit_routing_quantization",
+        activation_payload_producer=quantizer.op_id,
+        activation_scale_producer=quantizer.op_id,
+    )
+    return quantizer, replace(
+        gate, deps=tuple(quantizer.op_id if dep == dispatch_id else dep
+                         for dep in gate.deps),
+        metadata=tuple(gate_meta.items()))
+
+
+def lower_native_protocol(
+    ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
+    source_partitions, received_assignments, dtype, source_routing=None,
+    valid_tokens=None, source_rows_by_replica=None, destination_rows_by_rank=None,
+):
+    if (source_partitions < 1 or ep < 2 or dtype not in {"bf16", "fp16"}
+            or getattr(runtime, "moe_recipe", "alltoall") != "alltoall"):
+        raise ModelingError("mc2_fullmesh_requires_unpartitioned_float_rows_and_ep_alltoall")
+    if runtime.kernels.get("moe_transport"):
+        raise ModelingError("mc2_fullmesh_cannot_duplicate_separate_quantized_transport")
+    by_id = {op.op_id: op for op in ops}
+    pack, dispatch, combine, unpack = (by_id[prefix + suffix]
+                                      for suffix in (".pack", ".dispatch", ".combine", ".unpack"))
+    pack_quant = by_id.get(prefix + ".pack.quantize")
+    if pack_quant is not None and (
+            pack_quant.plan_required
+            or pack_quant.deps != (pack.op_id,)
+            or dict(pack_quant.metadata).get("quantization_scope")
+            != "moe_dispatch_expert_input"
+            or any(pack_quant.op_id in item.deps and item.op_id != dispatch.op_id
+                   for item in ops)):
+        raise ModelingError("mc2_cannot_absorb_external_pack_quantizer")
+    source_metadata = source_routing.to_dict() if source_routing is not None else None
+    # TPxDP without an explicit slice still publishes one source rank's rows.
+    if source_routing is not None:
+        valid_source_tokens = source_routing.valid_local_tokens
+    elif valid_tokens is not None:
+        # The caller's actual logical rows, not a physical padding count.
+        valid_source_tokens = valid_tokens
+    else:
+        valid_source_tokens = tokens
+    if source_partitions > 1:
+        tokens = math.ceil(tokens / source_partitions)
+        if source_routing is None:
+            valid_source_tokens = (valid_tokens / source_partitions
+                                   if valid_tokens is not None else tokens)
+    send = valid_source_tokens * top_k
+    quant, absorbed = _dispatch_quant_mode(selected, pack, pack_quant, by_id, prefix, dispatch, width)
+    parallel_cfg = getattr(runtime, "parallel", None)
+    has_redundant_slots = int(getattr(parallel_cfg, "redundant_experts_per_rank", 0) or 0) > 0
+    if (selected.get("selected_method") == FUSED_MC2
+            and received_assignments
+            and not has_redundant_slots):
+        megamoe = mc2_megamoe.try_lower_fused_frame(
+            ops, by_id, selected, runtime, prefix, tokens, width, top_k, received_assignments,
+            ep, dtype, pack, dispatch, combine, unpack, pack_quant,
+        )
+        if megamoe is not None:
+            return megamoe
+    received_quant = None
+    if pack_quant is not None and quant == "none" and received_assignments:
+        gate = by_id.get(prefix + ".expert_up")
+        if gate is None or gate.deps != (dispatch.op_id,):
+            raise ModelingError("mc2_received_quantizer_requires_direct_expert")
+        received_quant, by_id[gate.op_id] = _received_quantizer(
+            pack_quant, gate, dispatch.op_id, received_assignments, width)
+    payload_dtype = {"mx": "fp8_e4m3", "per_token_int8": "int8"}.get(quant, dtype)
+    quant_mode = "per_token" if quant == "per_token_int8" else quant
+    layouts = (dispatch_layout(width, input_dtype=dtype, payload_dtype=payload_dtype,
+                               quant_mode=quant_mode),
+               combine_layout(width, dtype=dtype))
+    if quant in {"mx", "per_token_int8"}:
+        _bind_quantized_expert_input(
+            by_id, prefix, dispatch, received_assignments, width, dtype,
+            quant, payload_dtype, layouts,
+        )
+    row_format = {"forward_bytes": layouts[0].packet_bytes,
+                  "reverse_bytes": layouts[1].packet_bytes}
+    ep_rank = _resolve_lowered_ep_rank(
+        pack, dispatch, unpack, by_id.get(prefix + ".expert_up"), source_routing,
+    )
+    declared_global_bs = selected.get("global_bs") if "global_bs" in selected else None
+    if declared_global_bs is not None:
+        if type(declared_global_bs) is not int or declared_global_bs < 0:
+            raise ModelingError("arch35_fullmesh_global_bs_requires_nonnegative_integer")
+        if declared_global_bs > 0:
+            ep_total_bs = math.ceil(tokens) * int(ep)
+            if declared_global_bs < ep_total_bs or declared_global_bs % int(ep) != 0:
+                raise ModelingError("arch35_fullmesh_global_bs_invalid_for_batch_and_ep")
+            has_active_mask = dict(dispatch.metadata).get("mc2_active_mask_producer") is not None
+            if has_active_mask and declared_global_bs > ep_total_bs:
+                raise ModelingError("arch35_fullmesh_global_bs_incompatible_with_active_mask")
+    declared_group_send = _declared_group_send(selected, runtime)
+    forward_raw, backward_raw, payload_basis, source_key = _routing_contracts(
+        source_routing, source_rows_by_replica, destination_rows_by_rank,
+        ep, width, dtype, tokens, valid_source_tokens, top_k, experts,
+        quant, quant_mode, payload_dtype, layouts, send, received_assignments,
+        global_bs=declared_global_bs, enable_group_send=declared_group_send,
+    )
+    dispatch_op, combine_op = _native_dispatch_combine(
+        pack, dispatch, combine, unpack, prefix, dtype, width, ep, selected,
+        quant, payload_dtype, layouts, received_assignments, absorbed,
+        forward_raw, backward_raw, source_routing, source_key, source_metadata,
+        row_format, source_partitions, payload_basis,
+        pack_quant=pack_quant, ep_rank=ep_rank,
+    )
+    return _replace_protocol_ops(
+        ops, by_id, pack, dispatch, combine, unpack, pack_quant,
+        dispatch_op, combine_op, received_quant,
+    )
+
+
+def _dispatch_quant_mode(selected, pack, pack_quant, by_id, prefix, dispatch, width):
+    quant = selected.get("dispatch_quant", "none")
+    # ``aclnnMoeInitRoutingV3`` may own the dispatch-input quantization
+    # (``quant_mode=1``) instead of a separate ``pack.quantize`` node.  The
+    # sender then publishes quantized rows and the receiver scales come from
+    # that pack, so no received quantizer is synthesized here.
+    absorbed = dict(pack.metadata).get("moe_init_routing")
+    if absorbed is not None:
+        if pack_quant is not None:
+            raise ModelingError("mc2_init_routing_absorption_conflicts_with_pack_quantizer")
+        absorbed_quant = _absorbed_quant_mode(absorbed)
+        if quant not in {"none", absorbed_quant}:
+            raise ModelingError("mc2_init_routing_absorption_conflicts_with_dispatch_quant")
+        quant = absorbed_quant
+    if (selected.get("selection") == "moe_comm_config"
+            and "dispatch_quant" not in selected
+            and pack_quant is not None
+            and absorbed is None):
+        pmeta = dict(pack_quant.metadata)
+        gate_cand = by_id.get(prefix + ".expert_up")
+        gmeta = dict(gate_cand.metadata) if gate_cand is not None else {}
+        if (gate_cand is not None and gate_cand.deps == (dispatch.op_id,)
+                and gate_cand.local_shape[-1] == width):
+            if (pmeta.get("output_format") in {"fp8_e4m3", "fp8_e5m2"}
+                    and pmeta.get("activation_group_size") == MX_DISPATCH_GROUP
+                    and pmeta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
+                    and gmeta.get("activation_format") == pmeta.get("output_format")
+                    and gmeta.get("activation_group_size") == MX_DISPATCH_GROUP
+                    and gmeta.get("activation_scale_format") == "fp8_e8m0"):
+                quant = "mx"
+            elif (pmeta.get("output_format") == "int8"
+                  and pmeta.get("activation_group_size") == width
+                  and pmeta.get("activation_scale_format") == "fp32"
+                  and gmeta.get("activation_format") == "int8"):
+                quant = "per_token_int8"
+    return quant, absorbed
+
+
+def _bind_quantized_expert_input(
+    by_id, prefix, dispatch, received_assignments, width, dtype,
+    quant, payload_dtype, layouts,
+):
+    if quant == "mx":
+        mx32_work(width, dtype, payload_dtype)
+    gate = by_id.get(prefix + ".expert_up")
+    if gate is None:
+        if received_assignments:
+            raise ModelingError("mc2_quantized_requires_direct_expert_input_consumer")
+    else:
+        meta = dict(gate.metadata)
+        # This dispatch owns exactly this consumer's input representation.
+        # A transport selection cannot suppress an unrelated conversion.
+        direct = (gate.deps == (dispatch.op_id,) and gate.local_shape[-1] == width
+                  and meta.get("activation_format") == payload_dtype)
+        if quant == "mx":
+            matched = (meta.get("activation_group_size") == MX_DISPATCH_GROUP
+                       and meta.get("activation_scale_format") == "fp8_e8m0"
+                       and tuple(meta.get("activation_scale_shape", ()))[1:] == (width // (2 * MX_DISPATCH_GROUP), 2))
+            requirement = "matching_e4m3_e8m0_group32"
+        else:
+            matched = (meta.get("activation_group_size") == width
+                       and meta.get("activation_scale_format") == "fp32"
+                       and tuple(meta.get("activation_scale_shape", ())) == (math.ceil(received_assignments),))
+            requirement = "matching_int8_fp32_per_row"
+        scale_bytes = meta.get("activation_scale_bytes")
+        expected_scale_bytes = float(received_assignments * layouts[0].scale_bytes)
+        scale_bytes_ok = (
+            not isinstance(scale_bytes, bool)
+            and isinstance(scale_bytes, (int, float))
+            and math.isfinite(float(scale_bytes))
+            and math.isclose(
+                float(scale_bytes),
+                expected_scale_bytes,
+                rel_tol=SCALE_BYTES_MATCH_TOL,
+                abs_tol=SCALE_BYTES_MATCH_TOL,
+            )
+        )
+        if not direct or not matched or not scale_bytes_ok:
+            raise ModelingError(f"mc2_{quant}_expert_input_requires_{requirement}_producer")
+        # The fused dispatch owns the absorbed init-routing quantization,
+        # so it publishes both the quantized payload and its scales.
+        meta.update(activation_producer="explicit_transport_quantization",
+                    activation_payload_producer=dispatch.op_id,
+                    activation_scale_producer=dispatch.op_id,
+                    moe_transport_kind=("arch35_fullmesh_mx32" if quant == "mx"
+                                        else "arch35_fullmesh_per_token_int8"))
+        by_id[gate.op_id] = replace(gate, metadata=tuple(meta.items()))
+    down = by_id.get(prefix + ".expert_down")
+    if down is not None and dict(down.metadata).get("output_format") != dtype:
+        raise ModelingError("mc2_quantized_combine_requires_declared_float_expert_return")
+
+
+def _resolve_lowered_ep_rank(pack, dispatch, unpack, expert_up, source_routing) -> int | None:
+    """Resolve local EP rank from operator metadata or routing realization, even on empty banks."""
+    for candidate in (unpack, expert_up, dispatch, pack):
+        if candidate is None:
+            continue
+        cand_rank = dict(candidate.metadata).get("ep_rank")
+        if isinstance(cand_rank, int) and not isinstance(cand_rank, bool):
+            return cand_rank
+    for candidate in (unpack, pack, dispatch):
+        if candidate is None:
+            continue
+        rr = dict(candidate.metadata).get("routing_realization")
+        if isinstance(rr, Mapping):
+            rep_rank = rr.get("representative_rank")
+            if isinstance(rep_rank, int) and not isinstance(rep_rank, bool):
+                return rep_rank
+    if source_routing is not None:
+        rep_rank = getattr(source_routing, "representative_rank", None)
+        if isinstance(rep_rank, int) and not isinstance(rep_rank, bool):
+            return rep_rank
+    return None
+
+
+def _declared_group_send(selected, runtime) -> bool | None:
+    if "enable_group_send" in selected and selected["enable_group_send"] is not None:
+        return bool(selected["enable_group_send"])
+    rmeta = dict(getattr(runtime, "metadata", ()) or ())
+    if "enable_group_send" in rmeta and rmeta["enable_group_send"] is not None:
+        return bool(rmeta["enable_group_send"])
+    radditional = rmeta.get("additional_config")
+    if isinstance(radditional, Mapping) and "enable_group_send" in radditional:
+        if radditional["enable_group_send"] is not None:
+            return bool(radditional["enable_group_send"])
+    return None
+
+
+def _routing_contracts(
+    source_routing, source_rows_by_replica, destination_rows_by_rank,
+    ep, width, dtype, tokens, valid_source_tokens, top_k, experts,
+    quant, quant_mode, payload_dtype, layouts, send, received_assignments,
+    *, global_bs: int | None = None, enable_group_send: bool | None = None,
+):
+    # An exact source force-EPLB ledger is a whole routed-row matrix.  It is
+    # never synthesized from a statistical destination expectation.
+    peer_matrix = None
+    if source_routing is not None:
+        cells = getattr(source_routing, "peer_assignments", None)
+        if cells is not None:
+            peer_matrix = tuple(tuple(int(value) for value in row) for row in cells)
+    route_rank = (int(getattr(source_routing, "representative_rank", 0))
+                  if source_routing is not None else 0)
+    if peer_matrix is not None:
+        payload_basis = source_routing.basis
+    elif source_routing is not None:
+        payload_basis = str(getattr(source_routing, "basis",
+                                    "declared_peer_expectation"))
+    else:
+        payload_basis = "uniform_peer_payload"
+    source_key = ("source_force_eplb" if source_routing is not None and
+                  source_routing.basis == "source_force_eplb_masked_integer_counts"
+                  else "source_token_mask")
+    # A complete TP1 DP cohort exposes one declared logical source row count
+    # per EP rank.  Use that declared policy to build the SAME expected
+    # assignment matrix for dispatch and its transpose for combine.  For a
+    # wider TP group the vector is DP-scoped, not EP-scoped, and is ignored.
+    global_source_rows = None
+    if (peer_matrix is None and source_routing is None
+            and source_rows_by_replica is not None
+            and len(source_rows_by_replica) == ep):
+        global_source_rows = tuple(
+            max(0, int(value)) for value in source_rows_by_replica)
+
+    def raw_contract(kind, incoming, outgoing):
+        raw = {"kind": kind, "width": width, "dtype": dtype,
+               "source_tokens": tokens if kind == "dispatch" else valid_source_tokens,
+               "top_k": top_k, "source_assignments": incoming,
+               "received_assignments": outgoing, "experts": experts, "ep": ep,
+               "payload_basis": payload_basis}
+        if kind == "dispatch" and quant != "none":
+            raw.update(dispatch_quant=quant_mode, payload_dtype=payload_dtype)
+        if global_bs is not None:
+            raw["global_bs"] = global_bs
+        if enable_group_send is not None:
+            raw["enable_group_send"] = bool(enable_group_send)
+        layout = layouts[0] if kind == "dispatch" else layouts[1]
+        if peer_matrix is not None:
+            # One representation: the shared source->destination forward
+            # matrix. route_reverse=True below is the combine transpose.
+            raw.update(route_matrix=peer_matrix, route_rank=route_rank)
+        elif (source_routing is not None
+              and hasattr(source_routing, "payload_matrix")):
+            # Declared statistical destination policy: expected directed bytes,
+            # never integer frame counts presented as observed peer traffic.
+            expected = source_routing.payload_matrix(
+                layout.packet_bytes, reverse=kind == "combine")
+            raw["route_matrix_bytes"] = tuple(
+                tuple(float(value) for value in row) for row in expected)
+        elif global_source_rows is not None:
+            # A source-blind two-way expectation conditional on the SAME
+            # source and destination marginals used by F3:
+            #   E[N_ij | s,d] = s_i * d_j / sum(s).
+            # The matrix includes the local diagonal; native transport still
+            # omits the local wire.  K3's all-one destination marginal keeps
+            # the signed 31 off-diagonal assignments; DS's 12 occupied and 4
+            # empty F3 ranks give .5 per occupied edge instead of .75*16.
+            source_values = tuple(float(rows * top_k)
+                                  for rows in global_source_rows)
+            total_source = sum(source_values)
+            if (destination_rows_by_rank is not None
+                    and len(destination_rows_by_rank) == ep):
+                destination_values = tuple(
+                    float(max(0, int(value)))
+                    for value in destination_rows_by_rank)
+            else:
+                destination_values = (
+                    (total_source / float(ep),) * ep
+                    if total_source > 0 else (0.0,) * ep)
+            matrix = []
+            for source in range(ep):
+                row = []
+                for destination in range(ep):
+                    # Dispatch is [original source, expert destination].
+                    # Combine is its transpose: [expert source, original
+                    # destination], re-framed at the combine packet width.
+                    s_value = (source_values[destination]
+                               if kind == "combine" else source_values[source])
+                    d_value = (destination_values[source]
+                               if kind == "combine"
+                               else destination_values[destination])
+                    expected = (s_value * d_value / total_source
+                                if total_source > 0 else 0.0)
+                    row.append(expected * float(layout.packet_bytes))
+                matrix.append(tuple(row))
+            raw["route_matrix_bytes"] = tuple(matrix)
+            raw["moe_expected_pairing"] = (
+                "conditional_source_destination_marginals"
+                if destination_rows_by_rank is not None
+                else "conditional_uniform_destination")
+        else:
+            # Uniform peer policy: one source's useful payload spread across
+            # its declared peers.  The expectation is positive unless the
+            # source row itself is a known zero.
+            raw["uniform_payload_bytes"] = float(
+                incoming * layout.packet_bytes)
+        raw["route_reverse"] = kind == "combine"
+        if incoming <= 0 and source_routing is None:
+            raw["payload_basis"] = "actual_zero"
+        return raw
+
+    forward_raw = raw_contract("dispatch", send, received_assignments)
+    backward_raw = raw_contract("combine", received_assignments, send)
+    return forward_raw, backward_raw, payload_basis, source_key
+
+
+def _native_dispatch_combine(
+    pack, dispatch, combine, unpack, prefix, dtype, width, ep, selected,
+    quant, payload_dtype, layouts, received_assignments, absorbed,
+    forward_raw, backward_raw, source_routing, source_key, source_metadata,
+    row_format, source_partitions, payload_basis,
+    *, pack_quant=None, ep_rank: int | None = None,
+):
+    phase_names = {
+        "dispatch": tuple(p.name for p in contract(forward_raw, 2).phases),
+        "combine": tuple(p.name for p in contract(backward_raw, 2).phases),
+    }
+    dispatch_returns = dispatch.returns
+    received_output = {}
+    if quant != "none":
+        # The native kernel completes after receiver materialization and flag
+        # retirement. These are receiver rows, even for an idle sender;
+        # original.local_shape still describes the source payload.
+        rows = math.ceil(received_assignments)
+        received_output = {
+            "output_format": payload_dtype,
+            "activation_payload_shape": (rows, width),
+            "activation_group_size": MX_DISPATCH_GROUP if quant == "mx" else width,
+            "activation_scale_format": "fp8_e8m0" if quant == "mx" else "fp32",
+            "activation_scale_shape": (rows, width // (2 * MX_DISPATCH_GROUP), 2) if quant == "mx" else (rows,),
+            "activation_scale_bytes": received_assignments * layouts[0].scale_bytes,
+            "activation_expected_rows": received_assignments,
+        }
+        if absorbed is None:
+            dispatch_returns = tuple(dict.fromkeys((*dispatch_returns, "activation_scales")))
+    combine_logical_rows = math.ceil(backward_raw["source_tokens"])
+    combine_physical_rows = max(combine_logical_rows, math.ceil(forward_raw["source_tokens"]))
+    combine_logical_shape = (combine_logical_rows, width)
+    combine_physical_shape = (combine_physical_rows, width)
+    mask_producer = dict(dispatch.metadata).get("mc2_active_mask_producer")
+
+    def native_metadata(kind, raw, kernel, group):
+        implementation = (
+            {"mx": "arch35_fullmesh_mx32_bf16_e4m3",
+             "per_token_int8": "arch35_fullmesh_per_token_int8"}.get(
+                 quant, "arch35_fullmesh_unquantized_rows")
+            if kind == "dispatch" else "arch35_fullmesh_unquantized_rows")
+        metadata = {
+            **(received_output if kind == "dispatch" else {}),
+            **({source_key: source_metadata} if source_routing is not None else {}),
+            "mc2_phase": raw,
+            "mc2_phases": phase_names[kind],
+            "group_axis": "ep", "steps": max(0, ep - 1),
+            "device_kernel_group": {"id": group, "entry": True, "exit": True,
+                                    "kernel": kernel},
+            "implementation": implementation,
+            "source": SOURCE, "native_kind": kernel,
+            "invocation_class": "vector",
+            **({"moe_comm_selection": dict(selected.get("moe_comm") or ())}
+               if selected.get("selection") == "moe_comm_config" else {}),
+            "peer_traffic_row_format": row_format,
+            "source_assignment_partitions": source_partitions,
+            "traffic_model": payload_basis,
+            "transport_options": {
+                "chunk_bytes": selected.get("chunk_bytes"),
+                "hop_startup_us": selected.get("hop_startup_us", 0.0),
+                "receive_capacity_bytes_per_peer": selected.get(
+                    "receive_capacity_bytes_per_peer"),
+                # The fused native phase scheduler owns its peer loop.  These
+                # are declared for the direct-peer transport recipe and are
+                # recorded here instead of being silently dropped.
+                "application": "direct_peer_transport_recipe",
+                "native_fused_phase_scheduler": (
+                    "separate_owner; not_rescheduled_by_mc2_graph"),
+            },
+            "coverage": "source_protocol_with_declared_row_grid_and_peer_window",
+        }
+        if ep_rank is not None:
+            metadata["ep_rank"] = ep_rank
+        if kind == "combine":
+            metadata["transpose_of_source_assignments"] = True
+            metadata["output_format"] = dtype
+            metadata["output_shape"] = combine_logical_shape
+            metadata["output_layout"] = {
+                "shape": combine_logical_shape,
+                "storage_shape": combine_physical_shape,
+            }
+        if kind == "dispatch" and mask_producer is not None:
+            metadata["mc2_active_mask_producer"] = mask_producer
+        if kind == "dispatch" and absorbed is not None:
+            # ``MoeDistributeDispatchV3`` owns the permutation *and* the
+            # ``aclnnMoeInitRoutingV3`` dynamic quantization (``quant_mode=1``)
+            # in one native call: no separate pack quantizer remains.
+            metadata["moe_init_routing"] = dict(absorbed)
+            metadata["fused_native_kinds"] = ("MoeDistributeDispatchV3",
+                                              absorbed["native_kind"])
+        return tuple(metadata.items())
+
+    absorbed_ids = {pack.op_id, *((pack_quant.op_id,) if pack_quant is not None else ())}
+    dispatch_extra_deps = tuple(dep for dep in dispatch.deps if dep not in absorbed_ids)
+    dispatch_deps = tuple(dict.fromkeys(pack.deps + dispatch_extra_deps))
+    dispatch_op = declared_floor_work(forward_raw, ep_rank=ep_rank).apply(replace(
+        dispatch, op_id=dispatch.op_id, deps=dispatch_deps,
+        family="mc2_protocol", recipe=RECIPE, source_boundary="kernel",
+        dtype=dtype, returns=dispatch_returns,
+        metadata=native_metadata(
+            "dispatch", forward_raw, "MoeDistributeDispatchV3",
+            prefix + ".mc2_dispatch")))
+    # The source reduction retains the actual weight producer dependency while
+    # replacing generic payload reads, arithmetic and final output publication.
+    final_deps = (dispatch.op_id,) + tuple(
+        d for d in unpack.deps if d not in {pack.op_id, combine.op_id})
+    combine_deps = tuple(dict.fromkeys(combine.deps + final_deps))
+    combine_op = declared_floor_work(backward_raw, ep_rank=ep_rank).apply(replace(
+        combine, op_id=unpack.op_id, deps=combine_deps,
+        family="mc2_protocol", recipe=RECIPE, source_boundary="kernel",
+        dtype=dtype,
+        local_shape=combine_logical_shape, semantic_shape=combine_logical_shape,
+        padded_shape=combine_physical_shape, launch_shape=combine_physical_shape,
+        metadata=native_metadata(
+            "combine", backward_raw, "MoeDistributeCombineV3",
+            prefix + ".mc2_combine")))
+    return dispatch_op, combine_op
+
+
+def _replace_protocol_ops(
+    ops, by_id, pack, dispatch, combine, unpack, pack_quant,
+    dispatch_op, combine_op, received_quant,
+):
+    # One native call replaces its semantic phase operators; the original
+    # pack/dispatch/combine/unpack aliases remain connected through the entry
+    # and exit ids, never through duplicated scheduling.
+    redirect = {pack.op_id: dispatch.op_id, combine.op_id: unpack.op_id}
+    result = []
+    for op in ops:
+        if op.op_id == dispatch.op_id:
+            result.append(dispatch_op)
+            if received_quant is not None:
+                result.append(received_quant)
+            continue
+        if op.op_id == unpack.op_id:
+            result.append(combine_op)
+            continue
+        if (op.op_id in {pack.op_id, combine.op_id}
+                or (pack_quant is not None and op.op_id == pack_quant.op_id)):
+            continue
+        current = by_id[op.op_id]
+        deps = tuple(redirect.get(dependency, dependency)
+                     for dependency in current.deps)
+        if deps != current.deps:
+            current = replace(current, deps=deps)
+        result.append(current)
+    return result

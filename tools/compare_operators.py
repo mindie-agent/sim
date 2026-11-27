@@ -15,7 +15,7 @@ from pathlib import Path
 from statistics import median
 
 from mindie_sim import Case
-from mindie_sim.observations.kernels import PROFILER_API_REQUIREMENT, kernel_rows
+from mindie_sim.observations.captures import PROFILER_API_REQUIREMENT, kernel_rows
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
 
 

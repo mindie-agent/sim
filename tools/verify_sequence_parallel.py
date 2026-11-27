@@ -28,7 +28,7 @@ def source_hashes(root):
 
 
 def make_case(root, balanced=False):
-    from mindie_sim.prediction.sequence_parallel import DECLARATION
+    from mindie_sim.prediction.sharding.sequence_parallel import DECLARATION
     from mindie_sim.prediction.structure import parse_case
     raw = json.loads((root / CASE_PATH).read_text())
     kernels = raw["runtime"].setdefault("kernels", {})
@@ -56,7 +56,7 @@ def one(ops, predicate):
 
 
 def build(case, rows):
-    from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
+    from mindie_sim.prediction.execution.cohort_traffic import bind_cohort_traffic
     from mindie_sim.prediction.frontend import Frontend
     from mindie_sim.schema.workload import RequestView
     frontend = Frontend()
@@ -72,7 +72,7 @@ def build(case, rows):
 
 
 def inspect(case, graphs, rows):
-    from mindie_sim.prediction.peer_traffic import PeerTraffic
+    from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
     from mindie_sim.schema.common import dtype_bytes
     p, model = case.runtime.parallel, case.model
     layer = model.layer_plans[1]

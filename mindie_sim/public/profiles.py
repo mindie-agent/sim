@@ -61,6 +61,8 @@ def _source_schema(source: Any) -> str:
             return ""
         value = json.loads(path.read_text(encoding="utf-8"))
         return value.get("schema", "") if isinstance(value, dict) else ""
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return ""
 

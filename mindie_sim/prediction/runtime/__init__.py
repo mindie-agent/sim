@@ -15,6 +15,24 @@ from .contracts import (
     ProgramCatalog, ReaderKey, ReleaseResult, ReleaseSpec, Submission,
     TranslationCertificate, VersionBinding, WorkTerm,
 )
+from .memory_physics import (
+    AddressRun, AddressRunPlan, AdmissionMemoryView, BoundAccess, BurstTurnRule,
+    ByteLedger, ConstraintTerm, CounterTerm, DirtyWriteback, HbmBusSpec,
+    MemoryAccessPattern, ReuseKey, VisibilityContract, bind_memory_access,
+    burst_turnaround_efficiency,
+)
+from .prepared_terms import (
+    BoundVectorOp, VectorInstructionGroup, bind_vector_groups,
+)
+from .ring_buffer import (
+    DepRecord, GenerationEvents, RingBuffer, SlotGenRecord, SlotGenerationId,
+    lower_generation,
+)
+from .tile_solver import (
+    LiveBufferSpec, OwnerPoolPeak, SubtileWaveSpec, TileCandidate,
+    TileInfeasibleError, TilePipelineSpec, TileRejection, TileShape,
+    TileSolution, solve as solve_tiles,
+)
 
 _ENGINE_NAMES = frozenset({
     "Allocation", "Engine", "Event", "ExecutionError", "Resource",
@@ -30,12 +48,25 @@ def __getattr__(name):
 
 
 __all__ = [
+    "AddressRun", "AddressRunPlan", "AdmissionMemoryView", "Allocation",
     "AllocationBinding", "AllocationKey", "BackingKey", "BindingFrame",
-    "CapacityDomainState", "CapTerm", "CatalogGeneration", "EdgeSpec",
-    "EventKey", "FiniteProgramSpec", "GrantResult", "HostProgramSpec",
-    "OccurrenceKey", "PlacementSpec", "PoolKey", "PortBinding", "PortSpec",
-    "ProgramCatalog", "ReaderKey", "ReleaseResult", "ReleaseSpec",
-    "Submission", "TranslationCertificate", "VersionBinding", "WorkTerm",
-    "Allocation", "Engine", "Event", "ExecutionError", "Resource",
-    "PreparedStage",
+    "BoundAccess", "BoundVectorOp",
+    "BurstTurnRule", "ByteLedger", "CapTerm", "CapacityDomainState",
+    "CatalogGeneration", "ConstraintTerm", "CounterTerm", "DepRecord",
+    "DirtyWriteback", "EdgeSpec", "Engine", "Event", "EventKey", "ExecutionError",
+    "FiniteProgramSpec", "GenerationEvents",
+    "GrantResult", "HbmBusSpec", "HostProgramSpec",
+    "LiveBufferSpec", "MemoryAccessPattern", "OccurrenceKey",
+    "OwnerPoolPeak", "PlacementSpec", "PoolKey",
+    "PortBinding", "PortSpec", "PreparedStage",
+    "ProgramCatalog", "ReaderKey", "ReleaseResult",
+    "ReleaseSpec", "Resource", "ReuseKey", "RingBuffer",
+    "SlotGenRecord", "SlotGenerationId", "Submission", "SubtileWaveSpec",
+    "TileCandidate", "TileInfeasibleError", "TilePipelineSpec",
+    "TileRejection", "TileShape", "TileSolution",
+    "TranslationCertificate", "VectorInstructionGroup", "VersionBinding",
+    "VisibilityContract", "WorkTerm",
+    "bind_memory_access", "bind_vector_groups",
+    "burst_turnaround_efficiency",
+    "lower_generation", "solve_tiles",
 ]

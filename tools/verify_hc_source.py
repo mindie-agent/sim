@@ -16,11 +16,11 @@ import subprocess
 import time
 
 import mindie_sim
-from mindie_sim.prediction.family_hc import (
+from mindie_sim.prediction.operators.hyper_connections.family_hc import (
     POST_PROFILE, PRE_PROFILE, pre_phase_work, selected_plan,
 )
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.native_fusion import _groups, lower_native_fusions
+from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

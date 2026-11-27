@@ -24,7 +24,7 @@ _DTYPE_BYTES = {
     "float16": 2.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
     "int8": 1.0, "uint8": 1.0, "w8a8": 1.0, "int4": 0.5, "w4a8": 0.5, "fp4": 0.5,
     "fp4_e2m1": 0.5, "int32": 4.0, "int64": 8.0,
-    "bool": 1.0, "fp8_e8m0": 1.0, "e8m0": 1.0,
+    "hifloat8": 1.0, "hif8": 1.0, "bool": 1.0, "fp8_e8m0": 1.0, "e8m0": 1.0,
     # MXFP8 transports 32 E4M3 elements plus one E8M0 block scale byte:
     # 32 payload bytes + 1 scale byte per 32 elements = 33/32 B per element.
     "mxfp8": 33.0 / 32.0, "mx_fp8": 33.0 / 32.0, "mxfp8_e4m3": 33.0 / 32.0,
@@ -61,6 +61,40 @@ _PEAK_DTYPE_ALIASES = {
 
 _BASE_PEAK_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
 
+#: Expected maximum deviation of a 2-rank zero-sum normal split (E[|Z|] = sqrt(2 / pi)).
+ORDER_STAT_M2_Z = math.sqrt(2.0 / math.pi)
+#: Precomputed ln(4 * pi) term in the Cramér-Leadbetter normal maximum order statistic.
+ORDER_STAT_LN_FOUR_PI = math.log(4.0 * math.pi)
+#: Variance damping factor when redundant EPLB slots mitigate EP rank skew.
+EPLB_VARIANCE_DAMPING = 0.35
+
+
+def normal_max_order_z(rank_count: int) -> float:
+    """Closed-form expected maximum of ``rank_count`` standard normals."""
+    m = int(rank_count)
+    if m <= 1:
+        return 0.0
+    if m == 2:
+        return ORDER_STAT_M2_Z
+    log_m = math.log(float(m))
+    root = math.sqrt(2.0 * log_m)
+    asymptotic = root - (math.log(log_m) + ORDER_STAT_LN_FOUR_PI) / (2.0 * root)
+    return max(ORDER_STAT_M2_Z, asymptotic)
+
+
+def inclusion_probability(draws: float, hit_prob: float) -> float:
+    """Exact ``1 - (1 - hit_prob) ** draws`` with zero-draw guard checked first."""
+    n = float(draws)
+    if not math.isfinite(n) or n <= 0.0:
+        return 0.0
+    p = float(hit_prob)
+    if not math.isfinite(p) or p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    return -math.expm1(n * math.log1p(-p))
+
+
 class ModelingError(ValueError):
     """Invalid or unsupported modeling input."""
 
@@ -79,15 +113,6 @@ def _unknown(mapping: Mapping[str, Any], allowed: set[str], context: str) -> Non
                 and key not in _IGNORED_DOCUMENT_FIELDS
                 and not str(key).startswith("x_")):
             raise ModelingError(f"unknown_field:{context}.{key}")
-
-def _float(value: Any, reason: str, *, minimum: float = 0.0) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ModelingError(reason) from exc
-    if not math.isfinite(result) or result < minimum:
-        raise ModelingError(reason)
-    return result
 
 def _int(value: Any, reason: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool):
@@ -110,11 +135,6 @@ def _positive_float(value: Any, reason: str, *, allow_zero: bool = False) -> flo
     if not math.isfinite(result) or result < 0 or (result == 0 and not allow_zero):
         raise ModelingError(reason)
     return result
-
-def _bool(value: Any, reason: str) -> bool:
-    if not isinstance(value, bool):
-        raise ModelingError(reason)
-    return value
 
 def _text(value: Any, reason: str, *, default: str | None = None) -> str:
     if value is None and default is not None:

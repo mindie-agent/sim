@@ -194,6 +194,8 @@ def _sysconf_memory_gib() -> tuple[float, float] | None:
     try:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
+    except TimeoutError:
+        raise
     except (AttributeError, ValueError, OSError):
         return None
     if not isinstance(pages, int) or not isinstance(page_size, int):

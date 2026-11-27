@@ -1,0 +1,204 @@
+{
+  "schema_version": "mindie-l0-primitives/1",
+  "tables": {
+    "Ascend910B4": {
+      "arch_preset": "npu_arch_2201",
+      "calibrated": true,
+      "calibrated_primitive_count": 15,
+      "cann_version": "9.2.1",
+      "capture_uri": "capture://a2-910b4-ep/camp-202611-l0/ac44045b6fbccea57a98480a34ac7832078f8b72ca530032c58a33414320a75c",
+      "compatible_skus": [
+        "Ascend910B4"
+      ],
+      "coverage_summary": {
+        "calibrated_metrics": 44,
+        "calibrated_modes": [
+          "bf16",
+          "fp16",
+          "fp32",
+          "hf32",
+          "int8"
+        ],
+        "conflict_metrics": 2,
+        "conflict_modes": [],
+        "supported_metrics": 68,
+        "unmeasured_modes": [
+          "int4"
+        ],
+        "unsupported_modes": [
+          "fp8_e4m3",
+          "fp8_e5m2",
+          "hifloat8",
+          "mxfp8",
+          "mxfp4"
+        ]
+      },
+      "envelope_sha256": "03b1ec9f3db8b982853d67820e3c704fde77841ffb16eda66069e1debfb55be2",
+      "file": "arch22_a2_910b4.json",
+      "ini_sha256": "314c14eefb53807216db8ed5486367e7ad615079d613423aa66ce2a0d22c74e1",
+      "sku": "Ascend910B4",
+      "total_primitives": 20,
+      "unmeasured_primitive_count": 3,
+      "unsupported_primitive_count": 2
+    },
+    "Ascend910_9362": {
+      "arch_preset": "npu_arch_2201",
+      "calibrated": true,
+      "calibrated_primitive_count": 14,
+      "cann_version": "9.3.0",
+      "capture_uri": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "compatible_skus": [
+        "Ascend910_9362"
+      ],
+      "coverage_summary": {
+        "calibrated_metrics": 40,
+        "calibrated_modes": [
+          "bf16",
+          "fp16",
+          "fp32",
+          "hf32",
+          "int8"
+        ],
+        "conflict_metrics": 1,
+        "conflict_modes": [],
+        "supported_metrics": 68,
+        "unmeasured_modes": [
+          "int4"
+        ],
+        "unsupported_modes": [
+          "fp8_e4m3",
+          "fp8_e5m2",
+          "hifloat8",
+          "mxfp8",
+          "mxfp4"
+        ]
+      },
+      "envelope_sha256": "bebb0d9e4294702112e631629b053bf0b594fe11bb338e11076d13a54c9612b2",
+      "file": "arch22_a3_9362.json",
+      "ini_sha256": "c070a85dd8063e034e772b178caf798b3f8fae4c4024f2afdf983eb4117a9fa3",
+      "sku": "Ascend910_9362",
+      "total_primitives": 20,
+      "unmeasured_primitive_count": 4,
+      "unsupported_primitive_count": 2
+    },
+    "Ascend910_9382": {
+      "arch_preset": "npu_arch_2201",
+      "calibrated": true,
+      "calibrated_primitive_count": 15,
+      "cann_version": "9.2.1",
+      "capture_uri": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "compatible_skus": [
+        "Ascend910_9382"
+      ],
+      "coverage_summary": {
+        "calibrated_metrics": 45,
+        "calibrated_modes": [
+          "bf16",
+          "fp16",
+          "fp32",
+          "hf32",
+          "int8"
+        ],
+        "conflict_metrics": 2,
+        "conflict_modes": [],
+        "supported_metrics": 68,
+        "unmeasured_modes": [
+          "int4"
+        ],
+        "unsupported_modes": [
+          "fp8_e4m3",
+          "fp8_e5m2",
+          "hifloat8",
+          "mxfp8",
+          "mxfp4"
+        ]
+      },
+      "envelope_sha256": "ef9fa06d0747009fc78a0d6bf007beb046edf1a31f2c3e3ba744c42b032694a9",
+      "file": "arch22_a3_9382.json",
+      "ini_sha256": "d2d84c0ded236393ef40284673cb62bc234e503ed4f0967f31a637f965aadd29",
+      "sku": "Ascend910_9382",
+      "total_primitives": 20,
+      "unmeasured_primitive_count": 3,
+      "unsupported_primitive_count": 2
+    },
+    "Ascend950DT_9582": {
+      "arch_preset": "npu_arch_3510",
+      "calibrated": true,
+      "calibrated_primitive_count": 18,
+      "cann_version": "9.3.0",
+      "capture_uri": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "compatible_skus": [
+        "Ascend950DT_9582",
+        "Ascend950DT_9581"
+      ],
+      "coverage_summary": {
+        "calibrated_metrics": 48,
+        "calibrated_modes": [
+          "bf16",
+          "fp16",
+          "fp32",
+          "hf32",
+          "int8",
+          "fp8_e4m3",
+          "fp8_e5m2",
+          "hifloat8",
+          "mxfp8",
+          "mxfp4"
+        ],
+        "conflict_metrics": 3,
+        "conflict_modes": [],
+        "supported_metrics": 75,
+        "unmeasured_modes": [],
+        "unsupported_modes": [
+          "int4"
+        ]
+      },
+      "envelope_sha256": "d288dd2f012a4879d6d131d78c0e9bd7ac9ba0d2968458e38ce023c121afb0d0",
+      "file": "arch35_a5_950dt.json",
+      "ini_sha256": "26a9caca4d1854e5eb95dbc5725249ddf0d7fcd85676f2f377149d38cb3ed251",
+      "sku": "Ascend950DT_9582",
+      "total_primitives": 20,
+      "unmeasured_primitive_count": 2,
+      "unsupported_primitive_count": 0
+    },
+    "Ascend950PR_9579": {
+      "arch_preset": "npu_arch_3510",
+      "calibrated": false,
+      "calibrated_primitive_count": 0,
+      "cann_version": "unmeasured",
+      "capture_uri": "capture://a5-9579-unmeasured/camp-202611-l0/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
+      "compatible_skus": [
+        "Ascend950PR_9579"
+      ],
+      "coverage_summary": {
+        "calibrated_metrics": 0,
+        "calibrated_modes": [],
+        "conflict_metrics": 0,
+        "conflict_modes": [],
+        "supported_metrics": 74,
+        "unmeasured_modes": [
+          "bf16",
+          "fp16",
+          "fp32",
+          "hf32",
+          "int8",
+          "fp8_e4m3",
+          "fp8_e5m2",
+          "hifloat8",
+          "mxfp8",
+          "mxfp4"
+        ],
+        "unsupported_modes": [
+          "int4"
+        ]
+      },
+      "envelope_sha256": "f0b0295e98fd5bb956c4fe7f54ecd32762e7e6dec2e88c53d1890bf267737319",
+      "file": "arch35_a5_950pr.json",
+      "ini_sha256": "",
+      "sku": "Ascend950PR_9579",
+      "total_primitives": 20,
+      "unmeasured_primitive_count": 20,
+      "unsupported_primitive_count": 0
+    }
+  }
+}

@@ -85,6 +85,25 @@ def _reference_attention_plan(model, draft, index: int) -> LayerPlan | None:
     return ref
 
 
+def _draft_common_kwargs(draft, index: int, *, mhc: int, mhc_lr: int, mhc_iters: int,
+                         hc_final_collapse: str, kv_elems: int, qk_norm: bool, q_gate: bool,
+                         mla_use_nope: bool, packed_input: bool,
+                         index_share: bool) -> dict:
+    return {
+        "index": index, "attention": draft.attention_kind,
+        "ffn": "moe" if draft.num_experts else "dense",
+        "moe_intermediate_size": draft.expert_intermediate_size, "scope": "draft",
+        "noncausal_attention": draft.noncausal_query_block,
+        "mla_variant": draft.mla_variant, "mla_use_nope": mla_use_nope,
+        "packed_input_projection": packed_input,
+        "index_share_for_mtp_iteration": index_share,
+        "kv_cache_elements": kv_elems, "qk_norm": qk_norm, "q_output_gate": q_gate,
+        "hyper_connections": bool(mhc), "hc_mult": mhc,
+        "hc_lowrank": mhc_lr, "hc_sinkhorn_iters": mhc_iters,
+        "hc_final_collapse": hc_final_collapse,
+    }
+
+
 def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     ref = _reference_attention_plan(model, draft, index)
     explicit_ratio = (
@@ -106,6 +125,10 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     mhc = int(draft.mhc_mult or (ref.hc_mult if ref and ref.hyper_connections else ZERO))
     mhc_lr = int(draft.mhc_lowrank or (ref.hc_lowrank if ref and ref.hyper_connections else ZERO))
     mhc_iters = int(draft.mhc_sinkhorn_iters or (ref.hc_sinkhorn_iters if ref and ref.hyper_connections else ZERO))
+    hc_collapse = str(
+        getattr(draft, "mhc_final_collapse", "")
+        or (getattr(ref, "hc_final_collapse", "learned") if ref and ref.hyper_connections else "learned")
+    )
     kv_elems = int(
         draft.kv_cache_elements
         or (ref.kv_cache_elements if ref else 0)
@@ -119,13 +142,25 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     # A draft block executes the target's MLA subgraph.  Its fused QKV-A
     # projection and NoPE declaration are properties of that subgraph, not of
     # the draft's own short declaration.
-    packed_input = bool(ref.packed_input_projection) if ref else False
+    packed_input = (
+        bool(ref.packed_input_projection) if ref
+        else bool(draft.attention_kind == "mla" and int(draft.q_lora_rank or ZERO) > ZERO)
+    )
     mla_use_nope = bool(ref.mla_use_nope) if ref else False
+    if ref is not None and int(plan_fields.get("qk_rope_head_dim", ZERO) or ZERO) <= ZERO and int(ref.qk_rope_head_dim or ZERO) > ZERO:
+        plan_fields = dict(plan_fields)
+        plan_fields["qk_rope_head_dim"] = int(ref.qk_rope_head_dim)
+        plan_fields["qk_nope_head_dim"] = int(ref.qk_nope_head_dim)
     # A body layer may declare the selection sharing; the draft spec keeps its
     # own explicit override so an external draft can opt out.
     index_share = bool(
         getattr(draft, "index_share_for_mtp_iteration", False)
         or (getattr(ref, "index_share_for_mtp_iteration", False) if ref else False))
+    common = _draft_common_kwargs(
+        draft, index, mhc=mhc, mhc_lr=mhc_lr, mhc_iters=mhc_iters,
+        hc_final_collapse=hc_collapse, kv_elems=kv_elems, qk_norm=qk_norm, q_gate=q_gate,
+        mla_use_nope=mla_use_nope, packed_input=packed_input, index_share=index_share,
+    )
 
     swa_only = (
         explicit_ratio == ZERO
@@ -142,19 +177,11 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         window = int(draft.sliding_window or (ref.window if ref else ZERO))
         cache_kind = ref.cache_kind if (ref and ref.cache_kind in {"dense", "window_compressed"}) else "window_compressed"
         return LayerPlan(
-            index=index, attention=draft.attention_kind, architecture="swa",
-            ffn="moe" if draft.num_experts else "dense",
-            moe_intermediate_size=draft.expert_intermediate_size, scope="draft",
-            noncausal_attention=draft.noncausal_query_block,
-            mla_variant=draft.mla_variant, mla_output_gate=mla_gate,
-            mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
-            index_share_for_mtp_iteration=index_share,
-            kv_cache_elements=kv_elems, qk_norm=qk_norm, q_output_gate=q_gate,
+            **common, architecture="swa", mla_output_gate=mla_gate,
             cache_kind=cache_kind, window=window, kv_owner_layer_id=LAST, owns_long_kv=False,
             compress_ratio=ZERO, compressor_kind="none", compressor_width=ONE, compressor_state_rows=ZERO,
             indexer=False, indexer_type="none", owns_index_k=False, index_k_owner_layer_id=LAST,
             owns_topk=False, topk_owner_layer_id=LAST, index_query_per_layer=False,
-            hyper_connections=bool(mhc), hc_mult=mhc, hc_lowrank=mhc_lr, hc_sinkhorn_iters=mhc_iters,
             **plan_fields,
         )
 
@@ -169,18 +196,10 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         )
         standalone_ck = "window_compressed" if standalone_comp > ZERO else "dense"
         return LayerPlan(
-            index=index, attention=draft.attention_kind, architecture=standalone_arch,
-            ffn="moe" if draft.num_experts else "dense",
-            moe_intermediate_size=draft.expert_intermediate_size, scope="draft",
-            noncausal_attention=draft.noncausal_query_block,
-            mla_variant=draft.mla_variant, kv_cache_elements=kv_elems,
-            mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
-            index_share_for_mtp_iteration=index_share,
-            qk_norm=qk_norm, q_output_gate=q_gate,
+            **common, architecture=standalone_arch,
             cache_kind=standalone_ck, window=standalone_win,
             compress_ratio=standalone_comp,
             kv_owner_layer_id=index, owns_long_kv=True,
-            hyper_connections=bool(mhc), hc_mult=mhc, hc_lowrank=mhc_lr, hc_sinkhorn_iters=mhc_iters,
             **plan_fields,
         )
 
@@ -195,14 +214,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     )
     window = int(draft.sliding_window or ref.window)
     return LayerPlan(
-        index=index, attention=draft.attention_kind, architecture=ref.architecture,
-        ffn="moe" if draft.num_experts else "dense",
-        moe_intermediate_size=draft.expert_intermediate_size, scope="draft",
-        noncausal_attention=draft.noncausal_query_block,
-        mla_variant=draft.mla_variant, mla_output_gate=mla_gate,
-        mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
-        index_share_for_mtp_iteration=index_share,
-        kv_cache_elements=kv_elems, qk_norm=qk_norm, q_output_gate=q_gate,
+        **common, architecture=ref.architecture, mla_output_gate=mla_gate,
         cache_kind=ref.cache_kind, window=window,
         kv_owner_layer_id=index if owns_long else LAST, owns_long_kv=owns_long,
         compress_ratio=ref.compress_ratio, compressor_kind=ref.compressor_kind,
@@ -227,7 +239,6 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         candidate_block_size=ref.candidate_block_size if has_indexer else ZERO,
         candidate_topk_blocks=ref.candidate_topk_blocks if has_indexer else ZERO,
         candidate_source_layer_id=LAST,
-        hyper_connections=bool(mhc), hc_mult=mhc, hc_lowrank=mhc_lr, hc_sinkhorn_iters=mhc_iters,
         **plan_fields,
     )
 

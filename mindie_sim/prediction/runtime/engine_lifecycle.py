@@ -12,7 +12,12 @@ from __future__ import annotations
 import heapq
 
 from . import frontier
+from ._engine_hbm_bus import (
+    _split_uncoupled_hbm_bus_task,
+    _task_needs_hbm_bus_split,
+)
 from .contracts import OccurrenceKey
+from .engine_prepare import _STAGE_PREPARATION_CACHE_LIMIT
 from .engine_types import (
     Allocation, Event, ExecutionError, _Task, _binding_for, _memory_binding,
     _units_to_mask,
@@ -168,95 +173,38 @@ class _EngineLifecycleMixin:
             self._periodic_tasks.pop(key, None)
         elif self._periodic_tasks:
             self._periodic_tasks.pop(key, None)
-        # A grant belongs to the live allocation and its real last use, not to
-        # the task that happened to acquire it. Release exactly at the free
-        # boundary; an acquire-only task keeps its grant until a later free.
         if task.free:
-            allocs = self.allocations
-            allocated = self.allocated
-            mem_grants = self._memory_grants
-            mem_pending = self._memory_pending
-            has_mem = bool(mem_grants or mem_pending)
-            alloc_dq = (self._alloc_trace_dq
-                        if self._alloc_trace_maxlen else None)
-            tname = task.event.name
-            popped_pools = []
-            for item in task.free:
-                iname = item if item.__class__ is str else item.name
-                if has_mem and (iname in mem_grants or iname in mem_pending):
-                    self._release_memory_grant(iname)
-                live = allocs.pop(iname, None)
-                if live is None:
-                    raise ExecutionError(f"release_without_live_allocation:{iname}")
-                allocated[live.pool] -= live.size * len(live.units)
-                popped_pools.append(live)
-                if alloc_dq is not None:
-                    alloc_dq.append((now, 0, live, tname))
-            n_free = len(task.free)
-            self.allocation_event_count += n_free
-            self._alloc_state_version += n_free
-            pool_masks = self._pool_unit_masks
-            if not allocs:
-                for live in popped_pools:
-                    lpool = live.pool
-                    allocated[lpool] = 0
-                    pool_masks[lpool] = 0
-                if self._unit_allocated:
-                    self._unit_allocated.clear()
-                self._unit_alloc_dirty = False
-            elif self._unit_alloc_dirty:
-                for live in popped_pools:
-                    pool_masks[live.pool] = 0
-                for rem_a in allocs.values():
-                    if rem_a.size > 0:
-                        rpool = rem_a.pool
-                        pool_masks[rpool] = (
-                            pool_masks.get(rpool, 0) | _units_to_mask(rem_a.units)
-                        )
-                for live in popped_pools:
-                    lpool = live.pool
-                    if not pool_masks.get(lpool, 0):
-                        allocated[lpool] = 0
-            elif (len(allocs) <= 4
-                  and sum(len(a.units) for a in allocs.values()) <= 8):
-                for live in popped_pools:
-                    pool_masks[live.pool] = 0
-                unit_alloc = self._unit_allocated
-                unit_alloc.clear()
-                for rem_a in allocs.values():
-                    rpool = rem_a.pool
-                    rsize = rem_a.size
-                    if rsize > 0:
-                        pool_masks[rpool] = (
-                            pool_masks.get(rpool, 0) | _units_to_mask(rem_a.units)
-                        )
-                    for u in rem_a.units:
-                        pair = (rpool, u)
-                        unit_alloc[pair] = unit_alloc.get(pair, 0) + rsize
-                for live in popped_pools:
-                    lpool = live.pool
-                    if not pool_masks.get(lpool, 0):
-                        allocated[lpool] = 0
-            else:
-                unit_alloc = self._unit_allocated
-                for live in popped_pools:
-                    lpool = live.pool
-                    lsize = live.size
-                    clear_mask = 0
-                    for unit in live.units:
-                        pair = (lpool, unit)
-                        new_val = unit_alloc[pair] - lsize
-                        if new_val:
-                            unit_alloc[pair] = new_val
-                        else:
-                            del unit_alloc[pair]
-                            clear_mask |= 1 << unit
-                    if clear_mask:
-                        new_m = pool_masks.get(lpool, 0) & ~clear_mask
-                        pool_masks[lpool] = new_m
-                        if not new_m:
-                            allocated[lpool] = 0
-        if task.metadata:
+            self._release_task_allocations(task, now)
+        if task.deliveries:
+            deliv = self.delivered
+            acc = task.delivered_acc
+            totals: dict[str, float] = {}
+            for ctr_id, amt in task.deliveries:
+                if amt > 0.0:
+                    totals[ctr_id] = totals.get(ctr_id, 0.0) + amt
+            for ctr_id, total_amt in totals.items():
+                prev = acc.get(ctr_id, 0.0) if acc is not None else 0.0
+                rem_amt = total_amt - prev
+                if rem_amt > 0.0:
+                    deliv[ctr_id] = deliv.get(ctr_id, 0.0) + rem_amt
+                    if acc is not None:
+                        acc[ctr_id] = total_amt
+            if self._delivery_live > 0:
+                self._delivery_live -= 1
+        if task.hbm_accounting:
+            acct_serviced = self._hbm_accounting_serviced
+            credited = task.hbm_credited or {}
+            for entry in task.hbm_accounting:
+                base = entry[0]
+                rem_at_bind = entry[2] + entry[3]
+                delta = rem_at_bind - credited.get(base, 0.0)
+                if delta > 0.0:
+                    task.service[base] = task.service.get(base, 0.0) + delta
+                    self.serviced[base] = self.serviced.get(base, 0.0) + delta
+                    acct_serviced[base] = acct_serviced.get(base, 0.0) + delta
+            if self._hbm_acct_live > 0:
+                self._hbm_acct_live -= 1
+        if not task.is_split_child and task.metadata:
             occurrence = task.metadata.get("occurrence")
             if isinstance(occurrence, OccurrenceKey):
                 record = self.occurrence_metrics.setdefault(
@@ -281,61 +229,233 @@ class _EngineLifecycleMixin:
             self._fifo_live -= 1
         if self._inline_blocked and self.task_blocks_native(task):
             self._inline_blocked -= 1
+        prep = task.prepared
+        if prep is not None and prep.partial_placed_resources:
+            live_partial = self._partial_placed_live
+            for rname in prep.partial_placed_resources:
+                rem_cnt = live_partial.get(rname, 0) - 1
+                if rem_cnt > 0:
+                    live_partial[rname] = rem_cnt
+                else:
+                    live_partial.pop(rname, None)
         del self._tasks[key]
-        self.completed_count += 1
-        t_ml = self._trace_maxlen
-        if t_ml:
-            tdq = self._trace_dq
-            if t_ml > 0 and len(tdq) == t_ml:
-                self.trace_dropped += 1
-            tdq.append((
-                task.event.name, task.owner, task.start, now,
-                task.demand, task.service, task.metadata,
-                task.placement, task.coupled,
-            ))
+        if not task.is_split_child:
+            self.completed_count += 1
+            t_ml = self._trace_maxlen
+            if t_ml:
+                tdq = self._trace_dq
+                if t_ml > 0 and len(tdq) == t_ml:
+                    self.trace_dropped += 1
+                    evicted = tdq[0]
+                    if evicted.__class__ is dict:
+                        ev_svc = evicted.get("serviced")
+                        ev_s_raw, ev_e_raw = evicted.get("start_ms"), evicted.get("end_ms")
+                        ev_name_raw = evicted.get("task")
+                    else:
+                        ev_name_raw, _, ev_s_raw, ev_e_raw, _, ev_svc = evicted[:6]
+                    if ev_svc and ev_e_raw > ev_s_raw:
+                        ev_name = str(ev_name_raw)
+                        parts = ev_name.split(":")
+                        ev_key = ":".join(parts[:3]) if len(parts) >= 3 else ev_name
+                        spans = self._evicted_service_spans.setdefault(ev_key, [])
+                        ev_s, ev_e = float(ev_s_raw), float(ev_e_raw)
+                        if spans and ev_s <= spans[-1][1]:
+                            spans[-1] = (min(spans[-1][0], ev_s), max(spans[-1][1], ev_e))
+                        else:
+                            spans.append((ev_s, ev_e))
+                tdq.append((
+                    task.event.name, task.owner, task.start, now,
+                    task.demand, task.service, task.metadata,
+                    task.placement, task.coupled,
+                ))
+                self._trace_appends += 1
         if native:
             self._native_slots.pop(key, None)
             self._native_seqs.discard(key)
             if self._native_active > 0:
                 self._native_active -= 1
         waiters = task.event._waiters
+        ledger_state = self.state_ledger
+        saved_waiters = (
+            tuple(waiters)
+            if (ledger_state is not None and waiters
+                and (ledger_state._event_commits or ledger_state._causal_stack
+                     or task.callback is not None))
+            else ()
+        )
         if native or self._native_seqs:
             if waiters:
                 self._wake(task.event, native=native)
         elif waiters:
-            tasks = self._tasks
-            ready_seen = self._ready_seen
-            ready_heap = self._ready_heap
-            releases = self._releases
-            if len(waiters) == 1:
-                successor = waiters.pop()
-                dependent = tasks.get(successor)
-                if dependent is not None:
-                    w = dependent.waiting - 1
-                    dependent.waiting = w
-                    if not w:
-                        if dependent.release <= now:
-                            if successor not in ready_seen:
-                                ready_seen.add(successor)
-                                heapq.heappush(ready_heap, (dependent.priority, successor))
-                        else:
-                            heapq.heappush(releases, (dependent.release, successor))
-            else:
-                for successor in waiters:
-                    dependent = tasks.get(successor)
-                    if dependent is None:
-                        continue
-                    dependent.waiting -= 1
-                    if not dependent.waiting:
-                        if dependent.release <= now:
-                            if successor not in ready_seen:
-                                ready_seen.add(successor)
-                                heapq.heappush(ready_heap, (dependent.priority, successor))
-                        else:
-                            heapq.heappush(releases, (dependent.release, successor))
-                waiters.clear()
+            self._wake_python_task_waiters(task, now, waiters)
         if task.callback is not None:
             task.callback(task.event)
+        if (ledger_state is not None
+                and (ledger_state._event_commits or ledger_state._causal_stack)):
+            ledger_state._propagate_to_waiters(key, saved_waiters, at=now)
+
+    def _release_task_allocations(self, task: _Task, now: float) -> None:
+        # A grant belongs to the live allocation and its real last use, not to
+        # the task that happened to acquire it. Release exactly at the free
+        # boundary; an acquire-only task keeps its grant until a later free.
+        allocs = self.allocations
+        allocated = self.allocated
+        mem_grants = self._memory_grants
+        mem_pending = self._memory_pending
+        has_mem = bool(mem_grants or mem_pending)
+        alloc_dq = (self._alloc_trace_dq
+                    if self._alloc_trace_maxlen else None)
+        tname = task.event.name
+        popped_pools = []
+        for item in task.free:
+            iname = item if item.__class__ is str else item.name
+            if has_mem and (iname in mem_grants or iname in mem_pending):
+                self._release_memory_grant(iname)
+            live = allocs.pop(iname, None)
+            if live is None:
+                raise ExecutionError(f"release_without_live_allocation:{iname}")
+            allocated[live.pool] -= live.size * len(live.units)
+            popped_pools.append(live)
+            if alloc_dq is not None:
+                alloc_dq.append((now, 0, live, tname))
+        wave_rec = self._wave_recorder
+        if wave_rec is not None:
+            for live in popped_pools:
+                for unit in live.units:
+                    slot_id, gen = wave_rec.release_slot_generation(
+                        live.pool, int(unit), live.name,
+                    )
+                    wave_rec.on_allocation(
+                        live.pool, int(unit), slot_id, gen, int(round(live.size)),
+                        now, "release",
+                    )
+        n_free = len(task.free)
+        self.allocation_event_count += n_free
+        self._alloc_state_version += n_free
+        pool_masks = self._pool_unit_masks
+        if not allocs:
+            for live in popped_pools:
+                lpool = live.pool
+                allocated[lpool] = 0
+                pool_masks[lpool] = 0
+            if self._unit_allocated:
+                self._unit_allocated.clear()
+            self._unit_alloc_dirty = False
+        elif self._unit_alloc_dirty:
+            for live in popped_pools:
+                pool_masks[live.pool] = 0
+            for rem_a in allocs.values():
+                if rem_a.size > 0:
+                    rpool = rem_a.pool
+                    pool_masks[rpool] = (
+                        pool_masks.get(rpool, 0) | _units_to_mask(rem_a.units)
+                    )
+            for live in popped_pools:
+                lpool = live.pool
+                if not pool_masks.get(lpool, 0):
+                    allocated[lpool] = 0
+        elif (len(allocs) <= 4
+              and sum(len(a.units) for a in allocs.values()) <= 8):
+            for live in popped_pools:
+                pool_masks[live.pool] = 0
+            unit_alloc = self._unit_allocated
+            unit_alloc.clear()
+            for rem_a in allocs.values():
+                rpool = rem_a.pool
+                rsize = rem_a.size
+                if rsize > 0:
+                    pool_masks[rpool] = (
+                        pool_masks.get(rpool, 0) | _units_to_mask(rem_a.units)
+                    )
+                for u in rem_a.units:
+                    pair = (rpool, u)
+                    unit_alloc[pair] = unit_alloc.get(pair, 0) + rsize
+            for live in popped_pools:
+                lpool = live.pool
+                if not pool_masks.get(lpool, 0):
+                    allocated[lpool] = 0
+        else:
+            unit_alloc = self._unit_allocated
+            for live in popped_pools:
+                lpool = live.pool
+                lsize = live.size
+                clear_mask = 0
+                for unit in live.units:
+                    pair = (lpool, unit)
+                    new_val = unit_alloc[pair] - lsize
+                    if new_val:
+                        unit_alloc[pair] = new_val
+                    else:
+                        del unit_alloc[pair]
+                        clear_mask |= 1 << unit
+                if clear_mask:
+                    new_m = pool_masks.get(lpool, 0) & ~clear_mask
+                    pool_masks[lpool] = new_m
+                    if not new_m:
+                        allocated[lpool] = 0
+
+    def _wake_python_task_waiters(self, task: _Task, now: float, waiters) -> None:
+        tasks = self._tasks
+        ready_seen = self._ready_seen
+        ready_heap = self._ready_heap
+        releases = self._releases
+        if len(waiters) == 1:
+            successor = waiters.pop()
+            dependent = tasks.get(successor)
+            if dependent is not None:
+                if dependent.pending_preds is not None:
+                    try:
+                        dependent.pending_preds.remove(task.event)
+                    except ValueError:
+                        pass
+                    if len(dependent.pending_preds) == 1:
+                        sole = dependent.pending_preds[0]
+                        dependent.blocker_event = sole.name
+                        dependent.blocker_reason = "publish"
+                        dependent.ready_at = now if now >= dependent.release else dependent.release
+                w = dependent.waiting - 1
+                dependent.waiting = w
+                if not w:
+                    if not dependent.blocker_event:
+                        dependent.blocker_event = task.event.name
+                        dependent.blocker_reason = "publish"
+                    if dependent.ready_at is None:
+                        dependent.ready_at = now
+                    if dependent.release <= now:
+                        if successor not in ready_seen:
+                            ready_seen.add(successor)
+                            heapq.heappush(ready_heap, (dependent.priority, successor))
+                    else:
+                        heapq.heappush(releases, (dependent.release, successor))
+        else:
+            for successor in waiters:
+                dependent = tasks.get(successor)
+                if dependent is None:
+                    continue
+                if dependent.pending_preds is not None:
+                    try:
+                        dependent.pending_preds.remove(task.event)
+                    except ValueError:
+                        pass
+                    if len(dependent.pending_preds) == 1:
+                        sole = dependent.pending_preds[0]
+                        dependent.blocker_event = sole.name
+                        dependent.blocker_reason = "publish"
+                        dependent.ready_at = now if now >= dependent.release else dependent.release
+                dependent.waiting -= 1
+                if not dependent.waiting:
+                    if not dependent.blocker_event:
+                        dependent.blocker_event = task.event.name
+                        dependent.blocker_reason = "publish"
+                    if dependent.ready_at is None:
+                        dependent.ready_at = now
+                    if dependent.release <= now:
+                        if successor not in ready_seen:
+                            ready_seen.add(successor)
+                            heapq.heappush(ready_heap, (dependent.priority, successor))
+                    else:
+                        heapq.heappush(releases, (dependent.release, successor))
+            waiters.clear()
 
     def _note_allocation(self, action: str, item: Allocation, task: str) -> None:
         self.allocation_event_count += 1
@@ -359,23 +479,8 @@ class _EngineLifecycleMixin:
                     {"occurrence": occurrence, "submitted": 0, "completed": 0,
                      "service": {}, "started": 0})
                 record["started"] += 1
-        obs1 = task.start_observer
-        if obs1 is not None:
-            task.start_observer = None
-            if not obs1._waiters and obs1._callbacks is None:
-                del self._promises[obs1.sequence]
-                obs1.started = obs1.time = now
-            else:
-                obs1.started = now
-                self.resolve(obs1)
-        if self._start_waiters:
-            for observer in self._start_waiters.pop(key, ()):
-                observer.started = now
-                self.resolve(observer)
-        if task.start_callback is not None:
-            # The callback runs before grants so a visibility/contract failure
-            # cannot leak a buffer into the caller's engine.
-            task.start_callback(task.event)
+        if task.start_observer is not None or self._start_waiters or task.start_callback is not None:
+            self._notify_task_start(task, key, now)
         if task.acquire:
             prep = task.prepared
             sid = prep.static_id if prep is not None else 0
@@ -443,7 +548,50 @@ class _EngineLifecycleMixin:
                 self.allocation_event_count += n_acq
                 self._alloc_state_version += n_acq
                 if empty_pools:
+                    if len(self._seen_floor_peaks) >= _STAGE_PREPARATION_CACHE_LIMIT:
+                        self._seen_floor_peaks.clear()
                     self._seen_floor_peaks.add(sid)
+            admit_gen = 0
+            wave_rec = self._wave_recorder
+            if wave_rec is not None:
+                first_gen = True
+                for item in task.acquire:
+                    for unit in item.units:
+                        slot_id, gen = wave_rec.allocate_slot_generation(
+                            item.pool, int(unit), item.name,
+                        )
+                        if first_gen:
+                            admit_gen = gen
+                            first_gen = False
+                        wave_rec.on_allocation(
+                            item.pool, int(unit), slot_id, gen, int(round(item.size)),
+                            now, "grant", task_id=key,
+                        )
+        else:
+            admit_gen = 0
+        wave_rec = self._wave_recorder
+        if wave_rec is not None:
+            owners = tuple(
+                sorted({u for units in (task.placement or {}).values() for u in units})
+            ) or (0,)
+            if task.metadata and "generation" in task.metadata:
+                admit_gen = int(task.metadata["generation"])
+            blockers = ()
+            if task.blocker_event:
+                p_pipe = next(iter(task.demand), "")
+                if p_pipe:
+                    r_ms = task.ready_at if task.ready_at is not None else now
+                    blockers = ((p_pipe, task.blocker_event, r_ms, task.blocker_reason or "publish"),)
+            wave_rec.on_admit(
+                key, now, owners=owners, generation=admit_gen, blockers=blockers,
+            )
+        if _task_needs_hbm_bus_split(task):
+            if self._accel is not None and self._accel.enabled and self._native_slots:
+                self._accel.disable(self, "hbm_bus_split")
+            _split_uncoupled_hbm_bus_task(self, task, admit_gen=admit_gen)
+            return
+        if task.latency_from_first_service and not task.demand:
+            task.first_service = now
         if self._accel is not None and key in self._native_seqs:
             self._accel.activate(self, key)
         if task.demand or task.latency > 0.0:
@@ -464,6 +612,25 @@ class _EngineLifecycleMixin:
                 self._completable_seen.add(key)
                 heapq.heappush(self._completable, key)
 
+    def _notify_task_start(self, task: _Task, key: int, now: float) -> None:
+        obs1 = task.start_observer
+        if obs1 is not None:
+            task.start_observer = None
+            if not obs1._waiters and obs1._callbacks is None:
+                del self._promises[obs1.sequence]
+                obs1.started = obs1.time = now
+            else:
+                obs1.started = now
+                self.resolve(obs1)
+        if self._start_waiters:
+            for observer in self._start_waiters.pop(key, ()):
+                observer.started = now
+                self.resolve(observer)
+        if task.start_callback is not None:
+            # The callback runs before grants so a visibility/contract failure
+            # cannot leak a buffer into the caller's engine.
+            task.start_callback(task.event)
+
     def _settle(self) -> None:
         self._settle_rounds = 0
         accel = self._accel
@@ -482,14 +649,16 @@ class _EngineLifecycleMixin:
             if len(latency_active) == 1:
                 lkey = next(iter(latency_active))
                 ltask = tasks_map[lkey]
-                if not ltask.remaining and now >= ltask.start + ltask.latency:
+                anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+                if not ltask.remaining and anchor is not None and now >= anchor + ltask.latency:
                     if lkey not in self._completable_seen:
                         self._completable_seen.add(lkey)
                         heapq.heappush(self._completable, lkey)
             else:
                 for key in latency_active:
                     task = tasks_map[key]
-                    if not task.remaining and now >= task.start + task.latency:
+                    anchor = task.first_service if task.latency_from_first_service else task.start
+                    if not task.remaining and anchor is not None and now >= anchor + task.latency:
                         if key not in self._completable_seen:
                             self._completable_seen.add(key)
                             heapq.heappush(self._completable, key)
@@ -514,6 +683,13 @@ class _EngineLifecycleMixin:
                     continue
                 if ((task.acquire or task.allocation_demands)
                         and not self._can_allocate(task)):
+                    if task.blocker_reason != "credit":
+                        task.ready_at = self.now
+                        task.blocker_reason = "credit"
+                        if task.acquire:
+                            task.blocker_event = task.acquire[0].name
+                        elif task.allocation_demands:
+                            task.blocker_event = f"pool:{task.allocation_demands[0][0][0]}"
                     if deferred is None:
                         deferred = [key]
                     else:
@@ -531,13 +707,17 @@ class _EngineLifecycleMixin:
                 key = completable.pop()
                 completable_seen.discard(key)
                 task = tasks.get(key)
-                if (task is not None and not task.remaining
-                        and self.now >= task.start + task.latency):
-                    _complete(task)
+                if task is not None and not task.remaining:
+                    anchor = task.first_service if task.latency_from_first_service else task.start
+                    if anchor is not None and self.now >= anchor + task.latency:
+                        _complete(task)
             else:
                 for key in frontier.take_completable(self):
                     task = tasks.get(key)
-                    if task is None or task.remaining or self.now < task.start + task.latency:
+                    if task is None or task.remaining:
+                        continue
+                    anchor = task.first_service if task.latency_from_first_service else task.start
+                    if anchor is None or self.now < anchor + task.latency:
                         continue
                     _complete(task)
             # A completion callback may submit another zero-work successor at
@@ -546,3 +726,67 @@ class _EngineLifecycleMixin:
             self._settle_rounds += 1
             if self._settle_rounds > self.zero_progress_limit:
                 raise ExecutionError("execution_zero_progress")
+
+    def _settle_asymmetric_cohorts(self) -> None:
+        # Each successful pass replaces at least one active cohort with
+        # singleton members. No pass creates a new cohort.
+        remaining = len(self._tasks)
+        while self._split_asymmetric_cohorts():
+            remaining -= 1
+            if remaining < 0:
+                raise ExecutionError("asymmetric_cohort_split_did_not_converge")
+
+    def _split_asymmetric_cohorts(self) -> bool:
+        """Split active cohorts on FIFO resources or asymmetric peer unit overlap."""
+        if not self._active or (self._placed_active == 0 and self._fifo_live == 0):
+            return False
+        from .engine_types import _EMPTY_FROZENSET, _EMPTY_METADATA
+        fifo_names = self.fifo_resource_names() if self._fifo_live else _EMPTY_FROZENSET
+        to_split: list[int] = []
+        tasks = self._tasks
+        active = self._active
+        for key in active:
+            task = tasks[key]
+            if task.cohort_size <= 1 or not task.remaining:
+                continue
+            if fifo_names and any(r in fifo_names for r in task.remaining):
+                to_split.append(key)
+                continue
+            if not task.cohort_members or len(active) < 2:
+                continue
+            broken = False
+            for peer_key in active:
+                if peer_key == key:
+                    continue
+                peer = tasks[peer_key]
+                if not peer.placement or not peer.remaining:
+                    continue
+                for rname, members in task.cohort_members:
+                    if rname not in task.remaining or peer.remaining.get(rname, 0.0) <= 0.0:
+                        continue
+                    peer_units = peer.placement.get(rname)
+                    if peer_units is None:
+                        continue
+                    task_units = task.placement.get(rname)
+                    if task_units is not None:
+                        if peer_units == task_units:
+                            continue
+                        if not (_units_to_mask(peer_units) & _units_to_mask(task_units)):
+                            continue
+                    peer_set = set(peer_units)
+                    if len({len(peer_set.intersection(m)) for m in members}) > 1:
+                        broken = True
+                        break
+                if broken:
+                    break
+            if broken:
+                to_split.append(key)
+        if not to_split:
+            return False
+        if self._accel is not None and any(k in self._native_slots for k in to_split):
+            self._accel.disable(self, "asymmetric_cohort_split")
+            to_split = [k for k in to_split if k in active and tasks[k].remaining]
+            if not to_split:
+                return False
+        from ._engine_hbm_bus import _execute_asymmetric_cohort_splits
+        return _execute_asymmetric_cohort_splits(self, to_split)

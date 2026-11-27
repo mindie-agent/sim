@@ -1,29 +1,765 @@
-"""Unique causal Engine: clock, event frontier and transaction settlement.
+"""Canonical continuous-time resource-sharing Engine.
 
-[Role] Execute the one selected physical catalog as real causal work on shared
-  physical resources. The Engine is the only writer of its RuntimeState clock,
-  frontier, event sequences and transaction commits.
-[Invariants] Service conserves work. Completion wakes only actual successors and
-  releases declared allocations. FIFO is non-preemptive; fair service is capped
-  max-min over the actual physical units. No second runtime, script replay or
-  old-executor fallback exists. Resource units are work per millisecond.
-[Timeouts & Locks] Finite virtual events only; no threads, sleeps or I/O. A
-  bounded settle/step budget reports zero progress instead of spinning.
-[Side-Effect Policy] Mutates the inherited RuntimeState and the Event handles it
-  creates. A callback failure aborts advance; the engine is not promised reusable
-  after a contract error.
-"""
+[Role] Single canonical Engine owning continuous-time resource arbitration,
+  periodic-stream execution, and C11 fast-coupled dispatch.
+[Invariants] Monotone event clock, exact resource conservation, and zero
+  divergent shadow simulation tracks.
+[Timeouts & Locks] Honors step deadlines; single-threaded event loop.
+[Side-Effect Policy] Pure in-memory simulation."""
 from __future__ import annotations
 
+from collections.abc import Mapping as _AbcMapping
+import math
+
+from .engine_types import ExecutionError, _structural_value
+
+_PERIODIC_EPOCH_MISS_MULTIPLIER = 2
+_PERIODIC_COLD_ISSUE_MULTIPLIER = 2
+_PERIODIC_BASE_MAX_LAG = 24
+_PERIODIC_LAG_MULTIPLIER = 2
+_MAX_PERIODIC_DETECTOR_LAG = 128
+_PERIODIC_NO_ISSUE_STEPS_PER_RUN = 8
+_MAX_PERIODIC_NO_ISSUE_STEPS = 256
+_PERIODIC_CLOCK_STEPS_PER_RUN = 16
+_MAX_PERIODIC_CLOCK_STEPS = 512
+_PERIODIC_BASE_HISTORY_BYTES = 8 * 1024 * 1024
+_PERIODIC_HISTORY_BYTES_PER_RUN = 512 * 1024
+_MAX_PERIODIC_HISTORY_BYTES = 16 * 1024 * 1024
+_MAX_PERIODIC_LIVE_TASKS = 4096
+_MAX_PERIODIC_RUNS = 64
+_MAX_PERIODIC_LIVE_SLOTS = 128
+_BINARY64_EXACT_INT_LIMIT = 1 << 53
+_BINARY64_DYADIC_DEN_LIMIT = 1 << 500
+_TIME_ROUND_DIGITS = 12
+_ENGINE_POOL_SET_CACHE_LIMIT = 256
+
+
+def _advance_periodic_clock_single_step(now: float, dt: float, cycles: int) -> float:
+    """Exact binary64 repeated addition ``now + dt`` (with nextafter on underflow) in O(log cycles)."""
+    if dt <= 0.0 or cycles <= 0:
+        return now
+    rem = int(cycles)
+    while rem > 0:
+        if now == 0.0:
+            now = dt
+            rem -= 1
+            continue
+        _, exp = math.frexp(now)
+        next_binade = math.ldexp(1.0, exp)
+        one = now + dt
+        if one == now:
+            one = math.nextafter(now, math.inf)
+        if one >= next_binade or rem == 1:
+            now = one
+            rem -= 1
+            continue
+        two = one + dt
+        if two == one:
+            two = math.nextafter(one, math.inf)
+        d1 = one - now
+        d2 = two - one
+        if d1 <= 0.0 or d1 != d2 or two >= next_binade:
+            now = one
+            rem -= 1
+            continue
+        jump = min(rem, int((next_binade - now) // d1))
+        while jump > 1 and now + jump * d1 >= next_binade:
+            jump -= 1
+        if jump <= 1:
+            now = one
+            rem -= 1
+        else:
+            now = now + jump * d1
+            rem -= jump
+    return now
+
+
+def _advance_periodic_clock_exact(now: float, steps: tuple[float, ...], cycles: int) -> float:
+    """Bit-exact periodic clock advance avoiding O(cycles) loops for large skip counts."""
+    if cycles <= 0 or not steps:
+        return now
+    if all(dt >= 0.0 and math.isfinite(dt) for dt in steps) and now >= 0.0 and math.isfinite(now):
+        now_num, now_den = now.as_integer_ratio()
+        ratios = [dt.as_integer_ratio() for dt in steps]
+        max_den = max(now_den, *(den for _, den in ratios))
+        if max_den <= _BINARY64_DYADIC_DEN_LIMIT:
+            i_now = now_num * (max_den // now_den)
+            i_sum = sum(num * (max_den // den) for num, den in ratios)
+            i_end = i_now + i_sum * cycles
+            if i_end <= _BINARY64_EXACT_INT_LIMIT:
+                return i_end / max_den
+        if len(steps) == 1:
+            return _advance_periodic_clock_single_step(now, steps[0], cycles)
+    from ..engine_periodic.frontier import _advance_periodic_clock
+    return _advance_periodic_clock(now, steps, cycles)
+
+
+def _admission_l2_digest(view) -> str:
+    """Return a deterministic digest of live L2 residency, reservations, and dirty state."""
+    fingerprint = getattr(view, "residency_fingerprint", None)
+    return fingerprint() if callable(fingerprint) else ""
+
+
+def _counter_delta(current, previous):
+    return {key: delta for key, value in current.items() if (delta := value - previous.get(key, 0.0))}
+
+
+class _EnginePeriodicMixin:
+    def _allocation_frontier(self) -> tuple[tuple, tuple, tuple]:
+        """Cached ``(allocations, pools, grants)`` structural residue.
+
+        Allocation occupancy and the persistent grant map only change when a
+        task acquires/releases a buffer or a memory grant is taken/returned;
+        ``_alloc_state_version`` is bumped at exactly those boundaries.  The
+        previous view is reused otherwise, so the periodic observer no longer
+        re-walks every persistent model weight/KV grant on every micro-step.
+        """
+        cached = self._periodic_alloc_cache
+        version = self._alloc_state_version
+        if cached is not None and cached[0] == version:
+            return cached[1], cached[2], cached[3]
+        allocation_shapes = {}
+        for item in self.allocations.values():
+            allocation_shapes[(item.pool, item.size, item.units)] = (
+                allocation_shapes.get((item.pool, item.size, item.units), 0) + 1)
+        allocations = tuple(sorted(
+            (pool, size, units, count)
+            for (pool, size, units), count in allocation_shapes.items()))
+        pools = tuple(sorted(
+            (name, round(self.allocated.get(name, 0.0), 12),
+             tuple(sorted((unit, round(amount, 12)) for unit, amount
+                          in self.unit_allocated.get(name, {}).items())))
+            for name in self.pools))
+        grants = tuple(sorted(
+            (name, record["replica"],
+             tuple(sorted((str(key), _structural_value(value))
+                          for key, value in record["binding"].items()
+                          if str(key) != "last_use")))
+            for name, record in self._memory_grants.items()))
+        self._periodic_alloc_cache = (version, allocations, pools, grants)
+        return allocations, pools, grants
+
+    def _periodic_state(self, epoch: str | None = None) -> tuple:
+        """Tile-index-independent exact structural view for the detector."""
+        periodic_tasks = self._periodic_tasks
+        periodic_runs = self._periodic_runs
+        now = self.now
+        round_ = round
+        digits = _TIME_ROUND_DIGITS
+        task_entries = []
+        for task in self._tasks.values():
+            metadata = periodic_tasks.get(task.event.sequence)
+            if metadata is not None:
+                run_id, tile, ordinal, kind = metadata
+                run = periodic_runs.get(run_id)
+                finished = run.get("finished", 0) if run is not None else 0
+                tkey = ("periodic", run_id, tile - finished, ordinal, kind)
+            else:
+                tkey = ("opaque", task.event.name)
+            rem = task.remaining
+            if not rem:
+                rem_tuple = ()
+            elif len(rem) == 1:
+                rk, rv = next(iter(rem.items()))
+                rem_tuple = ((rk, rv),) if rv > 0 else ()
+            else:
+                rem_tuple = tuple(sorted((rk, rv) for rk, rv in rem.items() if rv > 0))
+            caps = task.caps
+            if not caps:
+                caps_tuple = ()
+            elif len(caps) == 1:
+                caps_tuple = (next(iter(caps.items())),)
+            else:
+                caps_tuple = tuple(sorted(caps.items()))
+            pl = task.placement
+            if not pl:
+                pl_tuple = ()
+            elif len(pl) == 1:
+                pl_tuple = (next(iter(pl.items())),)
+            else:
+                pl_tuple = tuple(sorted(pl.items()))
+            rel_dt = task.release - now
+            rel_val = round_(rel_dt, digits) if rel_dt > 0.0 else 0.0
+            if task.latency_from_first_service:
+                if task.first_service is None:
+                    lat_val = (
+                        round_(task.latency, digits)
+                        if task.latency > 0.0
+                        else (None if task.start is None else 0.0)
+                    )
+                else:
+                    lat_dt = task.first_service + task.latency - now
+                    lat_val = round_(lat_dt, digits) if lat_dt > 0.0 else 0.0
+            elif task.start is None:
+                lat_val = None
+            else:
+                lat_dt = task.start + task.latency - now
+                lat_val = round_(lat_dt, digits) if lat_dt > 0.0 else 0.0
+            task_entries.append((
+                tkey, rem_tuple, task.waiting, rel_val, lat_val,
+                task.priority, caps_tuple, pl_tuple, task.coupled, task.owner,
+            ))
+        task_entries.sort()
+        tasks = tuple(task_entries)
+        runs = tuple(sorted(
+            (run_id, run.get("phase_ordinal", 0), run.get("phase_end", 0),
+             tuple(run.get("slots", ())),
+             tuple(sorted((a.pool, a.size, a.units)
+                          for a in run.get("persistent_allocations", ()))))
+            for run_id, run in periodic_runs.items()))
+        allocations, pools, grants = self._allocation_frontier()
+        releases = tuple(
+            (round_(when - now, digits), key) for when, key in self._releases)
+        # Keep the frozen 5-tuple adapter shape so engine_periodic can intern
+        # the static task template. Memory budget/grants are structural too,
+        # so they ride in the pool part rather than changing the outer arity.
+        pools = (*pools, ("@memory", 0.0,
+                          (((self._memory_epoch() if epoch is None else epoch), 0.0,
+                            (("grants", grants),))),))
+        return (tasks, runs, allocations, pools, releases)
+
+    def _memory_epoch(self) -> str:
+        """Exact shared-budget generation for one settled frontier.
+
+        A real grant/release/hold/retire changes ``budget_version``. Using the
+        live version (instead of a constant 0) makes an externally changed
+        admission frontier invalidate the previous periodic proof.
+        """
+        ledgers = dict(self._memory_ledgers)
+        if self.memory is not None:
+            ledgers[id(self.memory)] = self.memory
+
+        def version(ledger):
+            value = getattr(ledger, "budget_version", None)
+            if value is not None:
+                return int(value)
+            pools = getattr(ledger, "pools", None)
+            if isinstance(pools, _AbcMapping):
+                return sum(int(getattr(pool, "budget_version", 0))
+                           for pool in pools.values())
+            return 0
+
+        parts = sorted(str(version(ledger)) for ledger in ledgers.values())
+        base = "mem:" + ":".join(parts or ("0",))
+        l2_dig = _admission_l2_digest(getattr(self, "_admission_memory_view", None))
+        return f"{base}|l2:{l2_dig}" if l2_dig else base
+
+    def _progressable_periodic_run(self, periods: int) -> bool:
+        """Cheap necessary condition for any further periodic evidence.
+
+        A skip needs ``evidence_periods`` repeated periods *after* the current
+        landmark, and each period advances the live window by its slot count
+        (one retired and one issued tile per slot step).  A run that can no
+        longer issue that many tiles cannot produce one more comparison, so
+        the observer must not pay a full structural validation for it.
+        """
+        for run in self._periodic_runs.values():
+            slots = tuple(run.get("slots", ()))
+            if not slots:
+                continue
+            end = int(run.get("phase_end", run.get("total", 0)))
+            if end - int(run.get("next", 0)) > periods * len(slots):
+                return True
+        return False
+
+    def _crossed_external_or_opaque(self, previous, stop_at: float) -> bool:
+        """Did a real external task act inside the observed interval?
+
+        Blocked downstream tasks (``waiting > 0``) and passive lease holders
+        (started, zero remaining work, a release beyond ``stop_at``) consume no
+        pipe rate and cannot change the next interval, so they are never
+        mistaken for interference.  A non-periodic task that actually completed
+        in ``(previous_now, now]`` is tracked by a plain counter and always
+        sets the flag.
+        """
+        if self._external_completions > previous["external_completions"]:
+            return True
+        if self._releases:
+            stop_at = min(stop_at, self._releases[0][0])
+        periodic_tasks = self._periodic_tasks
+        tasks = self._tasks
+        now = self.now
+        for pool_keys in (
+            self._active,
+            self._ready_seen,
+            self._completable_seen,
+            self._latency_active,
+        ):
+            for key in pool_keys:
+                if key in periodic_tasks:
+                    continue
+                task = tasks.get(key)
+                if task is None or task.waiting > 0:
+                    continue
+                if (task.start is not None and not task.remaining
+                        and task.release > stop_at
+                        and (now >= task.start + task.latency
+                             or task.start + task.latency > stop_at)):
+                    continue
+                if bool(task.remaining) or bool(task.acquire) or bool(task.free):
+                    return True
+        for _, key in self._releases:
+            if key in periodic_tasks:
+                continue
+            task = tasks.get(key)
+            if task is None or task.waiting > 0:
+                continue
+            if (task.start is not None and not task.remaining
+                    and task.release > stop_at
+                    and (now >= task.start + task.latency
+                         or task.start + task.latency > stop_at)):
+                continue
+            if bool(task.remaining) or bool(task.acquire) or bool(task.free):
+                return True
+        return False
+
+    def _periodic_stop(self, horizon: float) -> float:
+        if self._releases:
+            horizon = min(horizon, self._releases[0][0])
+        periodic_tasks = self._periodic_tasks
+        periodic_runs = self._periodic_runs
+        for key in self._latency_active:
+            meta = periodic_tasks.get(key)
+            if meta is not None:
+                run = periodic_runs.get(meta[0])
+                if run is not None and int(run.get("next", 0)) < int(run.get("phase_end", run.get("total", 0))):
+                    continue
+            task = self._tasks[key]
+            anchor = task.first_service if task.latency_from_first_service else task.start
+            if anchor is not None and anchor + task.latency > self.now:
+                horizon = min(horizon, anchor + task.latency)
+        return horizon
+
+    def _periodic_runs_snapshot(self):
+        """Single-pass summary over ``_periodic_runs`` avoiding repeated scans."""
+        indexed = False
+        total_slots = 0
+        active_items = []
+        for run_id, run in self._periodic_runs.items():
+            if run.get("indexed"):
+                indexed = True
+                break
+            slots = run.get("slots")
+            if slots:
+                total_slots += len(slots)
+                active_items.append((run_id, run, slots))
+        if len(active_items) > 1:
+            active_items.sort(key=lambda item: item[0])
+        return indexed, total_slots, active_items
+
+    def _mark_periodic_epoch_stalled(self, detector) -> None:
+        """Record an O(1) stall latch for the current active periodic epoch."""
+        self._periodic_epoch_is_stalled = True
+        self._periodic_stalled_seq = self._sequence
+        self._periodic_stalled_completed = self.completed_count
+        self._periodic_stalled_runs_len = len(self._periodic_runs)
+        self._periodic_stalled_detector = detector
+        self._periodic_stall_ext = self._external_completions
+        self._periodic_last = None
+        self._periodic_clock_step = None
+
+    def _periodic_epoch_still_stalled(self) -> bool:
+        """Return True in O(1) while the stalled periodic epoch has not transitioned."""
+        if not self._periodic_epoch_is_stalled:
+            return False
+        runs = self._periodic_runs
+        if (self._periodic_stalled_detector is not self._periodic_detector
+                or self._external_completions != self._periodic_stall_ext):
+            self._periodic_epoch_is_stalled = False
+            return False
+        if (self._sequence == self._periodic_stalled_seq
+                and self.completed_count == self._periodic_stalled_completed
+                and len(runs) == self._periodic_stalled_runs_len):
+            return True
+        epoch = self._periodic_stall_epoch
+        if epoch is None:
+            self._periodic_epoch_is_stalled = False
+            return False
+        active_count = 0
+        for run_id, p_ord, p_end in epoch:
+            run = runs.get(run_id)
+            if (run is None or not run.get("slots")
+                    or run.get("phase_ordinal", 0) != p_ord
+                    or run.get("phase_end", 0) != p_end):
+                self._periodic_epoch_is_stalled = False
+                return False
+            active_count += 1
+        if len(runs) != active_count:
+            real_active = sum(1 for run in runs.values() if run.get("slots"))
+            if real_active != active_count:
+                self._periodic_epoch_is_stalled = False
+                return False
+        self._periodic_stalled_seq = self._sequence
+        self._periodic_stalled_completed = self.completed_count
+        self._periodic_stalled_runs_len = len(runs)
+        return True
+
+    def _periodic_epoch_stalled(self, detector, active_items=None) -> bool:
+        """Return True once the active periodic epoch cannot match within ``max_lag``."""
+        if active_items is None:
+            _, _, active_items = self._periodic_runs_snapshot()
+        epoch_key = tuple(
+            (run_id, run.get("phase_ordinal", 0), run.get("phase_end", 0))
+            for run_id, run, _ in active_items
+        )
+        active_runs = max(1, len(epoch_key))
+        miss_budget = _PERIODIC_EPOCH_MISS_MULTIPLIER * detector.history_limit
+        any_retired = False
+        next_sum = 0
+        for _, run, _ in active_items:
+            if int(run.get("finished", 0)) > 0:
+                any_retired = True
+            next_sum += int(run.get("next", 0))
+        base_issue_limit = min(
+            _MAX_PERIODIC_NO_ISSUE_STEPS,
+            max(detector.max_lag, active_runs * _PERIODIC_NO_ISSUE_STEPS_PER_RUN),
+        )
+        issue_limit = (
+            base_issue_limit
+            if any_retired
+            else _PERIODIC_COLD_ISSUE_MULTIPLIER * base_issue_limit
+        )
+        if (epoch_key != self._periodic_stall_epoch
+                or self._external_completions != self._periodic_stall_ext):
+            if (self._periodic_epoch_is_stalled
+                    or self._periodic_stall_obs >= miss_budget
+                    or self._periodic_no_issue_streak > issue_limit):
+                self._periodic_last = None
+                self._periodic_clock_step = None
+            self._periodic_epoch_is_stalled = False
+            self._periodic_stall_epoch = epoch_key
+            self._periodic_stall_ext = self._external_completions
+            self._periodic_stall_obs = 0
+            self._periodic_last_next_sum = -1
+            self._periodic_no_issue_streak = 0
+        if (self._periodic_stall_obs >= miss_budget
+                or self._periodic_no_issue_streak > issue_limit):
+            self._mark_periodic_epoch_stalled(detector)
+            return True
+        if next_sum == self._periodic_last_next_sum:
+            self._periodic_no_issue_streak += 1
+            if self._periodic_no_issue_streak > issue_limit:
+                self._mark_periodic_epoch_stalled(detector)
+                return True
+            return False
+        self._periodic_last_next_sum = next_sum
+        self._periodic_no_issue_streak = 0
+        return False
+
+    def _ensure_periodic_detector(self, active_runs: int | None = None):
+        """Return (or auto-size) the CycleDetector for the current active periodic run count."""
+        if active_runs is None:
+            active_runs = max(
+                1,
+                sum(1 for run in self._periodic_runs.values() if run.get("slots")),
+            )
+        else:
+            active_runs = max(1, active_runs)
+        required_lag = min(
+            _MAX_PERIODIC_DETECTOR_LAG,
+            max(_PERIODIC_BASE_MAX_LAG, active_runs * _PERIODIC_LAG_MULTIPLIER),
+        )
+        required_bytes = min(
+            _MAX_PERIODIC_HISTORY_BYTES,
+            max(
+                _PERIODIC_BASE_HISTORY_BYTES,
+                active_runs * _PERIODIC_HISTORY_BYTES_PER_RUN,
+            ),
+        )
+        detector = self._periodic_detector
+        if detector is None:
+            try:
+                from ..engine_periodic import CycleDetector
+            except ImportError:
+                return None
+            detector = CycleDetector(
+                max_lag=required_lag,
+                history_bytes_limit=required_bytes,
+            )
+            self._periodic_detector = detector
+            self._periodic_detector_auto = True
+        elif getattr(self, "_periodic_detector_auto", False) and (
+            detector.max_lag < required_lag
+            or detector.history_bytes_limit < required_bytes
+        ):
+            from ..engine_periodic import CycleDetector
+            detector = CycleDetector(
+                max_lag=max(detector.max_lag, required_lag),
+                history_bytes_limit=max(detector.history_bytes_limit, required_bytes),
+            )
+            self._periodic_detector = detector
+            self._periodic_last = None
+        return detector
+
+    def _periodic_wave_landmark(self, active_items=None):
+        """Compute the issue-wave landmark (per-tile for 1 run; wave-aligned for >1 runs)."""
+        stall_runs = max(1, len(self._periodic_stall_epoch))
+        if stall_runs <= 1:
+            return (self._periodic_stall_epoch, self._periodic_last_next_sum)
+        if active_items is None:
+            _, _, active_items = self._periodic_runs_snapshot()
+        wave_cursor = None
+        for _, run, _ in active_items:
+            nxt = int(run.get("next", 0))
+            if nxt < int(run.get("phase_end", run.get("total", 0))):
+                if wave_cursor is None or nxt < wave_cursor:
+                    wave_cursor = nxt
+        if wave_cursor is None:
+            wave_cursor = self._periodic_last_next_sum
+        wave_bucket = self._periodic_last_next_sum // stall_runs
+        return (self._periodic_stall_epoch, wave_cursor, wave_bucket)
+
+    def _periodic_observe(self, stop_at: float):
+        """Read-only periodic frontier observation on the settled Engine."""
+        if not self._periodic_runs:
+            return None
+        if len(self._tasks) > _MAX_PERIODIC_LIVE_TASKS:
+            return None
+        if len(self._periodic_runs) > _MAX_PERIODIC_RUNS:
+            return None
+        indexed, total_slots, active_items = self._periodic_runs_snapshot()
+        if indexed:
+            # G1 selects an indexed catalog by absolute panel. The ordered
+            # phase cursor and cycle correspondence are only proven for the
+            # legacy ordered template; G3 owns an exact indexed preflight.
+            # Until then the ordinary exact Engine advance is authoritative.
+            self._periodic_last = None
+            self._periodic_detector = None
+            return None
+        # The detector validates the whole structural tuple recursively. Keep
+        # this observation bounded to an active cohort that can actually be
+        # compared; an oversized ordinary graph keeps the detailed Engine path
+        # instead of paying O(live tasks) validation on every step.
+        if total_slots > _MAX_PERIODIC_LIVE_SLOTS:
+            return None
+        detector = self._ensure_periodic_detector(len(active_items))
+        if detector is None:
+            return None
+        periods = detector.evidence_periods
+        progressable = False
+        for _, run, slots in active_items:
+            end = int(run.get("phase_end", run.get("total", 0)))
+            if end - int(run.get("next", 0)) > periods * len(slots):
+                progressable = True
+                break
+        if not progressable:
+            # No run can reach the next comparable period, so no skip is
+            # possible here.  Keep the measured interval baseline: the next
+            # real observation then aggregates this whole span exactly.
+            return None
+        if self._periodic_epoch_stalled(detector, active_items):
+            return None
+        if (self._periodic_last is not None
+                and self._external_completions
+                > self._periodic_last["external_completions"]):
+            # Discard the crossed interval so the next observation can start
+            # fresh once external completions settle.
+            self._periodic_last = None
+            return None
+        previous = self._periodic_last
+        stop_at = self._periodic_stop(stop_at)
+        landmark = self._periodic_wave_landmark(active_items)
+        clock_steps = None
+        if previous is not None:
+            clock_steps = previous["clock_steps"]
+            clock = self._periodic_clock_step
+            active_runs = max(1, len(self._periodic_stall_epoch))
+            clock_step_limit = min(
+                _MAX_PERIODIC_CLOCK_STEPS,
+                max(detector.max_lag, active_runs * _PERIODIC_CLOCK_STEPS_PER_RUN),
+            )
+            if (clock_steps is not None and len(clock_steps) < clock_step_limit
+                    and clock is not None and clock[0] == self.advance_steps == previous["advance_steps"] + 1
+                    and not self._crossed_external_or_opaque(previous, stop_at)):
+                clock_steps.append(clock[1])
+            else:
+                clock_steps = None
+            # A valid cycle must issue tiles. Observe full structural evidence
+            # at issue landmarks and retain the arithmetic of intermediate steps.
+            if landmark == previous["landmark"]:
+                previous["clock_steps"] = clock_steps
+                previous["advance_steps"] = self.advance_steps
+                return None
+        from ..engine_periodic import Cursor, IntervalDelta, SettledFrontier
+        epoch = self._memory_epoch()
+        state = self._periodic_state(epoch)
+        cursors = tuple(
+            Cursor(run_id, run.get("phase_ordinal", 0),
+                   run.get("phase_end", 0), run.get("next", 0),
+                   run.get("finished", 0), tuple(run.get("slots", ())))
+            for run_id, run in sorted(self._periodic_runs.items()))
+        interval = None
+        if clock_steps:
+            issued = {
+                run_id: (run.get("next", 0) - previous["runs"].get(
+                    run_id, (0, 0))[0],
+                    run.get("finished", 0) - previous["runs"].get(
+                    run_id, (0, 0))[1])
+                for run_id, run in self._periodic_runs.items()
+            }
+            interval = IntervalDelta(
+                dt=max(0.0, self.now - previous["now"]),
+                issued_retired_by_run=issued,
+                sequence_count=max(0, self._sequence - previous["sequence"]),
+                service_by_resource=_counter_delta(self.serviced, previous["serviced"]),
+                busy_by_resource=_counter_delta(self.busy_ms, previous["busy"]),
+                deliveries_by_counter=_counter_delta(self.delivered, previous["delivered"]),
+                hbm_accounting=_counter_delta(self._hbm_accounting_serviced, previous["hbm_accounting"]),
+                clock_steps=tuple(clock_steps),
+                allocation_event_count=max(
+                    0, self.allocation_event_count
+                    - previous["allocation_event_count"]),
+                per_unit_peaks=dict(self.peak_allocated),
+                logical_completions=max(
+                    0, self.completed_count - previous["completed"]),
+                crossed_external_or_opaque=False,
+            )
+        frame = SettledFrontier(
+            now=self.now, epoch=epoch, normalized_state=state,
+            cursors=cursors, sequence=self._sequence)
+        skip = self._periodic_detector.observe(
+            frame, interval, stop_at=stop_at)
+        if skip is not None:
+            self._periodic_epoch_is_stalled = False
+            self._periodic_stall_obs = 0
+            self._periodic_last_next_sum = -1
+            self._periodic_no_issue_streak = 0
+        else:
+            self._periodic_stall_obs += 1
+        self._periodic_last = {
+            "now": self.now, "sequence": self._sequence,
+            "serviced": dict(self.serviced), "busy": dict(self.busy_ms),
+            "delivered": dict(self.delivered), "hbm_accounting": dict(self._hbm_accounting_serviced),
+            "advance_steps": self.advance_steps, "clock_steps": [], "landmark": landmark,
+            "allocation_event_count": self.allocation_event_count,
+            "completed": self.completed_count,
+            "external_completions": self._external_completions,
+            "runs": {run_id: (run.get("next", 0), run.get("finished", 0))
+                     for run_id, run in self._periodic_runs.items()},
+        }
+        return skip
+
+    def _apply_periodic_skip(self, skip) -> None:
+        """Apply one helper-approved skip to this Engine's live window.
+
+        The helper's ``delta`` is per period; ``total_delta`` applies the exact
+        cycle count. Public Event objects/sequences stay identical. Live tasks
+        keep their remaining work (the frontier is homogeneous over the skipped
+        cycles) but their start/release times advance by the skipped span;
+        already completed predecessors keep their original completion time.
+        """
+        total = skip.total_delta()
+        dt = float(total.dt)
+        if dt < 0 or not math.isfinite(dt):
+            raise ExecutionError("periodic_skip_period_invalid")
+        start_before = self.now
+        if skip.delta.clock_steps:
+            next_now = _advance_periodic_clock_exact(self.now, skip.delta.clock_steps, skip.cycles)
+            dt = next_now - start_before
+        else:
+            next_now = start_before + dt
+        wave_rec = getattr(self, "_wave_recorder", None)
+        wave_period_args = None
+        if wave_rec is not None:
+            per_cycle = getattr(skip, "delta", None)
+            cycle_dt = float(per_cycle.dt) if per_cycle is not None else dt
+            cycle_count = int(getattr(skip, "cycles", 1) or 1)
+            svc_pat, ho_pat = wave_rec.extract_cycle_pattern(
+                start_before - cycle_dt, start_before,
+            )
+            if svc_pat or ho_pat:
+                wave_period_args = (start_before, cycle_dt, cycle_count, svc_pat, ho_pat)
+            elif any(
+                float(amt) > 0.0
+                for amt in dict(getattr(per_cycle, "busy_by_resource", None) or ()).values()
+            ):
+                raise ExecutionError("periodic_skip_missing_proved_cycle_pattern")
+        self.now = next_now
+        if wave_period_args is not None:
+            a_ms, c_dt, c_cnt, svc_pat, ho_pat = wave_period_args
+            wave_rec.on_period(
+                a_ms, c_dt, c_cnt,
+                template_id="periodic_skip", state_digest="skip",
+                service_pattern=svc_pat, handoff_pattern=ho_pat,
+            )
+        seq_before = self._sequence
+        self._sequence += int(total.sequence_count)
+        if self._cohort_checked_seq == seq_before:
+            self._cohort_checked_seq = self._sequence
+        self.allocation_event_count += int(total.allocation_event_count)
+        skipped_completions = int(total.logical_completions)
+        self.completed_count += skipped_completions
+        if self._trace_maxlen != 0 and skipped_completions > 0:
+            self.trace_dropped += skipped_completions
+        for resource, amount in dict(total.service_by_resource).items():
+            if resource in self.serviced:
+                self.serviced[resource] += float(amount)
+        for resource, amount in dict(total.busy_by_resource).items():
+            if resource in self.busy_ms:
+                self.busy_ms[resource] += float(amount)
+        for counters, delta in ((self.delivered, total.deliveries_by_counter),
+                                (self._hbm_accounting_serviced, total.hbm_accounting)):
+            for name, amount in delta.items():
+                counters[name] = counters.get(name, 0.0) + amount
+        for pool, peak in dict(total.per_unit_peaks).items():
+            self.peak_allocated[pool] = max(
+                self.peak_allocated.get(pool, 0.0), float(peak))
+        for correspondence in skip.correspondence.runs:
+            run = self._periodic_runs.get(correspondence.run_id)
+            if run is None:
+                continue
+            run["phase_ordinal"] = correspondence.phase_ordinal
+            run["phase_end"] = correspondence.phase_end_exclusive
+            run["next"] = correspondence.next_issue_after
+            run["finished"] = correspondence.retired_after
+            offset = correspondence.tile_offset
+            run["live_tiles"] = {
+                tile + offset for tile in run.get("live_tiles", ())}
+            run["retire_tiles"] = {
+                seq: tile + offset
+                for seq, tile in run.get("retire_tiles", {}).items()}
+            run["slots"] = tuple(sorted(
+                tile - correspondence.retired_after
+                for tile in run["live_tiles"]))
+        for sequence, (run_id, tile, ordinal, kind) in tuple(
+                self._periodic_tasks.items()):
+            correspondence = next(
+                (item for item in skip.correspondence.runs
+                 if item.run_id == run_id), None)
+            if correspondence is not None:
+                self._periodic_tasks[sequence] = (
+                    run_id, tile + correspondence.tile_offset, ordinal, kind)
+        skipped_runs = {
+            item.run_id
+            for item in skip.correspondence.runs
+            if item.tile_offset != 0
+        }
+        for key, meta in self._periodic_tasks.items():
+            if meta[0] not in skipped_runs:
+                continue
+            task = self._tasks[key]
+            if task.start is not None:
+                task.start += dt
+                task.event.started = task.start
+            if task.first_service is not None:
+                task.first_service += dt
+            if task.ready_at is not None:
+                task.ready_at += dt
+        self._periodic_last = None
+
+
 from contextlib import contextmanager
+from contextvars import ContextVar
 import ctypes
 import heapq
 import math
+import time
 from typing import Any, Mapping, Sequence
 
-from ..coupled import coupled_rates, _coupled_pair_fast
+from ..runtime.coupled import coupled_rates, _coupled_pair_fast
 from ..ownership import unit_rates
 from .arbiter import component_rates, _fast_eligible_task
+from ._engine_hbm_bus import _hbm_entry_done_since_bind, _sync_task_hbm_accounting
 from .contracts import (
     AllocationBinding, AllocationKey, BindingFrame, EventKey, OccurrenceKey,
     PortBinding, Submission,
@@ -32,9 +768,8 @@ from .engine_catalog import _EngineCatalogMixin
 from .engine_lifecycle import _EngineLifecycleMixin
 from .engine_pair_cached import _EnginePairCachedMixin
 from .engine_pair_fast import _EnginePairFastMixin
-from .engine_periodic_mixin import _EnginePeriodicMixin
 from .engine_prepare import _EnginePrepareMixin
-from .engine_solo_step import _EngineSoloStepMixin
+from .engine_solo_step import _EngineSoloStepMixin, _emit_wave_service
 from .engine_submit import _EngineSubmitMixin
 from .engine_types import (
     Allocation, Event, ExecutionError, PreparedStage, Resource,
@@ -55,21 +790,67 @@ def _stop_window(now: float, horizon: float, releases, latency_active, tasks) ->
     if latency_active:
         if len(latency_active) == 1:
             ltask = tasks[next(iter(latency_active))]
-            if ltask.start + ltask.latency > now:
-                lat_dt = ltask.start + ltask.latency - now
+            anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+            if anchor is not None and anchor + ltask.latency > now:
+                lat_dt = anchor + ltask.latency - now
                 if lat_dt < dt:
                     dt = lat_dt
         else:
             for lkey in latency_active:
                 ltask = tasks[lkey]
-                if ltask.start + ltask.latency > now:
-                    lat_dt = ltask.start + ltask.latency - now
+                anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+                if anchor is not None and anchor + ltask.latency > now:
+                    lat_dt = anchor + ltask.latency - now
                     if lat_dt < dt:
                         dt = lat_dt
     return dt
 
 
+def _completed_targets(until_tuple, until_two_0, until_two_1, first):
+    if until_two_0 is not None:
+        d0 = until_two_0.time is not None
+        d1 = until_two_1.time is not None
+        if d0 and d1:
+            return until_tuple, True
+        if d0 or d1:
+            complete = (until_two_0,) if d0 else (until_two_1,)
+            if first:
+                return complete, True
+        else:
+            complete = ()
+    elif first:
+        complete = ()
+        for event in until_tuple:
+            if event.time is not None:
+                return tuple(ev for ev in until_tuple if ev.time is not None), True
+    else:
+        complete = tuple(ev for ev in until_tuple if ev.time is not None)
+        if len(complete) == len(until_tuple):
+            return complete, True
+    return complete, False
+
+
 DEADLINE_POLL_MASK = 255
+#: Cooperative per-candidate/outer sweep deadline.  Every pricing loop polls
+#: this value; no signal handler, thread or subprocess is involved.
+ACTIVE_DEADLINE_MONO: ContextVar[float | None] = ContextVar(
+    "mindie_sim_deadline_mono", default=None)
+
+
+def check_active_deadline() -> None:
+    deadline = ACTIVE_DEADLINE_MONO.get()
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError("simulation_deadline_exceeded")
+
+
+_CACHED_MIXED_PLAN_KIND = 3
+_CACHED_MIXED_REM_IDX = 6
+_TRIPLE_ACTIVE_COUNT = 3
+
+_COHORT_PRUNE_FACTOR = 2
+_NATIVE_EPOCH_STEP_LIMIT = 1 << 20
+_STALL_NAME_LIMIT = 300
+_SERVICE_ROUNDING_ULPS = 4
 
 #: Default no-progress guard of one Engine advance (structural, not physics).
 DEFAULT_ZERO_PROGRESS_LIMIT = 100_000
@@ -108,6 +889,9 @@ class Engine(
         self._stage_proto_prepared: dict[tuple, tuple] = {}
         self._compiled_programs: dict[int, tuple[Any, Any]] = {}
         self._seen_floor_peaks: set[int] = set()
+        self._next_static_id: int = 0
+        self._partial_placed_live: dict[str, int] = {}
+        self._validated_placements: dict[int, tuple[Any, dict[str, tuple[int, ...]], bool]] = {}
         self._empty_task: _PreparedTask = _EMPTY_TASK
         self.memory_ledger_error: str | None = None
         from .accel_bridge import make_backend
@@ -121,8 +905,57 @@ class Engine(
         self._native_seqs: set[int] = set()
         self._native_active = 0
         self._native_seeded = False
+        self._wave_recorder = None
+        self._admission_memory_view = None
+        self._allocation_versions: dict[str, int] = {}
+        self._resource_version: int = 0
+        self._hbm_bus_aliases: dict[str, Any] = {}
+        self._hbm_bus_epoch: int = 0
+        self._hbm_acct_live: int = 0
+        self._hbm_accounting_serviced: dict[str, float] = {}
+        self._periodic_clock_step: tuple[int, float] | None = None
+        self._periodic_epoch_is_stalled: bool = False
+        self._periodic_stalled_seq: int = -1
+        self._periodic_stalled_completed: int = -1
+        self._periodic_stalled_runs_len: int = -1
+        self._periodic_stalled_detector: Any = None
+        self._periodic_stall_ext: int = 0
+        self._cohort_active: int = 0
+        self._cohort_live_seqs: set[int] = set()
+        self._cohort_checked_seq: int = 0
+        self._pending_hbm_retrofits: dict[str, tuple[Any, bool]] = {}
+        self._discover_hbm_bus_aliases()
         if self._accel is not None and getattr(self._accel, "mode", "") == "c":
             self._accel.try_attach(self)
+
+    def attach_wave_recorder(self, recorder) -> None:
+        """Attach a read-only ``WaveRecorder`` observer without altering schedules."""
+        self._wave_recorder = recorder
+        if recorder is not None:
+            for rname in self.resources:
+                recorder.register_pipe(rname)
+
+    def detach_wave_recorder(self):
+        """Detach and return any active ``WaveRecorder`` observer."""
+        recorder = self._wave_recorder
+        self._wave_recorder = None
+        return recorder
+
+    @property
+    def admission_memory_view(self):
+        """Return the canonical per-die ``AdmissionMemoryView`` attached to this Engine."""
+        return self._admission_memory_view
+
+    def attach_admission_memory_view(self, view) -> None:
+        """Attach the canonical per-die ``AdmissionMemoryView`` for L2 state tracking."""
+        self._admission_memory_view = view
+
+    def bump_allocation_version(self, allocation_id: str) -> int:
+        """Advance and return the monotonic version counter for ``allocation_id``."""
+        key = str(allocation_id)
+        ver = self._allocation_versions.get(key, 0) + 1
+        self._allocation_versions[key] = ver
+        return ver
 
     @property
     def accel_backend(self) -> str:
@@ -152,11 +985,19 @@ class Engine(
         status.setdefault("requested", self._accel_telemetry.get("requested"))
         return status
 
+    def close(self) -> None:
+        """Release the native accelerator arena and transient scheduler caches immediately."""
+        if self._accel is not None:
+            self._accel_telemetry = self.accel_status()
+            self._accel.close()
+            self._accel = None
+        self._clear_prepared_caches()
+
     def _frontier_next_release(self) -> float:
         return self._releases[0][0] if self._releases else math.inf
 
     def _native_deliver(self, sequence: int) -> None:
-        if self._accel is not None:
+        if self._accel is not None and sequence in self._native_slots:
             self._accel.deliver.append(sequence)
 
     def _complete_native(self, task: _Task, moment: float) -> None:
@@ -182,7 +1023,7 @@ class Engine(
         auditing thousands of rows.
         """
         if (task.acquire or task.free or task.allocation_demands
-                or task.start_callback is not None):
+                or task.start_callback is not None or task.latency_from_first_service):
             return True
         if task.callback is not None and not task.native_hook:
             return True
@@ -201,7 +1042,7 @@ class Engine(
                 return True
         return False
 
-    def extend(self, resources=(), pools=None, pool_units=None):
+    def extend(self, resources=(), pools=None, pool_units=None, *, _discover_hbm: bool = True):
         """Add a disjoint physical pool to the same virtual clock.
 
         A second ``Execution``/``Memory`` binding may re-declare the exact
@@ -209,6 +1050,7 @@ class Engine(
         accepted only when the declaration is identical; a different rate,
         policy, unit count or capacity is still a real conflict and raises.
         """
+        added_resource = False
         for resource in resources:
             existing = self.resources.get(resource.name)
             if existing is not None:
@@ -218,6 +1060,7 @@ class Engine(
                 continue
             self.resources[resource.name] = resource
             self.serviced[resource.name] = self.busy_ms[resource.name] = 0
+            added_resource = True
         for name, capacity in (pools or {}).items():
             units = (pool_units or {}).get(name, 1)
             if name in self.pools:
@@ -230,10 +1073,16 @@ class Engine(
             self._pool_unit_masks[name] = 0
             self._alloc_state_version += 1
         self._seen_floor_peaks.clear()
-        self._compiled_programs.clear()
-        self._stage_id_prepared.clear()
-        self._stage_proto_prepared.clear()
-        self._pair_rate_cache.clear()
+        self._clear_prepared_caches()
+        if added_resource:
+            self._resource_version += 1
+            if _discover_hbm:
+                self._discover_hbm_bus_aliases()
+        if (added_resource and self._accel is not None
+                and self._accel.enabled
+                and not self._tasks and not self._native_slots):
+            self._accel.enabled = False
+            self._accel.try_attach(self)
 
     def bind_memory(self, memory, *, pools: Sequence[str] = ("hbm",)) -> bool:
         """Idempotently bind the single default ledger for this Engine.
@@ -251,7 +1100,8 @@ class Engine(
                    and getattr(memory, "runtime_state", None) is self)
         self.memory = memory
         self.memory_pools.update(str(pool) for pool in pools)
-        self._memory_pools_frozen = frozenset(self.memory_pools)
+        if self.memory_pools:
+            self._memory_pools_frozen = self._intern_pool_set(self.memory_pools)
         self._memory_ledgers[id(memory)] = memory
         if already:
             # Re-binding the same ledger to the same root is a no-op: the
@@ -272,6 +1122,22 @@ class Engine(
                 self.memory_ledger_error = str(error)
         return True
 
+    def _intern_pool_set(self, pools: Sequence[str]) -> frozenset[str]:
+        """Return an Engine-owned exact ``frozenset[str]`` safe for native admission."""
+        raw_items = (pools,) if isinstance(pools, str) else tuple(pools)
+        if not raw_items:
+            return _EMPTY_FROZENSET
+        if any(type(pool) is not str for pool in raw_items):
+            return frozenset(str(pool) for pool in raw_items)
+        pool_key = tuple(sorted(set(raw_items)))
+        pools_frozen = self._engine_pool_sets.get(pool_key)
+        if pools_frozen is None:
+            pools_frozen = frozenset(pool_key)
+            if len(self._engine_pool_sets) < _ENGINE_POOL_SET_CACHE_LIMIT:
+                self._engine_pool_sets[pool_key] = pools_frozen
+                self._engine_pool_set_ids.add(id(pools_frozen))
+        return pools_frozen
+
     @contextmanager
     def memory_scope(self, memory=None, *, replica: int = 0, stage: int = 0,
                      pools: Sequence[str] = ("hbm",), bindings=None):
@@ -287,10 +1153,10 @@ class Engine(
         ledger = memory if memory is not None else self.memory
         if ledger is not None:
             self._memory_ledgers[id(ledger)] = ledger
-        pools_frozen = (
-            pools if pools.__class__ is frozenset
-            else frozenset(str(pool) for pool in pools)
-        )
+        if pools.__class__ is frozenset:
+            pools_frozen = pools
+        else:
+            pools_frozen = self._intern_pool_set(pools)
         norm_bindings = dict(bindings) if bindings else {}
         rep_i = int(replica)
         stg_i = int(stage)
@@ -321,12 +1187,83 @@ class Engine(
             "ledger": record["ledger"], "binding": dict(record["binding"]),
         }
 
-    def _rates(self) -> dict[str, dict[int, float]]:
+    def _sync_cohort_active(self) -> int:
+        """O(min(|active|, |live_cohorts|)) amortized count of active ``cohort_size > 1`` tasks."""
+        cur_seq = self._sequence
+        prev_seq = self._cohort_checked_seq
+        live = self._cohort_live_seqs
+        tasks = self._tasks
+        if cur_seq > prev_seq:
+            if prev_seq == 0 or (cur_seq - prev_seq) > len(tasks):
+                for seq, task in tasks.items():
+                    if task.cohort_size > 1:
+                        live.add(seq)
+            else:
+                for seq in range(prev_seq + 1, cur_seq + 1):
+                    task = tasks.get(seq)
+                    if task is not None and task.cohort_size > 1:
+                        live.add(seq)
+            self._cohort_checked_seq = cur_seq
+        if not live:
+            self._cohort_active = 0
+            return 0
+        active = self._active
+        if not active:
+            self._cohort_active = 0
+            return 0
+        if len(live) > _COHORT_PRUNE_FACTOR * len(tasks):
+            live.intersection_update(tasks)
+            if not live:
+                self._cohort_active = 0
+                return 0
+        if len(active) <= len(live):
+            count = 0
+            for seq in active:
+                if tasks[seq].cohort_size > 1:
+                    count += 1
+            self._cohort_active = count
+            return count
+        stale: list[int] = []
+        added: list[int] = []
+        count = 0
+        for seq in live:
+            task = tasks.get(seq)
+            if task is None:
+                stale.append(seq)
+                continue
+            if seq in active:
+                count += 1
+            children = task.split_children
+            if not children:
+                continue
+            for child_ev in children:
+                cseq = child_ev.sequence
+                if cseq in live:
+                    continue
+                child_task = tasks.get(cseq)
+                if child_task is not None and child_task.cohort_size > 1:
+                    added.append(cseq)
+                    if cseq in active:
+                        count += 1
+        if stale:
+            live.difference_update(stale)
+        if added:
+            live.update(added)
+        self._cohort_active = count
+        return count
+
+    def _rates(
+        self,
+        *,
+        owner_rates_out: dict[str, dict[int, tuple[tuple[int, float], ...]]] | None = None,
+    ) -> dict[str, dict[int, float]]:
         return component_rates(
             self.resources, self._tasks, self._active,
             coupled_solver=coupled_rates,
             coupled_active=self._coupled_active,
-            placed_active=self._placed_active)
+            placed_active=self._placed_active,
+            allow_native=self._accel is not None,
+            owner_rates_out=owner_rates_out)
 
     def advance(
         self, *, until: Sequence[Event] = (), horizon: float = math.inf,
@@ -357,20 +1294,10 @@ class Engine(
         resources = self.resources
         pair_cache = self._pair_rate_cache
         _settle = self._settle
-        _step_pair_fast = self._step_pair_fast
-        _step_cached_pair = self._step_cached_pair
-        _cache_pair_plan = self._cache_pair_plan
         _step_solo_fast = self._step_solo_fast
-        _isfinite = math.isfinite
-        _ulp = math.ulp
-        _nextafter = math.nextafter
-        _heappush = heapq.heappush
-        _inf = math.inf
         while True:
-            if (steps & DEADLINE_POLL_MASK) == 0:
-                from ..evaluation import ACTIVE_DEADLINE_MONO, check_active_deadline
-                if ACTIVE_DEADLINE_MONO.get() is not None:
-                    check_active_deadline()
+            if (steps & DEADLINE_POLL_MASK) == 0 and ACTIVE_DEADLINE_MONO.get() is not None:
+                check_active_deadline()
             accel = self._accel
             if accel is not None and accel.start_conflict(self, until_tuple):
                 accel.disable(self, "start_boundary")
@@ -380,25 +1307,10 @@ class Engine(
                 if until_one.time is not None:
                     return until_tuple
                 complete = ()
-            elif until_two_0 is not None:
-                d0 = until_two_0.time is not None
-                d1 = until_two_1.time is not None
-                if d0 and d1:
-                    return until_tuple
-                if d0 or d1:
-                    complete = (until_two_0,) if d0 else (until_two_1,)
-                    if first:
-                        return complete
-                else:
-                    complete = ()
-            elif first and n_until:
-                complete = ()
-                for event in until_tuple:
-                    if event.time is not None:
-                        return tuple(ev for ev in until_tuple if ev.time is not None)
             elif n_until:
-                complete = tuple(ev for ev in until_tuple if ev.time is not None)
-                if len(complete) == n_until:
+                complete, reached = _completed_targets(
+                    until_tuple, until_two_0, until_two_1, first)
+                if reached:
                     return complete
             else:
                 complete = ()
@@ -409,25 +1321,32 @@ class Engine(
                 return complete
             if max_steps is not None and steps >= max_steps:
                 raise ExecutionError("execution_step_budget_exhausted")
+            if (self._placed_active or self._fifo_live) and self._sync_cohort_active():
+                self._settle_asymmetric_cohorts()
+            periodic_stalled = False
             if self._periodic_runs:
-                skipped = self._periodic_observe(horizon)
-                if skipped is not None:
-                    self._apply_periodic_skip(skipped)
-                    steps += 1
-                    continue
+                if self._periodic_epoch_still_stalled():
+                    periodic_stalled = True
+                else:
+                    skipped = self._periodic_observe(horizon)
+                    if skipped is not None:
+                        self._apply_periodic_skip(skipped)
+                        steps += 1
+                        continue
+                    periodic_stalled = self._periodic_epoch_is_stalled
             accel = self._accel
             if accel is not None and (self._native_seqs or accel.pending
                                       or accel.made_progress):
                 consumed = accel.advance_epoch(
                     self, horizon,
-                    (max_steps - steps) if max_steps is not None else (1 << 20),
+                    (max_steps - steps) if max_steps is not None else _NATIVE_EPOCH_STEP_LIMIT,
                     until_tuple)
                 if consumed:
                     steps += consumed
                     continue
                 if accel.made_progress:
                     continue
-            if not self._periodic_runs:
+            if not self._periodic_runs or periodic_stalled:
                 n_act = len(active)
                 if n_act == 0:
                     dt = horizon - now
@@ -435,16 +1354,17 @@ class Engine(
                         rel_dt = releases[0][0] - now
                         if rel_dt < dt:
                             dt = rel_dt
-                    if not _isfinite(dt):
+                    if not math.isfinite(dt):
                         names = ",".join(t.event.name for t in tasks.values())
-                        raise ExecutionError(f"execution_stalled:{names[:300]}")
+                        raise ExecutionError(f"execution_stalled:{names[:_STALL_NAME_LIMIT]}")
                     next_time = now + dt
                     if dt > 0 and next_time == now:
-                        next_time = _nextafter(now, _inf)
+                        next_time = math.nextafter(now, math.inf)
                     self.advance_steps += 1
                     steps += 1
                     self.now = next_time
                     continue
+                wave_rec = self._wave_recorder
                 solo_key = 0
                 solo_task = None
                 if n_act == 1:
@@ -462,151 +1382,248 @@ class Engine(
                     elif (t0.priority == t1.priority
                           and _fast_eligible_task(resources, t0)
                           and _fast_eligible_task(resources, t1)):
-                        p0, p1 = t0.prepared, t1.prepared
-                        if (p0 is not None and p1 is not None
-                                and len(rem0) == len(p0.demand)
-                                and len(rem1) == len(p1.demand)):
-                            hit = pair_cache.get((id(p0), id(p1)))
-                            if hit is not None and hit[0] is p0 and hit[1] is p1:
-                                cplan = hit[2]
-                                if cplan.__class__ is tuple:
-                                    if (cplan[0] != 3
-                                            or (rem1[cplan[3]] if cplan[1] else rem0[cplan[3]]) == cplan[6]):
-                                        dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                        next_time = _step_cached_pair(cplan, k0, t0, k1, t1, now, dt)
-                                        self.advance_steps += 1
-                                        steps += 1
-                                        self.now = next_time
-                                        continue
-                                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                elif cplan is False:
-                                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                else:
-                                    cp_fast = None
-                            else:
-                                cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                _cache_pair_plan(p0, p1, t0, cp_fast)
-                        else:
-                            cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                        if cp_fast is not None:
-                            dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                            next_time = _step_pair_fast(cp_fast, now, dt)
+                        next_pair = self._step_active_pair(
+                            k0, t0, k1, t1, now, horizon, releases, latency_active,
+                            tasks, resources, pair_cache, wave_rec)
+                        if next_pair is not None:
                             self.advance_steps += 1
                             steps += 1
-                            self.now = next_time
+                            self.now = next_pair
                             continue
-                elif n_act == 3:
-                    it_a = iter(active)
-                    k0, k1, k2 = next(it_a), next(it_a), next(it_a)
-                    t0, t1, t2 = tasks[k0], tasks[k1], tasks[k2]
-                    rem0, rem1, rem2 = t0.remaining, t1.remaining, t2.remaining
-                    if (t0.priority == t1.priority == t2.priority
-                            and _fast_eligible_task(resources, t0)
-                            and _fast_eligible_task(resources, t1)
-                            and _fast_eligible_task(resources, t2)):
-                        if not rem0 or not rem1 or not rem2:
-                            if not rem0:
-                                ka, ta, kb, tb = k1, t1, k2, t2
-                            elif not rem1:
-                                ka, ta, kb, tb = k0, t0, k2, t2
-                            else:
-                                ka, ta, kb, tb = k0, t0, k1, t1
-                            cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
-                            if cp_fast is not None:
-                                dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                next_time = _step_pair_fast(cp_fast, now, dt)
-                                self.advance_steps += 1
-                                steps += 1
-                                self.now = next_time
-                                continue
-                        else:
-                            ks, ts = 0, None
-                            if not t0.coupled and len(rem0) == 1:
-                                rcand = next(iter(rem0))
-                                if rcand not in rem1 and rcand not in rem2:
-                                    ks, ts, rs = k0, t0, rcand
-                                    ka, ta, kb, tb = k1, t1, k2, t2
-                            if ts is None and not t1.coupled and len(rem1) == 1:
-                                rcand = next(iter(rem1))
-                                if rcand not in rem0 and rcand not in rem2:
-                                    ks, ts, rs = k1, t1, rcand
-                                    ka, ta, kb, tb = k0, t0, k2, t2
-                            if ts is None and not t2.coupled and len(rem2) == 1:
-                                rcand = next(iter(rem2))
-                                if rcand not in rem0 and rcand not in rem1:
-                                    ks, ts, rs = k2, t2, rcand
-                                    ka, ta, kb, tb = k0, t0, k1, t1
-                            if ts is not None:
-                                cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
-                                if cp_fast is not None:
-                                    prep_s = ts.prepared
-                                    if prep_s is not None and prep_s.solo_rates is not None:
-                                        rate_s = prep_s.solo_rates[rs]
-                                    else:
-                                        res_s = resources[rs]
-                                        if res_s.policy == "fifo":
-                                            rate_s = res_s.rate
-                                        elif ts.placement and rs in ts.placement:
-                                            rate_s = res_s.rate / res_s.units * len(ts.placement[rs])
-                                        else:
-                                            rate_s = res_s.rate
-                                        if ts.caps and rs in ts.caps and ts.caps[rs] < rate_s:
-                                            rate_s = ts.caps[rs]
-                                    dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                    next_time = _step_pair_fast(cp_fast, now, dt, ks, ts, rs, rate_s)
-                                    self.advance_steps += 1
-                                    steps += 1
-                                    self.now = next_time
-                                    continue
+                elif n_act == _TRIPLE_ACTIVE_COUNT:
+                    next_triple = self._step_active_triple(
+                        active, now, horizon, releases, latency_active, tasks,
+                        resources, wave_rec)
+                    if next_triple is not None:
+                        self.advance_steps += 1
+                        steps += 1
+                        self.now = next_triple
+                        continue
                 if solo_task is not None and _fast_eligible_task(resources, solo_task):
                     next_solo = _step_solo_fast(solo_key, solo_task, now, horizon, max_steps)
                     if next_solo is not None:
+                        if solo_task.hbm_accounting:
+                            _sync_task_hbm_accounting(self, solo_task)
+                        if solo_task.deliveries:
+                            self._update_task_deliveries(solo_task)
                         self.advance_steps += 1
                         steps += 1
                         self.now = next_solo
                         continue
-            rates = self._rates()
-            dt = _stop_window(now, horizon, releases, latency_active, tasks)
-            for name, consumers in rates.items():
-                for key, rate in consumers.items():
-                    if rate == 0.0:
-                        raise ExecutionError(f"service_rate_underflow:{name}")
-                    work_dt = tasks[key].remaining[name] / rate
-                    if work_dt < dt:
-                        dt = work_dt
-            if not _isfinite(dt):
-                names = ",".join(task.event.name for task in tasks.values())
-                raise ExecutionError(f"execution_stalled:{names[:300]}")
-            next_time = now + dt
-            if dt > 0 and next_time == now:
-                next_time = _nextafter(now, _inf)
-            for name, consumers in rates.items():
-                busy_ms[name] += dt
-                for key, rate in consumers.items():
-                    task = tasks[key]
-                    remaining = task.remaining[name]
-                    scaled = dt * rate
-                    if scaled >= remaining:
-                        used, residual = remaining, 0.0
-                    else:
-                        residual = remaining - scaled
-                        if residual <= 4 * _ulp(remaining):
-                            used, residual = remaining, 0.0
-                        else:
-                            used = scaled
-                    service = task.service
-                    service[name] = service.get(name, 0.0) + used
-                    serviced[name] += used
-                    if residual:
-                        task.remaining[name] = residual
-                    else:
-                        del task.remaining[name]
-                        if not task.remaining and task.latency <= 0.0:
-                            completable_seen.add(key)
-                            _heappush(completable, key)
+            next_time = self._step_shared_service(
+                now, horizon, releases, latency_active, tasks, busy_ms, serviced,
+                completable, completable_seen)
             self.advance_steps += 1
             steps += 1
             self.now = next_time
+
+    def _step_active_pair(
+        self, k0, t0, k1, t1, now, horizon, releases, latency_active,
+        tasks, resources, pair_cache, wave_rec,
+    ) -> float | None:
+        rem0, rem1 = t0.remaining, t1.remaining
+        p0, p1 = t0.prepared, t1.prepared
+        if (p0 is not None and p1 is not None
+                and not t0.service and not t1.service
+                and len(rem0) == len(p0.demand)
+                and len(rem1) == len(p1.demand)):
+            hit = pair_cache.get((id(p0), id(p1)))
+            if hit is not None and hit[0] is p0 and hit[1] is p1:
+                cplan = hit[2]
+                if cplan.__class__ is tuple:
+                    if (cplan[0] != _CACHED_MIXED_PLAN_KIND
+                            or (rem1 if cplan[1] else rem0)[cplan[_CACHED_MIXED_PLAN_KIND]]
+                            == cplan[_CACHED_MIXED_REM_IDX]):
+                        dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                        watched = (
+                            ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
+                            if (wave_rec is not None or t0.deliveries or t1.deliveries
+                                or t0.hbm_accounting or t1.hbm_accounting) else ()
+                        )
+                        next_time = self._step_cached_pair(cplan, k0, t0, k1, t1, now, dt)
+                        if watched:
+                            self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                        return next_time
+                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                elif cplan is False:
+                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                else:
+                    cp_fast = None
+            else:
+                cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                self._cache_pair_plan(p0, p1, t0, cp_fast)
+        else:
+            cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+        if cp_fast is not None:
+            dt = _stop_window(now, horizon, releases, latency_active, tasks)
+            watched = (
+                ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
+                if (wave_rec is not None or t0.deliveries or t1.deliveries
+                    or t0.hbm_accounting or t1.hbm_accounting) else ()
+            )
+            next_time = self._step_pair_fast(cp_fast, now, dt)
+            if watched:
+                self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+            return next_time
+        return None
+
+    def _step_active_triple(
+        self, active, now, horizon, releases, latency_active, tasks, resources, wave_rec,
+    ) -> float | None:
+        it_a = iter(active)
+        k0, k1, k2 = next(it_a), next(it_a), next(it_a)
+        t0, t1, t2 = tasks[k0], tasks[k1], tasks[k2]
+        rem0, rem1, rem2 = t0.remaining, t1.remaining, t2.remaining
+        if not (t0.priority == t1.priority == t2.priority
+                    and _fast_eligible_task(resources, t0)
+                    and _fast_eligible_task(resources, t1)
+                    and _fast_eligible_task(resources, t2)):
+            return None
+        if not rem0 or not rem1 or not rem2:
+            if not rem0:
+                ka, ta, kb, tb = k1, t1, k2, t2
+            elif not rem1:
+                ka, ta, kb, tb = k0, t0, k2, t2
+            else:
+                ka, ta, kb, tb = k0, t0, k1, t1
+            cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
+            if cp_fast is not None:
+                dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                watched = (
+                    ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)))
+                    if (wave_rec is not None or ta.deliveries or tb.deliveries
+                        or ta.hbm_accounting or tb.hbm_accounting) else ()
+                )
+                next_time = self._step_pair_fast(cp_fast, now, dt)
+                if watched:
+                    self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                return next_time
+            return None
+        ks, ts = 0, None
+        if not t0.coupled and len(rem0) == 1:
+            rcand = next(iter(rem0))
+            if rcand not in rem1 and rcand not in rem2:
+                ks, ts, rs = k0, t0, rcand
+                ka, ta, kb, tb = k1, t1, k2, t2
+        if ts is None and not t1.coupled and len(rem1) == 1:
+            rcand = next(iter(rem1))
+            if rcand not in rem0 and rcand not in rem2:
+                ks, ts, rs = k1, t1, rcand
+                ka, ta, kb, tb = k0, t0, k2, t2
+        if ts is None and not t2.coupled and len(rem2) == 1:
+            rcand = next(iter(rem2))
+            if rcand not in rem0 and rcand not in rem1:
+                ks, ts, rs = k2, t2, rcand
+                ka, ta, kb, tb = k0, t0, k1, t1
+        if ts is not None:
+            cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
+            if cp_fast is not None:
+                prep_s = ts.prepared
+                if prep_s is not None and prep_s.solo_rates is not None:
+                    rate_s = prep_s.solo_rates[rs]
+                else:
+                    res_s = resources[rs]
+                    if res_s.policy == "fifo":
+                        rate_s = res_s.rate
+                    elif ts.placement and rs in ts.placement:
+                        rate_s = res_s.rate / res_s.units * len(ts.placement[rs])
+                    else:
+                        rate_s = res_s.rate
+                    if ts.caps and rs in ts.caps and ts.caps[rs] < rate_s:
+                        rate_s = ts.caps[rs]
+                dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                watched = (
+                    ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)),
+                     (ks, ts, dict(ts.service)))
+                    if (wave_rec is not None or ta.deliveries or tb.deliveries or ts.deliveries
+                        or ta.hbm_accounting or tb.hbm_accounting or ts.hbm_accounting) else ()
+                )
+                next_time = self._step_pair_fast(cp_fast, now, dt, ks, ts, rs, rate_s)
+                if watched:
+                    self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                return next_time
+        return None
+
+    def _step_shared_service(
+        self, now, horizon, releases, latency_active, tasks, busy_ms, serviced,
+        completable, completable_seen,
+    ) -> float:
+        wave_rec = self._wave_recorder
+        owner_rates: dict[str, dict[int, tuple[tuple[int, float], ...]]] | None = (
+            {} if wave_rec is not None else None
+        )
+        rates = self._rates(owner_rates_out=owner_rates)
+        dt = _stop_window(now, horizon, releases, latency_active, tasks)
+        stop_dt = dt
+        for name, consumers in rates.items():
+            for key, rate in consumers.items():
+                if rate == 0.0:
+                    raise ExecutionError(f"service_rate_underflow:{name}")
+                work_dt = tasks[key].remaining[name] / rate
+                if work_dt < dt:
+                    dt = work_dt
+        if not math.isfinite(dt):
+            names = ",".join(task.event.name for task in tasks.values())
+            raise ExecutionError(f"execution_stalled:{names[:_STALL_NAME_LIMIT]}")
+        if self._periodic_runs and not self._periodic_epoch_is_stalled:
+            self._periodic_clock_step = (self.advance_steps + 1, dt) if dt < stop_dt else None
+        next_time = now + dt
+        if dt > 0 and next_time == now:
+            next_time = math.nextafter(now, math.inf)
+        resources = self.resources
+        hbm_touched = None
+        deliv_touched = None
+        for name, consumers in rates.items():
+            busy_ms[name] += dt
+            r_units = resources[name].units
+            res_owner_weights = owner_rates.get(name) if owner_rates else None
+            for key, rate in consumers.items():
+                task = tasks[key]
+                remaining = task.remaining[name]
+                scaled = dt * rate
+                if scaled >= remaining:
+                    used, residual = remaining, 0.0
+                else:
+                    residual = remaining - scaled
+                    if residual <= _SERVICE_ROUNDING_ULPS * math.ulp(remaining):
+                        used, residual = remaining, 0.0
+                    else:
+                        used = scaled
+                if task.first_service is None and used > 0.0:
+                    task.first_service = now
+                service = task.service
+                service[name] = service.get(name, 0.0) + used
+                serviced[name] += used
+                if wave_rec is not None and dt > 0.0:
+                    _emit_wave_service(
+                        wave_rec, key, name, task.placement, now, next_time, used,
+                        units=r_units,
+                        owner_weights=res_owner_weights.get(key) if res_owner_weights else None,
+                    )
+                if residual:
+                    task.remaining[name] = residual
+                else:
+                    del task.remaining[name]
+                    if not task.remaining and task.latency <= 0.0:
+                        completable_seen.add(key)
+                        heapq.heappush(completable, key)
+                if task.hbm_accounting:
+                    if hbm_touched is None:
+                        hbm_touched = {key: task}
+                    else:
+                        hbm_touched[key] = task
+                if task.deliveries:
+                    if deliv_touched is None:
+                        deliv_touched = {key: task}
+                    else:
+                        deliv_touched[key] = task
+        if hbm_touched is not None:
+            for task in hbm_touched.values():
+                _sync_task_hbm_accounting(self, task)
+        if deliv_touched is not None:
+            for task in deliv_touched.values():
+                self._update_task_deliveries(task)
+        return next_time
 
     def service_of(self, event: Event) -> dict[str, float]:
         """Read-only per-task service; live native slots export accrued work."""
@@ -624,8 +1641,23 @@ class Engine(
                 merged = dict(task.service)
                 for idx, name in enumerate(names):
                     merged[name] = merged.get(name, 0.0) + float(buf[n + idx])
+                if task.hbm_accounting:
+                    live_rem = {name: float(buf[idx]) for idx, name in enumerate(names)}
+                    credited = task.hbm_credited or {}
+                    for entry in task.hbm_accounting:
+                        base = entry[0]
+                        done_since = _hbm_entry_done_since_bind(live_rem, entry)
+                        delta = done_since - credited.get(base, 0.0)
+                        if delta > 0.0:
+                            merged[base] = merged.get(base, 0.0) + delta
                 return merged
-        return dict(task.service)
+        merged = dict(task.service)
+        if task.split_children:
+            for child_ev in task.split_children:
+                if not child_ev.done:
+                    for rn, amt in self.service_of(child_ev).items():
+                        merged[rn] = merged.get(rn, 0.0) + amt
+        return merged
 
     def _accel_coverage(self) -> tuple[int, int, str | None]:
         if self._accel is not None:
@@ -670,9 +1702,10 @@ class Engine(
 
 
 __all__ = [
-    "Allocation", "AllocationBinding", "AllocationKey", "BindingFrame",
-    "Engine", "Event", "EventKey", "ExecutionError", "OccurrenceKey",
-    "PortBinding", "PreparedStage", "Resource", "Submission", "unit_rates",
+    "ACTIVE_DEADLINE_MONO", "Allocation", "AllocationBinding", "AllocationKey",
+    "BindingFrame", "Engine", "Event", "EventKey", "ExecutionError",
+    "OccurrenceKey", "PortBinding", "PreparedStage", "Resource", "Submission",
+    "check_active_deadline", "unit_rates",
     "_EMPTY_CAPS", "_EMPTY_FROZENSET", "_EMPTY_METADATA", "_EMPTY_PLACEMENT",
     "_EMPTY_TASK", "_FULL_FINITE_PREFLIGHT", "_PreparedTask", "_Task",
     "_binding_for", "_chain_callbacks", "_compute_pool_unit_masks",

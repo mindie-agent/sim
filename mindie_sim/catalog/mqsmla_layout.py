@@ -17,17 +17,17 @@ EXPONENT_SCALE_TYPES = frozenset({"uint8", "fp8_e8m0", "e8m0"})
 def packed_scale_type(window, compressed):
     if (window != compressed or window.packed_elements != 1 or window.dtype != "fp8_e4m3"
             or window.group_size not in (V0919_MODE_TAG, NATIVE_GROUP)
-            or window.suffix_elements):
+            or window.suffix_elements or window.alignment != 1):
         return None
     return "uint8" if window.scale_dtype in EXPONENT_SCALE_TYPES else (
         "bf16" if window.scale_dtype == "bf16" else None)
 
 
-def packed_row_parts(model, region, width):
+def packed_row_parts(model, region, width, *, plan=None, phase=None):
     if region not in {"window", "compressed_kv"} or width != HEAD_WIDTH:
         return None
-    fmt = cache_format(model, "window")
-    kind = packed_scale_type(fmt, cache_format(model, "compressed_kv"))
+    fmt = cache_format(model, "window", plan=plan, phase=phase)
+    kind = packed_scale_type(fmt, cache_format(model, "compressed_kv", plan=plan, phase=phase))
     if kind is None:
         return None
     from mindie_sim.schema.common import dtype_bytes

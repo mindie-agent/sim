@@ -1,0 +1,369 @@
+"""Finite arch22 BF16 paged MLA with explicit GM communication and source owners.
+
+[Role] Execute declared common SplitCore ownership through the shared Engine.
+[Invariants] Aliased K/V are separately read. Declared retained rows consume
+  finite shared L2 capacity and the same AIC copy pipe. Q reloads per S2; QK,
+  probability and PV cross GM. Atomic updates retain read/write traffic.
+  C1(i), V1/C2(i-1), V2(i-2) have two real drains and finite source buffers.
+[Timeouts & Locks] O(batch + owners + finite active tile windows), no locks.
+[Side-Effect Policy] Immutable virtual work only; no device, source or timing I/O.
+"""
+from bisect import bisect_right
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from typing import Literal
+
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.prediction.mechanism import OperatorPlan, Work
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from mindie_sim.prediction.operators.matrix.refill_steady import (
+    PeriodicPipelineSpec, compact_periodic_peer_group, compact_periodic_pipeline,
+)
+from .paged_mla_membase_dispatch import Dispatch, KEY_TILE, source_dispatch
+from .paged_mla_membase_matrix import (
+    CUBE_ALIGNMENT, LATENT_WIDTH, PAGE_INDEX_BYTES, PV_K_L0, PV_K_L1, PV_N,
+    QK_K_L0, QK_K_L1, QK_N, QK_WIDTH, matrix_program,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_ARCH22_ARCH_ID = 'npu_arch_2201'
+_HEAD_TILE_CHOICES = (8, 16)
+_SCORE_COLUMN_ALIGNMENT = 32
+_FP32_BYTES = 4
+_FD_STATS_BYTES = 64
+_SOFTMAX_OPS_PER_SCORE = 8
+_SOFTMAX_OPS_PER_HEAD = 30
+_FD_OUTPUT_OPS_PER_ELEM = 4
+_DIRECT_OUTPUT_OPS_PER_ELEM = 5
+_FD_MERGE_OPS_PER_PARTIAL = 48
+_PLAN_CACHE_SIZE = 64
+_MATRIX_CACHE_SIZE = 256
+_PIPELINE_SLOTS = 3
+_COMPACT_HEAD_CYCLES = 4
+_COMPACT_TAIL_CYCLES = 3
+
+
+IMPLEMENTATION = 'ascend_paged_mla_decode_arch22'
+SOURCE = {
+    'repository': 'cann/ops-transformer',
+    'revision': 'a3925fd49cd256ad478d2faf983bf2961b8ae2c8',
+    'directory': 'attention/fused_infer_attention_score/op_kernel/arch22',
+    'sha256': {
+        'fia_kernel_nonquant_mla.h': 'd76c338e39c6845d0c0ada93291cb0839016fb8142d5293ce6d1fd237d6d2a18',
+        'fia_block_cube_nonquant_mla.h': '5b6e2459788367a0e122dc7edb5d31797abf3a8c1972e1b9d46cf6bed0868a2c',
+        'fia_block_vec_nonquant_mla.h': '14737c7bca3cad6d8500d777fbc61997dbbb2d3cfa70e80e308fa09995d9c037',
+        'fia_block_vec_flashdecode_arch22.h': '55e67b72af3d2365e3868d308e85f4586570ebbdd0fde40ae2fbacc491169eb9',
+        'attention/common/op_host/split_core.cpp': '7a45c1e33258acd1b85b9a4919f1dd3d315f35201431983ddfdd79fa19710452',
+    },
+    'scope': 'q1/physical_heads8_or16/S2_512/D512/rope64; source compatible, binary identity unestablished',
+}
+SOURCES: tuple[SourceRef, ...] = tuple(
+    SourceRef(
+        repository=SOURCE['repository'],
+        revision=SOURCE['revision'],
+        relative_path=name if '/' in name else f"{SOURCE['directory']}/{name}",
+        source_sha256=digest,
+    )
+    for name, digest in SOURCE['sha256'].items()
+)
+# Source allocation maxima; FD resets UB to 122112 bytes after the FA barrier.
+BUFFERS = {'l1': 7*128*288*2, 'l0a': 65536, 'l0b': 65536,
+           'l0c': 131072, 'ub': 170*1024}
+
+
+def align(value, step=CUBE_ALIGNMENT):
+    return (value+step-1)//step*step
+
+
+@dataclass(frozen=True)
+class Spec:
+    contexts: tuple
+    heads: int
+    page_size: int
+    dispatch: Dispatch
+    dispatch_origin: str
+    retained_kv_rows: int = 0
+
+
+def tile_work(keys, heads, *, first, last, splits, page_size, retained_kv_rows=0):
+    """Source transfers and aligned matrix work; no measured service or split fit."""
+    hm, kn, columns = align(heads), align(keys), align(keys, _SCORE_COLUMN_ALIGNMENT)
+    blocks = (keys + QK_N - 1) // QK_N
+    # QK has two K288 panels per N128. PV reloads P from L1 for each N128,
+    # but each P row enters L1 only once; latent V is a separate GM source.
+    query_key = (heads+keys)*QK_WIDTH*2
+    probability = heads*columns*2
+    value_probability = keys*(LATENT_WIDTH+heads)*2
+    score_store, score_read = hm*kn*_FP32_BYTES, heads*columns*_FP32_BYTES
+    pv = hm*LATENT_WIDTH*_FP32_BYTES
+    # K and Krope share the page lookup within each K288 call; V has four
+    # N128 calls. Scalar instruction latency is deliberately not assigned.
+    pages = sum((min(QK_N,keys-start)+page_size-1)//page_size for start in range(0,keys,QK_N))
+    query_key += pages*2*PAGE_INDEX_BYTES
+    value_probability += pages*(LATENT_WIDTH // PV_N)*PAGE_INDEX_BYTES
+    softmax_ops = _SOFTMAX_OPS_PER_SCORE * columns + _SOFTMAX_OPS_PER_HEAD + (1 if last else 0)
+    works = {
+        'qk_load': Work(resources={'hbm':query_key, 'mte2_aic':query_key}),
+        'qk_operands': Work(resources={'mte1':(blocks*hm+kn)*QK_WIDTH*2}),
+        'qk': Work(matrix={'bf16':2*hm*kn*QK_WIDTH}),
+        'score_store': Work(resources={'hbm':score_store, 'fixpipe':score_store}),
+        'score_read': Work(resources={'hbm':score_read, 'mte2_aiv':score_read}),
+        # Scale/reduce/exp/update, AMLA row rescaling and BF16 cast. These
+        # are algebraic vector operations, not reconstructed instruction issue.
+        'softmax': Work(resources={'vector': heads * softmax_ops}),
+        'probability': Work(resources={'hbm':probability, 'mte3':probability}),
+        'nupdate_compute': Work(resources={} if first else {'vector':hm*QK_N}),
+        'nupdate': Work(resources={} if first else {'hbm':2*pv, 'mte3':pv}),
+        'pv_load': Work(resources={'hbm':value_probability, 'mte2_aic':value_probability}),
+        'pv_operands': Work(resources={'mte1':((LATENT_WIDTH // PV_N)*hm+LATENT_WIDTH)*kn*2}),
+        'pv': Work(matrix={'bf16':2*hm*kn*LATENT_WIDTH}),
+        'partial': Work(resources={'hbm':pv*(1 if first else 2), 'fixpipe':pv}),
+    }
+    if retained_kv_rows:
+        retained = min(keys, retained_kv_rows)
+        # QK fills the retained latent+rope rows. PV rereads the same latent
+        # addresses one outer iteration later; neither read nor cache fill is
+        # free. Probability, page metadata and all scratch remain offchip.
+        works['qk_load'] += Work(resources={'l2_write': retained*QK_WIDTH*2})
+        cached = retained*LATENT_WIDTH*2
+        works['pv_load'] = Work(resources={
+            'hbm': value_probability-cached, 'mte2_aic': value_probability-cached,
+            'mte2_aic_cached': cached, 'l2_read': cached})
+    if last:
+        read = heads*LATENT_WIDTH*_FP32_BYTES
+        write = heads*(LATENT_WIDTH*_FP32_BYTES+_FD_STATS_BYTES if splits > 1 else LATENT_WIDTH*2)
+        normalize_ops = _FD_OUTPUT_OPS_PER_ELEM if splits > 1 else _DIRECT_OUTPUT_OPS_PER_ELEM
+        works.update({
+            'output_read': Work(resources={'hbm':read,'mte2_aiv':read}),
+            'output_normalize': Work(resources={'vector': heads * LATENT_WIDTH * normalize_ops}),
+            'output_write': Work(resources={'hbm':write,'mte3':write}),
+        })
+    return works
+
+
+def merge_work(heads, splits):
+    read = splits*heads*(LATENT_WIDTH*_FP32_BYTES+_FD_STATS_BYTES)
+    write = heads*LATENT_WIDTH*2
+    return (
+        Work(resources={'hbm':read, 'mte2_aiv':read}),
+        Work(resources={'vector':heads*(CUBE_ALIGNMENT+(_FD_MERGE_OPS_PER_PARTIAL + 2 * LATENT_WIDTH) * splits)}),
+        Work(resources={'hbm':write, 'mte3':write}),
+    )
+
+
+def validate_domain(contexts, heads, *, page_size=None, retained_kv_rows=0):
+    """Shared admission predicate for Arch22 SplitCore paged MLA."""
+    if (not contexts or any(type(c) is not int or c < KEY_TILE for c in contexts)
+            or heads not in _HEAD_TILE_CHOICES
+            or (page_size is not None
+                and (type(page_size) is not int or page_size < 1 or KEY_TILE % page_size))):
+        raise ModelingError('paged_mla_arch22_requires_q1_heads8_or16_context_ge512_page_divisor512')
+    if type(retained_kv_rows) is not int or not 0 <= retained_kv_rows <= KEY_TILE:
+        raise ModelingError('paged_mla_arch22_retained_rows_must_fit_source_s2_tile')
+
+
+def build(op, geometry):
+    compute_arch = getattr(geometry, 'compute_arch', None) or getattr(
+        getattr(geometry, 'datapath', None), 'compute_arch', None)
+    if compute_arch is not None:
+        arch_id = str(getattr(compute_arch, 'arch_id', '') or getattr(compute_arch, 'preset', '') or '')
+        if arch_id and arch_id != _ARCH22_ARCH_ID:
+            raise ModelingError(f'paged_mla_arch22_unsupported_on_{arch_id}')
+    raw = dict(op.metadata)['paged_mla_geometry']
+    contexts, heads, page = tuple(raw['contexts']), raw['heads'], raw['page_size']
+    retained = raw.get('retained_kv_rows', 0)
+    validate_domain(contexts, heads, page_size=page, retained_kv_rows=retained)
+    declared = raw.get('dispatch')
+    dispatch = Dispatch.parse(declared if declared is not None else source_dispatch(
+        contexts,heads,geometry.compute_units),contexts,heads,geometry.compute_units)
+    for pool, needed in BUFFERS.items():
+        if geometry.buffers.get(pool,0) < needed:
+            raise ModelingError(f'paged_mla_arch22_source_pool_capacity:{pool}:{needed}')
+    ratios = {'mte1':1, 'mte2_aic':1, 'fixpipe':1,
+              'vector':2, 'mte2_aiv':2, 'mte3':2}
+    if any(geometry.resource_units.get(role) != geometry.compute_units*ratio
+           for role,ratio in ratios.items()):
+        raise ModelingError('paged_mla_arch22_requires_paired_aic_aiv_physical_pipes')
+    origin = 'source_common_SplitCore_q1_geometry' if declared is None else 'declared_common_SplitCore_endpoints'
+    # QK(i) precedes PV(i-1). Two private tile generations per live owner
+    # must survive; retaining one generation alone would reuse overwritten KV.
+    required_cache = 2*len(dispatch.owners)*retained*QK_WIDTH*2
+    if retained and (geometry.buffer_units.get('l2',1) != 1
+                     or geometry.buffers.get('l2',0) < required_cache):
+        raise ModelingError('paged_mla_arch22_retained_kv_requires_two_tiles_in_shared_l2')
+    return _plan(Spec(contexts,heads,page,dispatch,origin,retained),geometry.compute_units)
+
+
+@lru_cache(maxsize=_PLAN_CACHE_SIZE)
+def _plan(spec, cores):
+    owners = spec.dispatch.owners
+    total = Work()
+    for jobs in owners:
+        for seq,start,count,splits in jobs:
+            boundary_tiles = (0,) if count == 1 else (0, count - 1) if count > 1 else ()
+            for tile in boundary_tiles:
+                keys = min(KEY_TILE,spec.contexts[seq]+1-(start+tile)*KEY_TILE)
+                for work in tile_work(keys,spec.heads,first=tile==0,last=tile+1==count,
+                                      splits=splits,page_size=spec.page_size,
+                                      retained_kv_rows=spec.retained_kv_rows).values():
+                    total += work
+            if count > 2:
+                for work in tile_work(KEY_TILE,spec.heads,first=False,last=False,
+                                      splits=splits,page_size=spec.page_size,
+                                      retained_kv_rows=spec.retained_kv_rows).values():
+                    total += work.scaled(count - 2)
+    for jobs in spec.dispatch.merges:
+        for _,_,heads,splits in jobs:
+            for work in merge_work(heads,splits):
+                total += work
+
+    def lower(ctx):
+        if spec.retained_kv_rows:
+            if ctx.physical_role('mte2_aic_cached') != ctx.physical_role('mte2_aic'):
+                raise ModelingError('paged_mla_arch22_cached_reads_must_share_aic_pipe')
+            l2 = ctx.physical_role('l2_read')
+            if (l2 != ctx.physical_role('l2_write') or l2 not in ctx.resource_names
+                    or ctx.resource_units.get(l2) != 1):
+                raise ModelingError('paged_mla_arch22_requires_one_shared_l2_service')
+        def stage(name,work,owner,*,aiv=None,**kwargs):
+            roles = set(work.resources) | ({'cube'} if work.matrix else set())
+            placement = ctx.owned(owner,cores,roles-{'hbm','l2_read','l2_write'})
+            # Source vecDealM<=16 gives all live rows to subblock zero.
+            for role in roles & {'vector','mte2_aiv','mte3'}:
+                placement[ctx.resource_names[role]] = (2*owner if aiv is None else aiv,)
+            return Stage(name,ctx.bind(work),placement=placement,**kwargs)
+
+        @lru_cache(maxsize=_MATRIX_CACHE_SIZE)
+        def matrix(kind,keys,owner):
+            return matrix_program(ctx,kind,keys,spec.heads,spec.page_size,owner,cores,len(owners),
+                                  retained_kv_rows=spec.retained_kv_rows)
+
+        def matrix_steps(kind,keys,owner,*,after=(),previous=()):
+            # The cached compact IR is a three-stage chain. Put that chain in
+            # the existing tile window; zero-time nested wrappers add no work
+            # or dependency and otherwise dominate large-batch event counts.
+            load,steady,cube = matrix(kind,keys,owner).stages
+            return (replace(load,name=kind+'_load',after=after,previous=previous),
+                    replace(steady,name=kind+'_steady',after=(kind+'_load',)),
+                    replace(cube,name=kind,after=(kind+'_steady',)))
+
+        def merge_program(aiv,jobs):
+            def sequence(index):
+                _,_,heads,splits = jobs[index]
+                read,compute,write = merge_work(heads,splits)
+                return (
+                    stage('read',read,aiv//2,aiv=aiv),
+                    stage('reduce',compute,aiv//2,aiv=aiv,after=('read',)),
+                    stage('write',write,aiv//2,aiv=aiv,after=('reduce',)),
+                )
+            return PipelineProgram(len(jobs),1,sequence)
+
+        allocations = tuple(ctx.allocate(f'{pool}_{owner}',pool,size,
+            (2*owner,2*owner+1) if pool=='ub' else (owner,))
+            for owner in range(len(owners)) for pool,size in BUFFERS.items())
+        if spec.retained_kv_rows:
+            allocations += (ctx.allocate('retained_kv','l2',
+                2*len(owners)*spec.retained_kv_rows*QK_WIDTH*2,(0,)),)
+        pipelines = tuple(
+            _owner_pipeline_spec(owner, jobs, spec, stage, matrix_steps)
+            for owner, jobs in enumerate(owners)
+        )
+        producers = (
+            compact_periodic_peer_group(ctx, pipelines, compactor=compact_periodic_pipeline)
+            if all(len(jobs) == 1 for jobs in owners)
+            else tuple(pipe.literal() for pipe in pipelines)
+        )
+        return KernelProgram((
+            Stage('reserve',acquire=allocations),
+            Stage('producers',after=('reserve',),program=ParallelProgram(producers)),
+            Stage('merge',after=('producers',),program=ParallelProgram(tuple(
+                merge_program(aiv,jobs) for aiv,jobs in enumerate(spec.dispatch.merges)))),
+            Stage('release',after=('merge',),free=allocations),
+        ))
+    return OperatorPlan(total,lower,{
+        'implementation':IMPLEMENTATION,'source':SOURCE,'source_execution_domain':'cube_vector',
+        'host_dispatch':spec.dispatch_origin,
+        'active_aic_owners':len(owners),'active_fd_aiv_owners':len(spec.dispatch.merges),
+        'physical_segments':sum(map(len,owners)),'buffers_per_owner':BUFFERS,
+        'tile_sequence':'C1(i);V1_C2(i-1);V2(i-2);two_drains',
+        'matrix_micro_geometry':{'qk_n':QK_N,'qk_k_l1':QK_K_L1,'qk_k_l0':QK_K_L0,
+                                 'pv_n':PV_N,'pv_k_l1':PV_K_L1,'pv_k_l0':PV_K_L0},
+        'matrix_pipeline':'three_L1_refill_slots_two_L0_consumer_slots; compact_nominal_recurrence',
+        'gm_traffic':'source_transfers_and_atomic_read_write; declared_pv_alias_reuse_only',
+        'cache_policy':{'retained_kv_rows_per_s2_tile':spec.retained_kv_rows,
+            'resident_bytes':2*len(owners)*spec.retained_kv_rows*QK_WIDTH*2,
+            'lifetime':'two_qk_tile_generations_per_owner_until_pv_consumption',
+            'identity':'same_source_K_V_pointer_and_page_table',
+            'eviction':'conditional_declared_retention; no_observed_hit_rate',
+            'scope':'no_cross_request_or_head_cache_discount; scratch_remains_offchip'},
+        'omitted_mechanisms':['cross_core_flag_latency','scalar_page_translation_latency',
+                              'inner_instruction_issue','arbitrary_contention_pipeline_phase_alignment',
+                              'vector_instruction_issue'],
+    })
+
+
+def _owner_pipeline_spec(owner, jobs, spec, stage, matrix_steps):
+    prefix = [0]
+    for _,_,count,_ in jobs:
+        prefix.append(prefix[-1]+count)
+    count = prefix[-1]
+
+    def keys_at(index):
+        job = bisect_right(prefix,index)-1
+        seq,start,size,splits = jobs[job]
+        offset = index-prefix[job]
+        keys = min(KEY_TILE,spec.contexts[seq]+1-(start+offset)*KEY_TILE)
+        return keys,offset,size,splits
+
+    def work_at(index):
+        keys,offset,size,splits = keys_at(index)
+        return tile_work(keys,spec.heads,first=offset==0,last=offset+1==size,
+                         splits=splits,page_size=spec.page_size,
+                         retained_kv_rows=spec.retained_kv_rows)
+
+    def cycle(index):
+        steps = []
+        if index < count:
+            w = work_at(index)
+            steps.extend(matrix_steps('qk',keys_at(index)[0],owner,previous=('qk','pv')))
+            steps.extend((
+                stage('score_store',w['score_store'],owner,after=('qk',),
+                      previous=('probability',)),
+            ))
+        else:
+            steps.append(Stage('qk'))
+        if 1 <= index <= count:
+            w = work_at(index-1)
+            steps.extend((
+                stage('score_read',w['score_read'],owner,
+                      previous=('score_store','nupdate','output_write')),
+                stage('softmax',w['softmax'],owner,after=('score_read',)),
+                stage('probability',w['probability'],owner,after=('softmax',)),
+                stage('nupdate_compute',w['nupdate_compute'],owner,
+                      after=('probability',),previous=('partial',)),
+                stage('nupdate',w['nupdate'],owner,after=('nupdate_compute',)),
+            ))
+            steps.extend(matrix_steps('pv',keys_at(index-1)[0],owner,
+                                      after=('qk','probability'),previous=('pv',)))
+            steps.extend((
+                stage('partial',w['partial'],owner,after=('pv','nupdate'),
+                      previous=(f'output_release{(bisect_right(prefix,index-1)-1)%2}',)),
+            ))
+        else:
+            steps.append(Stage('nupdate'))
+        if index >= 2:
+            w = work_at(index-2)
+            if 'output_read' in w:
+                steps.extend((
+                    stage('output_read',w['output_read'],owner,
+                          after=('nupdate',),previous=('partial',)),
+                    stage('output_normalize',w['output_normalize'],owner,after=('output_read',)),
+                    stage('output_write',w['output_write'],owner,after=('output_normalize',)),
+                    Stage(f'output_release{(bisect_right(prefix,index-2)-1)%2}',
+                          after=('output_write',)),
+                ))
+        return tuple(steps)
+    return PeriodicPipelineSpec(
+        count + 2, _PIPELINE_SLOTS, cycle, head=_COMPACT_HEAD_CYCLES, tail=_COMPACT_TAIL_CYCLES,
+    )

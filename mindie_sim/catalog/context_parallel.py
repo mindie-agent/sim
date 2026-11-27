@@ -11,13 +11,16 @@
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from fractions import Fraction
+import heapq
+import math
 from typing import Any
 
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, normal_max_order_z
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.model import ModelSpec
-from mindie_sim.schema.subgraphs import KV_READING_ATTENTION_KINDS
 
 #: DCP strategy (kept as the historical string because plan consumers already
 #: report it).  It shards KV and merges (out, LSE); DSA indexers are replicated.
@@ -63,8 +66,15 @@ _CP_CONTEXT_FAMILIES = {
 CP_UNMODELED_SCHEDULES = ("compact_kv_gather",)
 DEFAULT_CP_INTERLEAVE = 128
 _FP32_BYTES = 4.0
-ZERO = 0
-ONE = 1
+#: First-principles DSA/SFA sparse Top-K DCP rank-skew physical constants.
+SINK_MAX_TOKENS = 128
+SINK_FRACTION_DIVISOR = 16
+SINK_MIN_TOKENS = 4
+TAIL_MAX_TOKENS = 512
+TAIL_FRACTION_DIVISOR = 4
+SEMANTIC_COHERENCE_TOKENS = 64
+_SPARSE_EPS = 1e-12
+_BALANCE_ITER_FACTOR = 4
 
 
 def strategy_for_plan(plan: str) -> str:
@@ -190,9 +200,9 @@ def split_causal_pairs(
     elif noncausal:
         rows = context + q_len
         win = int(window)
-        lo = max(ZERO, rows - win) if win > ZERO else ZERO
-        visible = max(ZERO, rows - lo)
-        per = tuple(float(q_len * owned_positions(lo, rows - ONE, cp, interleave, r))
+        lo = max(0, context - win) if win > 0 else 0
+        visible = min(rows, win + q_len) if win > 0 else rows
+        per = tuple(float(q_len * owned_positions(lo, rows - 1, cp, interleave, r))
                     for r in range(cp))
         total = float(q_len * visible)
     elif int(window) <= 0:
@@ -217,7 +227,7 @@ def _pair_total(
     if noncausal:
         rows = context + q_len
         win = int(window)
-        visible = min(rows, win) if win > ZERO else rows
+        visible = min(rows, win + q_len) if win > 0 else rows
         return float(q_len * visible)
     if window <= 0:
         return float(q_len * context + q_len * (q_len + 1) // 2)
@@ -292,13 +302,742 @@ def split_rows(rows: int, cp: int, unit: str = "rows") -> CpSplit:
     return CpSplit(cp, total, per, max(per, default=0.0), unit)
 
 
-def split_pairs(pairs: float, cp: int, unit: str = "pairs") -> CpSplit:
-    """Split a balanced pair count (sparse selected rows) across ranks."""
-    pairs = max(0.0, float(pairs))
-    cp = max(1, int(cp))
-    share = pairs / cp
-    per = tuple(share for _ in range(cp))
-    return CpSplit(cp, pairs, per, share, unit)
+# ---------------------------------------------------------------------------
+# Sparse Top-K DCP straggler rank skew (Sink + Local Tail + Semantic Variance)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SparseDcpSequence:
+    """One sequence's sparse KV selection geometry for DCP rank partitioning."""
+
+    kv_len: int
+    selected_rows: float
+    q_weight: float = 1.0
+    compress_ratio: int = 1
+    always_select_tail: int = 0
+
+
+def sparse_dcp_sequence_for_total(
+    kv_len: int,
+    total_work: float,
+    q_len: int,
+    *,
+    compress_ratio: int = 1,
+    always_select_tail: int = 0,
+) -> SparseDcpSequence:
+    """Map a per-view total sparse work quantity into a ``SparseDcpSequence``."""
+    ratio = max(1, int(compress_ratio))
+    raw_kv = max(0, int(kv_len))
+    eff_rows = (raw_kv + ratio - 1) // ratio if raw_kv > 0 else 0
+    total = max(0.0, float(total_work))
+    q_w = float(max(1, int(q_len)))
+    tail = max(0, int(always_select_tail))
+    if eff_rows <= 0 or total <= 0.0:
+        return SparseDcpSequence(raw_kv, 0.0, q_w, ratio, tail)
+    per_q = total / q_w
+    if per_q <= float(eff_rows):
+        return SparseDcpSequence(raw_kv, per_q, q_w, ratio, tail)
+    return SparseDcpSequence(raw_kv, float(eff_rows), total / float(eff_rows), ratio, tail)
+
+
+def dcp_sparse_imbalance_override(runtime: Any) -> float | None:
+    """Resolve optional explicit sparse DCP imbalance multiplier (>= 1.0)."""
+    raw = runtime_cp_flag(runtime, "dcp_sparse_imbalance", "sfa_dcp_imbalance")
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ModelingError(f"dcp_sparse_imbalance_invalid:{raw!r}")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ModelingError(f"dcp_sparse_imbalance_invalid:{raw!r}") from exc
+    if not math.isfinite(value) or value < 1.0:
+        raise ModelingError(f"dcp_sparse_imbalance_invalid:{raw!r}")
+    return value
+
+
+def _sparse_sequence_moments(
+    seq: SparseDcpSequence, cp: int, interleave: int,
+) -> tuple[list[float], list[float], list[float], list[float], list[float], float, list[float]]:
+    """Per-rank weighted (cap, pinned, sem_mean, sem_var, residual_cap, total, hard_pinned)."""
+    ratio = max(1, int(seq.compress_ratio))
+    raw_kv = max(0, int(seq.kv_len))
+    domain = (raw_kv + ratio - 1) // ratio if raw_kv > 0 else 0
+    block = max(1, int(interleave) // ratio)
+    weight = max(0.0, float(seq.q_weight))
+    sel = min(float(domain), max(0.0, float(seq.selected_rows)))
+    zeros = [0.0] * cp
+    if domain <= 0 or sel <= 0.0 or weight <= 0.0:
+        return (list(zeros), list(zeros), list(zeros), list(zeros), list(zeros), 0.0, list(zeros))
+    raw_caps = [owned_positions(0, domain - 1, cp, block, r) for r in range(cp)]
+    caps = [weight * float(c) for c in raw_caps]
+    if sel >= float(domain) - 1e-12:
+        return (caps, list(caps), list(zeros), list(zeros), list(zeros), weight * float(domain), list(caps))
+    k_int = int(math.floor(sel))
+    forced_tail = min(domain, k_int, max(0, int(seq.always_select_tail)))
+    sink_budget = max(0, min(domain, k_int) - forced_tail)
+    sink_cap = SINK_MAX_TOKENS // ratio
+    sink_floor = (
+        min(SINK_MIN_TOKENS, sink_budget)
+        if ratio == 1
+        else min(SINK_MIN_TOKENS // ratio, sink_budget)
+    )
+    sink_rows = min(
+        sink_budget, max(sink_floor, min(sink_cap, k_int // SINK_FRACTION_DIVISOR)),
+    )
+    tail_cap = TAIL_MAX_TOKENS // ratio
+    tail_target = max(forced_tail, min(tail_cap, k_int // TAIL_FRACTION_DIVISOR))
+    tail_rows = min(domain - sink_rows, max(0, k_int - sink_rows), tail_target)
+    a_sink = [
+        owned_positions(0, sink_rows - 1, cp, block, r) if sink_rows > 0 else 0
+        for r in range(cp)
+    ]
+    a_tail = [
+        owned_positions(domain - tail_rows, domain - 1, cp, block, r) if tail_rows > 0 else 0
+        for r in range(cp)
+    ]
+    a_forced_tail = [
+        owned_positions(domain - forced_tail, domain - 1, cp, block, r) if forced_tail > 0 else 0
+        for r in range(cp)
+    ]
+    res_raw = [raw_caps[r] - a_sink[r] - a_tail[r] for r in range(cp)]
+    res_total = sum(res_raw)
+    k_sem = max(0.0, sel - float(sink_rows) - float(tail_rows))
+    pinned = [weight * float(a_sink[r] + a_tail[r]) for r in range(cp)]
+    hard_pinned = [weight * float(a_forced_tail[r]) for r in range(cp)]
+    residual_caps = [weight * float(res_raw[r]) for r in range(cp)]
+    if k_sem <= 0.0 or res_total <= 0:
+        return (caps, pinned, list(zeros), list(zeros), residual_caps, weight * sel, hard_pinned)
+    g_eff = min(float(block), float(max(1, SEMANTIC_COHERENCE_TOKENS // ratio)), k_sem)
+    fpc = max(0.0, 1.0 - k_sem / float(res_total))
+    w_sq = weight * weight
+    sem_means: list[float] = []
+    variances: list[float] = []
+    for r in range(cp):
+        p_r = float(res_raw[r]) / float(res_total)
+        sem_means.append(weight * k_sem * p_r)
+        variances.append(w_sq * k_sem * g_eff * p_r * (1.0 - p_r) * fpc)
+    return (caps, pinned, sem_means, variances, residual_caps, weight * sel, hard_pinned)
+
+
+def _waterfill_sequence_on_batch(
+    alloc_i: list[float],
+    batch_load: list[float],
+    caps_i: Sequence[float],
+    remaining: float,
+    active_ranks: tuple[int, ...],
+) -> None:
+    """Waterfill one sequence's movable rows against cumulative batch load."""
+    rem = max(0.0, float(remaining))
+    movable = [r for r in active_ranks if alloc_i[r] < float(caps_i[r]) - _SPARSE_EPS]
+    while rem > _SPARSE_EPS and movable:
+        min_lvl = min(batch_load[r] for r in movable)
+        lowest = [r for r in movable if batch_load[r] <= min_lvl + _SPARSE_EPS]
+        upper_cands = [
+            batch_load[r] + (float(caps_i[r]) - alloc_i[r]) for r in lowest
+        ] + [batch_load[r] for r in movable if batch_load[r] > min_lvl + _SPARSE_EPS]
+        next_lvl = min(upper_cands)
+        step = (next_lvl - min_lvl) * float(len(lowest))
+        add = (rem / float(len(lowest))) if rem <= step + _SPARSE_EPS else (next_lvl - min_lvl)
+        if add <= _SPARSE_EPS:
+            break
+        for r in lowest:
+            actual = min(float(caps_i[r]) - alloc_i[r], add)
+            alloc_i[r] += actual
+            batch_load[r] += actual
+            rem = max(0.0, rem - actual)
+        movable = [r for r in active_ranks if alloc_i[r] < float(caps_i[r]) - _SPARSE_EPS]
+
+
+def _find_rebalance_path(
+    allocs: Sequence[Sequence[float]],
+    hard_floors: Sequence[Sequence[float]],
+    caps: Sequence[Sequence[float]],
+    batch_load: Sequence[float],
+    active_ranks: tuple[int, ...],
+    src: int,
+    target_max: float,
+) -> tuple[int, dict[int, tuple[int, int, float]]] | None:
+    """Find a residual augmenting path from peak rank ``src`` to a lower-load rank."""
+    parent: dict[int, tuple[int, int, float]] = {}
+    visited = {src}
+    queue = [src]
+    head = 0
+    while head < len(queue):
+        u = queue[head]
+        head += 1
+        for seq_idx, alloc_i in enumerate(allocs):
+            give = alloc_i[u] - float(hard_floors[seq_idx][u])
+            if give <= _SPARSE_EPS:
+                continue
+            caps_i = caps[seq_idx]
+            for v in active_ranks:
+                if v in visited or float(caps_i[v]) - alloc_i[v] <= _SPARSE_EPS:
+                    continue
+                edge_cap = min(give, float(caps_i[v]) - alloc_i[v])
+                visited.add(v)
+                parent[v] = (u, seq_idx, edge_cap)
+                if batch_load[v] < target_max - _SPARSE_EPS:
+                    return v, parent
+                queue.append(v)
+    return None
+
+
+def _minimax_balance_batch(
+    allocs: list[list[float]],
+    rems: Sequence[float],
+    hard_floors: Sequence[Sequence[float]],
+    caps: Sequence[Sequence[float]],
+    active_ranks: tuple[int, ...],
+    cp: int,
+) -> list[float]:
+    """Jointly waterfill and minimax-balance batch allocations across ``active_ranks``."""
+    batch_load = [sum(row[r] for row in allocs) for r in range(cp)]
+    if not active_ranks:
+        return batch_load
+    order = sorted(
+        range(len(allocs)),
+        key=lambda i: (
+            sum(max(0.0, float(caps[i][r]) - allocs[i][r]) for r in active_ranks) - float(rems[i]),
+            i,
+        ),
+    )
+    for i in order:
+        if rems[i] > _SPARSE_EPS:
+            _waterfill_sequence_on_batch(allocs[i], batch_load, caps[i], rems[i], active_ranks)
+    max_iters = len(active_ranks) * max(1, len(allocs)) * _BALANCE_ITER_FACTOR
+    for _ in range(max_iters):
+        hi = max(active_ranks, key=lambda r: batch_load[r])
+        lo_val = min(batch_load[r] for r in active_ranks)
+        if batch_load[hi] - lo_val <= _SPARSE_EPS:
+            break
+        found = _find_rebalance_path(
+            allocs, hard_floors, caps, batch_load, active_ranks, hi, batch_load[hi],
+        )
+        if found is None:
+            break
+        dst, parent = found
+        path: list[tuple[int, int, int, float]] = []
+        cur = dst
+        while cur != hi:
+            u, seq_idx, edge_cap = parent[cur]
+            path.append((u, cur, seq_idx, edge_cap))
+            cur = u
+        bottleneck = min(item[3] for item in path)
+        delta = min(bottleneck, (batch_load[hi] - batch_load[dst]) / 2.0)
+        if delta <= _SPARSE_EPS:
+            break
+        for u, v, seq_idx, _ in path:
+            allocs[seq_idx][u] -= delta
+            allocs[seq_idx][v] += delta
+        batch_load[hi] -= delta
+        batch_load[dst] += delta
+    return batch_load
+
+
+def _apply_sparse_imbalance_override(
+    moments: Sequence[tuple[list[float], list[float], list[float], list[float], list[float], float, list[float]]],
+    cp: int,
+    alpha: float,
+    total: float,
+) -> tuple[tuple[float, ...], tuple[tuple[float, ...], ...]]:
+    """Place ``min(hi[r*], alpha * total / cp)`` on highest-capacity rank ``r*`` respecting hard pins."""
+    caps_list = [m[0] for m in moments]
+    hard_list = [m[6] for m in moments]
+    if alpha <= 1.0 + _SPARSE_EPS:
+        allocs = [list(hard_i) for hard_i in hard_list]
+        rems = [max(0.0, m[5] - sum(m[6])) for m in moments]
+        batch_load = _minimax_balance_batch(
+            allocs, rems, hard_list, caps_list, tuple(range(cp)), cp,
+        )
+        return tuple(batch_load), tuple(tuple(row) for row in allocs)
+    eff_caps = [
+        sum(
+            m[6][r] + min(max(0.0, m[0][r] - m[6][r]), max(0.0, m[5] - sum(m[6])))
+            for m in moments
+        )
+        for r in range(cp)
+    ]
+    raw_caps = [sum(m[0][r] for m in moments) for r in range(cp)]
+    r_star = max(range(cp), key=lambda r: (eff_caps[r], raw_caps[r]))
+    bounds: list[tuple[float, float]] = []
+    for caps_i, _, _, _, _, tot_i, hard_i in moments:
+        rem_tot_i = max(0.0, tot_i - sum(hard_i))
+        res_i = [max(0.0, caps_i[r] - hard_i[r]) for r in range(cp)]
+        other_res = sum(res_i[r] for r in range(cp) if r != r_star)
+        lo_i = hard_i[r_star] + max(0.0, rem_tot_i - other_res)
+        hi_i = hard_i[r_star] + min(res_i[r_star], rem_tot_i)
+        bounds.append((lo_i, hi_i))
+    sum_lo = sum(lo for lo, _ in bounds)
+    sum_hi = sum(hi for _, hi in bounds)
+    k_star_batch = min(sum_hi, max(sum_lo, alpha * (total / float(cp))))
+    span = sum_hi - sum_lo
+    frac = (k_star_batch - sum_lo) / span if span > _SPARSE_EPS else 0.0
+    allocs = []
+    rems = []
+    for (_, _, _, _, _, tot_i, hard_i), (lo_i, hi_i) in zip(moments, bounds):
+        k_star_i = lo_i + (hi_i - lo_i) * frac
+        row = list(hard_i)
+        row[r_star] = k_star_i
+        other_hard = sum(hard_i[r] for r in range(cp) if r != r_star)
+        allocs.append(row)
+        rems.append(max(0.0, tot_i - k_star_i - other_hard))
+    active_ranks = tuple(r for r in range(cp) if r != r_star)
+    batch_load = _minimax_balance_batch(allocs, rems, hard_list, caps_list, active_ranks, cp)
+    return tuple(batch_load), tuple(tuple(row) for row in allocs)
+
+
+def _apply_sparse_default_skew(
+    moments: Sequence[tuple[list[float], list[float], list[float], list[float], list[float], float, list[float]]],
+    cp: int,
+) -> tuple[tuple[float, ...], tuple[tuple[float, ...], ...]]:
+    """Pool deterministic means and semantic variances across batch sequences."""
+    batch_mean = [sum(m[1][r] + m[2][r] for m in moments) for r in range(cp)]
+    batch_var = [sum(m[3][r] for m in moments) for r in range(cp)]
+    batch_res = [sum(m[4][r] for m in moments) for r in range(cp)]
+    batch_caps = [sum(m[0][r] for m in moments) for r in range(cp)]
+    active_ranks = sum(1 for r in range(cp) if batch_res[r] > 1e-12)
+    z_factor = normal_max_order_z(active_ranks)
+    r_star = max(
+        range(cp),
+        key=lambda r: (batch_mean[r] + z_factor * math.sqrt(max(0.0, batch_var[r])), batch_caps[r]),
+    )
+    seq_shifts: list[tuple[float, float]] = []
+    for caps_i, pinned_i, sem_i, _, _, _, _ in moments:
+        mu_star = pinned_i[r_star] + sem_i[r_star]
+        sem_other = sum(sem_i[r] for r in range(cp) if r != r_star)
+        room = max(0.0, caps_i[r_star] - mu_star)
+        seq_shifts.append((min(room, sem_other), sem_other))
+    max_shift_total = sum(shift for shift, _ in seq_shifts)
+    delta = min(max_shift_total, z_factor * math.sqrt(max(0.0, batch_var[r_star])))
+    per_seq: list[tuple[float, ...]] = []
+    for (_, pinned_i, sem_i, _, _, _, _), (max_shift_i, sem_other_i) in zip(moments, seq_shifts):
+        alloc_i = [pinned_i[r] + sem_i[r] for r in range(cp)]
+        if delta > 1e-12 and max_shift_total > 1e-12 and max_shift_i > 1e-12:
+            d_i = delta * (max_shift_i / max_shift_total)
+            alloc_i[r_star] += d_i
+            if sem_other_i > 1e-12:
+                scale = d_i / sem_other_i
+                for r in range(cp):
+                    if r != r_star:
+                        alloc_i[r] = max(0.0, alloc_i[r] - sem_i[r] * scale)
+        per_seq.append(tuple(alloc_i))
+    batch_per_rank = tuple(sum(row[r] for row in per_seq) for r in range(cp))
+    return batch_per_rank, tuple(per_seq)
+
+
+def split_sparse_dcp_batch_per_sequence(
+    sequences: Sequence[SparseDcpSequence],
+    cp: int,
+    interleave: int,
+    *,
+    imbalance_override: float | None = None,
+    runtime: Any = None,
+    unit: str = "pairs",
+) -> tuple[CpSplit, tuple[tuple[float, ...], ...]]:
+    """Batch-pooled sparse Top-K DCP rank partition with per-sequence breakdown."""
+    degree = max(1, int(cp))
+    block = max(1, int(interleave))
+    seq_list = tuple(sequences)
+    override = (
+        dcp_sparse_imbalance_override(runtime)
+        if imbalance_override is None
+        else float(imbalance_override)
+    )
+    if override is not None and (not math.isfinite(override) or override < 1.0):
+        raise ModelingError(f"dcp_sparse_imbalance_invalid:{override!r}")
+    if degree <= 1:
+        per_seq = tuple(
+            (max(0.0, float(s.q_weight)) * min(
+                float((max(0, int(s.kv_len)) + max(1, int(s.compress_ratio)) - 1)
+                      // max(1, int(s.compress_ratio)))
+                if int(s.kv_len) > 0 else 0.0,
+                max(0.0, float(s.selected_rows)),
+            ),)
+            for s in seq_list
+        )
+        total = float(sum(row[0] for row in per_seq))
+        return CpSplit(1, total, (total,), total, unit), per_seq
+    if not seq_list:
+        zeros = (0.0,) * degree
+        return CpSplit(degree, 0.0, zeros, 0.0, unit), ()
+    moments = tuple(_sparse_sequence_moments(seq, degree, block) for seq in seq_list)
+    total = float(sum(m[5] for m in moments))
+    if total <= 0.0:
+        zeros = (0.0,) * degree
+        return CpSplit(degree, 0.0, zeros, 0.0, unit), tuple(zeros for _ in seq_list)
+    if override is not None:
+        batch_per_rank, per_seq = _apply_sparse_imbalance_override(moments, degree, override, total)
+    else:
+        batch_per_rank, per_seq = _apply_sparse_default_skew(moments, degree)
+    return (
+        CpSplit(degree, total, batch_per_rank, max(batch_per_rank, default=0.0), unit),
+        per_seq,
+    )
+
+
+def split_sparse_dcp_batch(
+    sequences: Sequence[SparseDcpSequence],
+    cp: int,
+    interleave: int,
+    *,
+    imbalance_override: float | None = None,
+    runtime: Any = None,
+    unit: str = "pairs",
+) -> CpSplit:
+    """Batch-pooled sparse Top-K DCP rank partition across ``sequences``."""
+    return split_sparse_dcp_batch_per_sequence(
+        sequences, cp, interleave,
+        imbalance_override=imbalance_override, runtime=runtime, unit=unit,
+    )[0]
+
+
+def split_sparse_dcp_ranks(
+    kv_len: int,
+    selected_rows: float,
+    cp: int,
+    interleave: int,
+    *,
+    compress_ratio: int = 1,
+    always_select_tail: int = 0,
+    q_weight: float = 1.0,
+    imbalance_override: float | None = None,
+    runtime: Any = None,
+    unit: str = "pairs",
+) -> CpSplit:
+    """First-principles sparse Top-K DCP rank skew for one sequence."""
+    seq = SparseDcpSequence(
+        kv_len=int(kv_len),
+        selected_rows=float(selected_rows),
+        q_weight=float(q_weight),
+        compress_ratio=max(1, int(compress_ratio)),
+        always_select_tail=max(0, int(always_select_tail)),
+    )
+    return split_sparse_dcp_batch(
+        (seq,), cp, interleave,
+        imbalance_override=imbalance_override, runtime=runtime, unit=unit,
+    )
+
+
+def sparse_dcp_capacities(
+    seq: SparseDcpSequence, cp: int, interleave: int,
+) -> list[int]:
+    """Per-rank integer row capacities ``ceil(q_weight * C_{i, r})`` for ``seq``."""
+    degree = max(1, int(cp))
+    ratio = max(1, int(seq.compress_ratio))
+    raw_kv = max(0, int(seq.kv_len))
+    domain = (raw_kv + ratio - 1) // ratio if raw_kv > 0 else 0
+    block = max(1, int(interleave) // ratio)
+    weight = max(0.0, float(seq.q_weight))
+    if domain <= 0 or weight <= 0.0:
+        return [0] * degree
+    return [
+        int(math.ceil(weight * float(owned_positions(0, domain - 1, degree, block, r))))
+        for r in range(degree)
+    ]
+
+
+def round_sparse_dcp_counts(
+    per_rank: Sequence[float],
+    total: int,
+    capacities: Sequence[int] | None = None,
+) -> list[int]:
+    """Largest-remainder integer rounding conserving ``total`` within ``capacities``."""
+    cp = len(per_rank)
+    target = max(0, int(total))
+    if cp == 0:
+        return []
+    caps = (
+        [max(0, int(c)) for c in capacities]
+        if capacities is not None
+        else [target] * cp
+    )
+    base = [min(caps[r], max(0, int(math.floor(per_rank[r])))) for r in range(cp)]
+    rem = min(target, sum(caps)) - sum(base)
+    if rem > 0:
+        order = sorted(
+            (r for r in range(cp) if base[r] < caps[r]),
+            key=lambda r: (per_rank[r] - base[r], per_rank[r], -r),
+            reverse=True,
+        )
+        for r in order:
+            if rem <= 0:
+                break
+            add = min(rem, caps[r] - base[r])
+            if add > 0:
+                base[r] += 1
+                rem -= 1
+        while rem > 0:
+            progressed = False
+            for r in order:
+                if rem <= 0:
+                    break
+                if base[r] < caps[r]:
+                    base[r] += 1
+                    rem -= 1
+                    progressed = True
+            if not progressed:
+                break
+    return base
+
+
+def _normalize_feasible_row_fractions(
+    raw_row: Sequence[float], target: int, caps: Sequence[int],
+) -> list[Fraction]:
+    """Construct exact rational row entries in ``[0, caps[r]]`` summing to ``target``."""
+    width = len(caps)
+    if target <= 0:
+        return [Fraction(0)] * width
+    vals: list[Fraction] = []
+    for r in range(width):
+        raw = float(raw_row[r])
+        if not math.isfinite(raw):
+            raise ModelingError(f"dcp_sparse_nonfinite_entry:{raw!r}")
+        vals.append(min(Fraction(caps[r]), max(Fraction(0), Fraction(raw))))
+    total = sum(vals, Fraction(0))
+    if total == target:
+        return vals
+    if total < target:
+        deficit = Fraction(target) - total
+        headroom = [Fraction(caps[r]) - vals[r] for r in range(width)]
+        cap_rem = sum(headroom, Fraction(0))
+        if cap_rem <= 0:
+            return vals
+        return [vals[r] + deficit * headroom[r] / cap_rem for r in range(width)]
+    scale = Fraction(target) / total
+    return [v * scale for v in vals]
+
+
+def _add_flow_edge(
+    adj: list[list[list[int]]], u: int, v: int, cap: int, cost: int,
+) -> int:
+    """Append forward/reverse residual edge pair and return forward edge index."""
+    fwd_idx = len(adj[u])
+    rev_idx = len(adj[v])
+    adj[u].append([v, rev_idx, int(cap), int(cost)])
+    adj[v].append([u, fwd_idx, 0, -int(cost)])
+    return fwd_idx
+
+
+def _solve_dag_min_cost_flow(
+    n_nodes: int, src: int, snk: int, adj: list[list[list[int]]], target_flow: int,
+) -> int:
+    """Exact integer successive-shortest-path min-cost flow on a DAG-ordered network."""
+    if target_flow <= 0:
+        return 0
+    pot: list[int | None] = [None] * n_nodes
+    pot[src] = 0
+    for u in range(n_nodes):
+        pu = pot[u]
+        if pu is None:
+            continue
+        for v, _, cap, cost in adj[u]:
+            if cap > 0 and (pot[v] is None or pu + cost < pot[v]):
+                pot[v] = pu + cost
+    pushed = 0
+    while pushed < target_flow:
+        dist: list[int | None] = [None] * n_nodes
+        parent_u = [-1] * n_nodes
+        parent_e = [-1] * n_nodes
+        dist[src] = 0
+        heap: list[tuple[int, int]] = [(0, src)]
+        while heap:
+            du, u = heapq.heappop(heap)
+            if dist[u] is None or du != dist[u]:
+                continue
+            pu = pot[u]
+            assert pu is not None
+            for ei, (v, _, cap, cost) in enumerate(adj[u]):
+                if cap <= 0:
+                    continue
+                pv = pot[v]
+                if pv is None:
+                    continue
+                nd = du + cost + pu - pv
+                if dist[v] is None or nd < dist[v]:
+                    dist[v] = nd
+                    parent_u[v] = u
+                    parent_e[v] = ei
+                    heapq.heappush(heap, (nd, v))
+        if dist[snk] is None:
+            break
+        for v in range(n_nodes):
+            dv = dist[v]
+            if dv is not None and pot[v] is not None:
+                pot[v] += dv
+        flow = target_flow - pushed
+        cur = snk
+        while cur != src:
+            u = parent_u[cur]
+            ei = parent_e[cur]
+            flow = min(flow, adj[u][ei][2])
+            cur = u
+        cur = snk
+        while cur != src:
+            u = parent_u[cur]
+            ei = parent_e[cur]
+            rev = adj[u][ei][1]
+            adj[u][ei][2] -= flow
+            adj[cur][rev][2] += flow
+            cur = u
+        pushed += flow
+    return pushed
+
+
+def _round_sparse_dcp_prescribed_columns(
+    exact_rows: list[list[Fraction]],
+    row_targets: list[int],
+    caps: list[list[int]],
+    column_targets: Sequence[int],
+) -> list[list[int]]:
+    """Solve exact bounded Hoffman rounding for caller-prescribed integer column sums."""
+    rows = len(exact_rows)
+    cols = len(caps[0])
+    if len(column_targets) != cols:
+        raise ModelingError("dcp_column_targets_infeasible:width_mismatch")
+    col_t = [int(t) for t in column_targets]
+    total_flow = sum(row_targets)
+    if any(t < 0 for t in col_t) or sum(col_t) != total_flow:
+        raise ModelingError("dcp_column_targets_infeasible:total_mismatch")
+    floors = [[int(math.floor(exact_rows[i][r])) for r in range(cols)] for i in range(rows)]
+    ceils = [
+        [min(caps[i][r], int(math.ceil(exact_rows[i][r]))) for r in range(cols)]
+        for i in range(rows)
+    ]
+    for r in range(cols):
+        lo_sum = sum(floors[i][r] for i in range(rows))
+        hi_sum = sum(ceils[i][r] for i in range(rows))
+        if col_t[r] < lo_sum or col_t[r] > hi_sum:
+            raise ModelingError(
+                f"dcp_column_targets_out_of_rounding_bounds:col={r},target={col_t[r]},range=[{lo_sum},{hi_sum}]"
+            )
+    row_supplies = [row_targets[i] - sum(floors[i]) for i in range(rows)]
+    col_demands = [col_t[r] - sum(floors[i][r] for i in range(rows)) for r in range(cols)]
+    delta_flow = sum(row_supplies)
+    if delta_flow == 0:
+        return floors
+    src = 0
+    col_off = 1 + rows
+    snk = col_off + cols
+    adj: list[list[list[int]]] = [[] for _ in range(snk + 1)]
+    tie_span = (rows + cols + 2) * (rows * cols + cols + 2)
+    common_denom = math.lcm(*(f.denominator for row in exact_rows for f in row), 1)
+    cost_scale = common_denom * tie_span * 2
+    for i, supply in enumerate(row_supplies):
+        if supply > 0:
+            _add_flow_edge(adj, src, 1 + i, supply, 0)
+    cell_edge: list[list[int]] = [[-1] * cols for _ in range(rows)]
+    for i in range(rows):
+        for r in range(cols):
+            if floors[i][r] < ceils[i][r]:
+                frac = exact_rows[i][r] - floors[i][r]
+                cost = -int(frac * cost_scale) + (i * cols + r)
+                cell_edge[i][r] = _add_flow_edge(adj, 1 + i, col_off + r, 1, cost)
+    for r, demand in enumerate(col_demands):
+        if demand > 0:
+            _add_flow_edge(adj, col_off + r, snk, demand, 0)
+    pushed = _solve_dag_min_cost_flow(snk + 1, src, snk, adj, delta_flow)
+    if pushed != delta_flow:
+        raise ModelingError("dcp_column_targets_infeasible")
+    result = [list(row) for row in floors]
+    for i in range(rows):
+        for r in range(cols):
+            ei = cell_edge[i][r]
+            if ei >= 0 and adj[1 + i][ei][2] == 0:
+                result[i][r] += 1
+    return result
+
+
+def round_sparse_dcp_matrix(
+    per_seq: Sequence[Sequence[float]],
+    seq_totals: Sequence[int],
+    seq_caps: Sequence[Sequence[int]],
+    *,
+    column_targets: Sequence[int] | None = None,
+) -> list[list[int]]:
+    """Round per-sequence rank counts via bounded Hoffman min-cost integral circulation.
+
+    Conserves exact row totals ``sum_r m_{i,r} == K_i``, integer capacities
+    ``0 <= floor(x_{i,r}) <= m_{i,r} <= ceil(x_{i,r}) <= C_{i,r}``, and
+    bounded column totals ``floor(T_r) <= sum_i m_{i,r} <= ceil(T_r)``.
+    """
+    rows = len(per_seq)
+    if rows == 0:
+        return []
+    cols = len(per_seq[0])
+    if cols == 0:
+        return [[] for _ in range(rows)]
+    caps = [[max(0, int(c)) for c in seq_caps[i]] for i in range(rows)]
+    row_targets: list[int] = []
+    for i in range(rows):
+        raw_t = int(seq_totals[i])
+        cap_sum = sum(caps[i])
+        if raw_t < 0 or raw_t > cap_sum:
+            raise ModelingError(
+                f"dcp_row_target_exceeds_capacity:row={i},target={raw_t},cap={cap_sum}"
+            )
+        row_targets.append(raw_t)
+    exact_rows = [
+        _normalize_feasible_row_fractions(per_seq[i], row_targets[i], caps[i])
+        for i in range(rows)
+    ]
+    if column_targets is not None:
+        return _round_sparse_dcp_prescribed_columns(exact_rows, row_targets, caps, column_targets)
+
+    floors = [[int(math.floor(exact_rows[i][r])) for r in range(cols)] for i in range(rows)]
+    col_fracs = [sum((exact_rows[i][r] for i in range(rows)), Fraction(0)) for r in range(cols)]
+    col_floors = [int(math.floor(col_fracs[r])) for r in range(cols)]
+    total_k = sum(row_targets)
+    row_supplies = [row_targets[i] - sum(floors[i]) for i in range(rows)]
+    delta_flow = sum(row_supplies)
+    if delta_flow == 0:
+        return floors
+
+    src = 0
+    col_off = 1 + rows
+    t_node = col_off + cols
+    snk = t_node + 1
+    adj: list[list[list[int]]] = [[] for _ in range(snk + 1)]
+    tie_span = (rows + cols + 2) * (rows * cols + cols + 2)
+    common_denom = math.lcm(
+        *(f.denominator for row in exact_rows for f in row),
+        *(cf.denominator for cf in col_fracs),
+        1,
+    )
+    cost_scale = common_denom * tie_span * 2
+
+    for i, supply in enumerate(row_supplies):
+        if supply > 0:
+            _add_flow_edge(adj, src, 1 + i, supply, 0)
+    cell_edge: list[list[int]] = [[-1] * cols for _ in range(rows)]
+    for i in range(rows):
+        for r in range(cols):
+            frac = exact_rows[i][r] - floors[i][r]
+            if frac > 0 and floors[i][r] < caps[i][r]:
+                cost = -int(frac * cost_scale) + (i * cols + r)
+                cell_edge[i][r] = _add_flow_edge(adj, 1 + i, col_off + r, 1, cost)
+    for r in range(cols):
+        floor_sum_r = sum(floors[i][r] for i in range(rows))
+        mandatory = col_floors[r] - floor_sum_r
+        if mandatory > 0:
+            _add_flow_edge(adj, col_off + r, snk, mandatory, 0)
+        col_rem = col_fracs[r] - col_floors[r]
+        if col_rem > 0:
+            cost = -int(col_rem * cost_scale) + r
+            _add_flow_edge(adj, col_off + r, t_node, 1, cost)
+    t_demand = total_k - sum(col_floors)
+    if t_demand > 0:
+        _add_flow_edge(adj, t_node, snk, t_demand, 0)
+
+    pushed = _solve_dag_min_cost_flow(snk + 1, src, snk, adj, delta_flow)
+    if pushed != delta_flow:
+        raise ModelingError(f"dcp_hoffman_circulation_infeasible:pushed={pushed},expected={delta_flow}")
+    result = [list(row) for row in floors]
+    for i in range(rows):
+        for r in range(cols):
+            ei = cell_edge[i][r]
+            if ei >= 0 and adj[1 + i][ei][2] == 0:
+                result[i][r] += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -347,16 +1086,16 @@ class PcpSplit:
 
 
 def _pcp_chunk_bounds(q_len: int, pcp: int) -> tuple[int, ...]:
-    """Equal-as-possible contiguous bounds for ``2*pcp`` DualChunkSwap chunks.
+    """Contiguous bounds for ``2*pcp`` DualChunkSwap chunks matching upstream ``PCPManager``.
 
-    The upstream chunker pads every chunk to ``ceil(q/2pcp)``; the simulator
-    prices real tokens only, so it redistributes the remainder at the tail.
-    Sums stay exact (no invented tokens) and the chunk sizes differ by <= 1.
+    Upstream sizes each mirrored chunk to ``ceil(q_len / (2*pcp))`` and clips
+    trailing chunks to ``q_len``.  Real token sums stay exact (no invented tokens).
     """
     q_len = max(0, int(q_len))
     pcp = max(1, int(pcp))
     chunks = 2 * pcp
-    return tuple((index * q_len) // chunks for index in range(chunks + 1))
+    chunk_size = (q_len + chunks - 1) // chunks if q_len > 0 else 0
+    return tuple(min(index * chunk_size, q_len) for index in range(chunks + 1))
 
 
 def pcp_rank_chunk_ranges(q_len: int, pcp: int, rank: int) -> tuple[tuple[int, int], ...]:
@@ -370,14 +1109,6 @@ def pcp_rank_chunk_ranges(q_len: int, pcp: int, rank: int) -> tuple[tuple[int, i
         if end > start:
             ranges.append((start, end))
     return tuple(ranges)
-
-
-def pcp_query_tokens(q_len: int, pcp: int) -> tuple[int, ...]:
-    """Tokens owned by each rank (max rank is the declared local batch)."""
-    return tuple(
-        sum(end - start for start, end in pcp_rank_chunk_ranges(q_len, pcp, rank))
-        for rank in range(max(1, int(pcp)))
-    )
 
 
 def split_pcp_pairs(
@@ -417,27 +1148,6 @@ def split_pcp_pairs(
     )
 
 
-def pcp_worst_rank(split: PcpSplit) -> int:
-    """Rank with the largest causal work (lowest index on a tie)."""
-    if not split.per_rank:
-        return 0
-    return max(range(len(split.per_rank)), key=lambda rank: split.per_rank[rank])
-
-
-def pcp_kv_gather_bytes(
-    prefill_tokens: int, kv_row_bytes: float, pcp: int,
-) -> tuple[float, float]:
-    """(gathered full K/V payload, all-gather link volume per rank).
-
-    PCP gathers the *current prefill chunk's* K/V across the PCP group; the
-    older context is already replicated on every rank.  The full payload is the
-    gathered plane; each rank receives the other ranks' ``(pcp-1)/pcp``.
-    """
-    pcp = max(1, int(pcp))
-    full = float(max(0, int(prefill_tokens)) * float(kv_row_bytes))
-    return full, full * (pcp - 1) / pcp
-
-
 # ---------------------------------------------------------------------------
 # DSA-CP: query-token sequence parallel over the TP group
 #
@@ -463,9 +1173,23 @@ def dsa_cp_token_ranges(tokens: int, tp: int, rank: int) -> tuple[int, int, int,
     return start, start + per_rank, per_rank, padded
 
 
-def split_index_rows(rows: int, cp: int) -> CpSplit:
-    """Max-rank shard of a token/index row count (block-interleaved owner)."""
-    return split_rows(rows, cp, unit="rows")
+def dcp_indexer_sharded(model: Any, runtime: Any = None) -> bool:
+    """True when sparse LightningIndexer cache is sharded across DCP ranks.
+
+    By default ``vllm-ascend`` replicates the LightningIndexer cache across DCP
+    ranks and remaps global Top-K indices via Triton ``sparse_index_remap``.
+    Sharding is opt-in via model execution policy or runtime
+    ``enable_sfa_dcp_sharded_indexer`` / ``dcp_indexer_sharded``.
+    """
+    if runtime is not None:
+        meta = dict(getattr(runtime, "metadata", ()) or ())
+        extra = dict(meta.get("additional_config") or ()) if isinstance(meta.get("additional_config"), dict) else {}
+        for source in (meta, extra):
+            for key in ("enable_sfa_dcp_sharded_indexer", "dcp_indexer_sharded"):
+                if key in source and source[key] is not None:
+                    return bool(source[key])
+    from .paired_sfa import execution
+    return bool(execution(model).get("dcp_indexer_sharded"))
 
 
 def cp_interleave(runtime: Any) -> int:
@@ -489,10 +1213,6 @@ def cp_requested(parallel: ParallelSpec) -> bool:
     return int(getattr(parallel, "cp", 1) or 1) > 1
 
 
-def pcp_requested(parallel: ParallelSpec) -> bool:
-    return int(getattr(parallel, "pcp", 1) or 1) > 1
-
-
 def cp_plan_kind(parallel: ParallelSpec) -> str:
     """The declared plan, resolved defensively for objects built before this field."""
     plan = str(getattr(parallel, "cp_plan", CP_PLAN_NONE) or CP_PLAN_NONE)
@@ -501,29 +1221,162 @@ def cp_plan_kind(parallel: ParallelSpec) -> str:
     return CP_PLAN_DCP if cp_requested(parallel) else CP_PLAN_NONE
 
 
+def dcp_axis_factors(parallel: ParallelSpec) -> tuple[int, int, int]:
+    """Factorize ``parallel.cp`` into ``(pcp_factor, tp_gather, dcp_dp_width)``."""
+    from mindie_sim.schema.parallel import factor_dcp_axes
+
+    return factor_dcp_axes(
+        int(getattr(parallel, "cp", 1) or 1),
+        pcp=int(getattr(parallel, "pcp", 1) or 1),
+        tp=int(getattr(parallel, "tp", 1) or 1),
+        dp=int(getattr(parallel, "dp", 1) or 1),
+    )
+
+
+def is_v41_replicated_cache_model(model: ModelSpec) -> bool:
+    """True for latent-MQA C2 window-compressed backends requiring replicated KV caches.
+
+    Matches upstream ``DeepseekV41CacheLayer.supports_dcp = False`` and
+    ``AscendDSAV41PCPMetadataBuilder`` requiring ``DCP=1`` at backend
+    construction regardless of how many leading layers are sliced.
+    """
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    if any(
+        str(getattr(plan, "mla_variant", "") or "") == "latent_mqa"
+        and str(getattr(plan, "cache_kind", "") or "") == "window_compressed"
+        and (int(getattr(plan, "compress_ratio", 0) or 0) == 2
+             or str(getattr(plan, "compressor_kind", "") or "") == "gated_ring")
+        for plan in plans
+    ):
+        return True
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    ratios = tuple(
+        int(r)
+        for key in ("compress_ratios", "full_model_compress_ratios")
+        for r in (facts.get(key) or ())
+        if r is not None
+    )
+    attn_types = dict(facts.get("attention_types") or ())
+    full_attn_types = dict(facts.get("full_model_attention_types") or ())
+    has_latent_mqa = any(str(getattr(plan, "mla_variant", "") or "") == "latent_mqa" for plan in plans)
+    return bool(
+        has_latent_mqa
+        and (
+            2 in ratios
+            or int(attn_types.get("csa2", 0) or 0) > 0
+            or int(full_attn_types.get("csa2", 0) or 0) > 0
+        )
+    )
+
+
+def layer_dcp_factors(plan: Any, parallel: ParallelSpec) -> tuple[int, int, int]:
+    """Effective ``(pcp_factor, layer_tp_gather, dp_width)`` KV-sharding factors for one layer.
+
+    MLA/DSA/CSA/CSA2/SWA/HCA layers hold 1 compressed latent KV head regardless
+    of any HuggingFace ``num_kv_heads`` metadata field.  GQA layers shard across
+    ``tp_gather`` only up to their intra-TP KV replication factor
+    ``max(1, tp // num_kv_heads)``; hybrid layers already head-sharded on TP
+    (such as sliding layers with ``num_kv_heads >= tp``) keep
+    ``layer_tp_gather = 1`` rather than double-dividing KV cache or FLOPs.
+    """
+    cp = int(getattr(parallel, "cp", 1) or 1)
+    if cp <= 1:
+        return (1, 1, 1)
+    attn = str(getattr(plan, "attention", "") or "").strip().lower()
+    if attn not in _CP_CONTEXT_FAMILIES:
+        return (1, 1, 1)
+    pcp_factor, tp_gather, dp_width = dcp_axis_factors(parallel)
+    if attn != "gqa":
+        return (pcp_factor, tp_gather, dp_width)
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    kv_heads = max(1, int(getattr(plan, "num_kv_heads", 1) or 1))
+    kv_rep = (tp // kv_heads) if (tp >= kv_heads and tp % kv_heads == 0) else 1
+    if tp_gather <= 1:
+        layer_tp_gather = 1
+    elif kv_rep > 1 and tp_gather <= kv_rep and kv_rep % tp_gather == 0:
+        layer_tp_gather = tp_gather
+    elif kv_rep == 1:
+        layer_tp_gather = 1
+    else:
+        raise ModelingError(
+            f"cp_exceeds_gqa_decode_domain:cp={cp},tp={tp},kv_heads={kv_heads}"
+        )
+    return (pcp_factor, layer_tp_gather, dp_width)
+
+
+def layer_dcp_degree(plan: Any, parallel: ParallelSpec) -> int:
+    """Effective KV-cache and decode attention DCP shard count for one layer."""
+    pcp_factor, layer_tp_gather, dp_width = layer_dcp_factors(plan, parallel)
+    return int(pcp_factor * layer_tp_gather * dp_width)
+
+
+def kv_cache_replication_info(
+    model: ModelSpec, parallel: ParallelSpec,
+) -> dict[str, Any]:
+    """Diagnostic KV-cache replication metadata (informational only, never a ban)."""
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    cp = max(1, int(getattr(parallel, "cp", 1) or 1))
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    max_rep = 1
+    for plan in plans:
+        attn = str(getattr(plan, "attention", "") or "").strip().lower()
+        if attn not in _CP_CONTEXT_FAMILIES:
+            continue
+        if attn == "gqa":
+            kv_heads = max(1, int(getattr(plan, "num_kv_heads", 1) or 1))
+            raw_tp_rep = (tp // kv_heads) if (tp >= kv_heads and tp % kv_heads == 0) else 1
+        else:
+            raw_tp_rep = tp
+        _, layer_tp_gather, _ = layer_dcp_factors(plan, parallel)
+        residual = max(1, raw_tp_rep // max(1, layer_tp_gather))
+        if residual > max_rep:
+            max_rep = residual
+    if tp == 1 and cp == 1 and pcp == 1:
+        sharding = "pure_dp_ep"
+    elif pcp > 1 and cp > 1:
+        sharding = "pcp_dcp"
+    elif pcp > 1:
+        sharding = "pcp"
+    elif cp > 1:
+        sharding = "dcp"
+    elif max_rep > 1:
+        sharding = "tp_kv_replicated"
+    else:
+        sharding = "tp_kv_sharded"
+    return {
+        "kv_cache_replicated_tp": bool(tp > 1 and max_rep > 1),
+        "kv_cache_replication_factor": int(max_rep),
+        "canonical_kv_sharding": sharding,
+    }
+
+
 def validate_cp_geometry(parallel: ParallelSpec) -> None:
-    """Structural CP guards: DCP subdivides the TP group, it never exceeds it."""
+    """Algebraic-only CP guards across PCP, TP, and DP axes."""
     cp = int(getattr(parallel, "cp", 1) or 1)
     if cp <= 1:
         return
-    tp = int(parallel.tp)
-    if tp <= 1:
-        raise ModelingError("cp_requires_tp_group")
-    if cp > tp:
-        raise ModelingError(f"cp_exceeds_tp:{cp}>{tp}")
-    if tp % cp != 0:
-        raise ModelingError(f"tp_not_divisible_by_cp:{tp}%{cp}")
+    dp = max(1, int(getattr(parallel, "dp", 1) or 1))
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    max_domain = dp * tp * pcp
+    if cp > max_domain:
+        raise ModelingError(
+            f"cp_exceeds_parallel_domain:cp={cp}>dp*tp*pcp={max_domain}"
+        )
+    pcp_factor, tp_gather, dp_width = dcp_axis_factors(parallel)
+    rem = cp // pcp_factor
+    if (pcp % pcp_factor != 0 or cp % pcp_factor != 0
+            or tp % tp_gather != 0 or rem % tp_gather != 0
+            or dp % dp_width != 0 or pcp_factor * tp_gather * dp_width != cp):
+        raise ModelingError(
+            f"dcp_factorization_invalid:dcp={cp},pcp={pcp},tp={tp},dp={dp}"
+        )
 
 
 def validate_pcp_geometry(parallel: ParallelSpec) -> None:
-    """PCP adds a rank axis and owns a prefill-only schedule.
-
-    CP reuses the TP group, so ``cp > 1`` is allowed beside PCP when
-    ``tp % cp == 0``. PP and DP compose through placement. Recurrent PCP
-    carries its own inter-chunk state transfer.
-    """
-    pcp = int(getattr(parallel, "pcp", 1) or 1)
-    if pcp <= 1:
+    """PCP adds a rank axis and owns a prefill-only schedule."""
+    if int(getattr(parallel, "pcp", 1) or 1) <= 1:
         return
     if int(getattr(parallel, "cp", 1) or 1) > 1:
         validate_cp_geometry(parallel)
@@ -551,26 +1404,34 @@ def validate_cp_plan(model: ModelSpec, parallel: ParallelSpec) -> None:
         raise ModelingError(f"cp_plan_unmodeled:{plan}")
 
 
+def has_kpool_indexer(model: ModelSpec) -> bool:
+    """True when any layer declares a pooled-key indexer (``index_kpool > 1``)."""
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    return any(int(getattr(lp, "index_kpool", 1) or 1) > 1 for lp in plans)
+
+
 def verify_cp_model(model: ModelSpec, parallel: ParallelSpec) -> None:
     """Refuse a model/strategy CP cannot express.  Called by ``validate``."""
     cp = int(getattr(parallel, "cp", 1) or 1)
     if cp <= 1:
         return
+    if is_v41_replicated_cache_model(model):
+        raise ModelingError("v41_replicated_cache_requires_dcp_1")
     kinds = _attention_families(model)
     if not kinds & _CP_CONTEXT_FAMILIES:
         raise ModelingError(f"cp_requires_context_attention:{'+'.join(sorted(kinds))}")
-    for plan in getattr(model, "layer_plans", ()) or ():
-        if plan.attention == "gqa":
-            _verify_gqa_kv_domain(int(plan.num_kv_heads), int(parallel.tp), cp)
-    if not getattr(model, "layer_plans", ()) and model.attention == "gqa":
-        _verify_gqa_kv_domain(int(model.num_kv_heads), int(parallel.tp), cp)
-
-
-def _attention_kinds(model: ModelSpec) -> set[str]:
-    plans = getattr(model, "layer_plans", ()) or ()
-    if plans:
-        return {str(plan.attention) for plan in plans}
-    return {str(model.attention)}
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    kv_degrees = [
+        layer_dcp_degree(plan, parallel)
+        for plan in plans
+        if str(getattr(plan, "attention", "") or "").strip().lower()
+        in _CP_CONTEXT_FAMILIES
+    ]
+    max_layer_dcp = max(kv_degrees, default=1)
+    if max_layer_dcp < cp:
+        raise ModelingError(
+            f"cp_exceeds_gqa_decode_domain:cp={cp},max_layer_dcp={max_layer_dcp}"
+        )
 
 
 def _cp_attention_family(plan: Any) -> str:
@@ -602,17 +1463,6 @@ def _attention_families(model: ModelSpec) -> set[str]:
     if plans:
         return {_cp_attention_family(plan) for plan in plans}
     return {_cp_attention_family(model)}
-
-
-def _verify_gqa_kv_domain(num_kv_heads: int, tp: int, cp: int) -> None:
-    # DCP for GQA requires (tp // num_kv_heads) >= cp and an integral divisor;
-    # a rank below the KV-head count replicates heads and cannot own a context
-    # shard (vLLM: ``tp // num_kv_heads % dcp == 0``).
-    domain = tp // max(1, num_kv_heads)
-    if domain < cp or cp <= 0 or domain % cp != 0:
-        raise ModelingError(
-            f"cp_exceeds_gqa_decode_domain:cp={cp},tp//kv_heads={domain}"
-        )
 
 
 def verify_pcp_model(model: ModelSpec, parallel: ParallelSpec) -> None:
@@ -648,57 +1498,6 @@ def verify_dsa_cp_model(model: ModelSpec, parallel: ParallelSpec) -> None:
         raise ModelingError("dsa_cp_requires_declared_topk")
 
 
-def cp_layer_scope(
-    model: ModelSpec, plan: str = CP_PLAN_DCP,
-) -> dict[str, Any]:
-    """Which layers CP shards and which stay replicated, declared explicitly."""
-    kinds = _attention_families(model)
-    if plan == CP_PLAN_DSA_CP:
-        return {
-            "context_addressed": [],
-            "replicated": sorted(kinds),
-            "strategy": strategy_for_plan(plan),
-            "phase_scope": "prefill",
-            "query_token_sharded": True,
-            "kv_cache": "replicated_full",
-            "indexer_cache": "replicated_full",
-            "indexer_policy": DSA_CP_INDEXER_POLICY,
-            "indexer_cache_sharded": False,
-            "local_indexer": "local_query_topk_over_full_kv_prefix",
-            "output_merge": "token_all_gather",
-        }
-    scope = {
-        "context_addressed": sorted(kinds & _CP_CONTEXT_FAMILIES),
-        "replicated": sorted(kinds - _CP_CONTEXT_FAMILIES),
-        "strategy": strategy_for_plan(plan),
-        "indexer_policy": (PCP_INDEXER_POLICY if plan == CP_PLAN_PCP
-                           else CP_INDEXER_POLICY),
-        "indexer_cache_sharded": False,
-    }
-    from .paired_sfa import execution
-    if plan in {CP_PLAN_DCP, CP_PLAN_PCP_DCP} and execution(model).get("dcp_indexer_sharded"):
-        scope.update(indexer_cache_sharded=True,
-                     indexer_policy="token_sharded_candidate_topk",
-                     output_merge="head_alltoall_lse")
-    if plan == CP_PLAN_PCP:
-        scope.update({
-            "prefill_cp_plan": "pcp",
-            "decode_cp_plan": "none",
-            "phase_scope": "prefill",
-            "pcp_kv_gather": "full_index_k_and_active_kv_rows",
-            "indexer_policy": PCP_INDEXER_POLICY,
-        })
-    elif plan == CP_PLAN_PCP_DCP:
-        scope.update({
-            "prefill_cp_plan": "pcp",
-            "decode_cp_plan": "dcp",
-            "phase_scope": "prefill+decode",
-            "pcp_kv_gather": "full_index_k_and_active_kv_rows",
-            "decode_merge": "npu_attention_update",
-        })
-    return scope
-
-
 def merge_payload_bytes(
     q_tokens: int, local_heads: int, v_dim: int, cp: int,
 ) -> tuple[float, float]:
@@ -722,23 +1521,145 @@ def merge_update_elements(
                  * max(1, int(v_dim)) * cp)
 
 
-def merge_metadata(
-    cp: int, q_tokens: int, local_heads: int, v_dim: int,
-) -> tuple[tuple[str, Any], ...]:
-    full, link = merge_payload_bytes(q_tokens, local_heads, v_dim, cp)
-    return (
-        ("cp", cp),
-        ("cp_strategy", CP_STRATEGY),
-        ("partial_reduction", "logsumexp"),
-        ("partial_payload_bytes", full),
-        ("merge_link_bytes", link),
-        ("merge_update", "npu_attention_update"),
-        ("merge_dtype", "fp32"),
+def runtime_cp_flag(runtime: Any, *keys: str) -> Any:
+    """Resolve a boolean/scalar CP flag from ``runtime.metadata`` or ``additional_config``."""
+    if runtime is None:
+        return None
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    extra = meta.get("additional_config")
+    extra_map = dict(extra) if isinstance(extra, dict) else {}
+    for source in (meta, extra_map):
+        for key in keys:
+            if key in source and source[key] is not None:
+                return source[key]
+    return None
+
+
+def dcp_q_replicate_enabled(
+    runtime: Any, *, pcp_factor: int, dp_width: int, sparse: bool,
+) -> bool:
+    """Opt-in Q-projection replication on dense MLA with single-axis TP DCP."""
+    if pcp_factor != 1 or dp_width != 1 or sparse:
+        return False
+    return bool(runtime_cp_flag(runtime, "dcp_q_replicate", "enable_dcp_q_replicate"))
+
+
+def _has_non_negative_id(obj: Any, attr: str) -> bool:
+    raw = getattr(obj, attr, None)
+    return raw is not None and not isinstance(raw, bool) and int(raw) >= 0
+
+
+def _model_dcp_attention_class(model: ModelSpec) -> str:
+    """Classify a model's KV-reading attention family for vLLM-Ascend DCP co-domain rules."""
+    if is_v41_replicated_cache_model(model):
+        return "replicated_cache"
+    if has_kpool_indexer(model):
+        return "kpool_indexer"
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    has_sfa_dsa = any(
+        str(getattr(lp, "attention", "") or "").lower() == "dsa"
+        or (
+            str(getattr(lp, "attention", "") or "").lower() == "mla"
+            and (
+                bool(getattr(lp, "indexer", False))
+                or bool(getattr(lp, "owns_topk", False))
+                or _has_non_negative_id(lp, "topk_owner_layer_id")
+                or _has_non_negative_id(lp, "index_k_owner_layer_id")
+            )
+        )
+        for lp in plans
     )
+    if has_sfa_dsa:
+        return "sfa_dsa"
+    has_mla = any(
+        str(getattr(lp, "attention", "") or "").lower() == "mla"
+        or str(getattr(lp, "cache_kind", "") or "").lower() == "window_compressed"
+        for lp in plans
+    )
+    if has_mla:
+        return "mla"
+    has_gqa = any(
+        str(getattr(lp, "attention", "") or "").lower() in {"gqa", "mha", "mqa"}
+        for lp in plans
+    )
+    return "gqa" if has_gqa else "non_kv"
 
 
-def split_metadata(split: CpSplit, *, local_rows: int = 0) -> tuple[tuple[str, Any], ...]:
-    extra: tuple[tuple[str, Any], ...] = ()
-    if local_rows:
-        extra = (("cp_local_rows", int(local_rows)),)
-    return split.metadata() + extra
+def legal_vllm_ascend_dcp_values(
+    model: ModelSpec, *, tp: int, pcp: int = 1,
+) -> tuple[int, ...]:
+    """Structural ``vllm-ascend`` legal DCP degrees reusing TP (and optional PCP) ranks.
+
+    Canonical single truth table shared with ``validate_vllm_ascend_dcp_codomain``:
+    - ``dcp == 1`` is always legal (including PCP-only ``pcp > 1, dcp == 1``).
+    - Replicated cache (DS-V4.1 latent-MQA C2), KPool/QSA (``index_kpool > 1``),
+      and non-KV models: ``dcp == 1`` only.
+    - SFA / DSA sparse MLA: ``dcp in {1, pcp, pcp * tp}`` (``{1, tp}`` at ``pcp == 1``).
+    - Standard MLA: all positive divisors of ``tp * pcp``.
+    - GQA: ``(1, pcp)`` when ``pcp > 1`` else all positive divisors of ``tp``.
+    """
+    tp_n = max(1, int(tp))
+    pcp_n = max(1, int(pcp))
+    kind = _model_dcp_attention_class(model)
+    if kind in {"replicated_cache", "kpool_indexer", "non_kv"}:
+        return (1,)
+    if kind == "gqa":
+        if pcp_n > 1:
+            return (1, pcp_n)
+        return tuple(d for d in range(1, tp_n + 1) if tp_n % d == 0)
+    if kind == "sfa_dsa":
+        if pcp_n > 1:
+            return tuple(dict.fromkeys((1, pcp_n, pcp_n * tp_n)))
+        return (1, tp_n) if tp_n > 1 else (1,)
+    domain = tp_n * pcp_n
+    return tuple(d for d in range(1, domain + 1) if domain % d == 0)
+
+
+def validate_vllm_ascend_dcp_codomain(
+    model: ModelSpec, parallel: ParallelSpec, *, runtime: Any = None,
+) -> tuple[bool, str | None]:
+    """Check whether ``parallel`` obeys structural DCP <-> TP co-domain rules."""
+    dcp = max(1, int(getattr(parallel, "cp", 1) or 1))
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    if dcp <= 1:
+        return True, None
+    kind = _model_dcp_attention_class(model)
+    legal = legal_vllm_ascend_dcp_values(model, tp=tp, pcp=pcp)
+    if dcp not in legal:
+        if kind == "replicated_cache":
+            return False, "vllm_ascend_replicated_cache_requires_dcp_1"
+        if kind == "kpool_indexer":
+            return False, "kpool_indexer_requires_dcp_1"
+        if kind == "non_kv":
+            return False, "vllm_ascend_non_kv_model_requires_dcp_1"
+        if kind == "gqa":
+            if pcp > 1:
+                return False, f"vllm_ascend_gqa_pcp_dcp_must_match:pcp={pcp},dcp={dcp}"
+            return False, f"vllm_ascend_gqa_dcp_must_divide_tp:dcp={dcp},tp={tp}"
+        if kind == "sfa_dsa":
+            if pcp > 1:
+                return (
+                    False,
+                    f"vllm_ascend_sfa_pcp_dcp_must_be_pcp_or_pcp_times_tp:"
+                    f"dcp={dcp},pcp={pcp},tp={tp}",
+                )
+            return False, f"vllm_ascend_sfa_dcp_must_equal_tp:dcp={dcp},tp={tp}"
+        if pcp > 1:
+            return (
+                False,
+                f"vllm_ascend_mla_pcp_dcp_must_divide_tp_times_pcp:"
+                f"dcp={dcp},pcp={pcp},tp={tp}",
+            )
+        return False, f"vllm_ascend_mla_dcp_must_divide_tp:dcp={dcp},tp={tp}"
+    if kind == "gqa":
+        return True, "vllm_ascend_gqa_dcp_deprecated"
+    if kind == "sfa_dsa" and runtime is not None and not dcp_indexer_sharded(model, runtime):
+        interleave = cp_interleave(runtime)
+        if interleave % DEFAULT_CP_INTERLEAVE != 0:
+            return (
+                False,
+                f"vllm_ascend_sfa_replicated_dcp_interleave_not_multiple_of_128:"
+                f"interleave={interleave}",
+            )
+    return True, None

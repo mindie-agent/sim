@@ -1,33 +1,36 @@
 """Declared native correspondences over existing semantic operator groups.
 
-[Role] Retain fusion membership, scope and evidence at the composing builder.
+[Role] Retain fusion membership, scope and evidence at the composing builder,
+  resolving portable ``SourceRef`` provenance via ``ProbedAbiRegistry``.
 [Invariants] Declarations use model/runtime geometry, never captured shapes.
-  A group adds no execution node, work or measured duration.
-[Timeouts & Locks] Finite layer metadata updates; no I/O or locks.
+  A group adds no execution node, work or measured duration. Zero hardcoded
+  model-name source tables (AG014).
+[Timeouts & Locks] Finite layer metadata updates; cached read-only ABI lookup;
+  no locks.
 [Side-Effect Policy] Replaces records in the caller-owned operator list.
 """
+from __future__ import annotations
+
 from dataclasses import replace
+from functools import lru_cache
+import json
+from pathlib import Path
+from typing import Any
 
+from mindie_sim.backends.abi_registry import default_abi_dir, default_abi_registry
 
-_SOURCE_FILES = {
-    "vllm_ascend/ops/gdn.py": (
-        "724f43cc24ee4b4d4d01c36e7967d02d95646b5e4ab011940e16bb5374a20c9f", "local_worktree"),
-    "vllm_ascend/models/deepseek_v4/model.py": (
-        "257c415f820f6d203b78b3e1000b5e30c475281db1d99a270c65cba52a3f62ab", "committed"),
-    "vllm_ascend/models/deepseek_v4/compressor.py": (
-        "37ca695e3b9564d95c60f628dbfee8268264885d774b91ac6caeeb97c2375ce9", "committed"),
-    "vllm_ascend/models/kimi_k3.py": (
-        "498839ee000fd1d0731915613de1b98b562474c9da5c5357c686b5ae2cc0922d", "local_worktree"),
-    "vllm_ascend/ops/kimi_kda.py": (
-        "2e9890d18312708875ca2ad0a6dda2116c6b45fd521e9041467c8499ad2da96d", "local_worktree"),
-    "vllm_ascend/ops/fused_moe/moe_mlp.py": (
-        "9a18993599563f7d65c47c06ad9ac5ac406590d779bde2def0d86620e6997656", "local_worktree"),
-}
+_DEFAULT_REPOSITORY = "vllm-project/vllm-ascend"
+_ABI_ARCH_SEARCH_ORDER = ("A5", "A3", "A2")
+_VLLM_ASCEND_MANIFEST_PATH = (
+    Path(__file__).resolve().parents[1] / "stacks" / "vllm_ascend" / "manifest.json"
+)
+_MAX_MANIFEST_BYTES = 50 * 1024 * 1024
 
 
 def declare_group(ops, *, key, role, family, members, entries, anchor, view,
                   implementation, source=None, block="attention", scope_role=None,
-                  coverage=None):
+                  coverage=None, fusion_status=None, fusion_reason=None,
+                  native_fusion_eligible=True):
     declaration = {
         "key": key, "role": role, "family": family,
         "op_ids": tuple(members), "entry_op_ids": tuple(entries),
@@ -35,6 +38,12 @@ def declare_group(ops, *, key, role, family, members, entries, anchor, view,
     }
     if coverage is not None:
         declaration["coverage"] = coverage
+    if fusion_status is not None:
+        declaration["fusion_status"] = fusion_status
+    if fusion_reason is not None:
+        declaration["fusion_reason"] = fusion_reason
+    if not native_fusion_eligible:
+        declaration["native_fusion_eligible"] = False
     selected = set(members)
     for index, op in enumerate(ops):
         if op.op_id not in selected:
@@ -54,12 +63,91 @@ def declare_group(ops, *, key, role, family, members, entries, anchor, view,
         ops[index] = replace(op, metadata=tuple(meta.items()))
 
 
-def source_reference(path, symbol):
-    digest, state = _SOURCE_FILES[path]
-    return {
-        "repository": "vllm-ascend",
-        "base_revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
-        "source_state": state, "sha256": digest,
-        "path": path, "symbol": symbol,
-        "scope": "independent_source_semantics; not_capture_binary_identity",
-    }
+_SOURCE_REF_CACHE_MAXSIZE = 256
+
+
+@lru_cache(maxsize=1)
+def _load_manifest_provenance_index() -> dict[str, tuple[str, str, str]]:
+    """Index ``relative_path -> (repository, revision, source_sha256)`` without L4 imports."""
+    if not _VLLM_ASCEND_MANIFEST_PATH.is_file():
+        return {}
+    try:
+        if _VLLM_ASCEND_MANIFEST_PATH.stat().st_size > _MAX_MANIFEST_BYTES:
+            return {}
+        raw = json.loads(_VLLM_ASCEND_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    default_rev = str(raw.get("manifest_revision") or "")
+    index: dict[str, tuple[str, str, str]] = {}
+    for item in raw.get("bindings") or ():
+        if not isinstance(item, dict):
+            continue
+        prov = item.get("provenance")
+        if not isinstance(prov, dict):
+            continue
+        rel = str(prov.get("relative_path") or "").strip().lstrip("./")
+        sha = str(prov.get("source_sha256") or "").strip()
+        if rel and sha and rel not in index:
+            index[rel] = (
+                str(prov.get("repository") or _DEFAULT_REPOSITORY),
+                str(prov.get("revision") or default_rev),
+                sha,
+            )
+    return index
+
+
+@lru_cache(maxsize=_SOURCE_REF_CACHE_MAXSIZE)
+def _lookup_sealed_source_ref(norm_path: str, norm_symbol: str) -> tuple[tuple[str, str], ...]:
+    if norm_path:
+        hit = _load_manifest_provenance_index().get(norm_path)
+        if hit is not None:
+            repo, rev, sha = hit
+            return (
+                ("repository", repo),
+                ("revision", rev),
+                ("relative_path", norm_path),
+                ("symbol", norm_symbol),
+                ("source_sha256", sha),
+                ("provenance", "stack_manifest"),
+            )
+    if (default_abi_dir() / "abi_schema_manifest.json").is_file():
+        registry = default_abi_registry()
+        for arch in _ABI_ARCH_SEARCH_ORDER:
+            snapshot = registry.get_snapshot(arch)
+            for entry in snapshot.entries:
+                ref = entry.source_ref
+                rel = str(ref.relative_path or "").strip().lstrip("./") if ref is not None else ""
+                path_match = bool(norm_path and rel == norm_path)
+                sym_match = bool(
+                    not norm_path
+                    and norm_symbol
+                    and (entry.symbol_or_kernel == norm_symbol or entry.abi_id == norm_symbol)
+                )
+                if path_match or sym_match:
+                    return (
+                        ("repository", str(ref.repository if ref is not None else _DEFAULT_REPOSITORY)),
+                        ("revision", str(ref.revision if ref is not None else "")),
+                        ("relative_path", rel or norm_path),
+                        ("symbol", norm_symbol),
+                        ("source_sha256", str(ref.source_sha256 if ref is not None else "")),
+                        ("provenance", "abi_registry"),
+                    )
+    return (
+        ("repository", _DEFAULT_REPOSITORY),
+        ("revision", ""),
+        ("relative_path", norm_path),
+        ("symbol", norm_symbol),
+        ("source_sha256", ""),
+        ("provenance", "declared_path"),
+    )
+
+
+def source_reference(path: str, symbol: str) -> dict[str, Any]:
+    """Resolve portable ``SourceRef`` metadata from ``ProbedAbiRegistry`` (AG014=0)."""
+    norm_path = str(path or "").strip().lstrip("./")
+    norm_symbol = str(symbol or "").strip()
+    return dict(_lookup_sealed_source_ref(norm_path, norm_symbol))

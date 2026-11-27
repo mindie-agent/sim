@@ -13,24 +13,48 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 import json
+import re
+from typing import Any
 
 from mindie_sim.schema.common import ModelingError
-from .native_coverage import (
+from .program.native_coverage import (
     NativeAbiRegion, _attach_selection, _bound_state, bind_abi_call,
     bind_selected_native_call, coverage_from_records, join_profiler_rows,
     native_call_coverage, selection_delivery_for_op,
 )
 
 SCHEMA = "mindie-sim/native-call-binding/1"
-_MAX_NESTED = 64
+NATIVE_CALL_METADATA_KEY = "native_call_binding"
 
 #: Execution classes a producer may prove.  These are declarations, not a
 #: name->core rule; anything else remains unresolved.
 PROVED_CORES = frozenset(("aic", "aiv", "mix", "aicpu", "hccl", "host"))
-_NAMESPACES = frozenset(("aclnn", "torch", "hccl", "cann_kernel", "triton"))
+_NAMESPACES = frozenset((
+    "aclnn",
+    "torch",
+    "torch_npu",
+    "hccl",
+    "cann_kernel",
+    "triton",
+    "vllm_ascend_csrc",
+    "catlass",
+    "third_party_wheel",
+))
+_NAMESPACE_TO_ABI_BACKEND: dict[str, str] = {
+    "aclnn": "cann_aclnn",
+    "hccl": "hccl_mc2",
+    "torch": "torch_npu",
+    "torch_npu": "torch_npu",
+    "triton": "triton",
+    "vllm_ascend_csrc": "vllm_ascend_csrc",
+    "catlass": "catlass",
+    "third_party_wheel": "third_party_wheel",
+}
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 #: Evidence values that positively resolve a callable or kernel identity.
 _POSITIVE_EVIDENCE = frozenset(("established", "source_declared"))
 
@@ -55,10 +79,26 @@ def _text(value):
 
 
 def _source_record(raw):
-    if not isinstance(raw, dict) or not raw:
+    if raw is None:
         return None
-    record = {"repository": _text(raw.get("repository")), "path": _text(raw.get("path")),
-              "sha256": _text(raw.get("sha256")), "symbol": _text(raw.get("symbol")),
+    if not isinstance(raw, dict):
+        if hasattr(raw, "relative_path") or hasattr(raw, "source_sha256"):
+            raw = {
+                "repository": getattr(raw, "repository", None),
+                "relative_path": getattr(raw, "relative_path", None),
+                "source_sha256": getattr(raw, "source_sha256", None),
+                "revision": getattr(raw, "revision", None),
+                "symbol": getattr(raw, "symbol", None),
+                "state": getattr(raw, "state", None),
+            }
+        else:
+            return None
+    if not raw:
+        return None
+    record = {"repository": _text(raw.get("repository")),
+              "path": _text(raw.get("path") or raw.get("relative_path")),
+              "sha256": _text(raw.get("sha256") or raw.get("source_sha256")),
+              "symbol": _text(raw.get("symbol")),
               "revision": _text(raw.get("revision") or raw.get("base_revision")),
               "state": _text(raw.get("source_state") or raw.get("state")) or "unknown"}
     return record if record["path"] or record["sha256"] else None
@@ -112,7 +152,11 @@ def _typed_payload(op, meta, *, include_launch=True):
              "attrs": {key: attrs[key] for key in sorted(attrs)},
              "rank_width": max((len(value) for value in shapes.values()
                                 if isinstance(value, (list, tuple))), default=0)}
-    payload = {**typed, "matrix_flops": _jsonable(getattr(op, "matrix_flops", ()))}
+    payload = (
+        {**typed, "matrix_flops": _jsonable(getattr(op, "matrix_flops", ()))}
+        if include_launch
+        else dict(typed)
+    )
     typed["signature_hash"] = _digest(payload)
     return typed
 
@@ -186,17 +230,22 @@ def _kernel_records(op, meta, children):
             # The expansion join is a logical barrier, never a child kernel.
             continue
         child_meta = dict(child.metadata)
+        child_call = child_meta.get("native_call") or child_meta.get("native_call_binding")
+        if isinstance(child_call, dict) and child_call.get("kernels"):
+            records.extend(_normalize_kernels(child_call.get("kernels", ())))
+            continue
         implementation = child_meta.get("native_implementation") or {}
-        name = (child_meta.get("native_kind")
-                or (implementation.get("native_kinds") or [None])[0]
-                or child.recipe or child.family)
+        name = (_text(child_meta.get("native_kind"))
+                or _text((implementation.get("native_kinds") or [None])[0]))
+        if not name:
+            # Never promote internal simulator recipe or family identifiers.
+            continue
         source = _first_source(child_meta) or {}
         records.append({
             "name": str(name), "role": _text(child_meta.get("kernel_role")) or "unknown",
             "source_path": source.get("path"), "source_sha256": source.get("sha256"),
             "launch_shape": list(child.launch_shape) if child.launch_shape else None,
-            "evidence": ("source_declared" if child_meta.get("native_kind")
-                         or implementation else "unresolved")})
+            "evidence": "source_declared"})
     unique = {}
     for record in records:
         unique.setdefault(record["name"], record)
@@ -301,6 +350,114 @@ class NativeCallBinding:
     def bound(self) -> bool:
         return _bound_state(
             self.evidence, (self.source or {}).get("sha256"), self.typed, self.kernels)[0]
+
+    @property
+    def symbol(self) -> str:
+        return str(self.api.get("aclnn_symbol") or self.api.get("entry") or "")
+
+    @property
+    def backend_kind(self) -> str:
+        ns = str(self.api.get("namespace") or "")
+        if ns == "cann_kernel":
+            return "cann_aclnn" if self.api.get("aclnn_symbol") else "cann_kernel"
+        return _NAMESPACE_TO_ABI_BACKEND.get(ns, ns)
+
+    @property
+    def owner_repo(self) -> str:
+        return str((self.source or {}).get("repository") or "")
+
+    @property
+    def device_kernels(self) -> tuple[str, ...]:
+        return tuple(str(row["name"]) for row in self.kernels if isinstance(row, dict) and row.get("name"))
+
+    def to_metadata(self) -> tuple[tuple[str, Any], ...]:
+        """Serialize this binding into canonical ``OpSpec.metadata`` key-value pairs."""
+        return ((NATIVE_CALL_METADATA_KEY, self.to_dict()),)
+
+    @classmethod
+    def from_metadata(
+        cls, metadata: Mapping[str, Any] | Sequence[tuple[str, Any]],
+    ) -> NativeCallBinding:
+        """Decode a canonical ``NativeCallBinding`` from ``OpSpec.metadata``."""
+        meta = dict(metadata) if not isinstance(metadata, Mapping) else metadata
+        raw = meta.get(NATIVE_CALL_METADATA_KEY)
+        if isinstance(raw, cls):
+            raw = raw.to_dict()
+        if not isinstance(raw, Mapping):
+            raise ModelingError("native_call_binding_metadata_missing")
+        schema = raw.get("schema")
+        if schema is not None and schema != SCHEMA:
+            raise ModelingError(f"native_call_metadata_schema_invalid:{schema!r}")
+        for required in ("call_id", "op_id", "family", "recipe", "source_boundary", "api", "typed"):
+            if raw.get(required) is None:
+                raise ModelingError(f"native_call_metadata_missing_field:{required}")
+        if not isinstance(raw["api"], Mapping) or not isinstance(raw["typed"], Mapping):
+            raise ModelingError("native_call_metadata_api_or_typed_invalid")
+        api_dict = dict(raw["api"])
+        typed_dict = dict(raw["typed"])
+        namespace = api_dict.get("namespace")
+        if namespace is not None and namespace not in _NAMESPACES:
+            raise ModelingError(f"native_call_namespace_unknown:{namespace}")
+        kernels_tuple = tuple(dict(row) for row in (raw.get("kernels") or ()) if isinstance(row, Mapping))
+        has_api_call = bool(
+            namespace
+            and (
+                (isinstance(api_dict.get("entry"), str) and api_dict["entry"].strip())
+                or (isinstance(api_dict.get("aclnn_symbol"), str) and api_dict["aclnn_symbol"].strip())
+            )
+        )
+        has_named_kernel = any(isinstance(row.get("name"), str) and row["name"].strip() for row in kernels_tuple)
+        if not has_api_call and not has_named_kernel:
+            raise ModelingError("native_call_metadata_missing_callable_or_kernel")
+        source_dict = dict(raw["source"]) if isinstance(raw.get("source"), Mapping) else None
+        if source_dict is not None and "sha256" in source_dict and source_dict["sha256"] is not None:
+            src_sha = source_dict["sha256"]
+            if not isinstance(src_sha, str) or not _SHA256_HEX_RE.fullmatch(src_sha):
+                raise ModelingError("native_call_metadata_source_sha256_invalid")
+        if "signature_hash" in typed_dict and typed_dict["signature_hash"] is not None:
+            sig_sha = typed_dict["signature_hash"]
+            if not isinstance(sig_sha, str) or not _SHA256_HEX_RE.fullmatch(sig_sha):
+                raise ModelingError("native_call_metadata_signature_hash_invalid")
+        exec_core = str(raw["execution_core"]) if raw.get("execution_core") is not None else None
+        raw_ev = dict(raw["evidence"]) if isinstance(raw.get("evidence"), Mapping) else {}
+        if raw_ev:
+            derived_ev = _evidence(api_dict, source_dict, kernels_tuple, exec_core)
+            if raw_ev.get("entry") in _POSITIVE_EVIDENCE and derived_ev["entry"] not in _POSITIVE_EVIDENCE:
+                raise ModelingError("native_call_metadata_evidence_contradicts_api_entry")
+            if raw_ev.get("entry") == "established" and derived_ev["entry"] != "established":
+                raise ModelingError("native_call_metadata_evidence_unverified_established")
+            if raw_ev.get("aclnn_symbol") in _POSITIVE_EVIDENCE and derived_ev["aclnn_symbol"] not in _POSITIVE_EVIDENCE:
+                raise ModelingError("native_call_metadata_evidence_contradicts_aclnn_symbol")
+            if raw_ev.get("aclnn_symbol") == "established" and derived_ev["aclnn_symbol"] != "established":
+                raise ModelingError("native_call_metadata_evidence_unverified_established")
+            if raw_ev.get("kernels") in _POSITIVE_EVIDENCE and derived_ev["kernels"] not in _POSITIVE_EVIDENCE:
+                raise ModelingError("native_call_metadata_evidence_contradicts_kernels")
+        raw_members = raw.get("members")
+        member_ids = (
+            tuple(str(x) for x in raw_members.get("op_ids", ()))
+            if isinstance(raw_members, Mapping)
+            else tuple(str(x) for x in (raw.get("member_op_ids") or ()))
+        )
+        return cls(
+            call_id=str(raw["call_id"]),
+            op_id=str(raw["op_id"]),
+            family=str(raw["family"]),
+            recipe=str(raw["recipe"]),
+            source_boundary=str(raw["source_boundary"]),
+            api=api_dict,
+            source=source_dict,
+            typed=typed_dict,
+            occurrence=dict(raw["occurrence"]) if isinstance(raw.get("occurrence"), Mapping) else {},
+            observed_aliases=tuple(dict(row) for row in (raw.get("observed_aliases") or ()) if isinstance(row, Mapping)),
+            kernels=kernels_tuple,
+            member_op_ids=member_ids,
+            execution_core=exec_core,
+            timing_owner=dict(raw["timing_owner"]) if isinstance(raw.get("timing_owner"), Mapping) else {},
+            evidence=raw_ev,
+            unresolved=tuple(str(x) for x in (raw.get("unresolved") or ())),
+            physical=dict(raw["physical"]) if isinstance(raw.get("physical"), Mapping) else None,
+            non_claims=tuple(str(x) for x in (raw.get("non_claims") or self_non_claims())),
+        )
 
 
 def _kernel_evidence(kernels):
@@ -561,7 +718,7 @@ def member_physical_view(binding, plan, prepared=None):
     return replace(binding, physical=physical)
 
 
-__all__ = ("SCHEMA", "PROVED_CORES", "NativeCallBinding", "NativeAbiRegion",
+__all__ = ("SCHEMA", "NATIVE_CALL_METADATA_KEY", "PROVED_CORES", "NativeCallBinding", "NativeAbiRegion",
            "declare_native_call", "bind_abi_call", "bind_selected_native_call",
            "selection_delivery_for_op",
            "bind_native_call", "bind_expanded_call", "validate_invocation",

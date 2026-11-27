@@ -1,0 +1,446 @@
+"""Typed immutable physical identity for lowered operators.
+
+[Role] Provide the hashable, typed grouping primitive for lowered operators
+  with alpha-renamed graph references and on-demand serialization.
+[Invariants] Only declared graph-reference leaves are alpha-renamed; every
+  tensor shape, stride, layout, dtype, routing, cache, and state field is
+  preserved verbatim.  Cross-layer loop-invariant ops hoisted to step prologue
+  (e.g., ``s0.pre_forward.<name>`` without ``.l<N>.``) do not match the
+  layer-indexed occurrence pattern and therefore stay invariant across all
+  consumer layers without generating distinct ``0 - l`` relative offsets.
+[Timeouts & Locks] O(op metadata size) pure projection; no I/O or locks.
+[Side-Effect Policy] Pure immutable key construction; zero mutation.
+
+Details:
+    survive the normalization.
+  * Layer-indexed state references (``kda.layer[L]`` / ``gdn.layer[L]``) and the
+    integer ``stage``/``layer`` leaves of ``state_accesses`` and
+    ``fused_origin_scopes`` are relative to the
+    operator that owns them, for the same injective reason.  ``context_kv<L>``
+    alias planes use their own declared rule instead of widening the
+    occurrence pattern's capture groups.
+  * Unknown metadata is retained unchanged.  An unrecognized identity-bearing
+    field can only prevent deduplication; it can never cause a false merge.
+  * No regular expression is applied to a serialized JSON document; the rewrite
+    visits declared values and only their occurrence prefixes.
+  * ``physical_key`` returns a tuple and performs no serialization;
+    ``physical_signature`` is its deterministic serialization and
+    ``physical_id`` its SHA-256 digest.
+
+[Timeouts & Locks]
+  Pure value transformation over one operator; no I/O.
+
+[Side-Effect Policy]
+  Reads the operator declaration and returns a new immutable value.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from functools import lru_cache
+import hashlib
+import json
+import math
+import re
+from typing import Any
+
+
+#: Version tag of the physical identity projection.
+IDENTITY_VERSION = "physical-key/4"
+#: Canonical stage-level prologue segment for hoisted cross-layer loop-invariant ops
+#: (``s<stage>.pre_forward.<name>``, intentionally omitting ``.l<layer>.``).
+HOISTED_PROLOGUE_PREFIX = "pre_forward."
+
+#: Metadata keys whose values name other occurrences and must be normalized.
+REFERENCE_KEYS = frozenset({
+    "absorbed_source_ops",
+    "activation_input_segments",
+    "activation_payload_producer",
+    "activation_residual_inputs",
+    "activation_residual_outputs",
+    "audit_trail",
+    "binding_name",
+    "collective_id",
+    "composite_shared_subgraphs",
+    "device_kernel_group",
+    "folded_subgraph_key",
+    "fused_from",
+    "fused_members",
+    "fused_origin_scopes",
+    "fusion_boundary",
+    "fusion_external_outputs",
+    "fusion_group_key",
+    "fusion_semantic_ids",
+    "gdn_state_contract",
+    "gdn_state_effects",
+    "input_conversion_subgraphs",
+    "input_ports",
+    "input_state_version",
+    "inverse_index_producer",
+    "kda_recurrent_params",
+    "output_port_aliases",
+    "output_state_version",
+    "primary_anchor_id",
+    "recover_ssm_geometry",
+    "prefix_cache_reads",
+    "kda_state_contract",
+    "kda_state_effects",
+    "memory_accesses",
+    "moe_init_routing",
+    "packed_parent",
+    "payload_producer",
+    "quantizer_op",
+    "receive_allocation",
+    "request_input_state_versions",
+    "request_output_state_versions",
+    "reverse_of_collective",
+    "semantic_metadata",
+    "storage",
+    "synchronization_boundary",
+    "typed_outputs",
+})
+
+#: Prefix families that describe occurrence ownership or state effects.
+REFERENCE_PREFIXES = ("state_", "attn_res_", "structure_subgraph")
+
+#: Suffix families whose value names the producer occurrence.
+REFERENCE_SUFFIXES = ("_producer", "_consumer", "_parent")
+
+#: Instance pairing ids: they name one collective or bank-slot provenance occurrence, not its work.
+PAIRING_ONLY_KEYS = frozenset({
+    "collective_id",
+    "reverse_of_collective",
+    "attn_res_bank_ids",
+    "attn_res_bank_rows",
+})
+
+#: Metadata leaves carrying an absolute stage/layer pair to be made relative.
+STATE_ACCESS_KEY = "state_accesses"
+STATE_STAGE_FIELD = "stage"
+STATE_LAYER_FIELD = "layer"
+
+#: Reference mappings store absolute non-negative layer/stage anchors (for
+#: example ``fused_origin_scopes`` as ``("layer", 15)``).  They are made
+#: relative to the owning occurrence so corresponding operators in different
+#: layers compare equal instead of producing one recipe per layer.
+NONNEGATIVE_ANCHOR_FLOOR = 0
+
+_STAGE_GROUP = 2
+_LAYER_GROUP = 3
+_LAYER_REFERENCE_GROUP = 2
+_STATE_FAMILY_GROUP = 1
+_CONTEXT_KV_GROUP = 2
+_STATE_LAYER_TOKEN_GROUP = 1
+_OCCURRENCE = re.compile(
+    r"(?<![\w.])(?P<draft>draft(?:\d+|_prefill)\.)?s(\d+)\.l(\d+)(?=\.|$)")
+_LAYER_REFERENCE = re.compile(r"(?<![\w.])(kda|gdn)\.layer\[(\d+)\]")
+#: Draft/shared context-KV plane names carry the layer whose cache they alias.
+#: They are occurrence-relative like ``s<stage>.l<layer>`` but their ordinal is
+#: a bare ``context_kv<layer>`` token, so they need their own rewriting rule
+#: (``_OCCURRENCE``'s capture groups stay untouched).
+_CONTEXT_KV_OCCURRENCE = re.compile(
+    r"(?<![\w])(?P<draft>draft(?:\d+|_prefill)\.)?context_kv(\d+)(?=\.|$)")
+_STATE_LAYER_TOKEN = re.compile(r"(?<![\w.])layer(\d+)(?=:|$)")
+
+#: Identity field order.  A stable declaration, not a per-call inspection.
+IDENTITY_FIELDS = (
+    "family", "phase", "semantic_shape", "local_shape", "padded_shape",
+    "launch_shape", "flops", "hbm_bytes", "mte2_bytes", "mte3_bytes",
+    "vector_ops", "link_bytes", "link_scope", "recipe", "coverage", "dtype",
+    "layout",
+)
+_SCALAR_WORK_FIELDS = frozenset({
+    "flops", "hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops", "link_bytes",
+})
+OPTIONAL_IDENTITY_FIELDS = ("returns", "source_boundary")
+OPTIONAL_STRUCTURED_IDENTITY_FIELDS = (
+    "precision_abi", "kernel_binding", "owner_schedule",
+)
+ASCII = "utf-8"
+
+
+def is_reference_key(key: str) -> bool:
+    """True when this metadata key's value names other graph occurrences."""
+    if key in REFERENCE_KEYS:
+        return True
+    if key.startswith(REFERENCE_PREFIXES):
+        return True
+    return key.endswith(REFERENCE_SUFFIXES)
+
+
+_REF_CACHE_MAXSIZE = 4096
+
+
+@lru_cache(maxsize=_REF_CACHE_MAXSIZE)
+def _normalize_reference_cached(value: str, stage: int, layer: int) -> str:
+    renamed = value
+    if ".l" in renamed:
+        renamed = _OCCURRENCE.sub(
+            lambda m: (f"{m.group('draft') or ''}s{int(m.group(_STAGE_GROUP)) - stage}"
+                       f".l{int(m.group(_LAYER_GROUP)) - layer}"),
+            renamed,
+        )
+    if ".layer[" in renamed:
+        renamed = _LAYER_REFERENCE.sub(
+            lambda m: (f"{m.group(_STATE_FAMILY_GROUP)}.layer["
+                       f"{int(m.group(_LAYER_REFERENCE_GROUP)) - layer}]"),
+            renamed,
+        )
+    if "context_kv" in renamed:
+        renamed = _CONTEXT_KV_OCCURRENCE.sub(
+            lambda m: (f"{m.group('draft') or ''}context_kv"
+                       f"{int(m.group(_CONTEXT_KV_GROUP)) - layer}"),
+            renamed,
+        )
+    if "layer" in renamed:
+        renamed = _STATE_LAYER_TOKEN.sub(
+            lambda m: f"layer{int(m.group(_STATE_LAYER_TOKEN_GROUP)) - layer}",
+            renamed,
+        )
+    return renamed
+
+
+def normalize_reference(value: str, stage: int, layer: int) -> str:
+    """Rename occurrence prefixes relative to one anchor, preserving offsets."""
+    if ".l" not in value and "layer" not in value and "context_kv" not in value:
+        return value
+    return _normalize_reference_cached(value, int(stage), int(layer))
+
+
+def _normalize_mapping_entry(key: Any, item: Any, stage: int,
+                             layer: int) -> tuple[str, Any]:
+    """One mapping leaf: relative anchor for stage/layer ordinals."""
+    name = key if type(key) is str else str(key)
+    if type(item) is int and item >= NONNEGATIVE_ANCHOR_FLOOR:
+        if name == STATE_STAGE_FIELD:
+            return name, item - stage
+        if name == STATE_LAYER_FIELD or name == "layer_index":
+            return name, item - layer
+    return name, normalize_graph_value(item, stage, layer)
+
+
+def normalize_graph_value(value: Any, stage: int, layer: int) -> Any:
+    """Recursively normalize declared reference leaves into a hashable value."""
+    kind = type(value)
+    if kind is str:
+        if ".l" not in value and "layer" not in value and "context_kv" not in value:
+            return value
+        return _normalize_reference_cached(value, stage, layer)
+    if kind is int or kind is float or kind is bool or value is None:
+        return value
+    if kind is tuple or kind is list:
+        return tuple(normalize_graph_value(item, stage, layer) for item in value)
+    if kind is dict:
+        if not value:
+            return ()
+        return tuple(sorted(
+            (_normalize_mapping_entry(key, item, stage, layer)
+             for key, item in value.items()),
+            key=lambda item: item[0]))
+    if kind is set or kind is frozenset:
+        return frozenset(normalize_graph_value(item, stage, layer)
+                         for item in value)
+    if isinstance(value, str):
+        return normalize_reference(value, stage, layer)
+    if isinstance(value, Mapping):
+        return tuple(sorted(
+            (_normalize_mapping_entry(key, item, stage, layer)
+             for key, item in value.items()),
+            key=lambda item: item[0]))
+    if isinstance(value, (list, tuple)):
+        return tuple(normalize_graph_value(item, stage, layer) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(normalize_graph_value(item, stage, layer)
+                         for item in value)
+    return value
+
+
+def _relative_state_accesses(value: Any, stage: int, layer: int) -> Any:
+    """Normalize the integer stage/layer leaves of declared state accesses."""
+    kind = type(value)
+    if kind is not tuple and kind is not list and not isinstance(value, (list, tuple)):
+        return normalize_graph_value(value, stage, layer)
+    entries = []
+    for item in value:
+        ikind = type(item)
+        if ikind is not dict and not isinstance(item, Mapping):
+            entries.append(normalize_graph_value(item, stage, layer))
+            continue
+        pairs = []
+        for key, leaf in item.items():
+            lkind = type(leaf)
+            if key == STATE_STAGE_FIELD and (lkind is int or (isinstance(leaf, int) and not isinstance(leaf, bool))):
+                pairs.append((key, int(leaf) - stage))
+            elif key == STATE_LAYER_FIELD and (lkind is int or (isinstance(leaf, int) and not isinstance(leaf, bool))):
+                pairs.append((key, int(leaf) - layer))
+            else:
+                pairs.append((key, normalize_graph_value(leaf, stage, layer)))
+        pairs.sort(key=lambda pair: pair[0] if type(pair[0]) is str else str(pair[0]))
+        entries.append(tuple(pairs))
+    return tuple(entries)
+
+
+def _normalized_metadata(metadata: Any, stage: int, layer: int) -> tuple:
+    """Hashable occurrence-relative projection of one operator's metadata."""
+    stage_i = int(stage)
+    layer_i = int(layer)
+    mkind = type(metadata)
+    items = (
+        metadata.items()
+        if (mkind is dict or isinstance(metadata, Mapping))
+        else (metadata if mkind is tuple else tuple(metadata or ()))
+    )
+    normalized = []
+    for key, value in items:
+        name = key if type(key) is str else str(key)
+        if name in PAIRING_ONLY_KEYS:
+            continue
+        if name == STATE_ACCESS_KEY or name == "fused_origin_scopes":
+            normalized.append((name, _relative_state_accesses(value, stage_i, layer_i)))
+        elif is_reference_key(name):
+            normalized.append((name, normalize_graph_value(value, stage_i, layer_i)))
+        else:
+            normalized.append((name, _hashable(value)))
+    normalized.sort(key=lambda item: item[0])
+    return tuple(normalized)
+
+
+def _hashable(value: Any) -> Any:
+    """Non-reference leaf projection; preserves value, only makes it hashable."""
+    kind = type(value)
+    if kind is str or kind is int or kind is float or kind is bool or value is None:
+        return value
+    if kind is tuple or kind is list:
+        return tuple(_hashable(item) for item in value)
+    if kind is dict:
+        if not value:
+            return ()
+        return tuple(sorted(((key if type(key) is str else str(key), _hashable(item))
+                             for key, item in value.items()),
+                            key=lambda item: item[0]))
+    if kind is set or kind is frozenset:
+        return frozenset(_hashable(item) for item in value)
+    if isinstance(value, Mapping):
+        return tuple(sorted(((str(key), _hashable(item))
+                             for key, item in value.items()),
+                            key=lambda item: item[0]))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_hashable(item) for item in value)
+    return value
+
+
+_METADATA_MEMO: dict[tuple[int, int, int], tuple[Any, tuple]] = {}
+_METADATA_MEMO_LIMIT = 512
+
+
+def operator_metadata_key(metadata: Any, stage: int, layer: int) -> tuple:
+    """Canonical hashable projection of one operator's metadata."""
+    identity = (id(metadata), int(stage), int(layer))
+    hit = _METADATA_MEMO.get(identity)
+    if hit is not None and hit[0] is metadata:
+        return hit[1]
+    value = _normalized_metadata(metadata, stage, layer)
+    if len(_METADATA_MEMO) >= _METADATA_MEMO_LIMIT:
+        _METADATA_MEMO.clear()
+    _METADATA_MEMO[identity] = (metadata, value)
+    return value
+
+
+def _memoized_attribute(op: Any, name: str) -> Any:
+    """Read one instance-local memo, ignoring duck-typed objects that reject it."""
+    try:
+        return getattr(op, name, None)
+    except AttributeError:
+        return None
+
+
+def _store_attribute(op: Any, name: str, value: Any) -> None:
+    """Attach an immutable memo to one frozen occurrence, best effort."""
+    try:
+        object.__setattr__(op, name, value)
+    except (AttributeError, TypeError):
+        pass
+
+
+def _canonical_scalar(value: Any) -> Any:
+    """Normalize integral floats to exact int without losing >53-bit int precision."""
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return value
+
+
+def physical_key(op: Any) -> tuple:
+    """Typed immutable physical identity of one operator occurrence.
+
+    ``OpSpec`` is frozen: its declared work and implementation cannot change
+    for the lifetime of the instance.  The projection is therefore memoized on
+    the occurrence itself instead of being rebuilt for every reader (graph
+    execution, isolated pricing and post-processing all ask repeatedly).
+    """
+    cached = _memoized_attribute(op, "_cached_physical_key")
+    if cached is not None:
+        return cached
+    key = [IDENTITY_VERSION]
+    for field in IDENTITY_FIELDS:
+        val = getattr(op, field, None)
+        if field in _SCALAR_WORK_FIELDS and isinstance(val, (int, float)) and not isinstance(val, bool):
+            val = _canonical_scalar(val)
+        key.append(val)
+    for field in OPTIONAL_IDENTITY_FIELDS:
+        if getattr(op, field, None):
+            key.append((field, getattr(op, field)))
+    if getattr(op, "matrix_flops", ()):
+        key.append(("matrix_flops", tuple(sorted(
+            (str(name), _canonical_scalar(value))
+            for name, value in op.matrix_flops))))
+    logical_reqs = getattr(op, "logical_precision_reqs", ())
+    if logical_reqs:
+        key.append(("logical_precision_reqs", tuple(sorted(
+            (str(name), str(value)) for name, value in logical_reqs))))
+    for field in OPTIONAL_STRUCTURED_IDENTITY_FIELDS:
+        structured = getattr(op, field, None)
+        if structured is not None:
+            payload = structured.to_dict() if hasattr(structured, "to_dict") else structured
+            key.append((field, _hashable(payload)))
+    key.append(operator_metadata_key(
+        getattr(op, "metadata", ()), int(op.stage), int(op.layer)))
+    key = tuple(key)
+    _store_attribute(op, "_cached_physical_key", key)
+    return key
+
+
+def canonical_json(key: Any) -> str:
+    return json.dumps(key, sort_keys=True, separators=(",", ":"), default=repr,
+                      ensure_ascii=False, allow_nan=False)
+
+
+_SIGNATURE_MEMO: dict[int, tuple[Any, str]] = {}
+_SIGNATURE_MEMO_LIMIT = 512
+
+
+def physical_signature(op: Any) -> str:
+    """Deterministic serialization of the physical key.
+
+    The signature is memoized on the frozen occurrence.  A short process-local
+    identity memo still covers duck-typed declarations that cannot carry an
+    instance attribute; an identity mismatch never serves a stale signature.
+    """
+    cached = _memoized_attribute(op, "_cached_physical_sig")
+    if cached is not None:
+        return cached
+    identity = id(op)
+    hit = _SIGNATURE_MEMO.get(identity)
+    if hit is not None and hit[0] is op:
+        return hit[1]
+    value = canonical_json(physical_key(op))
+    _store_attribute(op, "_cached_physical_sig", value)
+    if len(_SIGNATURE_MEMO) >= _SIGNATURE_MEMO_LIMIT:
+        _SIGNATURE_MEMO.clear()
+    _SIGNATURE_MEMO[identity] = (op, value)
+    return value
+
+
+def physical_id(op: Any) -> str:
+    """Stable digest of the serialized physical key."""
+    return hashlib.sha256(physical_signature(op).encode(ASCII)).hexdigest()

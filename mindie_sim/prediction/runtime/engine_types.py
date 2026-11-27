@@ -95,14 +95,16 @@ def _compute_pool_unit_masks(
 
 
 class Event:
-    __slots__ = ("sequence", "name", "time", "started", "_waiters", "_callbacks")
+    __slots__ = ("sequence", "name", "time", "started", "runtime_uid", "_waiters", "_callbacks")
 
     def __init__(self, sequence: int, name: str,
-                 time: float | None = None, started: float | None = None):
+                 time: float | None = None, started: float | None = None,
+                 runtime_uid: str = ""):
         self.sequence = sequence
         self.name = name
         self.time = time
         self.started = started
+        self.runtime_uid = str(runtime_uid) if runtime_uid else ""
         self._waiters: list[int] = []
         self._callbacks: list | None = None
 
@@ -154,6 +156,21 @@ class _Task:
     #: before Python admits the pre-prepared successors.  Only rows whose hook
     #: is virtual-time independent set this.
     native_hook: bool = False
+    cohort_widened: tuple[str, ...] = ()
+    cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
+    deliveries: tuple[tuple[str, float], ...] = ()
+    delivered_acc: dict[str, float] | None = None
+    is_split_child: bool = False
+    ready_at: float | None = None
+    blocker_event: str = ""
+    blocker_reason: str = ""
+    fifo_order: tuple[int, int] | None = None
+    latency_from_first_service: bool = False
+    first_service: float | None = None
+    pending_preds: list[Event] | None = None
+    hbm_accounting: tuple[tuple[str, float, float, float, float | None, str, float, str, float, str], ...] = ()
+    hbm_credited: dict[str, float] | None = None
+    split_children: tuple[Event, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,9 +200,18 @@ class _PreparedTask:
     coupled_res_info: dict[str, tuple[float, float, float, float, tuple[int, ...] | None]] | None = None
     uncoupled_res_info: dict[str, tuple[float, float, float, float, float, tuple[int, ...] | None]] | None = None
     pool_unit_masks: tuple[tuple[str, int], ...] | None = ()
+    cohort_widened: tuple[str, ...] = ()
+    cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
+    latency_from_first_service: bool = False
+    hbm_bus_epoch: int = 0
+    hbm_accounting: tuple[tuple[str, float, float, float, float | None, str, float, str, float, str], ...] = ()
+    partial_placed_resources: frozenset[str] = _EMPTY_FROZENSET
+    static_stable: bool = False
+    explicit_units: int = 0
+    effective_units: int = 0
 
 
-_EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0)
+_EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0, static_stable=True)
 
 _MEMORY_FIELDS = (
     "owner", "storage", "tier", "rank", "stage", "generation", "ranges",

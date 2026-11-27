@@ -13,8 +13,50 @@ from __future__ import annotations
 import math
 from typing import Mapping
 
-from ..ownership import unit_rates
 from .arbiter_fast_coupled import fast_single_tier_coupled
+
+
+_TRIPLE_CONTENDER_ARITY = 3
+_CAP_ULPS = 8.0
+_SAT_ULPS = 16.0
+_NEXTAFTER_STEPS = 64
+_MAX_ATTEMPTS = 256
+_FLOW_UNPLACED_IDX = 5
+_EMPTY_FROZENSET: frozenset[str] = frozenset()
+
+
+def _fifo_rank(tasks, key: int, name: str):
+    """Non-preemptive FIFO order: active holder on ``name``, priority, arrival."""
+    task = tasks[key]
+    return (
+        task.service.get(name, 0.0) <= 0.0,
+        task.priority,
+        task.start is None,
+        task.start if task.start is not None else math.inf,
+        task.fifo_order if getattr(task, "fifo_order", None) is not None else (key, 0),
+    )
+
+
+def _unit_sat_tol(ref_cap: float, residual: float) -> float:
+    """Scale-invariant 16-ULP unit saturation tolerance."""
+    return _SAT_ULPS * math.ulp(max(abs(ref_cap), abs(residual)))
+
+
+def _member_placements(task, name: str, cohort: int) -> tuple[tuple[int, ...] | None, ...]:
+    """Resolve per-member unit tuples for an uncoupled cohort on ``name``."""
+    members_raw = getattr(task, "cohort_members", ())
+    if members_raw:
+        for rname, members in members_raw:
+            if rname == name and len(members) == cohort:
+                return members
+    pl = task.placement
+    units = pl.get(name) if pl else None
+    if (units is not None
+            and name in getattr(task, "cohort_widened", ())
+            and len(units) % cohort == 0):
+        width = len(units) // cohort
+        return tuple(units[idx * width:(idx + 1) * width] for idx in range(cohort))
+    return (units,) * cohort
 
 
 def _max_min_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, float]:
@@ -31,7 +73,7 @@ def _max_min_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, floa
         rate1 = cap1 if cap1 < share else share
         remaining = capacity - rate1
         return {key1: rate1, key2: cap2 if cap2 < remaining else remaining}
-    if size == 3:
+    if size == _TRIPLE_CONTENDER_ARITY:
         (k0, c0), (k1, c1), (k2, c2) = caps.items()
         if (c1, k1) < (c0, k0):
             k0, c0, k1, c1 = k1, c1, k0, c0
@@ -39,21 +81,29 @@ def _max_min_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, floa
             k1, c1, k2, c2 = k2, c2, k1, c1
             if (c1, k1) < (c0, k0):
                 k0, c0, k1, c1 = k1, c1, k0, c0
-        s0 = capacity / 3.0
-        r0 = c0 if c0 < s0 else s0
-        rem1 = capacity - r0
+        s0 = capacity / float(_TRIPLE_CONTENDER_ARITY)
+        if c0 >= s0:
+            return {k0: s0, k1: s0, k2: s0}
+        rem1 = capacity - c0
         s1 = rem1 * 0.5
-        r1 = c1 if c1 < s1 else s1
-        rem2 = rem1 - r1
-        return {k0: r0, k1: r1, k2: c2 if c2 < rem2 else rem2}
+        if c1 >= s1:
+            return {k0: c0, k1: s1, k2: s1}
+        rem2 = rem1 - c1
+        return {k0: c0, k1: c1, k2: c2 if c2 < rem2 else rem2}
     result: dict[int, float] = {}
+    consumed: list[float] = []
     remaining = capacity
     ordered = sorted(caps.items(), key=lambda item: (item[1], item[0]))
+    total_n = len(ordered)
     for index, (key, cap) in enumerate(ordered):
-        share = remaining / (len(ordered) - index)
-        rate = min(cap, share)
-        result[key] = rate
-        remaining -= rate
+        share = remaining / (total_n - index)
+        if cap >= share:
+            for rem_key, _ in ordered[index:]:
+                result[rem_key] = share
+            break
+        result[key] = cap
+        consumed.append(cap)
+        remaining = max(0.0, capacity - math.fsum(consumed))
     return result
 
 
@@ -66,15 +116,20 @@ def fair_rates(capacity: float, caps: Mapping[int, float],
             tiers.setdefault(int(priorities.get(key, 0)), {})[key] = cap
         if len(tiers) > 1:
             result: dict[int, float] = {}
+            consumed_all: list[float] = []
             remaining = capacity
             for priority in sorted(tiers):
                 tier = tiers[priority]
-                if remaining <= 0:
+                if remaining <= 0.0:
                     result.update({key: 0.0 for key in tier})
                     continue
                 share = _max_min_rates(remaining, tier)
                 result.update(share)
-                remaining = max(0.0, remaining - sum(share.values()))
+                consumed_all.extend(share.values())
+                if any(rate < tier[k] for k, rate in share.items()):
+                    remaining = 0.0
+                else:
+                    remaining = max(0.0, capacity - math.fsum(consumed_all))
             return result
     return _max_min_rates(capacity, caps)
 
@@ -97,12 +152,12 @@ def _unit_span(resource, declared, unit_remaining) -> tuple[int, ...]:
     count = max(1, int(resource.units))
     if declared is None:
         units = tuple(unit for unit in range(count)
-                      if unit_remaining[unit] > 1e-12)
+                      if unit_remaining[unit] > 0.0)
     else:
         units = tuple(unit for unit in declared if 0 <= unit < count)
     if not units:
         return ()
-    if any(unit_remaining[unit] <= 1e-12 for unit in units):
+    if any(unit_remaining[unit] <= 0.0 for unit in units):
         return ()
     return units
 
@@ -144,11 +199,14 @@ def _tier_flows(resources, tasks, tier, unit_remaining, fifo_winners) -> list:
             if blocked or not spans:
                 continue
             cohort = max(1, int(getattr(task, "cohort_size", 1) or 1))
+            widened_set = getattr(task, "cohort_widened", ())
             scale = 0.0
             for name, units in spans.items():
                 capacity = resources[name].rate / max(
                     1, int(resources[name].units))
                 denominator = capacity * len(units)
+                if cohort > 1 and name not in widened_set:
+                    denominator *= cohort
                 if denominator <= 0.0:
                     scale = math.inf
                     break
@@ -161,7 +219,7 @@ def _tier_flows(resources, tasks, tier, unit_remaining, fifo_winners) -> list:
             rates: list[tuple[str, float]] = []
             terms: list[tuple[str, int, float]] = []
             for name, units in spans.items():
-                demand = float(remaining[name]) / scale * cohort
+                demand = float(remaining[name]) / scale
                 rates.append((name, demand))
                 weight = demand / len(units)
                 terms.extend((name, unit, weight) for unit in units)
@@ -170,248 +228,293 @@ def _tier_flows(resources, tasks, tier, unit_remaining, fifo_winners) -> list:
                     limit = min(limit, (max(0.0, float(cap)) / demand
                                         if demand > 0.0 else 0.0))
             if limit > 0.0:
-                flows.append((key, True, limit, tuple(terms), tuple(rates)))
+                unplaced_res = frozenset(
+                    name for name, units in spans.items()
+                    if placement.get(name) is None and len(units) > 1
+                )
+                flows.append((key, True, limit, tuple(terms), tuple(rates), unplaced_res))
             continue
+        cohort = max(1, int(getattr(task, "cohort_size", 1) or 1))
         for name, amount in remaining.items():
             if amount <= 0.0:
                 continue
             resource = resources[name]
             if resource.policy == "fifo" and fifo_winners.get(name) != key:
                 continue
-            units = _unit_span(resource, placement.get(name),
-                               unit_remaining[name])
-            if not units:
-                continue
-            demand = (resource.rate / max(1, int(resource.units))) * len(units)
-            if demand <= 0.0:
-                continue
-            limit = 1.0
             cap = task.caps.get(name)
-            if cap is not None:
-                limit = min(limit, max(0.0, float(cap)) / demand)
-            if limit <= 0.0:
-                continue
-            weight = demand / len(units)
-            flows.append((key, False, limit,
-                          tuple((name, unit, weight) for unit in units),
-                          ((name, demand),)))
+            entries = (
+                tuple((m_decl, None if cap is None else max(0.0, float(cap)) / cohort)
+                      for m_decl in _member_placements(task, name, cohort))
+                if cohort > 1 else ((placement.get(name), None if cap is None else max(0.0, float(cap))),)
+            )
+            unit_cap = resource.rate / max(1, int(resource.units))
+            for declared, member_cap in entries:
+                units = _unit_span(resource, declared, unit_remaining[name])
+                if not units:
+                    continue
+                demand = unit_cap * len(units)
+                if demand <= 0.0:
+                    continue
+                limit = 1.0 if member_cap is None else min(1.0, member_cap / demand)
+                if limit <= 0.0:
+                    continue
+                weight = demand / len(units)
+                unplaced_res = (
+                    frozenset((name,)) if (declared is None and len(units) > 1)
+                    else _EMPTY_FROZENSET
+                )
+                flows.append((key, False, limit,
+                              tuple((name, unit, weight) for unit in units),
+                              ((name, demand),), unplaced_res))
     return flows
 
 
-def _progressive_unit_fill(flows, unit_remaining, *, orig_capacity=None,
-                           cumulative_terms=None) -> list[float]:
-    """Equal-alpha progressive filling bounded by every physical unit.
+def _term_value(idx: int, pair: tuple[str, int], alpha: float,
+                base_committed, base_alpha, cur_weight) -> float:
+    """Committed value on ``pair`` for active flow ``idx`` at progress ``alpha``."""
+    rname = pair[0]
+    w = cur_weight[idx][rname]
+    ba = base_alpha[idx].get(rname, 0.0)
+    if ba:
+        return base_committed[idx].get(pair, 0.0) + (alpha - ba) * w
+    return alpha * w
 
-    At each step every unfrozen flow advances by the same ``alpha`` increment.
-    The increment stops at the first task cap or the first ``(resource, unit)``
-    residual that would be exhausted.  A *cap-limited* step freezes only the
-    flow(s) that actually reached their own declared cap and keeps their
-    allocated service; every uncapped peer continues on the residual capacity,
-    even when the common increment is as small as ``1e-13`` or a representable
-    zero.  A *unit-limited* step uses the scale-aware 16-ULP physical-capacity
-    saturation check to retire only the flows blocked on that saturated unit
-    while independent non-blocked flows continue.
 
-    Every per-unit total is a ``math.fsum`` of the *actual* committed
-    ``alpha * weight`` terms.  The active slope is the ``math.fsum`` of the
-    active weights, upper-rounded once with ``nextafter`` before the division,
-    so a candidate increment cannot overshoot the exact residual.  Each
-    candidate is then re-summed exactly before it is committed: if the rounded
-    per-peer products would cross the unit capacity, ``alpha`` is tightened by
-    ``nextafter`` (then halved only if no representable step suffices).  A
-    genuine oversubscription still raises from the final independent guard, so
-    the invariant is never removed.
-
-    When ``orig_capacity`` and ``cumulative_terms`` are supplied the caller owns
-    one cross-tier ledger.  The residual is then always
-    ``orig_capacity[u] - math.fsum(cumulative_terms[u])`` rather than a
-    previously rounded per-tier remainder, the prospective candidate is checked
-    as ``math.fsum(cumulative_terms[u] + new_tier_terms[u]) <=
-    orig_capacity[u]``, and the committed terms are appended to the shared list
-    before the next tier starts.  A locally correct tier sum therefore can never
-    hide drift already embedded in an incoming residual.
-    """
-    cumulative = orig_capacity is not None and cumulative_terms is not None
-    alphas = [0.0] * len(flows)
-    active = set(range(len(flows)))
-    # Per-unit capacity at entry to this tier: the exact bound every committed
-    # term is checked against.  Residual and capacity accounting stay separate.
-    capacities: dict[tuple[str, int], float] = {}
-    for name, units in unit_remaining.items():
-        for unit, value in enumerate(units):
-            pair = (name, unit)
-            if cumulative:
-                capacities[pair] = float(orig_capacity[name][unit]) - math.fsum(
-                    cumulative_terms[name][unit])
+def _prospective_terms(pair_terms, active, act_units, alphas, base_committed,
+                       base_alpha, cur_weight, committed, step: float):
+    """Exact tier terms and totals for every unit at ``alpha + step``."""
+    terms_by_unit: dict[tuple[str, int], list[float]] = {}
+    totals: dict[tuple[str, int], float] = {}
+    for pair, terms in pair_terms.items():
+        rname, unit = pair
+        values = []
+        for idx, _weight in terms:
+            au = act_units[idx].get(rname)
+            if idx in active and (au is None or unit in au):
+                values.append(_term_value(
+                    idx, pair, alphas[idx] + step,
+                    base_committed, base_alpha, cur_weight,
+                ))
             else:
-                capacities[pair] = float(value)
+                values.append(committed[idx].get(pair, 0.0))
+        terms_by_unit[pair] = values
+        totals[pair] = math.fsum(values)
+    return terms_by_unit, totals
+
+
+def _tighten_fill_step(delta: float, pair_terms, active, act_units, alphas,
+                       base_committed, base_alpha, cur_weight, committed,
+                       totals, capacities, cumulative: bool,
+                       orig_capacity, cumulative_terms):
+    """Tighten ``delta`` via ``nextafter``/halving until every unit sum is safe."""
+    blocking: set[tuple[str, int]] = set()
+    for attempt in range(_MAX_ATTEMPTS):
+        if delta <= 0.0:
+            return 0.0, totals, blocking
+        candidate_terms, candidate_totals = _prospective_terms(
+            pair_terms, active, act_units, alphas, base_committed,
+            base_alpha, cur_weight, committed, delta,
+        )
+        failed: set[tuple[str, int]] = set()
+        if cumulative:
+            for pair, values in candidate_terms.items():
+                if (math.fsum(cumulative_terms[pair[0]][pair[1]] + values)
+                        > float(orig_capacity[pair[0]][pair[1]])):
+                    failed.add(pair)
+        else:
+            for pair, total in candidate_totals.items():
+                if total > capacities[pair]:
+                    failed.add(pair)
+        if not failed:
+            return delta, candidate_totals, blocking
+        blocking = failed
+        delta = (math.nextafter(delta, 0.0) if attempt < _NEXTAFTER_STEPS
+                 else delta * 0.5)
+    return 0.0, totals, blocking
+
+
+def _retire_or_redistribute(flows, active, alphas, act_units, flow_demand,
+                            base_committed, base_alpha, cur_weight, committed,
+                            saturated, headrooms, headroom: float,
+                            no_step: bool) -> tuple[set[int], bool]:
+    """Freeze capped/pinned flows and redistribute unplaced spans on remaining units."""
+    frozen: set[int] = set()
+    redistributed: list[tuple[int, str]] = []
+    shrunk = False
+    for idx in active:
+        limit = flows[idx][2]
+        alpha = alphas[idx]
+        cap_tol = _CAP_ULPS * math.ulp(max(abs(limit), abs(alpha)))
+        if alpha >= limit - cap_tol:
+            frozen.add(idx)
+            continue
+        au_map = act_units[idx]
+        pinned_hit = any(
+            name not in au_map and (name, unit) in saturated
+            for name, unit, _w in flows[idx][3]
+        )
+        if pinned_hit:
+            frozen.add(idx)
+            continue
+        exhausted = False
+        for rname, u_set in au_map.items():
+            drop = [u for u in u_set if (rname, u) in saturated]
+            if not drop:
+                continue
+            shrunk = True
+            u_set.difference_update(drop)
+            if not u_set:
+                exhausted = True
+                break
+            redistributed.append((idx, rname))
+        if exhausted:
+            frozen.add(idx)
+            continue
+        if no_step and headrooms[idx] <= headroom + cap_tol:
+            frozen.add(idx)
+    for idx, rname in redistributed:
+        if idx in frozen:
+            continue
+        base_alpha[idx][rname] = alphas[idx]
+        cur_weight[idx][rname] = flow_demand[idx][rname] / len(act_units[idx][rname])
+        for u in act_units[idx][rname]:
+            pair = (rname, u)
+            base_committed[idx][pair] = committed[idx].get(pair, 0.0)
+    return frozen, shrunk
+
+
+def _progressive_unit_fill(flows, unit_remaining, *, orig_capacity=None,
+                           cumulative_terms=None, committed_out=None) -> list[float]:
+    """Equal-alpha progressive filling with unified unplaced-span redistribution."""
+    cumulative = orig_capacity is not None and cumulative_terms is not None
+    n_flows = len(flows)
+    alphas = [0.0] * n_flows
+    active = set(range(n_flows))
+    flow_demand = [dict(flow[4]) for flow in flows]
+    act_units: list[dict[str, set[int]]] = [{} for _ in flows]
+    cur_weight: list[dict[str, float]] = [{} for _ in flows]
+    base_alpha: list[dict[str, float]] = [{} for _ in flows]
+    base_committed: list[dict[tuple[str, int], float]] = [{} for _ in flows]
     pair_terms: dict[tuple[str, int], list[tuple[int, float]]] = {}
-    for index, flow in enumerate(flows):
+    for idx, flow in enumerate(flows):
+        unplaced = flow[_FLOW_UNPLACED_IDX] if len(flow) > _FLOW_UNPLACED_IDX else _EMPTY_FROZENSET
         for name, unit, weight in flow[3]:
-            pair_terms.setdefault((name, unit), []).append((index, weight))
-    committed: list[dict[tuple[str, int], float]] = [dict() for _ in flows]
-
-    def prospective(step: float = 0.0
-                    ) -> tuple[dict[tuple[str, int], list[float]],
-                               dict[tuple[str, int], float]]:
-        """Exact tier terms and totals for every unit at ``alpha + step``.
-
-        An active peer's term is evaluated as ``(alpha + step) * weight``, the
-        exact expression the returned rate uses; inactive peers keep their last
-        committed term.  This makes the prospective capacity check, the stored
-        committed term and the independent final guard agree bit-for-bit.
-        """
-        terms_by_unit: dict[tuple[str, int], list[float]] = {}
-        totals: dict[tuple[str, int], float] = {}
-        for pair, terms in pair_terms.items():
-            values = []
-            for index, weight in terms:
-                if index in active:
-                    values.append((alphas[index] + step) * weight)
-                else:
-                    values.append(committed[index].get(pair, 0.0))
-            terms_by_unit[pair] = values
-            totals[pair] = math.fsum(values)
-        return terms_by_unit, totals
-
+            pair_terms.setdefault((name, unit), []).append((idx, weight))
+            cur_weight[idx][name] = weight
+            if name in unplaced:
+                act_units[idx].setdefault(name, set()).add(unit)
+    capacities = {
+        (name, unit): (
+            float(orig_capacity[name][unit]) - math.fsum(cumulative_terms[name][unit])
+            if cumulative else float(value)
+        )
+        for name, units in unit_remaining.items()
+        for unit, value in enumerate(units)
+    }
+    committed: list[dict[tuple[str, int], float]] = [{} for _ in flows]
     totals = dict.fromkeys(pair_terms, 0.0)
+    tier_saturated: set[tuple[str, int]] = set()
+
     while active:
-        slopes: dict[tuple[str, int], tuple[float, int]] = {}
+        bounds_by_pair: dict[tuple[str, int], float] = {}
         for pair, terms in pair_terms.items():
-            weights = [weight for index, weight in terms if index in active]
+            rname, unit = pair
+            weights = [
+                cur_weight[idx][rname] for idx, _w in terms
+                if idx in active and (rname not in act_units[idx] or unit in act_units[idx][rname])
+            ]
             if weights:
                 slope = math.fsum(weights)
                 if slope > 0.0:
-                    slopes[pair] = (slope, len(weights))
-        bounds = [(capacities[pair] - totals[pair])
-                  / (slope if count == 1 else math.nextafter(slope, math.inf))
-                  for pair, (slope, count) in slopes.items()]
-        headrooms = {index: flows[index][2] - alphas[index]
-                     for index in active}
+                    denom = slope if len(weights) == 1 else math.nextafter(slope, math.inf)
+                    bounds_by_pair[pair] = (capacities[pair] - totals[pair]) / denom
+        headrooms = {idx: flows[idx][2] - alphas[idx] for idx in active}
         headroom = min(headrooms.values())
-        bound_limit = min(bounds) if bounds else math.inf
-        delta = min(bound_limit, headroom)
-        if not math.isfinite(delta) or delta < 0.0:
+        raw_delta = min(min(bounds_by_pair.values()) if bounds_by_pair else math.inf, headroom)
+        if not math.isfinite(raw_delta) or raw_delta < 0.0:
             break
-        # Verify the exact committed sum of the rounded per-peer products
-        # before touching any alpha or residual.  Nextafter steps at capacity
-        # scale are sub-ULP; halving is the conservative fallback for an
-        # increment that no representable step can make safe.  In cumulative
-        # mode the authoritative check is the exact all-tier sum against the
-        # original physical capacity, never the rounded local remainder.
-        candidate_totals = totals
-        for attempt in range(256):
-            if delta <= 0.0:
-                candidate_totals = totals
-                break
-            candidate_terms, candidate_totals = prospective(delta)
-            if cumulative:
-                unsafe = any(
-                    math.fsum(cumulative_terms[pair[0]][pair[1]] + values)
-                    > float(orig_capacity[pair[0]][pair[1]])
-                    for pair, values in candidate_terms.items())
-            else:
-                unsafe = any(total > capacities[pair]
-                             for pair, total in candidate_totals.items())
-            if not unsafe:
-                break
-            delta = (math.nextafter(delta, 0.0) if attempt < 64
-                     else delta * 0.5)
-        else:
-            delta = 0.0
-            candidate_totals = totals
-        # Advance only by a representable positive increment.  A zero or an
-        # absorbed increment is not a reason to abandon unrelated peers: the
-        # flows responsible are frozen below and the remaining set continues.
+        delta, totals, blocking = _tighten_fill_step(
+            raw_delta, pair_terms, active, act_units, alphas, base_committed,
+            base_alpha, cur_weight, committed, totals, capacities,
+            cumulative, orig_capacity, cumulative_terms,
+        )
         advanced = False
         if delta > 0.0:
-            for index in active:
-                value = alphas[index] + delta
-                if value != alphas[index]:
+            for idx in active:
+                lim = flows[idx][2]
+                value = min(lim, alphas[idx] + delta)
+                if value != alphas[idx]:
                     advanced = True
-                alphas[index] = value
-                for name, unit, weight in flows[index][3]:
-                    committed[index][(name, unit)] = value * weight
-        totals = candidate_totals
+                alphas[idx] = value
+                au_map = act_units[idx]
+                for name, unit, _w in flows[idx][3]:
+                    au = au_map.get(name)
+                    if au is None or unit in au:
+                        pair = (name, unit)
+                        committed[idx][pair] = _term_value(
+                            idx, pair, value, base_committed, base_alpha, cur_weight,
+                        )
+        saturated: set[tuple[str, int]] = set()
         for pair, total in totals.items():
             name, unit = pair
             residual = capacities[pair] - total
-            ulp_tol = max(1e-12, 16.0 * math.ulp(
-                max(1.0, abs(capacities[pair]), abs(residual))))
-            # A saturated unit transitions cleanly to exactly zero residual;
-            # pure sub-16-ULP rounding dust never leaves a phantom remainder.
-            unit_remaining[name][unit] = (
-                0.0 if residual <= ulp_tol else residual)
-        saturated: set[tuple[str, int]] = set()
-        for pair in pair_terms:
-            name, unit = pair
-            residual = unit_remaining[name][unit]
-            unit_tol = max(1e-12, 16.0 * math.ulp(
-                max(1.0, abs(capacities[pair]), abs(residual))))
-            if residual <= unit_tol:
+            ref_cap = float(orig_capacity[name][unit]) if cumulative else capacities[pair]
+            has_uncapped = any(
+                idx in active
+                and (name not in act_units[idx] or unit in act_units[idx][name])
+                and alphas[idx] < flows[idx][2] - _CAP_ULPS * math.ulp(
+                    max(abs(flows[idx][2]), abs(alphas[idx])))
+                for idx, _w in pair_terms[pair]
+            )
+            unit_bound = residual <= 0.0 or (
+                (pair in blocking or has_uncapped)
+                and residual <= _unit_sat_tol(ref_cap, residual)
+            )
+            if unit_bound:
                 unit_remaining[name][unit] = 0.0
                 saturated.add(pair)
-        frozen: set[int] = set()
-        no_step = not advanced
-        for index in active:
-            limit = flows[index][2]
-            alpha = alphas[index]
-            # A dimensionless cap tolerance scaled to its own magnitude: an
-            # absolute 1e-12 would wrongly pre-freeze a valid 1e-13 cap.
-            cap_tol = 8.0 * math.ulp(max(abs(limit), abs(alpha)))
-            if alpha >= limit - cap_tol:
-                frozen.add(index)
-                continue
-            if any((name, unit) in saturated
-                   for name, unit, _weight in flows[index][3]):
-                frozen.add(index)
-                continue
-            if no_step and headrooms[index] <= headroom + cap_tol:
-                # No representable common increment remains; retire only the
-                # flow(s) closest to their cap so an independent peer can use
-                # the residual instead of the whole tier stalling.
-                frozen.add(index)
-        if not frozen:
+                tier_saturated.add(pair)
+            else:
+                unit_remaining[name][unit] = residual
+        frozen, shrunk = _retire_or_redistribute(
+            flows, active, alphas, act_units, flow_demand, base_committed,
+            base_alpha, cur_weight, committed, saturated, headrooms, headroom,
+            not advanced,
+        )
+        if not frozen and not shrunk:
             break
         active -= frozen
-    # Independent final bound check.  In cumulative mode it is the exact
-    # all-tier ``math.fsum`` against the original physical capacity; otherwise
-    # it is the exact sum of this tier's committed ``alpha * weight`` terms
-    # against the tier entry capacity (sub-16-ULP dust allowed, as before).
-    assigned = {pair: math.fsum(committed[index].get(pair, 0.0)
-                                for index, _weight in terms)
-                for pair, terms in pair_terms.items()}
+
+    assigned = {
+        pair: math.fsum(committed[idx].get(pair, 0.0) for idx, _w in terms)
+        for pair, terms in pair_terms.items()
+    }
     for pair, total in assigned.items():
         name, unit = pair
         if cumulative:
             capacity = float(orig_capacity[name][unit])
             accumulated = math.fsum(
                 cumulative_terms[name][unit]
-                + [committed[index].get(pair, 0.0)
-                   for index, _weight in pair_terms[pair]])
+                + [committed[idx].get(pair, 0.0) for idx, _w in pair_terms[pair]])
             if accumulated > capacity:
-                raise AssertionError(
-                    f"unit_service_overallocated:{name}:{unit}")
-            # ``committed`` holds this tier's running total per flow, so the
-            # tier is appended exactly once at exit; appending per step would
-            # double count the earlier alpha increments of the same tier.
+                raise AssertionError(f"unit_service_overallocated:{name}:{unit}")
             cumulative_terms[name][unit].extend(
-                committed[index].get(pair, 0.0)
-                for index, _weight in pair_terms[pair])
-            # The next tier derives its headroom from the same ledger, never
-            # from the rounded per-tier remainder that caused the drift.
-            unit_remaining[name][unit] = capacity - accumulated
+                committed[idx].get(pair, 0.0) for idx, _w in pair_terms[pair])
+            unit_remaining[name][unit] = (
+                0.0 if pair in tier_saturated else max(0.0, capacity - accumulated)
+            )
             continue
         capacity = capacities.get((name, unit), total)
-        ulp_tol = max(1e-12, 16.0 * math.ulp(
-            max(1.0, abs(capacity), abs(total))))
-        if total > capacity + ulp_tol:
-            raise AssertionError(
-                f"unit_service_overallocated:{name}:{unit}")
+        if total > capacity + _unit_sat_tol(capacity, total):
+            raise AssertionError(f"unit_service_overallocated:{name}:{unit}")
+    if committed_out is not None:
+        committed_out.extend(committed)
     return alphas
 
 
-def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, float]]:
+def _tiered_coupled(
+    resources, tasks, active, solver, *, allow_native: bool = True,
+) -> dict[str, dict[int, float]]:
     """Strict priority tiers solved collectively against per-unit residuals.
 
     Coupled contenders in one tier are never clipped independently: the whole
@@ -424,14 +527,10 @@ def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, flo
     per-unit fill must own the computation to see the owner dimension.
     """
     del solver
-    fast = fast_single_tier_coupled(resources, tasks, active)
+    fast = fast_single_tier_coupled(
+        resources, tasks, active, allow_native=allow_native)
     if fast is not None:
         return fast
-    # One immutable physical ledger for the whole tier walk.  ``orig_capacity``
-    # is the per-unit capacity declared by the resource; ``cumulative_terms`` is
-    # the single shared list of every committed ``alpha * weight`` term from all
-    # priority tiers.  Residuals are always ``orig - math.fsum(all terms)``, so
-    # a rounded per-tier remainder can never become the next tier's capacity.
     orig_capacity = {
         name: [float(resource.rate) / max(1, int(resource.units))]
         * max(1, int(resource.units))
@@ -440,16 +539,10 @@ def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, flo
         name: [[] for _unit in units] for name, units in orig_capacity.items()}
     unit_remaining = {name: list(units) for name, units in orig_capacity.items()}
     result: dict[str, dict[int, float]] = {}
-    # FIFO ownership is non-preemptive across every priority tier: the active
-    # holder owns its physical queue until it retires.  Only waiting tasks are
-    # ordered by priority for the *next* admission.
     fifo_winners = {
         name: min((key for key in active
                    if tasks[key].remaining.get(name, 0.0) > 0.0),
-                  key=lambda key: (
-                      tasks[key].start is None,
-                      tasks[key].start if tasks[key].start is not None else math.inf,
-                      tasks[key].priority, key))
+                  key=lambda key, rname=name: _fifo_rank(tasks, key, rname))
         for name, resource in resources.items()
         if resource.policy == "fifo"
         and any(tasks[key].remaining.get(name, 0.0) > 0.0 for key in active)}
@@ -461,18 +554,26 @@ def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, flo
                             fifo_winners)
         if not flows:
             continue
+        committed_tier: list[dict[tuple[str, int], float]] = []
         alphas = _progressive_unit_fill(
             flows, unit_remaining, orig_capacity=orig_capacity,
-            cumulative_terms=cumulative_terms)
+            cumulative_terms=cumulative_terms, committed_out=committed_tier)
         for index, alpha in enumerate(alphas):
+            flow = flows[index]
+            key = flow[0]
+            if (not flow[1] and len(flow) > _FLOW_UNPLACED_IDX
+                    and flow[_FLOW_UNPLACED_IDX]):
+                rate_val = math.fsum(committed_tier[index].values())
+                if rate_val > 0.0:
+                    name = flow[4][0][0]
+                    target = result.setdefault(name, {})
+                    target[key] = target.get(key, 0.0) + rate_val
+                continue
             if alpha <= 0.0:
                 continue
-            key, _coupled, _limit, _terms, rates = flows[index]
-            for name, demand in rates:
+            for name, demand in flow[4]:
                 target = result.setdefault(name, {})
                 target[key] = target.get(key, 0.0) + alpha * demand
-    # Independent all-tier guard: the exact sum of every committed term from
-    # every priority tier may never exceed the original physical unit capacity.
     for name, units in cumulative_terms.items():
         for unit, terms in enumerate(units):
             total = math.fsum(terms)
@@ -512,76 +613,188 @@ def _lockstep_coupled(result: dict[str, dict[int, float]], tasks) -> None:
                 result[name][key] = scaled
 
 
-def _residual_unit_rates(unit_remaining: list[float],
-                         caps: Mapping[int, float],
-                         placements: Mapping[int, tuple[int, ...]],
-                         explicit: set[int] | None = None
-                         ) -> dict[int, float]:
-    """Max-min with a distinct residual capacity on each physical unit.
+def _tighten_residual_step(delta: float, active, units, result, base_result,
+                           base_committed, committed, caps, count: int,
+                           orig_cap: list[float], cumulative_terms: list[list[float]]):
+    """Tighten ``delta`` so every unit's exact ``fsum`` stays within ``orig_cap``."""
+    blocking: set[int] = set()
+    for attempt in range(_MAX_ATTEMPTS):
+        if delta <= 0.0:
+            return 0.0, None, blocking
+        by_unit: list[list[float]] = [[] for _ in range(count)]
+        for key, comm_map in committed.items():
+            is_act = key in active
+            if is_act:
+                next_r = min(caps[key], result[key] + delta)
+                u_list = units[key]
+                n_u = len(u_list)
+                br = base_result[key]
+                step_u = (next_r - br) / n_u
+                for u, val in comm_map.items():
+                    if u in u_list:
+                        by_unit[u].append(base_committed[key].get(u, 0.0) + step_u)
+                    elif val > 0.0:
+                        by_unit[u].append(val)
+                for u in u_list:
+                    if u not in comm_map:
+                        by_unit[u].append(base_committed[key].get(u, 0.0) + step_u)
+            else:
+                for u, val in comm_map.items():
+                    if val > 0.0:
+                        by_unit[u].append(val)
+        failed = {
+            u for u in range(count)
+            if math.fsum(cumulative_terms[u] + by_unit[u]) > orig_cap[u]
+        }
+        if not failed:
+            return delta, by_unit, blocking
+        blocking = failed
+        delta = math.nextafter(delta, 0.0) if attempt < _NEXTAFTER_STEPS else delta * 0.5
+    return 0.0, None, blocking
 
-    Unplaced (fanned-out) tasks may consume only units that still have
-    residual capacity.  When such a unit saturates, a fanned task redistributes
-    over its remaining available units; an explicitly pinned task instead ends
-    its allocation because it cannot borrow a sibling unit.
-    """
+
+def _residual_unit_rates(unit_remaining: list[float],
+                         caps: Mapping,
+                         placements: Mapping,
+                         explicit: set | None = None,
+                         *,
+                         orig_capacity: list[float] | None = None,
+                         cumulative_terms: list[list[float]] | None = None
+                         ) -> dict:
+    """Max-min with a distinct residual capacity on each physical unit."""
     count = len(unit_remaining)
     explicit = set(explicit or ())
-    tolerance = 1e-12
+    orig_cap = [float(v) for v in (orig_capacity if orig_capacity is not None else unit_remaining)]
+    cum_terms = cumulative_terms if cumulative_terms is not None else [[] for _ in range(count)]
     result = dict.fromkeys(caps, 0.0)
-    units: dict[int, list[int]] = {}
+    base_result = dict.fromkeys(caps, 0.0)
+    base_committed: dict = {key: {} for key in caps}
+    committed: dict = {key: {} for key in caps}
+    units: dict = {}
     for key in caps:
         declared = placements.get(key)
         if declared is None:
-            units[key] = [unit for unit in range(count)
-                          if unit_remaining[unit] > tolerance]
+            units[key] = [unit for unit in range(count) if unit_remaining[unit] > 0.0]
         else:
             owned = [unit for unit in declared if 0 <= unit < count]
-            if any(unit_remaining[unit] <= tolerance for unit in owned):
-                units[key] = []
-            else:
-                units[key] = owned
-    active = {key for key in caps
-              if caps[key] > 0.0 and units[key]}
+            units[key] = ([] if any(unit_remaining[unit] <= 0.0 for unit in owned) else owned)
+    active = {key for key in caps if caps[key] > 0.0 and units[key]}
+    tier_saturated: set[int] = set()
     while active:
         slopes: dict[int, float] = {}
         for unit in range(count):
-            if unit_remaining[unit] <= tolerance:
+            if unit_remaining[unit] <= 0.0:
                 continue
-            slope = 0.0
-            for key in active:
-                if unit in units[key]:
-                    slope += 1.0 / len(units[key])
-            if slope > 0.0:
-                slopes[unit] = slope
+            weights = [1.0 / len(units[key]) for key in active if unit in units[key]]
+            if weights:
+                slope = math.fsum(weights)
+                if slope > 0.0:
+                    slopes[unit] = slope if len(weights) == 1 else math.nextafter(slope, math.inf)
         if not slopes:
             break
-        bounds = {unit: unit_remaining[unit] / slope
-                  for unit, slope in slopes.items()}
-        delta = min(min(bounds.values()),
-                    min(caps[key] - result[key] for key in active))
-        if delta <= tolerance or not math.isfinite(delta):
+        bounds = {unit: unit_remaining[unit] / slope for unit, slope in slopes.items()}
+        headrooms = {key: caps[key] - result[key] for key in active}
+        min_hr = min(headrooms.values())
+        raw_delta = min(min(bounds.values()), min_hr)
+        if not math.isfinite(raw_delta) or raw_delta < 0.0:
             break
-        for key in active:
-            result[key] += delta
-        for unit, slope in slopes.items():
-            unit_remaining[unit] = max(0.0, unit_remaining[unit] - delta * slope)
-        saturated = {unit for unit, bound in bounds.items()
-                     if bound <= delta + tolerance}
+        delta, by_unit, blocking = _tighten_residual_step(
+            raw_delta, active, units, result, base_result, base_committed,
+            committed, caps, count, orig_cap, cum_terms,
+        )
+        advanced = False
+        if delta > 0.0 and by_unit is not None:
+            for key in active:
+                nv = min(caps[key], result[key] + delta)
+                if nv != result[key]:
+                    advanced = True
+                result[key] = nv
+                u_list = units[key]
+                step_u = (nv - base_result[key]) / len(u_list)
+                for u in u_list:
+                    committed[key][u] = base_committed[key].get(u, 0.0) + step_u
+        saturated: set[int] = set()
+        for unit in slopes:
+            tier_vals = [committed[k].get(unit, 0.0) for k in committed if committed[k].get(unit, 0.0) > 0.0]
+            rem = orig_cap[unit] - math.fsum(cum_terms[unit] + tier_vals)
+            has_uncapped = any(
+                unit in units[k] and result[k] < caps[k] - (
+                    _CAP_ULPS * math.ulp(max(abs(caps[k]), abs(result[k])))
+                    if math.isfinite(caps[k]) else 0.0)
+                for k in active
+            )
+            unit_bound = rem <= 0.0 or (
+                (unit in blocking or has_uncapped)
+                and rem <= _unit_sat_tol(orig_cap[unit], rem)
+            )
+            if unit_bound:
+                unit_remaining[unit] = 0.0
+                saturated.add(unit)
+                tier_saturated.add(unit)
+            else:
+                unit_remaining[unit] = rem
+        progressed = False
         for key in list(active):
-            if result[key] >= caps[key] - tolerance:
+            cap_k = caps[key]
+            cap_tol = (_CAP_ULPS * math.ulp(max(abs(cap_k), abs(result[key])))
+                       if math.isfinite(cap_k) else 0.0)
+            if result[key] >= cap_k - cap_tol or (not advanced and headrooms[key] <= min_hr + cap_tol):
                 active.discard(key)
+                progressed = True
                 continue
-            hit = [unit for unit in saturated if unit in units[key]]
-            if not hit:
+            if not any(unit in saturated for unit in units[key]):
                 continue
+            progressed = True
             if key in explicit:
                 active.discard(key)
             else:
-                units[key] = [unit for unit in units[key]
-                              if unit not in saturated]
+                units[key] = [unit for unit in units[key] if unit not in saturated]
                 if not units[key]:
                     active.discard(key)
+                else:
+                    base_result[key] = result[key]
+                    for u in units[key]:
+                        base_committed[key][u] = committed[key].get(u, 0.0)
+        if not progressed:
+            break
+    for unit in range(count):
+        tier_vals = [committed[k].get(unit, 0.0) for k in committed if committed[k].get(unit, 0.0) > 0.0]
+        if tier_vals:
+            cum_terms[unit].extend(tier_vals)
+        unit_remaining[unit] = (
+            0.0 if unit in tier_saturated
+            else max(0.0, orig_cap[unit] - math.fsum(cum_terms[unit]))
+        )
     return result
+
+
+def _expand_simple_tier(tasks, tier, name: str, count: int,
+                        available: tuple[int, ...], unit_remaining: list[float]):
+    """Build placement/cap maps for one fair tier, expanding ``cohort_size > 1``."""
+    has_cohort = any(getattr(tasks[key], "cohort_size", 1) > 1 for key in tier)
+    placements: dict = {}
+    explicit: set = set()
+    scoped: dict = {}
+    for key, cap in tier.items():
+        task = tasks[key]
+        cohort = max(1, int(getattr(task, "cohort_size", 1) or 1)) if has_cohort else 1
+        entries = (
+            tuple(((key, idx), cap / cohort, m_decl)
+                  for idx, m_decl in enumerate(_member_placements(task, name, cohort)))
+            if has_cohort else ((key, cap, task.placement.get(name)),)
+        )
+        for c_key, c_cap, declared in entries:
+            if declared is None:
+                placements[c_key] = available
+                scoped[c_key] = c_cap
+                continue
+            owned = tuple(unit for unit in declared if 0 <= unit < count)
+            if not owned or any(unit_remaining[unit] <= 0.0 for unit in owned):
+                continue
+            placements[c_key] = owned
+            explicit.add(c_key)
+            scoped[c_key] = c_cap
+    return scoped, placements, explicit, has_cohort
 
 
 def _tiered_simple(resources, tasks, active) -> dict[str, dict[int, float]]:
@@ -604,35 +817,21 @@ def _tiered_simple(resources, tasks, active) -> dict[str, dict[int, float]]:
     for name, caps in contenders.items():
         resource = resources[name]
         count = max(1, int(resource.units))
-        unit_remaining = [float(resource.rate) / count] * count
+        orig_caps = [float(resource.rate) / count] * count
+        unit_remaining = list(orig_caps)
+        cumulative_terms: list[list[float]] = [[] for _ in range(count)]
         shares: dict[int, float] = {}
 
-        def consume(key: int, rate: float, units: tuple[int, ...]) -> None:
-            if not units:
-                return
-            share = rate / len(units)
-            for unit in units:
-                if 0 <= unit < count:
-                    unit_remaining[unit] = max(0.0, unit_remaining[unit] - share)
-
         if resource.policy == "fifo":
-            # Non-preemptive: the active holder is the unique owner.  Priority
-            # only selects among tasks that have not started yet.
             eligible = {key: cap for key, cap in caps.items() if cap > 0.0}
             if eligible:
-                winner = min(eligible, key=lambda key: (
-                    tasks[key].start is None,
-                    tasks[key].start if tasks[key].start is not None else math.inf,
-                    tasks[key].priority, key))
+                winner = min(eligible, key=lambda key, rname=name: _fifo_rank(tasks, key, rname))
                 declared = tasks[winner].placement.get(name)
-                placements = ({winner: declared} if declared is not None
-                              else {winner: None})
-                # ``_residual_unit_rates`` already debits the exact per-unit
-                # residual; consuming the returned rate again double-charged
-                # the physical owner.
+                placements = {winner: declared}
                 tier_shares = _residual_unit_rates(
                     unit_remaining, {winner: eligible[winner]}, placements,
-                    {winner} if declared is not None else set())
+                    {winner} if declared is not None else set(),
+                    orig_capacity=orig_caps, cumulative_terms=cumulative_terms)
                 rate = tier_shares.get(winner, 0.0)
                 if rate > 0.0:
                     shares[winner] = rate
@@ -640,50 +839,43 @@ def _tiered_simple(resources, tasks, active) -> dict[str, dict[int, float]]:
             continue
         for _priority, tier_keys in _priority_tiers(caps, tasks).items():
             tier = {key: caps[key] for key in tier_keys if caps[key] > 0.0}
-            remaining = sum(unit_remaining)
+            remaining = math.fsum(unit_remaining)
             if not tier or remaining <= 0.0:
                 continue
             available = tuple(unit for unit in range(count)
-                              if unit_remaining[unit] > 1e-12)
+                              if unit_remaining[unit] > 0.0)
             if not available:
                 break
-            placements: dict[int, tuple[int, ...]] = {}
-            explicit: set[int] = set()
-            for key in tier:
-                declared = tasks[key].placement.get(name)
-                if declared is None:
-                    placements[key] = available
-                    continue
-                owned = tuple(unit for unit in declared if 0 <= unit < count)
-                if any(unit_remaining[unit] <= 1e-12 for unit in owned):
-                    # Its exact owner is exhausted; it cannot borrow a peer's
-                    # residual capacity in this tier.
-                    continue
-                placements[key] = owned
-                explicit.add(key)
+            scoped, placements, explicit, has_cohort = _expand_simple_tier(
+                tasks, tier, name, count, available, unit_remaining)
             if not placements:
                 continue
-            scoped = {key: tier[key] for key in placements}
-            uniform = max(unit_remaining) - min(unit_remaining) <= 1e-9
+            max_u = max(unit_remaining)
+            uniform = max_u - min(unit_remaining) <= _SAT_ULPS * math.ulp(max_u)
             if uniform and not explicit:
-                # Preserve the exact aggregate fair-fill arithmetic when every
-                # unit is equally free and every contender fans out uniformly.
                 tier_shares = fair_rates(remaining, scoped)
-                debit = consume
-            elif uniform:
-                tier_shares = unit_rates(remaining, count, scoped, placements)
-                debit = consume
+                tier_sat = any(rate < scoped[c_key] for c_key, rate in tier_shares.items())
+                for c_key, rate in tier_shares.items():
+                    if rate > 0.0:
+                        orig_key = c_key[0] if has_cohort else c_key
+                        shares[orig_key] = shares.get(orig_key, 0.0) + rate
+                        u_tuple = placements.get(c_key, available)
+                        per_u = rate / len(u_tuple)
+                        for u in u_tuple:
+                            cumulative_terms[u].append(per_u)
+                for u in available:
+                    unit_remaining[u] = (
+                        0.0 if tier_sat
+                        else max(0.0, orig_caps[u] - math.fsum(cumulative_terms[u]))
+                    )
             else:
-                # The residual allocator debits each unit itself, exactly once.
                 tier_shares = _residual_unit_rates(
-                    unit_remaining, scoped, placements, explicit)
-                debit = None
-            for key, rate in tier_shares.items():
-                if rate > 0.0:
-                    shares[key] = shares.get(key, 0.0) + rate
-                    if debit is not None:
-                        debit(key, rate, placements.get(
-                            key, tuple(range(count))))
+                    unit_remaining, scoped, placements, explicit,
+                    orig_capacity=orig_caps, cumulative_terms=cumulative_terms)
+                for c_key, rate in tier_shares.items():
+                    if rate > 0.0:
+                        orig_key = c_key[0] if has_cohort else c_key
+                        shares[orig_key] = shares.get(orig_key, 0.0) + rate
         result[name] = {key: rate for key, rate in shares.items() if rate > 0.0}
     return result
 

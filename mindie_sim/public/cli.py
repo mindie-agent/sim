@@ -86,6 +86,8 @@ def extensions_main(argv: Sequence[str] | None = None, *,
             payload = context.describe(extension_id=args.id)
             payload["inspection"] = {"id": args.id}
         return _emit(payload, args.output)
+    except TimeoutError:
+        raise
     except (ExtensionError, OSError, ValueError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
         return 2
@@ -109,6 +111,8 @@ def profile_main(argv: Sequence[str] | None = None, *,
     try:
         profile = load_user_profile(args.file, profile_id=args.profile_id)
         return _emit(profile.describe(), args.output)
+    except TimeoutError:
+        raise
     except (ExtensionError, OSError, ValueError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
         return 2
@@ -123,13 +127,6 @@ def public_main(argv: Sequence[str] | None = None, *,
             "error": "public_command_requires:" + ",".join(sorted(PUBLIC_COMMANDS)),
         }), file=sys.stderr)
         return 2
-    command, rest = args[0], args[1:]
-    if command == "profile":
-        return profile_main(rest, prog=prog + " profile")
-    if command == "structure":
-        from ..structure import main as structure_main
-        return structure_main(rest)
-    if command == "compare-cohorts":
-        from ..cohort_comparison import main as cohorts_main
-        return cohorts_main(rest)
-    return extensions_main(rest, prog=prog + " extensions")
+    from ..cli import _main
+
+    return _main(args, prog=prog)

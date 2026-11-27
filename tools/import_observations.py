@@ -12,7 +12,7 @@ from pathlib import Path
 
 from mindie_sim.observations.captures import capture_inventory, iter_observations
 from mindie_sim.observations.comparison import comparison_report
-from mindie_sim.observations.store import json_items
+from mindie_sim.observations.captures import json_items
 
 
 def main(argv=None):

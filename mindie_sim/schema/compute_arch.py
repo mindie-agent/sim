@@ -20,6 +20,9 @@ from dataclasses import dataclass, field
 import math
 
 from .common import ModelingError
+from .compute_arch_presets import CAPABILITY_PRESETS
+from .compute_peak_aliases import canonical_format
+from .device_input import HBM_CACHELINE_SERVICE
 
 
 REPRESENTATION_ROLES = frozenset({"storage", "transfer", "operand", "accumulator"})
@@ -29,10 +32,6 @@ STORAGE_DOMAINS = frozenset({
     "gm", "hbm", "l1", "l0a", "l0b", "l0c", "ub", "ssbuffer", "reg",
 })
 
-_FORMAT_ALIASES = {
-    "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
-    "float8_e4m3": "fp8_e4m3", "float8_e5m2": "fp8_e5m2",
-}
 _CAPABILITY_MAP_FIELDS = (
     "instruction_services", "representations", "native_compute", "casts",
     "paths", "runtimes",
@@ -51,11 +50,6 @@ def _positive_int(value, reason):
     return value
 
 
-def _format(value):
-    name = _text(value, "representation_format_invalid")
-    return _FORMAT_ALIASES.get(name, name)
-
-
 @dataclass(frozen=True)
 class InstructionService:
     name: str
@@ -67,6 +61,10 @@ class InstructionService:
     resource: str | None = None
     clock_hz: float | None = None
     cycles_per_unit: float | None = None
+
+    @property
+    def has_linked_supply(self) -> bool:
+        return bool(self.scale_with or self.clock_hz is not None or self.name == HBM_CACHELINE_SERVICE)
 
     def to_dict(self):
         supply = ({"clock_hz": self.clock_hz, "cycles_per_unit": self.cycles_per_unit}
@@ -117,11 +115,11 @@ class NativeComputeMode:
     provenance: object = field(default_factory=dict)
 
     def accepts(self, operand: str, accumulator: str | None = None) -> bool:
-        if _format(operand) not in self.operands and operand not in self.operands:
+        if canonical_format(operand) not in self.operands and operand not in self.operands:
             return False
         if accumulator is None:
             return True
-        return _format(accumulator) in self.accumulators
+        return canonical_format(accumulator) in self.accumulators
 
     def to_dict(self):
         return {"kind": self.kind, "operands": list(self.operands),
@@ -178,9 +176,9 @@ class DataPath:
 
     def supports(self, representation: str,
                  registry: dict[str, RepresentationCapability]) -> bool:
-        name = _format(representation)
-        if self.representations:
-            return name in self.representations
+        name = canonical_format(representation)
+        if self.representations and name not in self.representations:
+            return False
         declared = registry.get(name) or registry.get(representation)
         if declared is None:
             return False
@@ -228,8 +226,13 @@ class ComputeArchSpec:
     casts: tuple[CastCapability, ...] = ()
     paths: tuple[DataPath, ...] = ()
     runtimes: tuple[RuntimeCapability, ...] = ()
+    clock_hz: float | None = None
 
     # ---- capability queries ------------------------------------------------
+    @property
+    def declared(self) -> bool:
+        return bool(self.preset or self.clock_hz or self.instruction_services or self.has_capabilities())
+
     def has_capabilities(self) -> bool:
         return bool(self.representations or self.native_modes or self.casts
                     or self.paths or self.runtimes)
@@ -238,7 +241,7 @@ class ComputeArchSpec:
         return bool(self.native_modes)
 
     def representation(self, name: str) -> RepresentationCapability:
-        wanted = _format(name)
+        wanted = canonical_format(name)
         for item in self.representations:
             if item.name == wanted:
                 return item
@@ -312,14 +315,14 @@ class ComputeArchSpec:
             + ":" + runtime.name)
 
     def cast_rule(self, source: str, target: str) -> CastCapability | None:
-        wanted = (_format(source), _format(target))
+        wanted = (canonical_format(source), canonical_format(target))
         for item in self.casts:
             if (item.source, item.target) == wanted:
                 return item
         return None
 
     def can_cast(self, source: str, target: str) -> bool:
-        if _format(source) == _format(target):
+        if canonical_format(source) == canonical_format(target):
             try:
                 self.representation(source)
                 return True
@@ -395,6 +398,14 @@ class ComputeArchSpec:
             preset_name = str(preset_name)
         else:
             effective = declared
+        raw_clock = effective.get("clock_hz")
+        clock_hz: float | None = None
+        if raw_clock is not None:
+            if isinstance(raw_clock, bool) or not isinstance(raw_clock, (int, float)):
+                raise ModelingError(f"compute_arch_clock_hz_invalid:{raw_clock}")
+            clock_hz = float(raw_clock)
+            if not math.isfinite(clock_hz) or clock_hz <= 0.0:
+                raise ModelingError(f"compute_arch_clock_hz_invalid:{raw_clock}")
         services = _parse_instruction_services(effective.get("instruction_services", {}))
         representations = _parse_representations(effective.get("representations", {}))
         native_modes = _parse_native_modes(effective.get("native_compute", {}))
@@ -410,6 +421,7 @@ class ComputeArchSpec:
             paths=tuple(sorted(paths, key=lambda item: (item.source, item.target,
                                                         item.name))),
             runtimes=tuple(sorted(runtimes, key=lambda item: item.name)),
+            clock_hz=clock_hz,
         )
         spec._validate_declarations()
         return spec
@@ -448,6 +460,8 @@ class ComputeArchSpec:
                 if name not in registry:
                     raise ModelingError(
                         f"data_path_representation_missing:{item.name}:{name}")
+                if not item.supports(name, registry):
+                    raise ModelingError(f"data_path_representation_role_mismatch:{item.name}:{name}")
         for item in self.casts:
             if item.source not in registry or item.target not in registry:
                 raise ModelingError(
@@ -499,6 +513,8 @@ class ComputeArchSpec:
         result = {}
         if self.preset:
             result["preset"] = self.preset
+        if self.clock_hz is not None:
+            result["clock_hz"] = self.clock_hz
         if self.instruction_services:
             result["instruction_services"] = {
                 item.name: item.to_dict() for item in self.instruction_services}
@@ -522,7 +538,7 @@ class ComputeArchSpec:
 def _validate_peak_formats(peaks, modes) -> None:
     matrix = tuple(mode for mode in modes if mode.kind == "matrix")
     for dtype in peaks:
-        aliases = {dtype, _format(dtype)}
+        aliases = {dtype, canonical_format(dtype)}
         covered = any(alias in mode.operands for mode in matrix for alias in aliases)
         if not covered:
             raise ModelingError(f"compute_peak_without_native_compute_mode:{dtype}")
@@ -576,7 +592,7 @@ def _parse_representations(raw):
         if not roles or not set(roles) <= REPRESENTATION_ROLES:
             raise ModelingError(f"representation_roles_invalid:{name}")
         result.append(RepresentationCapability(
-            _format(name),
+            canonical_format(name),
             _positive_int(item.get("bits"), f"representation_bits_invalid:{name}"),
             roles,
             _positive_int(item.get("alignment_bytes", 1),
@@ -594,9 +610,9 @@ def _parse_native_modes(raw):
         if not isinstance(item, Mapping):
             raise ModelingError(f"native_compute_mapping_required:{name}")
         kind = _text(item.get("kind"), f"native_compute_kind_invalid:{name}")
-        operands = tuple(sorted({_format(value)
+        operands = tuple(sorted({canonical_format(value)
                                  for value in item.get("operands", ())}))
-        accumulators = tuple(sorted({_format(value)
+        accumulators = tuple(sorted({canonical_format(value)
                                      for value in item.get("accumulators", ())}))
         if not operands:
             raise ModelingError(f"native_compute_operands_required:{name}")
@@ -617,8 +633,8 @@ def _parse_casts(raw):
     for name, item in raw.items():
         if not isinstance(item, Mapping):
             raise ModelingError(f"cast_mapping_required:{name}")
-        source = _format(item.get("source", ""))
-        target = _format(item.get("target", ""))
+        source = canonical_format(item.get("source", ""))
+        target = canonical_format(item.get("target", ""))
         if not source or not target or source == target:
             raise ModelingError(f"cast_requires_distinct_representations:{name}")
         result.append(CastCapability(
@@ -653,7 +669,7 @@ def _parse_paths(raw):
             str(item.get("sync", "pipe")),
             _positive_int(item.get("alignment_bytes", 1),
                           f"path_alignment_invalid:{name}"),
-            tuple(sorted({_format(value)
+            tuple(sorted({canonical_format(value)
                           for value in item.get("representations", ())})),
             deepcopy(item.get("provenance", {})),
         ))
@@ -679,214 +695,6 @@ def _parse_runtimes(raw):
             deepcopy(item.get("provenance", {})),
         ))
     return result
-
-
-def _prov(kind, architecture, basis, source):
-    return {"kind": kind, "architecture": architecture, "basis": basis,
-            "source": source}
-
-
-_2201_SOURCE = "registered A2/A3 profile npu_arch=2201 and design 4.7"
-_3510_SOURCE = ("data/observations/sources/arch3510-physical-services/"
-                "platform-units/npu_arch_3510.md")
-_COMMON_FORMATS = ("bf16", "fp16", "fp32")
-
-
-def _storage_representations(architecture, source, *, fp8_operand,
-                            int4_operand):
-    """Payload formats every family stores/transfers; operand roles differ."""
-    result = {}
-    for name, bits, roles in (
-        ("bf16", 16, ("storage", "transfer", "operand", "accumulator")),
-        ("fp16", 16, ("storage", "transfer", "operand", "accumulator")),
-        ("fp32", 32, ("storage", "transfer", "operand", "accumulator")),
-        ("hf32", 32, ("storage", "transfer", "operand")),
-        ("int8", 8, ("storage", "transfer", "operand")),
-        ("int4", 4, (("storage", "transfer", "operand") if int4_operand
-                     else ("storage", "transfer"))),
-        ("int32", 32, ("storage", "transfer", "accumulator")),
-        ("u8", 8, ("storage", "transfer")),
-        ("s8", 8, ("storage", "transfer")),
-        ("u16", 16, ("storage", "transfer")),
-        ("s16", 16, ("storage", "transfer")),
-        ("u32", 32, ("storage", "transfer")),
-        ("s32", 32, ("storage", "transfer")),
-    ):
-        result[name] = {"bits": bits, "roles": list(roles),
-                        "alignment_bytes": max(1, bits // 8),
-                        "provenance": _prov("payload_format", architecture,
-                                            "payload storage/transfer role", source)}
-    fp8_roles = ("storage", "transfer", "operand") if fp8_operand else (
-        "storage", "transfer")
-    for name in ("fp8", "fp8_e4m3", "fp8_e5m2"):
-        result[name] = {"bits": 8, "roles": list(fp8_roles), "alignment_bytes": 1,
-                        "provenance": _prov(
-                            "payload_format", architecture,
-                            ("8-bit payload may be stored/transferred; native FP8 "
-                             "matrix is a separate declared mode")
-                            if not fp8_operand else "native FP8 operand",
-                            source)}
-    return result
-
-
-def _native_machine_modes(architecture, source, *, fp8, int4_operand):
-    modes = {}
-    formats = [
-        ("bf16", "fp32"), ("fp16", "fp32"), ("fp32", "fp32"),
-        ("hf32", "fp32"), ("int8", "int32"),
-    ]
-    if int4_operand:
-        # arch2201 converts INT4 k64; arch3510 storage-only INT4 (S4 is not a
-        # native Cube operand) must not become a Cube mode through a peak.
-        formats.append(("int4", "int32"))
-    for operand, accumulator in formats:
-        name = f"{operand}_x_{operand}_acc_{accumulator}"
-        modes[name] = {"kind": "matrix", "operands": [operand],
-                       "accumulators": [accumulator], "unit": "cube",
-                       "provenance": _prov("native_matrix_mode", architecture,
-                                           "native matrix operand/accumulator",
-                                           source)}
-    if fp8:
-        for operand in ("fp8_e4m3", "fp8_e5m2"):
-            name = f"{operand}_x_{operand}_acc_fp32"
-            modes[name] = {"kind": "matrix",
-                           "operands": [operand, "fp8"],
-                           "accumulators": ["fp32"], "unit": "cube",
-                           "provenance": _prov(
-                               "native_matrix_mode", architecture,
-                               "native FP8 matrix operand; FP32 accumulator is "
-                               "the declared profile condition (source lists "
-                               "operand formats only)", source)}
-    return modes
-
-
-def _casts(architecture, source_ref):
-    return {
-        f"{source_format}->{target}": {
-            "source": source_format, "target": target,
-            "lossless": lossless,
-            "provenance": _prov(
-                "declared_element_conversion", architecture,
-                "representation conversion only; no selected kernel, runtime "
-                "implementation or rate is claimed", source_ref)}
-        for source_format, target, lossless in (
-            ("bf16", "fp32", True), ("fp32", "bf16", False),
-            ("fp16", "fp32", True), ("fp32", "fp16", False),
-            ("bf16", "fp16", False), ("fp16", "bf16", False),
-            ("hf32", "fp32", True), ("fp32", "hf32", False),
-        )
-    }
-
-
-def _path(name, source, target, roles, *, unit="", executor="", reach=(),
-          buffer="", sync="pipe", alignment=1, representation_provenance=None):
-    item = {"source": source, "target": target, "roles": list(roles),
-            "sync": sync, "alignment_bytes": alignment}
-    if unit:
-        item["unit"] = unit
-    if executor:
-        item["executor"] = executor
-    if reach:
-        item["reach"] = list(reach)
-    if buffer:
-        item["buffer"] = buffer
-    item["provenance"] = representation_provenance
-    return item
-
-
-def _paths_2201():
-    source = _prov("directional_data_path", "npu_arch_2201",
-                   "registration of the legacy direct-route set", _2201_SOURCE)
-    paths = {}
-    for name, src, dst, roles, unit, executor, reach, buffer, align in (
-        ("gm->l1", "gm", "l1", ("storage", "transfer"),
-         "mte2_aic", "aic", ("aic",), "l1", 1),
-        ("gm->ub", "gm", "ub", ("storage", "transfer"),
-         "mte2_aiv", "aiv", ("aiv",), "ub", 1),
-        ("ub->gm", "ub", "gm", ("storage", "transfer"),
-         "mte3", "aiv", ("aiv",), "", 1),
-        ("l1->l0a", "l1", "l0a", ("operand",), "mte1", "aic", ("aic",), "l0a", 1),
-        ("l1->l0b", "l1", "l0b", ("operand",), "mte1", "aic", ("aic",), "l0b", 1),
-        ("l0c->gm", "l0c", "gm", ("accumulator",),
-         "fixpipe", "aic", ("aic",), "", 1),
-        ("l0c->l1", "l0c", "l1", ("accumulator",),
-         "fixpipe", "aic", ("aic",), "l1", 1),
-        # 2201 expresses C/V exchange through GM; these direct routes exist.
-        ("gm->l0a", "gm", "l0a", ("operand",),
-         "mte2_aic", "aic", ("aic",), "l0a", 1),
-        ("gm->l0b", "gm", "l0b", ("operand",),
-         "mte2_aic", "aic", ("aic",), "l0b", 1),
-        # Existence is declared; this legacy route has no registered service.
-        ("l1->gm", "l1", "gm", ("storage", "transfer"), "", "", (), "", 1),
-    ):
-        paths[name] = _path(name, src, dst, roles, unit=unit, executor=executor,
-                            reach=reach, buffer=buffer, alignment=align,
-                            representation_provenance=source)
-    return paths
-
-
-def _paths_3510():
-    source = _prov("directional_data_path", "npu_arch_3510",
-                   "sourced L0C->UB and UB->L1 additions; GM->L0A/L0B and "
-                   "L1->GM removed", _3510_SOURCE)
-    align = {"gm": 1, "l1": 32, "l0a": 512, "l0b": 512, "l0c": 64, "ub": 32}
-    paths = {}
-    for name, src, dst, roles, unit, executor, reach, buffer, sync in (
-        ("gm->l1", "gm", "l1", ("storage", "transfer"),
-         "mte2_aic", "aic", ("aic",), "l1", "pipe"),
-        ("gm->ub", "gm", "ub", ("storage", "transfer"),
-         "mte2_aiv", "aiv", ("aiv",), "ub", "pipe"),
-        ("ub->gm", "ub", "gm", ("storage", "transfer"),
-         "mte3", "aiv", ("aiv",), "", "pipe"),
-        ("l1->l0a", "l1", "l0a", ("operand",),
-         "mte1", "aic", ("aic",), "l0a", "pipe"),
-        ("l1->l0b", "l1", "l0b", ("operand",),
-         "mte1", "aic", ("aic",), "l0b", "pipe"),
-        # Sourced L1->UB route; the profile binds the shared MTE1 mode at
-        # 128 B/cycle. T07 confirms the final owner/sync/capacity contract.
-        ("l1->ub", "l1", "ub", ("storage", "transfer"),
-         "mte1_l1_ub", "aic", ("aic", "aiv"), "ub", "event"),
-        ("l0c->gm", "l0c", "gm", ("accumulator",),
-         "fixpipe", "aic", ("aic",), "", "pipe"),
-        ("l0c->l1", "l0c", "l1", ("accumulator",),
-         "fixpipe", "aic", ("aic",), "l1", "pipe"),
-        ("l0c->ub", "l0c", "ub", ("accumulator",),
-         "fixpipe", "aic", ("aic", "aiv"), "ub", "event"),
-        ("ub->l1", "ub", "l1", ("storage", "transfer"),
-         "mte3", "aiv", ("aic", "aiv"), "l1", "event"),
-    ):
-        paths[name] = _path(
-            name, src, dst, roles, unit=unit, executor=executor, reach=reach,
-            buffer=buffer, sync=sync,
-            alignment=max(align[src], align[dst]),
-            representation_provenance=source)
-    paths["l1->ub"]["provenance"] = _prov(
-        "directional_data_path", "npu_arch_3510",
-        "sourced L1->UB PIPE_MTE1 128 B/cycle route; profile binds shared "
-        "MTE1 mode mte1_l1_ub; final owner/sync/capacity remains T07", _3510_SOURCE)
-    return paths
-
-
-CAPABILITY_PRESETS: dict[str, dict] = {
-    "npu_arch_2201": {
-        "representations": _storage_representations(
-            "npu_arch_2201", _2201_SOURCE, fp8_operand=False,
-            int4_operand=True),
-        "native_compute": _native_machine_modes(
-            "npu_arch_2201", _2201_SOURCE, fp8=False, int4_operand=True),
-        "casts": _casts("npu_arch_2201", _2201_SOURCE),
-        "paths": _paths_2201(),
-    },
-    "npu_arch_3510": {
-        "representations": _storage_representations(
-            "npu_arch_3510", _3510_SOURCE, fp8_operand=True,
-            int4_operand=False),
-        "native_compute": _native_machine_modes(
-            "npu_arch_3510", _3510_SOURCE, fp8=True, int4_operand=False),
-        "casts": _casts("npu_arch_3510", _3510_SOURCE),
-        "paths": _paths_3510(),
-    },
-}
 
 
 __all__ = [

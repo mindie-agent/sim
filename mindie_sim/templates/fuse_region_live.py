@@ -1,0 +1,238 @@
+"""Replay template memory accesses against a live admission view.
+
+[Role] Bind template transfers, track reuse lifetimes and record deliveries.
+[Invariants] An L2 fill becomes readable at its transfer completion.
+[Timeouts & Locks] Engine events sequence dependencies without waits or locks.
+[Side-Effect Policy] Execution updates only the supplied engine and admission view.
+"""
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from dataclasses import dataclass, replace
+from fractions import Fraction
+
+from mindie_sim.prediction.program.stages import KernelProgram, Stage, scope_allocations
+from mindie_sim.prediction.runtime.l2_residency import _dram_segments
+from mindie_sim.prediction.runtime.memory_physics import (
+    AdmissionMemoryView, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey,
+    SectorCoverage,
+)
+from mindie_sim.schema.common import ModelingError
+
+from .contracts import (
+    FuseRegionSpec, FusedRegionSummary, TensorRangeObligation, _entry_with_runs, _logical_obligation,
+    _obligation_runs, _partition_runs, _split_entry_residency, _union_obligations,
+)
+
+
+class _ReuseLifetimes:
+    """Pin each allocation to its producer key through its final access."""
+
+    def __init__(self, state, patterns):
+        self.state = state
+        self.pending = Counter(p.reuse_key for p in patterns if p.reuse_key is not None)
+        self.keys: dict[ReuseKey, tuple[ReuseKey, bool]] = {}
+
+    def resolve(self, pattern):
+        key = pattern.reuse_key
+        if key is None:
+            return pattern
+        if key not in self.keys:
+            resolved = self.state.resolve_reuse_key(key)
+            self.keys[key] = resolved, self.state.retain_template_key(resolved)
+        return replace(pattern, reuse_key=self.keys[key][0])
+
+    def complete(self, key):
+        if key is not None:
+            self.pending[key] -= 1
+            if not self.pending[key]:
+                resolved, owned = self.keys.pop(key)
+                if owned:
+                    self.state.release_template_key(resolved)
+
+    def close(self):
+        for resolved, owned in self.keys.values():
+            if owned:
+                self.state.release_template_key(resolved)
+        self.keys.clear()
+
+
+@dataclass(frozen=True)
+class _BoundTemplateProgram(KernelProgram):
+    """Declare directional admission rows before submitting the bound DAG."""
+
+    hbm_bus: HbmBusSpec | None = None
+    live_state: AdmissionMemoryView | None = None
+    l2_reservation: tuple[int, int, int] | None = None
+    summary: FusedRegionSummary | None = None
+
+    def start(self, engine, name, ready, *, owner=""):
+        bus = self.hbm_bus
+        if bus is not None:
+            present = (bus.row_r in engine.resources, bus.row_w in engine.resources)
+            if not any(present):
+                engine.add_hbm_bus(bus)
+            elif all(present):
+                engine.bind_hbm_bus(bus)
+            else:
+                raise ModelingError("template_directional_hbm_rows_incomplete")
+        if self.live_state is None:
+            return super().start(engine, name, ready, owner=owner)
+        delivered = Counter()
+        lifetimes = _ReuseLifetimes(self.live_state, (
+            stage.program.pattern for stage in self.stages if isinstance(stage.program, _LiveAccess)
+        ))
+        obligations = {"read": [], "write": []}
+        explicit = self.summary.spec if isinstance(self.summary.spec, FuseRegionSpec) else None
+        stages = []
+        for stage in self.stages:
+            if isinstance(stage.program, _LiveAccess):
+                stage = replace(stage, program=replace(stage.program, delivered=delivered, lifetimes=lifetimes,
+                                                       obligations=obligations, explicit=explicit is not None))
+            elif (engine._accel is not None and (stage.acquire or stage.free)
+                    and not (stage.program or stage.work or stage.latency or stage.fragment or stage.deliveries)):
+                scoped = replace(stage, acquire=scope_allocations(name, stage.acquire),
+                                 free=scope_allocations(name, stage.free))
+                stage = Stage(stage.name, after=stage.after, program=_LiveAllocation(f"{name}:{stage.name}", scoped))
+            stages.append(stage)
+        state, key = self.live_state, name + ":l2_reservation"
+        reservation = self.l2_reservation
+        if reservation is not None:
+            die, reserved, capacity = reservation
+
+            def grant(_event):
+                if state.reserved_bytes(die) + reserved > capacity:
+                    raise ModelingError("fuse_region_live_l2_reservation_overflow")
+                state.grant_reservation(die, key, reserved)
+
+            ready = engine.submit(key, after=(ready,), owner=owner, on_complete=grant, native_hook=True)
+        invocation = KernelProgram(tuple(stages))
+        done = invocation.start(engine, name, ready, owner=owner)
+        # Scoped observers are unique to this invocation and cannot reuse a compiled plan.
+        engine._compiled_programs.pop(id(invocation), None)
+
+        def finalize(_event):
+            lifetimes.close()
+            if reservation is not None:
+                state.release_reservation(die, key)
+            reads, writes = obligations["read"], obligations["write"]
+            if explicit is not None:
+                reads = _observed_obligations(explicit.live_in_obligations, reads)
+                writes = _observed_obligations(explicit.live_out_obligations, writes)
+            self.summary._record_delivery(delivered, _union_obligations(reads), _union_obligations(writes))
+
+        return engine.submit(name + ":delivery", after=(done,), owner=owner,
+                             on_complete=finalize, native_hook=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveAllocation:
+    name: str
+    stage: Stage
+
+    def start(self, engine, name, ready, *, owner=""):
+        return engine._submit_allocation_boundary(self.name, self.stage, (ready,), owner=owner)
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveAccess:
+    bound: BoundAccess
+    state: AdmissionMemoryView
+    pattern: MemoryAccessPattern
+    obligation: TensorRangeObligation | None
+    delivered: Counter | None = None
+    lifetimes: _ReuseLifetimes | None = None
+    obligations: dict | None = None
+    explicit: bool = False
+
+    def start(self, engine, name, ready, *, owner=""):
+        def record(ledger, resident, dirty):
+            pattern = self.pattern
+            if self.delivered is not None:
+                if ledger.dram_sector_bytes:
+                    rules = self.bound.bind_config[-2]
+                    curves_by_die = getattr(self.state, "_knee_curves_by_die", None)
+                    has_knee = bool(
+                        curves_by_die.get(pattern.die)
+                        if curves_by_die is not None
+                        else getattr(self.state, "_knee_curve", None)
+                    )
+                    if ledger.dram_bus_transaction_bytes == ledger.dram_sector_bytes:
+                        turnaround = Fraction(ledger.dram_sector_bytes)
+                    elif rules and not has_knee:
+                        cov = resident if ledger.l2_hit_bytes else SectorCoverage()
+                        turnaround = _rational_service(pattern.runs, cov, rules)
+                    else:
+                        turnaround = Fraction(ledger.dram_bus_transaction_bytes)
+                else:
+                    turnaround = 0
+                self.delivered.update({
+                    "logical_transfer_bytes": ledger.logical_tensor_bytes,
+                    "issued_copy_bytes": ledger.aligned_transfer_bytes,
+                    "dram_sector_bytes": ledger.dram_sector_bytes + dirty,
+                    "turnaround_service_bytes": dirty + turnaround,
+                    "realized_l2_hit_bytes": ledger.l2_hit_bytes,
+                    "realized_l2_miss_bytes": ledger.dram_miss_copy_bytes,
+                    "realized_hbm_delivered_bytes": ledger.dram_sector_bytes + dirty,
+                    "dram_bus_service_bytes": ledger.dram_bus_transaction_bytes + dirty,
+                })
+                entry = self.obligation
+                if self.explicit and not pattern.visibility.private_workspace:
+                    entry = _logical_obligation(pattern)
+                if entry is not None:
+                    self.obligations[pattern.direction].extend(_split_entry_residency(entry, resident))
+            self.lifetimes.complete(pattern.reuse_key)
+
+        return engine.submit_bound_access(
+            name, self.bound, after=(ready,), owner=owner, memory_state=self.state,
+            pattern=lambda: self.lifetimes.resolve(self.pattern), on_delivery=record,
+        )
+
+
+def _observed_obligations(declared, observed):
+    """Use observed residency for the covered parts of explicit region obligations."""
+    by_tensor = defaultdict(list)
+    for entry in observed:
+        by_tensor[entry.die, entry.allocation_id, entry.tensor_version].append(entry)
+    for entry in declared:
+        matching = by_tensor[entry.die, entry.allocation_id, entry.tensor_version]
+        if not matching or entry.initial_residency == "onchip_resident":
+            yield entry
+            continue
+        tagged = [(run, None) for run in _obligation_runs(entry)]
+        tagged.extend((run, item.initial_residency) for item in matching for run in _obligation_runs(item))
+        split = defaultdict(list)
+        for residency, run in _partition_runs(tagged, lambda labels: (
+            "hbm_cold" if "hbm_cold" in labels else "l2_warm" if "l2_warm" in labels else entry.initial_residency
+        ) if None in labels else None):
+            split[residency].append(run)
+        for residency, runs in split.items():
+            yield _entry_with_runs(entry, runs, initial_residency=residency)
+
+
+def _rational_service(plan, resident: SectorCoverage, rules):
+    service = Fraction()
+    for sectors, width, stride, run in _dram_segments(plan, resident, burst_rules=rules):
+        if not width or run is None:
+            service += sectors
+            continue
+        granule = Fraction(0)
+        if run.layout in {"scatter", "scattered", "gather", "indexed"}:
+            granule = Fraction(plan.hbm_scatter_row_open_bytes)
+        if run.stride_bytes > run.row_bytes:
+            granule = max(granule, Fraction(plan.hbm_burst_granule_bytes))
+        if rules:
+            penalty = sum((Fraction(str(rule.penalty_bytes)) for rule in rules
+                           if rule.matches(width, stride)), Fraction())
+            if penalty > 0:
+                if granule <= 0:
+                    service += sectors + sectors * penalty / width
+                    continue
+                granule = max(granule, Fraction(width) + penalty)
+        if granule <= run.row_bytes:
+            service += sectors
+        else:
+            wire = run.sector_union_bytes(plan.sector_bytes)
+            rows = run.rows if run.stride_bytes else 1
+            service += sectors * max(Fraction(1), Fraction(rows) * granule / wire)
+    return service

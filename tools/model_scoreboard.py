@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from copy import deepcopy
 from hashlib import file_digest
 import json
@@ -22,10 +23,10 @@ import time
 from mindie_sim.observations.scoreboard import (
     model_scoreboard, prediction_from_probe, render_markdown,
 )
-from mindie_sim.observations.scoreboard_accuracy import (
+from mindie_sim.observations.scoreboard import (
     annotate_kimi_report, render_kimi_markdown,
 )
-from mindie_sim.observations.cohort_scoreboard import (
+from mindie_sim.observations.scoreboard import (
     render_cohort_campaigns, summarize_cohorts,
 )
 
@@ -63,6 +64,31 @@ def run_prediction(spec, *, timeout):
         return read_json(output)
 
 
+def _executed_geometry(geometry, report):
+    """Read the scheduled workload identity from the plans sent to the frontend."""
+    plans = report["iteration"]["plans"]
+    requests = {rank: plan["requests"] for rank, plan in plans.items()}
+    active = {rank: [view for view in rows if not view["padding"]] for rank, rows in requests.items()}
+
+    def uniform(values):
+        unique = sorted(set(values))
+        return unique[0] if len(unique) == 1 else unique
+
+    def replica_counts(counts):
+        return next(iter(counts.values())) if len(set(counts.values())) == 1 else {
+            str(rank): count for rank, count in counts.items()
+        }
+
+    return {
+        **geometry,
+        "tokens": uniform(view["q_len"] + view["draft_proposal_tokens"] for rows in active.values() for view in rows),
+        "context": uniform(view["context"] for rows in active.values() for view in rows),
+        "sequences": replica_counts({rank: len(rows) for rank, rows in requests.items()}),
+        "active_sequences": replica_counts({rank: len(rows) for rank, rows in active.items()}),
+        "padding_sequences": replica_counts({rank: len(rows) - len(active[rank]) for rank, rows in requests.items()}),
+    }
+
+
 def execution_identity(spec, report):
     """Bind comparison facts to the case/geometry actually given to run_probe."""
     from mindie_sim.prediction.structure import parse_case
@@ -74,6 +100,8 @@ def execution_identity(spec, report):
     if case_key != report["effective_case_key"]:
         raise ValueError("scoreboard_worker_case_differs_from_executed_case")
     geometry = {"context": 0, "sequences": 1, "scope": "model", **spec["geometry"]}
+    has_request_views = "request_views" in spec or "request_views" in geometry
+    geometry.pop("request_views", None)
     scheduled = spec.get("driver") in {"scheduled_iteration", "scheduled_prefill"}
     prefill = spec.get("driver") == "scheduled_prefill"
     draft_structure = None
@@ -86,6 +114,14 @@ def execution_identity(spec, report):
             "noncausal_query_block": draft.noncausal_query_block,
             "markov_rank": draft.markov_rank,
         }
+    conditions_geometry = {key: geometry[key] for key in ("phase", "tokens", "context", "sequences")}
+    if scheduled:
+        actual = _executed_geometry(geometry, report)
+        conditions_geometry = {key: actual[key] for key in conditions_geometry}
+        if has_request_views or actual["padding_sequences"] or "active_sequences" in geometry:
+            conditions_geometry.update({key: actual[key] for key in ("active_sequences", "padding_sequences")})
+        # The geometry retains the non-speculative input token count.
+        geometry = {**actual, "tokens": geometry["tokens"]}
     quant = case.model.quant
     return {
         "effective_case_key": case_key, "input_case_sha256": fingerprint(spec["case"]),
@@ -99,9 +135,7 @@ def execution_identity(spec, report):
                 "dies_per_package": case.machine.dies_per_package,
             },
             "parallel": case.runtime.parallel.to_dict(),
-            **{key: geometry[key] for key in ("phase", "tokens", "context", "sequences")},
-            **({"tokens": geometry["tokens"] + spec["proposal_tokens"]}
-               if scheduled and not prefill else {}),
+            **conditions_geometry,
             "precision": {
                 **{key: getattr(quant, key) for key in (
                     "weight_format", "activation_format", "expert_weight_format", "kv_dtype")},
@@ -122,17 +156,60 @@ def execution_identity(spec, report):
     }
 
 
+def _scheduled_plans(spec, participants, *, prefill):
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    geometry = spec["geometry"]
+    supplied = spec.get("request_views", geometry.get("request_views"))
+    if supplied is not None:
+        def as_view(raw):
+            if isinstance(raw, RequestView):
+                return raw
+            fields = dict(raw)
+            kv_len = fields.pop("kv_len", None)
+            if "query_ranges" in fields:
+                fields["query_ranges"] = tuple(tuple(span) for span in fields["query_ranges"])
+            view = RequestView(**fields)
+            if kv_len is not None and kv_len != view.kv_len:
+                raise ValueError("scoreboard_request_view_kv_length_mismatch")
+            return view
+
+        by_rank = ({int(rank): rows for rank, rows in supplied.items()} if isinstance(supplied, Mapping)
+                   else dict.fromkeys(participants, supplied))
+        if set(by_rank) != set(participants):
+            raise ValueError("scoreboard_request_view_replica_mismatch")
+        views = {rank: tuple(as_view(row) for row in by_rank[rank]) for rank in participants}
+    else:
+        padding = geometry.get("padding_sequences", 0)
+        sequences = geometry.get("sequences", geometry.get("active_sequences", 1) + padding)
+        active = geometry.get("active_sequences", sequences - padding)
+        if not 0 <= padding < sequences or active + padding != sequences:
+            raise ValueError("scoreboard_sequence_counts_mismatch")
+        views = {rank: tuple(RequestView(
+            f"r{rank}:{index}", geometry["tokens"], geometry["context"], index < active,
+            geometry["phase"], padding=index >= active, draft_prepare=prefill and index < active,
+            draft_proposal_tokens=spec.get("proposal_tokens", 0) if index < active else 0,
+        ) for index in range(sequences)) for rank in participants}
+
+    for rows in views.values():
+        if any(view.phase != geometry["phase"] for view in rows):
+            raise ValueError("scoreboard_request_view_phase_mismatch")
+        if any(view.padding and (view.samples or view.draft_proposal_tokens or prefill and view.draft_prepare)
+               for view in rows):
+            raise ValueError("scoreboard_padding_view_schedules_active_work")
+    return {rank: IterationPlan(rows) for rank, rows in views.items()}
+
+
 def scheduled_probe(spec):
     """Execute a complete fixed iteration without request-admission inference."""
     from mindie_sim import operator_costs
-    from mindie_sim.prediction.attention import AttentionPolicy
-    from mindie_sim.prediction.cost import CostModel
-    from mindie_sim.prediction.dispatch import cohorts
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution.dispatch import cohorts
     from mindie_sim.prediction.execution import Execution
     from mindie_sim.prediction.frontend import Frontend
     from mindie_sim.prediction.program import RecipeBook
     from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.schema.workload import IterationPlan, RequestView
     from model_convergence import _runtime_identity, fingerprint, summarize_costs, worker_usage
 
     started = time.monotonic()
@@ -151,18 +228,15 @@ def scheduled_probe(spec):
           or geometry["tokens"] != 1):
         raise ValueError("scheduled_iteration_requires_single_token_decode_model_scope")
     participants = cohorts(case.runtime.parallel)[0]
-    views = {rank: tuple(RequestView(
-        f"r{rank}:{index}", geometry["tokens"], geometry["context"], True, geometry["phase"],
-        draft_proposal_tokens=spec.get("proposal_tokens", 0), draft_prepare=prefill,
-    ) for index in range(geometry.get("sequences", 1))) for rank in participants}
-    global_views = tuple(view for group in views.values() for view in group)
+    plans = _scheduled_plans(spec, participants, prefill=prefill)
+    global_views = tuple(view for plan in plans.values() for view in plan.requests)
     global_tokens = sum(view.q_len + view.draft_proposal_tokens for view in global_views)
     frontend = Frontend(attention_policy=AttentionPolicy(**case.runtime.attention_policy))
     works = {rank: frontend(
-        IterationPlan(group), case.model, case.runtime, case.machine,
+        plan, case.model, case.runtime, case.machine,
         global_tokens=global_tokens if len(participants) > 1 else None,
         global_views=global_views if len(participants) > 1 else None,
-    ) for rank, group in views.items()}
+    ) for rank, plan in plans.items()}
     recipes = RecipeBook.from_mapping(case.runtime.kernels)
     if sum(len(recipes.expand(work.ops)) for work in works.values()) > spec["max_operators"]:
         raise ValueError("scheduled_iteration_operator_budget_exceeded")
@@ -209,7 +283,7 @@ def load_prediction(prediction, entry, manifest, args, started):
             "case": read_json(case_path), "geometry": prediction["geometry"],
             "level": "graph", "max_operators": prediction.get("max_operators", 50000),
             "top": prediction.get("top", 12),
-            **{key: prediction[key] for key in ("driver", "proposal_tokens", "draft_layers")
+            **{key: prediction[key] for key in ("driver", "proposal_tokens", "draft_layers", "request_views")
                if key in prediction},
         }
         remaining = args.total_timeout - (time.monotonic() - started)

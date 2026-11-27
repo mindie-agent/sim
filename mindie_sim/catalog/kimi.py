@@ -20,6 +20,9 @@
 """
 from __future__ import annotations
 
+from functools import lru_cache
+import json
+from pathlib import Path
 from typing import Any, Mapping
 
 from mindie_sim.catalog.config import _int, _require, flatten_config
@@ -61,9 +64,24 @@ KIMI_DSPARK_GQA_SOURCE: dict[str, str] = {
 }
 
 
-def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
-    declared = DraftSpec.__dataclass_fields__
-    return {key: value for key, value in candidates.items() if key in declared}
+@lru_cache(maxsize=None)
+def _external_dspark_config(filename: str) -> Mapping[str, Any]:
+    path = Path(__file__).resolve().parent.parent / "model_configs" / filename
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _dspark_block5_causal(c: Mapping[str, Any], config: Mapping[str, Any]) -> bool:
+    if "full_attention_causal" in c:
+        return bool(c.get("full_attention_causal", False))
+    if "full_attention_causal" in config:
+        return bool(config.get("full_attention_causal", False))
+    companion = _external_dspark_config("kimi-k3-dspark-block5.json")
+    dflash = c.get("dflash_config") or companion.get("dflash_config")
+    if isinstance(dflash, Mapping) and "causal" in dflash:
+        return bool(dflash["causal"])
+    return bool(companion.get("full_attention_causal", False))
 
 
 def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
@@ -102,7 +120,7 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
     kv_rank = int(_require(c, "kv_lora_rank"))
     qk_nope = int(_require(c, "qk_nope_head_dim"))
     rope = int(_require(c, "qk_rope_head_dim"))
-    v_dim = int(c.get("v_head_dim", 128) or 128)
+    v_dim = int(_require(c, "v_head_dim"))
     gate_lower_bound = linear.get("gate_lower_bound")
     if gate_lower_bound is not None:
         if isinstance(gate_lower_bound, bool) or not isinstance(gate_lower_bound, (int, float)):
@@ -206,8 +224,10 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
 
 
 def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
+    from mindie_sim.catalog.draft_spec import parse_draft_max_position_embeddings
     h = int(c["hidden_size"])
     mla_block = c.get("dspark_attention_kind") == "mla" or c.get("dspark_block_size") == 5
+    draft_max_len = parse_draft_max_position_embeddings(c) or parse_draft_max_position_embeddings(config)
     if mla_block:
         markov = _int(c, "dspark_markov_rank", 256)
         target_ids = tuple(int(v) for v in (
@@ -231,9 +251,11 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
             confidence_input_width=h + markov,
             target_shared_embedding=True, target_shared_lm_head=True,
             base_logits=True, markov_replicated=True,
-            noncausal_query_block=True, pp_capability=KIMI_DSPARK_PP_CAPABILITY,
+            noncausal_query_block=not _dspark_block5_causal(c, config),
+            pp_capability=KIMI_DSPARK_PP_CAPABILITY,
             vocab_size=int(c.get("vocab_size", KIMI_DEFAULT_VOCAB_SIZE)),
             num_experts=0, top_k=0,
+            max_position_embeddings=draft_max_len,
             source=merge_source(
                 KIMI_DSPARK_MLA_SOURCE,
                 {
@@ -243,10 +265,8 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
                 },
             ),
             notes=("external five-layer MLA dense draft; selected via explicit draft mode",),
-            **_draft_compat_kwargs(
-                independent_context=True,
-                context_projection_mode="mla_prolog",
-            ),
+            independent_context=True,
+            context_projection_mode="mla_prolog",
         )
         return AuxiliarySpec(
             dspark=dspark, external_draft_key="kimi-k3-dspark-block5",
@@ -262,7 +282,7 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
         kv_cache_elements=KIMI_DSPARK_KV_PLANES * KIMI_DSPARK_GQA_KV_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
         q_width=KIMI_DSPARK_GQA_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
         kv_width=KIMI_DSPARK_GQA_KV_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
-        attention_kind="gqa",
+        attention_kind="gqa", qk_norm=True,
         target_layer_ids=target_ids, block_size=block, markov_rank=markov,
         confidence_enabled=True, confidence_executes=False,
         confidence_input_width=h + markov,
@@ -271,6 +291,7 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
         noncausal_query_block=True, pp_capability=KIMI_DSPARK_PP_CAPABILITY,
         vocab_size=int(c.get("vocab_size", KIMI_DEFAULT_VOCAB_SIZE)),
         num_experts=0, top_k=0,
+        max_position_embeddings=draft_max_len,
         source=merge_source(
             KIMI_DSPARK_GQA_SOURCE,
             {
@@ -281,11 +302,9 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
             },
         ),
         notes=("external five-layer dense draft; selected via explicit draft mode",),
-        **_draft_compat_kwargs(
-            independent_context=True,
-            context_projection_mode="fused_kv_bank",
-            dcp_sharded=False,
-        ),
+        independent_context=True,
+        context_projection_mode="fused_kv_bank",
+        dcp_sharded=False,
     )
     return AuxiliarySpec(
         dspark=dspark, external_draft_key="kimi-k3-dspark",
@@ -308,7 +327,7 @@ def _standard_kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
     from mindie_sim.catalog.deepseek import _standard_deepseek_plans
 
     c, _ = _standard_kimi_flat(config)
-    return _standard_deepseek_plans(c)
+    return _standard_deepseek_plans(c, packed_input_projection=True)
 
 
 def _aux_standard_kimi(config: Mapping[str, Any]) -> AuxiliarySpec:
@@ -321,12 +340,21 @@ def _aux_standard_kimi(config: Mapping[str, Any]) -> AuxiliarySpec:
 
 
 def _standard_kimi_gaps(config: Mapping[str, Any]) -> tuple[str, ...]:
-    """Shared DeepSeek gaps plus Kimi vision/hybrid-field visibility."""
+    """Shared MLA gaps plus structural vision and hybrid-field visibility."""
     from mindie_sim.catalog.deepseek import _standard_deepseek_gaps
 
     c, vision = _standard_kimi_flat(config)
     gaps = list(_standard_deepseek_gaps(c))
-    if vision is not None or str(c.get("model_type", "")) in {"kimi_vl", "kimi_k25"}:
+    has_vision = (
+        vision is not None
+        or bool(config.get("vision_config"))
+        or bool(config.get("vision_tower"))
+        or "media_placeholder_token_id" in config
+        or "media_placeholder_token_id" in c
+        or "image_token_id" in config
+        or "image_token_id" in c
+    )
+    if has_vision:
         gaps.extend(("vision_tower_unmodeled", "vision_projector_unmodeled"))
     if any(key in c for key in (
         "linear_attn_config", "kda_layers", "linear_num_key_heads",

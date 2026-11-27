@@ -108,7 +108,7 @@ def _hccl_case(collective, expansion, template):
                          'num_heads': 4, 'num_kv_heads': 2, 'head_dim': 8,
                          'intermediate_size': 64, 'residual_block_size': 2}])
         kernels['sequence_parallel'] = {
-            'implementation': 'vllm_ascend_kimi_sequence_parallel',
+            'implementation': 'vllm_ascend_sequence_parallel',
             'enable_expert_parallel': True, 'padding': 'none',
             'attention_output': 'separate_reduce_scatter',
             'shard_materialization': 'view', 'shared_expert_layout': 'tp_sharded'}

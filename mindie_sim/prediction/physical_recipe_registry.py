@@ -16,12 +16,12 @@ from dataclasses import dataclass
 import re
 
 from mindie_sim.schema.common import ModelingError
-from .attention_pipeline import TiledFlashAndPagedAttentionRecipe
-from .linear_attention_pipeline import ChunkedLinearAttentionRecipe
+from mindie_sim.prediction.operators.attention.attention_pipeline import TiledFlashAndPagedAttentionRecipe
+from mindie_sim.prediction.operators.recurrent.linear_attention_pipeline import ChunkedLinearAttentionRecipe
 from .program import KernelProgram, Stage
-from .sparse_indexer_pipeline import TiledSparseIndexerRecipe
-from .topology_collective import TopologyCollectiveRecipe
-from .vector_pipeline import AIVTiledVectorAndGatherRecipe
+from mindie_sim.prediction.operators.sparse_indexer.sparse_indexer_pipeline import TiledSparseIndexerRecipe
+from mindie_sim.prediction.operators.collectives.topology_collective import TopologyCollectiveRecipe
+from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
 
 
 
@@ -103,7 +103,7 @@ VECTOR_FAMILIES = frozenset({
     "activation", "add", "add_rmsnorm", "add_rmsnorm_quant", "attention_merge", "attention_residual", "cache_store", "cast", "conv1d", "copy", "elementwise",
     "embedding", "engram_apply", "engram_gather", "engram_query", "fill", "geglu", "gdn_gating", "hbm_load", "histogram", "indexer_quant_cache", "kv_cache_write", "kv_cast", "kv_compress_epilog",
     "layernorm", "mhc", "multiply", "native_fusion", "pad", "quantize", "relu", "rmsnorm", "rmsnorm_quant", "rotary", "routing", "sigmoid", "silu", "state_gather", "state_transfer", "test",
-    "sampling", "acceptance", "situ", "softmax", "swiglu", "tensor_copy",
+    "sampling", "acceptance", "confidence", "situ", "softmax", "swiglu", "tensor_copy",
     "tensor_fill", "tensor_materialization", "tensor_select", "tensor_view",
     "state_scatter", "topk", "vector", "zero_fill",
 })
@@ -177,28 +177,61 @@ def physical_family_bindings() -> dict[str, object]:
     return bindings
 
 
-def physical_recipe_bindings() -> dict[str, object]:
-    """Default exact recipes for topk/indexer names that are family-ambiguous.
+def uses_retained_source_plan(op) -> bool:
+    """Recognize source contracts that carry the retained planner's inputs."""
+    metadata = dict(op.metadata or ())
+    if metadata.get("requested_abi") or metadata.get("abi"):
+        return False
+    if op.family == "attn_res_prefix" and "attn_res_view" in metadata:
+        from mindie_sim.prediction.operators.hyper_connections.family_attnres import RECIPE
 
-    The three source-planned kernels below resolve a declared recipe to a
-    ``PlannedRecipe`` builder.  Each builder is capability-scoped inside its own
-    module: A2/A3 or a non-matching operand form returns the previously
-    registered physical mechanism unchanged, so this registry never adds a
-    hardware branch to the execution loop.
+        # Preserve the caller's per-owner service and prepared tensor view.
+        return op.recipe == RECIPE
+    if "megamoe_geometry" in metadata:
+        from .operators.mc2.megamoe import RECIPE
+        from .operators.grouped_moe.common import contract_fields
+
+        # Aggregate routed work has no per-expert histogram for the grouped planner.
+        return op.recipe == RECIPE and not {
+            "matrix_group_rows", "group_rows", "expert_rows", "group_list",
+        }.intersection(contract_fields(op))
+    if metadata.get("implementation") == op.recipe and {
+        "chunk", "lengths", "head_dim_k", "head_dim_v",
+    }.issubset(metadata):
+        from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import OUTPUT_RECIPE, PREPARE_RECIPE, STATE_RECIPE
+
+        # The native Chunk32 caller supplies one leaf's layout and work contract.
+        return op.recipe in {PREPARE_RECIPE, STATE_RECIPE, OUTPUT_RECIPE}
+    if "mc2_v2_local" in metadata:
+        from mindie_sim.prediction.operators.mc2.mc2_local_caller import LOCAL
+
+        # Preserve the retained local-caller lower bound for explicit V2 caller graphs.
+        return op.recipe == LOCAL
+    return False
+
+
+def physical_recipe_bindings() -> dict[str, object]:
+    """Default exact recipes, including call expanders and retained source plans.
+
+    Kernel planning for owned recipe IDs goes through the family registry.
+    These bindings also provide the legacy Chunk32 and aggregate MegaMoE
+    source contracts and the attention call expanders.
     """
-    from .gdn_chunk32 import recipes as chunk32_recipes
-    from .index_cache_writer import recipes as cache_writer_recipes
-    from .matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
-    from .moe_cann_fusion import ScopedGatingRecipe, build_moe_gating_topk
-    from .mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
-    from .operators.block_sparse_attention_arch35 import recipes as bsa_recipes
-    from .operators.hc_gated_residual_arch35 import recipes as hc_recipes
-    from .operators.megamoe_arch35 import recipes as megamoe_recipes
-    from .operators.mla_prolog_v4_arch35 import recipes as prolog_v4_recipes
-    from .operators.sparse_index_scorers_arch35 import recipes as scorer_recipes
+    from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import recipes as chunk32_recipes
+    from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import recipes as cache_writer_recipes
+    from mindie_sim.prediction.operators.hyper_connections.lowrank_hc_vector import recipes as lowrank_hc_recipes
+    from mindie_sim.prediction.operators.matrix.matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
+    from .operators.mc2.megamoe import recipes as megamoe_recipes
+    from mindie_sim.prediction.operators.moe_routing.moe_gating_fusion import ScopedGatingRecipe, build_moe_gating_topk
+    from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
+    from .operators.attention import recipes as bsa_recipes
+    from .operators.mla_prolog import recipes as prolog_v4_recipes
+    from .operators.mla_prolog.draft_context import recipes as draft_context_recipes
+    from .operators.sparse_indexer import recipes as scorer_recipes
     bindings = {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
     bindings.update({
         "moe_gating_topk": ScopedGatingRecipe(build_moe_gating_topk),
+        "router_topk": ScopedGatingRecipe(build_moe_gating_topk),
         "router": ScopedRouterRecipe(build_router_splitk),
     })
     bindings.update({
@@ -215,7 +248,8 @@ def physical_recipe_bindings() -> dict[str, object]:
         bsa_recipes(),
         scorer_recipes(),
         prolog_v4_recipes(),
-        hc_recipes(),
+        draft_context_recipes(),
+        lowrank_hc_recipes(),
     ):
         bindings.update(group)
     return bindings

@@ -229,10 +229,35 @@ class AllocationPlan:
             current = target
         return current.name
 
+    @staticmethod
+    def _normalise_item_ranges(item: Allocation) -> tuple[tuple[float, float], ...]:
+        raw = item.ranges
+        if raw is None:
+            return ((0.0, item.bytes),) if item.bytes > 0.0 else ()
+        pairs: list[tuple[float, float]] = []
+        for entry in raw:
+            lo, hi = entry
+            lo_f, hi_f = float(lo), float(hi)
+            if hi_f > lo_f:
+                pairs.append((lo_f, hi_f))
+        return tuple(pairs)
+
+    @staticmethod
+    def _union_interval_bytes(ranges: list[tuple[float, float]]) -> float:
+        ordered = sorted((float(lo), float(hi)) for lo, hi in ranges if hi > lo)
+        merged: list[tuple[float, float]] = []
+        for lo, hi in ordered:
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        return float(sum(hi - lo for lo, hi in merged))
+
     def resolve(self) -> dict:
         by_name = {item.name: item for item in self.allocations}
         pools = {item.name for item in self.allocations if item.category == "pool"}
         top: dict[str, Allocation] = {}
+        phys_groups: dict[tuple, list[Allocation]] = {}
         aliases = {}
         pool_requests: dict[str, float] = {}
         retired = 0.0
@@ -254,15 +279,38 @@ class AllocationPlan:
                 pool_requests[item.pool] = pool_requests.get(item.pool, 0.0) + item.bytes
                 continue
             if item.physical_key:
-                for existing_name, existing in list(top.items()):
-                    if existing.physical_key == item.physical_key:
-                        if item.bytes > existing.bytes:
-                            top[existing_name] = item
-                        break
-                else:
-                    top[item.name] = item
+                g_key = (
+                    item.physical_key,
+                    item.rank,
+                    str(item.storage or ""),
+                    str(item.tier or "hbm").lower(),
+                    item.generation,
+                )
+                phys_groups.setdefault(g_key, []).append(item)
             else:
                 top[item.name] = item
+        phys_not_added = 0.0
+        for group_items in phys_groups.values():
+            winner = max(group_items, key=lambda v: v.bytes)
+            if any(it.ranges is not None for it in group_items):
+                all_ranges = [
+                    span for it in group_items for span in self._normalise_item_ranges(it)
+                ]
+                union_b = self._union_interval_bytes(all_ranges)
+                raw_sum = float(sum(it.bytes for it in group_items))
+                phys_not_added += max(0.0, raw_sum - union_b)
+                if union_b != winner.bytes:
+                    top[winner.name] = Allocation(
+                        winner.name, union_b, winner.category,
+                        live=True, note=winner.note, physical_key=winner.physical_key,
+                        rank=winner.rank, storage=winner.storage, tier=winner.tier,
+                        generation=winner.generation, ranges=winner.ranges,
+                    )
+                else:
+                    top[winner.name] = winner
+            else:
+                top[winner.name] = winner
+                phys_not_added += float(sum(it.bytes for it in group_items)) - winner.bytes
         for pool_name, requested in pool_requests.items():
             reserve = by_name[pool_name].bytes
             if requested > reserve + max(1e-9, reserve * 1e-12):
@@ -300,9 +348,7 @@ class AllocationPlan:
             "alias_bytes_not_added": float(sum(
                 row["bytes"] for values in aliases.values() for row in values)),
             "pool_bytes_not_added": float(sum(pool_requests.values())),
-            "physical_bytes_not_added": float(sum(
-                item.bytes for item in self.allocations
-                if item.live and item.physical_key and item.name not in top)),
+            "physical_bytes_not_added": float(phys_not_added),
         }
         return result
 
@@ -325,6 +371,7 @@ class CachePageGroup:
     allocation: str = "live"
     metadata_bytes_per_page: int = 0
     metadata_scan: str = "touched"
+    auxiliary: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Mapping) -> "CachePageGroup":
@@ -430,10 +477,12 @@ class CachePages:
             for layer in group.layers:
                 if layer not in component_names:
                     raise ModelingError(f"cache_page_group_unknown_layer:{layer}")
+                if group.auxiliary:
+                    continue
                 components = ({component for member_layer, component in group.members
                                if member_layer == layer} if group.members else
-                              set(group.components or component_names[layer]))
-                unknown = components - component_names[layer]
+                              set(group.components or self.component_names[layer]))
+                unknown = components - self.component_names[layer]
                 if unknown:
                     raise ModelingError(f"cache_page_group_unknown_components:{layer}:{sorted(unknown)}")
                 owned = self.covered.setdefault(layer, set())
@@ -445,6 +494,8 @@ class CachePages:
 
     def group_components(self, group: CachePageGroup) -> dict[int, set[str]]:
         """Resolve the components a page group actually owns on each layer."""
+        if group.auxiliary:
+            return {}
         result = {}
         for layer in group.layers:
             if group.members:

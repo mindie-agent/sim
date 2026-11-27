@@ -54,7 +54,7 @@
     "requests": [
       {
         "request_id": "r0",
-        "prompt_tokens": 1,
+        "prompt_tokens": 5,
         "media_tokens": 4,
         "output_tokens": 2
       }

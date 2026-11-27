@@ -7,9 +7,9 @@ identification of the historical loaded CANN kernel.
 
 The implementation owns:
 
-- `mindie_sim/prediction/call_grouped.py` -- public descriptor/builder and the
+- `mindie_sim/prediction/operators/grouped_moe/call_grouped.py` -- public descriptor/builder and the
   narrow `mapped_matmul` binding;
-- `mindie_sim/observations/grouped_binding.py` -- audited producer/capture
+- `mindie_sim/observations/calibration.py` -- audited producer/capture
   binder;
 - the `quantized_grouped` entry in `prediction.call_builders.CALL_BUILDERS`;
 - the standalone `grouped_calls` binder in

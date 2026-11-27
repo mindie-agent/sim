@@ -28,6 +28,7 @@ from dataclasses import replace
 from typing import Any, Mapping
 
 from mindie_sim.catalog.config import _int, _require
+from mindie_sim.catalog.draft_spec import parse_draft_max_position_embeddings
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError
@@ -78,10 +79,46 @@ def _router_operands(c: Mapping[str, Any], *, v41: bool) -> dict[str, Any]:
     return {"router_dtype": "fp32", "router_precast_weight_copy": True}
 
 
+_DEEPSEEK_V4_DEFAULT_COMPRESS_RATES: dict[str, int] = {
+    "sliding_attention": 0,
+    "swa": 0,
+    "compressed_sparse_attention": 4,
+    "heavily_compressed_attention": 128,
+}
+_DEEPSEEK_V41_DEFAULT_COMPRESS_RATES: dict[str, int] = {
+    "sliding_attention": 0,
+    "swa": 0,
+    "compressed_sparse_attention": 1,
+    "heavily_compressed_attention": 2,
+}
+
+
+def _resolve_compress_ratios(c: Mapping[str, Any], *, v41: bool) -> list[int]:
+    """Resolve per-layer compression ratios from legacy ``compress_ratios`` or HF ``layer_types``."""
+    raw_ratios = c.get("compress_ratios")
+    if raw_ratios:
+        return [int(v) for v in raw_ratios]
+    layer_types = c.get("layer_types")
+    if not layer_types:
+        return []
+    rates = dict(_DEEPSEEK_V41_DEFAULT_COMPRESS_RATES if v41 else _DEEPSEEK_V4_DEFAULT_COMPRESS_RATES)
+    raw_rates = c.get("compress_rates")
+    if isinstance(raw_rates, Mapping):
+        for name, ratio in raw_rates.items():
+            rates[str(name)] = int(ratio)
+    out: list[int] = []
+    for raw_kind in layer_types:
+        kind = str(raw_kind)
+        if kind not in rates:
+            raise ModelingError(f"model_config_deepseek_layer_type_unknown:{kind}")
+        out.append(rates[kind])
+    return out
+
+
 def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
     d = _deepseek_dims(c, v41=v41)
     layers = int(_require(c, "num_hidden_layers"))
-    ratios = [int(v) for v in c.get("compress_ratios", ())]
+    ratios = _resolve_compress_ratios(c, v41=v41)
     if len(ratios) < layers:
         raise ModelingError(f"model_config_compress_ratios_short:{len(ratios)}<{layers}")
     ratios = ratios[:layers]
@@ -93,6 +130,9 @@ def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
     hc_mult = _int(c, "hc_mult")
     hc_iters = _int(c, "hc_sinkhorn_iters")
     hash_layers = _int(c, "num_hash_layers", 0)
+    raw_mlp_types = c.get("mlp_layer_types")
+    mlp_layer_types = tuple(str(v) for v in raw_mlp_types) if raw_mlp_types is not None else None
+    routed_scale = _routed_scaling_factor(c)
     kv_sources = tuple(int(v) for v in c.get("kv_source_layer_ids", ()) or ())
     index_sources = tuple(int(v) for v in c.get("index_source_layer_ids", ()) or ())
     candidate = _int(c, "candidate_source_layer_id", -1)
@@ -175,8 +215,19 @@ def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
             intermediate_size=0, num_experts=experts, top_k=top_k,
             moe_intermediate_size=moe_i, num_shared_experts=shared,
             router_input_size=d["h"], router_mode=(
-                "hash" if not v41 and index < hash_layers else str(c.get("scoring_func", "softmax"))),
+                "hash"
+                if (
+                    not v41
+                    and (
+                        (index < len(mlp_layer_types) and mlp_layer_types[index] == "hash_moe")
+                        if mlp_layer_types is not None
+                        else (index < hash_layers)
+                    )
+                )
+                else str(c.get("scoring_func", "softmax"))
+            ),
             router_norm_topk=bool(c.get("norm_topk_prob", False)),
+            routed_scaling_factor=routed_scale,
             **_router_operands(c, v41=v41),
             expert_latent_size=0,
             hyper_connections=True, hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
@@ -204,11 +255,6 @@ DSV4_DSPARK_SOURCE: dict[str, str] = {
 }
 
 
-def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
-    declared = DraftSpec.__dataclass_fields__
-    return {key: value for key, value in candidates.items() if key in declared}
-
-
 def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> AuxiliarySpec:
     h = int(c["hidden_size"])
     experts = _int(c, "n_routed_experts")
@@ -219,11 +265,11 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
     block = _int(c, "dspark_block_size", 1)
     markov = _int(c, "dspark_markov_rank", 0)
     nextn = _int(c, "num_nextn_predict_layers", 0)
-    layers = len(targets) if targets else nextn
+    layers = nextn if nextn > 0 else len(targets)
     if layers <= 0:
         return AuxiliarySpec()
     body_layers = int(_require(c, "num_hidden_layers"))
-    ratios = [int(v) for v in (c.get("compress_ratios") or ())]
+    ratios = _resolve_compress_ratios(c, v41=v41)
     draft_ratios = (
         tuple(ratios[body_layers : body_layers + layers])
         if len(ratios) >= body_layers + layers else ()
@@ -265,6 +311,7 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         vocab_size=_int(c, "vocab_size"),
         mhc_mult=_int(c, "hc_mult"), mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters"),
         input_projection_category="dspark_input",
+        max_position_embeddings=parse_draft_max_position_embeddings(c),
         source=merge_source(
             dspark_source,
             {
@@ -274,10 +321,8 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
             },
         ),
         notes=("native se-tools MTP uses dspark expert geometry; one selected mode",),
-        **_draft_compat_kwargs(
-            independent_context=False,
-            context_projection_mode="shared_compressed_kv",
-        ),
+        independent_context=False,
+        context_projection_mode="shared_compressed_kv",
     )
     if dspark_mode:
         # The declared auxiliary for a multi-token block IS the native DSpark
@@ -299,7 +344,9 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
     )
 
 
-def _standard_deepseek_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
+def _standard_deepseek_plans(
+    c: Mapping[str, Any], *, packed_input_projection: bool = False,
+) -> list[LayerPlan]:
     """Body plans for the native DeepSeek V2/V2-Lite/V3/R1 checkpoints."""
     layers = int(_require(c, "num_hidden_layers"))
     h = int(_require(c, "hidden_size"))
@@ -342,6 +389,7 @@ def _standard_deepseek_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             q_lora_rank=q_rank, kv_lora_rank=kv_rank,
             qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
             mla_variant="latent_mla", kv_cache_elements=kv_rank + rope,
+            packed_input_projection=bool(packed_input_projection and q_rank > 0),
             kv_owner_layer_id=index, owns_long_kv=True,
             indexer=has_indexer, indexer_type="full" if has_indexer else "none",
             index_topk=idx_topk if has_indexer else 0,

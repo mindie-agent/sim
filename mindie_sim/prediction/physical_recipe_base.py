@@ -17,17 +17,13 @@ from typing import Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
-from .program import KernelProgram, PipelineProgram, Stage
+from .program.pipeline import PipelineProgram
+from .program.stages import KernelProgram, Stage
 
 MAX_TILES = 64
 MIN_TILE_BYTES = 4096
-DEFAULT_AIV_TILES = 64
 DEFAULT_PIPELINE_SLOTS = 2
 IO_HBM_CATEGORY = "hbm"
-IO_READ_CATEGORY = "mte2"
-IO_WRITE_CATEGORY = "mte3"
-COMPUTE_CATEGORIES = ("cube", "vector")
-LINK_CATEGORY = "link"
 
 
 @dataclass(frozen=True)
@@ -43,18 +39,7 @@ def _fraction(value: float, total: float) -> float:
 
 def work_from_op(op) -> Work:
     """Recover the declared physical work without re-pricing the operator."""
-    matrix = dict(getattr(op, "matrix_flops", ()) or ())
-    resources = {}
-    for field, role in (("hbm_bytes", "hbm"), ("mte2_bytes", "mte2"),
-                        ("mte3_bytes", "mte3"), ("vector_ops", "vector"),
-                        ("link_bytes", "link")):
-        value = float(getattr(op, field, 0.0) or 0.0)
-        if value:
-            resources[role] = resources.get(role, 0.0) + value
-    metadata = dict(getattr(op, "metadata", ()) or ())
-    for role, value in dict(metadata.get("resource_work", {})).items():
-        resources[role] = resources.get(role, 0.0) + float(value)
-    return Work(matrix, resources)
+    return Work.from_op(op)
 
 
 #: Canonical phase category for each declared physical resource role.  Both
@@ -76,6 +61,9 @@ CATEGORY_BY_ROLE = {
 }
 
 
+_TOPOLOGY_LINK_TOKENS = frozenset({"link", "port", "switch", "ub_inj"})
+
+
 def _category(role: str) -> str | None:
     """One canonical phase category per physical resource, or ``None``."""
     if role in CATEGORY_BY_ROLE:
@@ -87,10 +75,10 @@ def _category(role: str) -> str | None:
         if role.startswith(prefix):
             return category
     # Topology-owned link resources carry a namespace and endpoint identity
-    # (``<scope>:link:<channel>:<rank>:<endpoint>``); their category is the
-    # link token, not the caller's namespace.
+    # (``<scope>:link:...``, ``port:...``, ``switch:...``, ``ub_inj:...``);
+    # their category is the topology link token, not the caller's namespace.
     tokens = role.split(":")
-    if "link" in tokens:
+    if any(tok in _TOPOLOGY_LINK_TOKENS for tok in tokens):
         return "link"
     return None
 
@@ -165,6 +153,48 @@ def _phase_amounts(context, phases: Sequence[Phase]) -> list[dict[str, float]]:
     return result
 
 
+def _phase_caps(
+    context,
+    amounts: Sequence[Mapping[str, float]],
+    *,
+    pipelined: bool = False,
+    tile_index: int | None = None,
+    tile_count: int = 1,
+) -> list[dict[str, float]]:
+    """Bind sustainable Stage.caps without inflating declared physical Work."""
+    service_caps = getattr(context, "service_caps", None)
+    if not service_caps:
+        return [{} for _ in amounts]
+    totals: dict[str, float] = {}
+    phase_indices: dict[str, list[int]] = {}
+    for idx, amount in enumerate(amounts):
+        for name, value in amount.items():
+            if value > 0.0 and name in service_caps:
+                totals[name] = totals.get(name, 0.0) + float(value)
+                phase_indices.setdefault(name, []).append(idx)
+    result: list[dict[str, float]] = []
+    for idx, amount in enumerate(amounts):
+        share: dict[str, float] | None = None
+        if pipelined:
+            share = {}
+            for name, value in amount.items():
+                if value <= 0.0 or name not in service_caps:
+                    continue
+                idxs = phase_indices.get(name, ())
+                if len(idxs) <= 1 or totals.get(name, 0.0) <= 0.0:
+                    continue
+                # PipelineProgram serializes same-name stages across tiles.
+                # Tile 0's earliest phase and tile (count-1)'s latest phase run
+                # solo on this resource, while interior tiles overlap at exact C.
+                if tile_index == 0 and idx == idxs[0]:
+                    continue
+                if tile_index is not None and tile_index == tile_count - 1 and idx == idxs[-1]:
+                    continue
+                share[name] = float(value) / totals[name]
+        result.append(context.stage_caps_for(amount, share=share))
+    return result
+
+
 def phased_program(context, phases: Sequence[Phase], *,
                    minimum_ms: float | None = None) -> KernelProgram:
     """Lower named phases with explicit dependencies and conserved work."""
@@ -173,12 +203,13 @@ def phased_program(context, phases: Sequence[Phase], *,
                              minimum_ms=(context.minimum_ms
                                          if minimum_ms is None else minimum_ms))
     amounts = _phase_amounts(context, phases)
+    phase_caps = _phase_caps(context, amounts, pipelined=False)
     stages = []
-    for phase, amount in zip(phases, amounts):
+    for phase, amount, caps in zip(phases, amounts, phase_caps):
         work = {name: value for name, value in amount.items()
                 if value > 0.0}
         stages.append(Stage(phase.name, work, after=phase.after,
-                            keep_empty=True))
+                            caps=caps, keep_empty=True))
     return KernelProgram(tuple(stages),
                          minimum_ms=(context.minimum_ms
                                      if minimum_ms is None else minimum_ms))
@@ -186,7 +217,8 @@ def phased_program(context, phases: Sequence[Phase], *,
 
 def _tile_count(context, *, cap: int = MAX_TILES) -> int:
     op = context.op
-    units = int(context.resource_units.get(
+    effective_aiv = int(getattr(context, "effective_aiv_cores", 0) or 0)
+    units = effective_aiv or int(context.resource_units.get(
         "vector", max(1, context.core_count)))
     bytes_to_cover = max(float(getattr(op, "mte2_bytes", 0.0) or 0.0),
                          float(getattr(op, "hbm_bytes", 0.0) or 0.0))
@@ -199,22 +231,36 @@ def tiled_phased_program(context, phases: Sequence[Phase], *,
     """Run the same phase DAG as a bounded finite tile pipeline."""
     count = _tile_count(context, cap=cap)
     if count <= 1:
-        return phased_program(context, phases)
+        setup_ms = float(context.setup_ms or 0.0)
+        body = phased_program(context, phases, minimum_ms=0.0 if setup_ms > 0.0 else None)
+        if setup_ms > 0.0:
+            return KernelProgram(
+                (Stage("setup", latency=setup_ms),
+                 Stage("tiles", after=("setup",), program=body)),
+                minimum_ms=context.minimum_ms,
+            )
+        return body
     amounts = _phase_amounts(context, phases)
+    eff_slots = max(1, int(slots))
+    pipelined = eff_slots > 1
+    head_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=0, tile_count=count)
+    mid_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=1, tile_count=count)
+    tail_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=count - 1, tile_count=count)
 
     def tile(index):
+        tile_caps = head_caps if index == 0 else (tail_caps if index == count - 1 else mid_caps)
         stages = []
-        for phase, amount in zip(phases, amounts):
+        for phase, amount, caps in zip(phases, amounts, tile_caps):
             start = float(index) / count
             end = float(index + 1) / count
             work = {name: value * (end - start)
                     for name, value in amount.items()
                     if value > 0.0}
             stages.append(Stage(phase.name, work, after=phase.after,
-                                keep_empty=True))
+                                caps=caps, keep_empty=True))
         return stages
 
-    pipeline = PipelineProgram(count, max(1, int(slots)), tile,
+    pipeline = PipelineProgram(count, eff_slots, tile,
                                minimum_ms=context.minimum_ms)
     return KernelProgram((Stage("setup", latency=context.setup_ms),
                           Stage("tiles", after=("setup",), program=pipeline)),

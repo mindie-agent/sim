@@ -25,20 +25,21 @@ from .implementations import (
     merge_typed_roles, producer_input_values, produced_values,
     typed_outputs,
 )
-from .passes_ffn_fusion import (
+from .sharding.ffn_rules import (
     activation_quant_fusion,
     gmm_swiglu_quant_fusion,
     moe_tail_residual_fusion,
 )
-from .passes_indexer import online_indexer_topk
-from .passes_mhc_recurrent import (
+from .rewrite import online_indexer_topk
+from .rewrite_mhc_rules import (
     MHC_DEFAULT_CUTOFF_ROWS,
     gdn_projection_overlap,
     kda_in_kernel_l2norm,
     mhc_boundary_fusion_overlap,
     qkv_norm_rope_fusion,
 )
-from .transform_norm_quant import (
+from mindie_sim.prediction.operators.mc2.mc2_tp_overlap import tp_mc2_overlap_fusion
+from mindie_sim.prediction.operators.vector.transform_norm_quant import (
     _norm_quant_domain,
     norm_quant,
     residual_norm,
@@ -81,7 +82,7 @@ def _native_group_members(ops, roles):
     """Members of declared native groups whose role is explicitly selected."""
     if not roles:
         return frozenset()
-    from .native_fusion import _groups
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups
     members = set()
     for declaration, group in _groups(ops):
         if declaration.get("role") in roles:
@@ -125,6 +126,126 @@ def _fusion_metadata(*ops):
     return fold_region_metadata_dict(ops)
 
 
+_LOW_PRECISION_ACTIVATION_FORMATS = frozenset({
+    "int8", "fp8", "fp8_e4m3", "fp8_e5m2", "fp4", "fp4_e2m1", "mxfp8", "mxfp4",
+})
+_STALE_ACT_SCALE_KEYS = (
+    "activation_group_size",
+    "activation_scale_format",
+    "activation_scale_shape",
+    "activation_scale_bytes",
+    "activation_scale_in_mte2",
+)
+
+
+def _clean_float_matmul_stale_scales(op, meta):
+    """Strip stale activation scale metadata on FLOAT matmuls before shortcuts."""
+    if meta.get("program_kind") != "matmul":
+        return op, meta, False
+    act_fmt = str(meta.get("activation_format") or "").lower().replace("-", "_")
+    if act_fmt in _LOW_PRECISION_ACTIVATION_FORMATS:
+        return op, meta, False
+    if any(key in meta for key in _STALE_ACT_SCALE_KEYS):
+        cleaned = {k: v for k, v in meta.items() if k not in _STALE_ACT_SCALE_KEYS}
+        return replace(op, metadata=tuple(cleaned.items())), cleaned, True
+    return op, meta, True
+
+
+_QUANT_VEC_OPS_PER_ELEM = 4
+_QUANT_VEC_OPS_PER_GROUP = 3
+
+
+def _build_activation_quantizer_op(
+    op, meta, input_value, conversion_input,
+    rows, cols, shape_rows, expected_rows, read_dtype, output_dtype, read_bytes,
+):
+    """Materialize one explicit dynamic activation-quantization op with audit metadata."""
+    output = expected_rows * cols * dtype_bytes(output_dtype) + meta["activation_scale_bytes"]
+    groups = expected_rows * math.ceil(cols / meta["activation_group_size"])
+    # Per-group absolute maximum, scale construction, rescale and cast.
+    vector = _QUANT_VEC_OPS_PER_ELEM * expected_rows * cols - groups + _QUANT_VEC_OPS_PER_GROUP * groups
+    quant_meta = {
+        "output_format": output_dtype,
+        "primary_output": "payload",
+        **{key: meta[key] for key in (
+            "activation_group_size", "activation_scale_shape",
+            "activation_scale_format", "activation_scale_bytes")},
+        **{key: meta[key] for key in ("structure_block", "structure_role",
+            "graph_active_query_rows", "graph_physical_query_rows") if key in meta},
+    }
+    if meta.get("input_conversion_subgraphs"):
+        quant_meta["structure_subgraph_memberships"] = meta["input_conversion_subgraphs"]
+    quantized = vector_op(
+        op_id=op.op_id + ".quantize", deps=op.deps, stage=op.stage, layer=op.layer,
+        requests=op.requests, elements=rows * cols, ops_per_element=0,
+        vector_ops_override=vector, dtype=read_dtype, family="quantize",
+        phase=op.phase, recipe="dynamic_quantize", shape=(shape_rows, cols),
+        read_bytes_override=read_bytes,
+        write_bytes_override=output, returns=("activation_scales",),
+        metadata=tuple(quant_meta.items()),
+    )
+    quantized = replace(quantized, stream=op.stream)
+    outputs = typed_outputs(quantized)
+    quant_meta = dict(quantized.metadata)
+    audit = {
+        "kind": "activation_materialization",
+        "replaces_work": True, "replaces_allocation": True,
+        "replaced_occurrences": (),
+        "replacement_occurrence": quantized.op_id,
+        "work": {"mte2_bytes": quantized.mte2_bytes,
+                 "mte3_bytes": quantized.mte3_bytes,
+                 "hbm_bytes": quantized.hbm_bytes,
+                 "vector_ops": quantized.vector_ops,
+                 "flops": quantized.flops},
+        "allocations": {"inserted": (quantized.op_id,),
+                        "materialized": tuple(value["output"] for value in outputs)},
+        "external_outputs": (),
+        "external_consumers": (),
+        "events": {"deps": list(quantized.deps),
+                   "stream": quantized.stream or "main",
+                   "outputs": list(quantized.returns)},
+        "capture": capture_fusion_overlap((quantized,), kind="activation")["capture"],
+        "overlap": capture_fusion_overlap((quantized,), kind="activation")["overlap"],
+        "capture_fusion_overlap_separate": True,
+        "typed_inputs": (conversion_input,),
+        "typed_outputs": outputs,
+        "typed_roles": merge_typed_roles(op, quantized),
+        "output_ports": tuple(
+            {"output": value["output"], "dtype": value["dtype"],
+             "role": value["role"]} for value in outputs),
+        "field_dispositions": (
+            field_disposition("activation.input", "consume", op.op_id,
+                              "read once by grouped dynamic quantization"),
+            field_disposition("activation.payload", "rewrite", quantized.op_id,
+                              "low-precision payload materialized"),
+            field_disposition("activation.scales", "rewrite", quantized.op_id,
+                              "scale output is an independent value"),
+            field_disposition("activation.group_size", "consume", op.op_id,
+                              "grouped amax and scale construction"),
+            field_disposition("matrix.activation_operand", "rewrite", quantized.op_id,
+                              "consumer edge is rebound to the payload port"),
+        ),
+        "materialization": {
+            "kind": "implicit_activation_conversion",
+            "inserted_occurrence": quantized.op_id,
+            "rewired_consumer": op.op_id,
+            "replaces_implicit_conversion": True,
+            "outputs": tuple(value["output"] for value in outputs),
+        },
+    }
+    append_audit(quant_meta, kind="activation_materialization",
+                 op_id=quantized.op_id, boundary=audit,
+                 layer=quantized.layer, stage=quantized.stage,
+                 block=quant_meta.get("structure_block"),
+                 role=quant_meta.get("structure_role"))
+    quantized = replace(quantized, metadata=tuple(quant_meta.items()))
+    old_producer = input_value.get("producer") or (op.deps[0] if op.deps else "")
+    old_output = input_value.get("output") or "output"
+    return add_input_ports(quantized, ({
+        "op": old_producer, "output": old_output,
+        "source_op": old_producer},))
+
+
 def activation_quantization(ops, source_dtype):
     result, conversions, positions = [], {}, {}
     outputs_by_id = {}
@@ -135,14 +256,15 @@ def activation_quantization(ops, source_dtype):
             outputs_by_id[op.op_id] = ()
     for op in ops:
         meta = dict(op.metadata)
-        if (op.plan_required or meta.get("program_kind") != "matmul"
+        op, meta, is_float_matmul = _clean_float_matmul_stale_scales(op, meta)
+        if (is_float_matmul or op.plan_required or meta.get("program_kind") != "matmul"
                 or not meta.get("activation_scale_bytes")
                 or meta.get("activation_producer") in {
                     "explicit_transport_quantization", "explicit_routing_quantization",
                     "explicit_quantization"}):
             # Selected callers or an earlier pass already produced this
-            # low-precision payload and scales. Preserve that producer;
-            # other matmuls still receive their ordinary conversion.
+            # low-precision payload and scales, or the MatMul consumes FLOAT
+            # activations directly (never insert DynamicQuant/DynamicMxQuant).
             result.append(op)
             continue
         rows, _, cols = op.local_shape
@@ -186,90 +308,10 @@ def activation_quantization(ops, source_dtype):
             input_value.get("binding_name"), read_bytes,
         )
         if signature not in conversions:
-            output = expected_rows * cols * dtype_bytes(output_dtype) + meta["activation_scale_bytes"]
-            groups = expected_rows * math.ceil(cols / meta["activation_group_size"])
-            # Per-group absolute maximum, scale construction, rescale and cast.
-            vector = 4 * expected_rows * cols - groups + 3 * groups
-            quant_meta = {
-                "output_format": output_dtype,
-                "primary_output": "payload",
-                **{key: meta[key] for key in (
-                    "activation_group_size", "activation_scale_shape",
-                    "activation_scale_format", "activation_scale_bytes")},
-                **{key: meta[key] for key in ("structure_block", "structure_role",
-                    "graph_active_query_rows", "graph_physical_query_rows") if key in meta},
-            }
-            if meta.get("input_conversion_subgraphs"):
-                quant_meta["structure_subgraph_memberships"] = meta["input_conversion_subgraphs"]
-            quantized = vector_op(
-                op_id=op.op_id + ".quantize", deps=op.deps, stage=op.stage, layer=op.layer,
-                requests=op.requests, elements=rows * cols, ops_per_element=0,
-                vector_ops_override=vector, dtype=read_dtype, family="quantize",
-                phase=op.phase, recipe="dynamic_quantize", shape=(shape_rows, cols),
-                read_bytes_override=read_bytes,
-                write_bytes_override=output, returns=("activation_scales",),
-                metadata=tuple(quant_meta.items()),
+            quantized = _build_activation_quantizer_op(
+                op, meta, input_value, conversion_input,
+                rows, cols, shape_rows, expected_rows, read_dtype, output_dtype, read_bytes,
             )
-            quantized = replace(quantized, stream=op.stream)
-            outputs = typed_outputs(quantized)
-            quant_meta = dict(quantized.metadata)
-            audit = {
-                "kind": "activation_materialization",
-                "replaces_work": True, "replaces_allocation": True,
-                "replaced_occurrences": (),
-                "replacement_occurrence": quantized.op_id,
-                "work": {"mte2_bytes": quantized.mte2_bytes,
-                         "mte3_bytes": quantized.mte3_bytes,
-                         "hbm_bytes": quantized.hbm_bytes,
-                         "vector_ops": quantized.vector_ops,
-                         "flops": quantized.flops},
-                "allocations": {"inserted": (quantized.op_id,),
-                                "materialized": tuple(value["output"] for value in outputs)},
-                "external_outputs": (),
-                "external_consumers": (),
-                "events": {"deps": list(quantized.deps),
-                           "stream": quantized.stream or "main",
-                           "outputs": list(quantized.returns)},
-                "capture": capture_fusion_overlap((quantized,), kind="activation")["capture"],
-                "overlap": capture_fusion_overlap((quantized,), kind="activation")["overlap"],
-                "capture_fusion_overlap_separate": True,
-                "typed_inputs": (conversion_input,),
-                "typed_outputs": outputs,
-                "typed_roles": merge_typed_roles(op, quantized),
-                "output_ports": tuple(
-                    {"output": value["output"], "dtype": value["dtype"],
-                     "role": value["role"]} for value in outputs),
-                "field_dispositions": (
-                    field_disposition("activation.input", "consume", op.op_id,
-                                      "read once by grouped dynamic quantization"),
-                    field_disposition("activation.payload", "rewrite", quantized.op_id,
-                                      "low-precision payload materialized"),
-                    field_disposition("activation.scales", "rewrite", quantized.op_id,
-                                      "scale output is an independent value"),
-                    field_disposition("activation.group_size", "consume", op.op_id,
-                                      "grouped amax and scale construction"),
-                    field_disposition("matrix.activation_operand", "rewrite", quantized.op_id,
-                                      "consumer edge is rebound to the payload port"),
-                ),
-                "materialization": {
-                    "kind": "implicit_activation_conversion",
-                    "inserted_occurrence": quantized.op_id,
-                    "rewired_consumer": op.op_id,
-                    "replaces_implicit_conversion": True,
-                    "outputs": tuple(value["output"] for value in outputs),
-                },
-            }
-            append_audit(quant_meta, kind="activation_materialization",
-                         op_id=quantized.op_id, boundary=audit,
-                         layer=quantized.layer, stage=quantized.stage,
-                         block=quant_meta.get("structure_block"),
-                         role=quant_meta.get("structure_role"))
-            quantized = replace(quantized, metadata=tuple(quant_meta.items()))
-            old_producer = input_value.get("producer") or (op.deps[0] if op.deps else "")
-            old_output = input_value.get("output") or "output"
-            quantized = add_input_ports(quantized, ({
-                "op": old_producer, "output": old_output,
-                "source_op": old_producer},))
             result.append(quantized)
             conversions[signature] = quantized.op_id
             positions[quantized.op_id] = len(result) - 1
@@ -294,7 +336,11 @@ def activation_quantization(ops, source_dtype):
                         moved["payload"] = moved.pop(old_key)
                 consumer_meta[key] = moved
         consumer_meta["activation_producer"] = "explicit_quantization"
-        consumer = replace(op, deps=(conversions[signature],),
+        retained_deps = tuple(dict.fromkeys((
+            conversions[signature],
+            *(dep for dep in op.deps if dep != old_producer),
+        )))
+        consumer = replace(op, deps=retained_deps,
                            metadata=tuple(consumer_meta.items()))
         existing = [entry for entry in input_ports(op)
                     if entry.get("op") != old_producer]
@@ -326,6 +372,7 @@ LOWERING_PASSES = {
     "kda_in_kernel_l2norm": kda_in_kernel_l2norm,
     "gdn_projection_overlap": gdn_projection_overlap,
     "moe_tail_residual": moe_tail_residual_fusion,
+    "tp_mc2_overlap": tp_mc2_overlap_fusion,
 }
 
 
@@ -340,17 +387,65 @@ def insert_representations(ops, runtime, source_dtype):
     return result, inserted
 
 
+def _resolve_runtime_arch_family(runtime, machine=None) -> str:
+    """Resolve declared Ascend architecture family (``a2``/``a3``/``a5`` or ``""``)."""
+    candidates: list[object] = []
+    if machine is not None:
+        if isinstance(machine, Mapping):
+            candidates.extend((machine.get("arch_family"), machine.get("architecture"), machine.get("sku")))
+        else:
+            candidates.extend((
+                getattr(machine, "arch_family", None),
+                getattr(machine, "architecture", None),
+                getattr(machine, "sku", None),
+            ))
+    meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    candidates.append(meta.get("arch_family"))
+    va_prof = meta.get("va_profile")
+    if isinstance(va_prof, Mapping):
+        candidates.extend((va_prof.get("hardware_arch"), va_prof.get("sku")))
+    for raw in candidates:
+        low = str(raw or "").strip().lower()
+        if not low:
+            continue
+        if low in {"a5", "arch35", "dav_3510"} or low.startswith(("ascend950", "ascend910_95")):
+            return "a5"
+        if low in {"a3", "arch22"} or low.startswith("ascend910_93"):
+            return "a3"
+        if low in {"a2", "arch20"} or low.startswith("ascend910b"):
+            return "a2"
+    return ""
+
+
+def _validate_hccl_arch_compatibility(runtime, machine=None) -> None:
+    """Reject explicit hardware CCU collective bindings on non-CCU architectures."""
+    bindings = (getattr(runtime, "kernels", None) or {}).get("hccl", {})
+    if not isinstance(bindings, Mapping) or not bindings:
+        return
+    arch = _resolve_runtime_arch_family(runtime, machine=machine)
+    if arch not in {"a2", "a3"}:
+        return
+    for collective, raw in bindings.items():
+        if not isinstance(raw, Mapping):
+            continue
+        expansion = str(raw.get("expansion") or "").strip().upper()
+        if expansion.startswith("CCU"):
+            raise ModelingError(
+                f"hccl_ccu_unsupported_on_arch:{arch.upper()}:{collective}:{expansion}"
+            )
+
+
 def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_fusion=True,
                           local_tokens=None, replay_scope=None, capture_state=None,
-                          skip_passes=(), preactivated=False):
+                          skip_passes=(), preactivated=False, machine=None):
     from .implementations import capture_partition, lower_operators, select
 
     bindings = runtime.kernels.get("lowerings", {})
-    from .family_shared_quant import lower_shared_experts
+    from mindie_sim.prediction.operators.mx_quant_matrix.family_shared_quant import lower_shared_experts
     # Bind explicitly selected kernels before generic fusion can erase them.
     # A fused-family selection binds after that family is actually produced.
     ops = lower_operators(ops, bindings)
-    from .family_moe_init import apply as apply_moe_init
+    from mindie_sim.prediction.operators.moe_routing.family_moe_init import apply as apply_moe_init
     ops = apply_moe_init(ops, bindings, runtime)
     consumers, external_output = _norm_quant_domain(runtime.kernels)
     registry = {**LOWERING_PASSES, "norm_quant": partial(
@@ -365,7 +460,8 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     )
     rt_meta = dict(getattr(runtime, "metadata", ()) or ())
     qkv_fx_only = rt_meta.get("qkv_norm_rope_mode") == "fx"
-    for name in runtime.lowering_passes:
+    lowering_passes = tuple(runtime.lowering_passes)
+    for pass_index, name in enumerate(lowering_passes):
         if name in skip_passes:
             continue
         if name in TORCH_COMPILE_PASSES and not enable_compile:
@@ -396,19 +492,33 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
                 registry[name], ops, source_dtype, excluded)
         else:
             transformed = registry[name](ops, source_dtype)
-        ops = lower_operators(transformed, bindings,
+        # Defer rmsnorm_quant native binding until a pending residual_norm pass
+        # has had a chance to fuse Add + RmsNormDynamicMxQuant into one op.
+        pending_residual = (
+            "residual_norm" in lowering_passes[pass_index + 1:]
+            and "residual_norm" not in skip_passes
+            and ("residual_norm" not in TORCH_COMPILE_PASSES or enable_compile)
+        )
+        step_bindings = (
+            {key: value for key, value in bindings.items() if key != "rmsnorm_quant"}
+            if (pending_residual and "rmsnorm_quant" in bindings)
+            else bindings
+        )
+        ops = lower_operators(transformed, step_bindings,
                               activation_quantized=activation_quantized)
         if capture_state is not None:
             generated = capture_partition(ops, runtime, replay_scope)
             if generated:
                 for identifier, value in generated.items():
                     capture_state.setdefault(identifier, value)
+    from mindie_sim.prediction.sharding.context_parallel import rewrite_quantized_allreduce
+    ops = rewrite_quantized_allreduce(ops, runtime, source_dtype)
     ops = lower_operators(ops, bindings, activation_quantized=activation_quantized, final=True)
     ops = lower_shared_experts(ops, bindings)
     grouped_int8 = select(bindings, "grouped_int8_caller")
     if grouped_int8:
         ops = grouped_int8.module.lower(ops, bindings)
-    from .moe_group_list import lower as lower_group_list
+    from mindie_sim.prediction.operators.moe_routing.moe_group_list import lower as lower_group_list
     ops = lower_group_list(ops, bindings)
     wrapper = select(bindings, "matrix_wrapper")
     if wrapper:
@@ -417,10 +527,11 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     mx_matrix = select(bindings, "mx_matrix")
     if mx_matrix:
         ops = mx_matrix.module.apply(ops, mx_matrix, local_tokens=local_tokens)
-    from .hccl_graph import lower as lower_hccl
+    _validate_hccl_arch_compatibility(runtime, machine=machine)
+    from mindie_sim.prediction.operators.collectives.hccl_graph import lower as lower_hccl
     ops = lower_hccl(ops, runtime, source_dtype)
     if resource_fusion:
-        from .native_fusion import lower_native_fusions
+        from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions
         ops = lower_native_fusions(ops, runtime, local_tokens=local_tokens)
     return tuple(ops)
 

@@ -31,7 +31,10 @@ def unit_group(index, owners, units):
     raise ValueError(f"resource_ownership_geometry_incompatible:{owners}:{units}")
 
 
-@lru_cache(maxsize=None)
+_OWNERSHIP_CACHE_MAXSIZE = 1024
+
+
+@lru_cache(maxsize=_OWNERSHIP_CACHE_MAXSIZE)
 def _full_units(count):
     return tuple(range(count))
 
@@ -39,7 +42,7 @@ def _full_units(count):
 _ZERO_MASK = 0; _ONE_BIT = 1
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=_OWNERSHIP_CACHE_MAXSIZE)
 def _unit_mask(units):
     mask = _ZERO_MASK
     for unit in units:
@@ -85,9 +88,12 @@ def _partition_rates(rate, count, caps, placements):
         for index, key in enumerate(ordered):
             cap = caps[key]
             share = capacity / (n_ord - index)
-            assigned = cap if cap < share else share
-            result[key] = assigned
-            capacity -= assigned
+            if cap >= share:
+                for rem_key in ordered[index:]:
+                    result[rem_key] = share
+                break
+            result[key] = cap
+            capacity -= cap
     return result
 
 
@@ -130,8 +136,13 @@ def unit_rates(rate, count, caps, placements):
     result = dict.fromkeys(caps, 0.0)
     active = set(caps)
     while active:
-        slopes = {unit: sum(weight for key, weight in consumers.items() if key in active)
-                  for unit, consumers in weights.items()}
+        slopes = {}
+        for unit, consumers in weights.items():
+            total = 0.0
+            for key, weight in consumers.items():
+                if key in active:
+                    total += weight
+            slopes[unit] = total
         bounds = {unit: remaining[unit] / slope
                   for unit, slope in slopes.items() if slope}
         delta = min(min(bounds.values(), default=math.inf),

@@ -93,3 +93,39 @@ info: 'MindIESimSpec.PrefetchAndLedger.static_plus_transient_at_start' depends o
 /-- info: 'MindIESimSpec.AllToAllRounds.resolveSteps_ok_legal' does not depend on any axioms -/
 #guard_msgs in
 #print axioms MindIESimSpec.AllToAllRounds.resolveSteps_ok_legal
+
+/-- info: 'MindIESimSpec.RooflineAndMesh.physical_ideal_le_predicted' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in
+#print axioms MindIESimSpec.RooflineAndMesh.physical_ideal_le_predicted
+
+/-- info: 'MindIESimSpec.RooflineAndMesh.kMesh_capacity_partition' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms MindIESimSpec.RooflineAndMesh.kMesh_capacity_partition
+
+/--
+info: 'MindIESimSpec.OptimalityCertificate.farkas_dual_le_any_feasible_schedule' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms MindIESimSpec.OptimalityCertificate.farkas_dual_le_any_feasible_schedule
+
+/-- info: 'MindIESimSpec.OptimalityCertificate.epoch_bilinear_pair_cap' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms MindIESimSpec.OptimalityCertificate.epoch_bilinear_pair_cap
+
+/-- info: 'MindIESimSpec.OptimalityCertificate.capacity_reload_trace_bound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms MindIESimSpec.OptimalityCertificate.capacity_reload_trace_bound
+
+/--
+info: 'MindIESimSpec.OptimalityCertificate.max_plus_critical_path_bound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms MindIESimSpec.OptimalityCertificate.max_plus_critical_path_bound
+
+/-- info: 'MindIESimSpec.OptimalityCertificate.certified_ladder_chain' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in
+#print axioms MindIESimSpec.OptimalityCertificate.certified_ladder_chain

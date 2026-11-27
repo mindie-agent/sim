@@ -15,7 +15,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.pointwise import TiledPointwise
+from mindie_sim.prediction.operators.vector import TiledPointwise
 from mindie_sim.prediction.program import RecipeContext
 
 

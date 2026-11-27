@@ -1,0 +1,820 @@
+"""Compilation of service regime domains and continuity groups.
+
+[Role] Normalize applicability and validate coverage and shared faces.
+[Invariants] Response tolerances apply only to duration comparisons.
+[Timeouts & Locks] Interval and face sampling budgets bound validation. No waits or locks.
+[Side-Effect Policy] Returns normalized records and geometric validation reports.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from itertools import product
+import json
+import math
+
+from mindie_sim.schema.common import ModelingError
+from ..response_functions import ResponseFunction, nonnegative
+
+
+ATOL_US = 1e-6
+RTOL = 1e-9
+MAX_PROBES = 100_000
+MAX_FACE_VERTICES = 4_096
+EXECUTION_MODES = frozenset({"completion_floor", "joint_native", "mac_service"})
+OUTSIDE_POLICIES = frozenset({"analytic", "linear", "error"})
+_BOUND_FIELDS = frozenset({"min", "max", "min_inclusive", "max_inclusive"})
+_CONTINUITY_FIELDS = frozenset({"group", "support", "outside"})
+
+
+@dataclass(frozen=True)
+class Interval:
+    """One closed (or explicitly half-open) physical interval."""
+
+    name: str
+    lower: float
+    upper: float
+    lower_inclusive: bool = True
+    upper_inclusive: bool = True
+
+    @property
+    def empty(self):
+        if self.lower > self.upper:
+            return True
+        return self.lower == self.upper and not (self.lower_inclusive and self.upper_inclusive)
+
+    def intersect(self, other):
+        lower, lower_inclusive = self.lower, self.lower_inclusive
+        if other.lower > lower:
+            lower, lower_inclusive = other.lower, other.lower_inclusive
+        elif other.lower == lower:
+            lower_inclusive = lower_inclusive and other.lower_inclusive
+        upper, upper_inclusive = self.upper, self.upper_inclusive
+        if other.upper < upper:
+            upper, upper_inclusive = other.upper, other.upper_inclusive
+        elif other.upper == upper:
+            upper_inclusive = upper_inclusive and other.upper_inclusive
+        return Interval(self.name, lower, upper, lower_inclusive, upper_inclusive)
+
+    def contains(self, value):
+        if value < self.lower or value > self.upper:
+            return False
+        if value == self.lower and not self.lower_inclusive:
+            return False
+        if value == self.upper and not self.upper_inclusive:
+            return False
+        return True
+
+    def to_dict(self):
+        return {
+            "min": self.lower if math.isfinite(self.lower) else None,
+            "max": self.upper if math.isfinite(self.upper) else None,
+            "min_inclusive": self.lower_inclusive,
+            "max_inclusive": self.upper_inclusive,
+        }
+
+
+@dataclass(frozen=True)
+class RuleDomain:
+    """Normalized applicability, response and execution of one rule."""
+
+    rule_id: str
+    index: int
+    match: Mapping
+    coordinates: Mapping
+    execution_mode: str
+    execution: Mapping | None
+    group: str
+    support: Mapping[str, Interval]
+    function: ResponseFunction
+    response: Mapping
+    outside: str
+    coverage: Mapping[str, Interval]
+    guards: Mapping[str, Interval]
+
+    def to_dict(self):
+        return {"id": self.rule_id, "index": self.index,
+                "execution_mode": self.execution_mode,
+                "response_basis": self.response.get("kind", "affine"),
+                "outside": self.outside,
+                "coverage": {name: interval.to_dict()
+                             for name, interval in self.coverage.items()}}
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, default=repr, allow_nan=False,
+                      separators=(",", ":"))
+
+
+def _number(value, code):
+    try:
+        return nonnegative(value)
+    except ModelingError as exc:
+        raise ModelingError(code) from exc
+
+
+def _flag(bounds, field):
+    value = bounds.get(field, True)
+    if not isinstance(value, bool):
+        raise ModelingError("service_regime_domain_inclusive_flag_requires_boolean:" + field)
+    return value
+
+
+def _interval(name, bounds, *, require_max=False):
+    if not isinstance(bounds, Mapping):
+        raise ModelingError("service_regime_domain_bounds_require_mapping:" + name)
+    if set(bounds) - _BOUND_FIELDS:
+        raise ModelingError("service_regime_domain_unknown_fields:" + name)
+    if require_max and ({"min", "max"} - set(bounds)):
+        raise ModelingError("service_regime_continuity_support_requires_bounds:" + name)
+    lower = _number(bounds.get("min", 0), "service_regime_domain_requires_finite_bounds:" + name)
+    if "max" in bounds:
+        upper = _number(bounds["max"], "service_regime_domain_requires_finite_bounds:" + name)
+    else:
+        upper = math.inf
+    lower_inclusive = _flag(bounds, "min_inclusive")
+    upper_inclusive = _flag(bounds, "max_inclusive")
+    if upper < lower:
+        raise ModelingError("service_regime_domain_reversed:" + name)
+    return Interval(name, lower, upper, lower_inclusive, upper_inclusive)
+
+
+def _execution(rule):
+    execution = rule.get("execution")
+    if execution is None:
+        return "completion_floor", None
+    if not isinstance(execution, Mapping):
+        raise ModelingError("service_regime_execution_requires_mapping")
+    kind = execution.get("kind")
+    if kind == "completion_floor":
+        if set(execution) != {"kind"}:
+            raise ModelingError("service_regime_completion_floor_execution_requires_only_kind")
+        return "completion_floor", None
+    if kind == "mac_service":
+        if (set(execution) != {"kind", "resource", "native_kernel",
+                               "tile_m", "tile_n", "tile_k", "slots"}
+                or execution.get("resource") != "cube"
+                or not execution.get("native_kernel")):
+            raise ModelingError("mac_service_requires_cube_and_native_kernel")
+        for key in ("tile_m", "tile_n", "tile_k", "slots"):
+            if (isinstance(execution.get(key), bool)
+                    or not isinstance(execution.get(key), int)
+                    or execution[key] <= 0):
+                raise ModelingError("mac_service_requires_positive_tile_geometry")
+        return "mac_service", dict(execution)
+    if kind != "joint_native":
+        raise ModelingError("service_regime_execution_kind_unknown")
+    if not execution.get("resource") or not execution.get("native_kernel"):
+        raise ModelingError("joint_native_service_requires_queue_and_native_boundary")
+    if _number(execution.get("reference_rate", 0),
+               "service_regime_reference_rate_must_be_positive") == 0:
+        raise ModelingError("service_regime_reference_rate_must_be_positive")
+    return "joint_native", dict(execution)
+
+
+def _continuity(rule):
+    raw = rule.get("continuity")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or set(raw) - _CONTINUITY_FIELDS:
+        raise ModelingError("service_regime_continuity_unknown_fields")
+    group = raw.get("group")
+    if not isinstance(group, str) or not group.strip():
+        raise ModelingError("service_regime_continuity_requires_group")
+    support = raw.get("support")
+    if not isinstance(support, Mapping) or not support:
+        raise ModelingError("service_regime_continuity_requires_support")
+    outside = raw.get("outside", "analytic")
+    if outside not in OUTSIDE_POLICIES:
+        raise ModelingError("service_regime_continuity_outside_requires_analytic_linear_or_error")
+    return {"group": group,
+            "support": {name: _interval(name, bounds, require_max=True)
+                        for name, bounds in support.items()},
+            "outside": outside}
+
+
+def _response(rule, coordinates):
+    response = rule.get("response")
+    if not isinstance(response, Mapping):
+        raise ModelingError("service_regime_response_requires_mapping")
+    function = ResponseFunction.from_mapping(response, coordinates)
+    outside = response.get("outside", "analytic") if function.kind in {
+        "piecewise_linear", "multilinear"} else "analytic"
+    if function.kind in {"piecewise_linear", "multilinear"} and outside not in OUTSIDE_POLICIES:
+        raise ModelingError("service_regime_curve_outside_requires_analytic_linear_or_error")
+    return response, function, outside
+
+
+def _coverage(rule, domain, function, support, outside):
+    declared = rule.get("domain") or {}
+    if not isinstance(declared, Mapping):
+        raise ModelingError("service_regime_domain_requires_mapping")
+    if set(declared) - set(domain):
+        raise ModelingError("service_regime_domain_requires_declared_coordinate")
+    if not set(function.varying_coordinates) <= set(support):
+        missing = sorted(set(function.varying_coordinates) - set(support))
+        raise ModelingError("service_regime_domain_support_requires_response_coordinate:"
+                            + ",".join(missing))
+    coverage = {}
+    for name, base in support.items():
+        bounds = declared.get(name)
+        interval = _interval(name, bounds) if bounds is not None else base
+        interval = interval.intersect(base)
+        limits = function.knot_support.get(name)
+        if limits is not None and outside != "linear":
+            interval = interval.intersect(Interval(name, limits[0], limits[1]))
+        if interval.empty:
+            raise ModelingError("service_regime_domain_rule_outside_support:"
+                                + str(rule.get("id")) + ":" + name)
+        coverage[name] = interval
+    # A non-support coordinate is an applicability guard, not a coverage axis:
+    # a bounded guard asserts applicability throughout its range, while the
+    # support contract covers only the response coordinates.
+    guards = {}
+    for name in set(domain) - set(support):
+        bounds = declared.get(name)
+        if bounds is not None:
+            guards[name] = _interval(name, bounds)
+    return coverage, guards
+
+
+def _normalize(declarations, index):
+    rule = declarations[index]
+    if not isinstance(rule, Mapping):
+        raise ModelingError("service_regime_requires_mapping")
+    if not rule.get("id"):
+        raise ModelingError("service_regime_requires_unique_id")
+    coordinates = rule.get("coordinates") or {}
+    if not isinstance(coordinates, Mapping):
+        raise ModelingError("service_regime_coordinates_require_mapping")
+    response, function, outside = _response(rule, coordinates)
+    execution_mode, execution = _execution(rule)
+    continuity = _continuity(rule)
+    if continuity is None:
+        return None
+    if continuity["support"].keys() - coordinates.keys():
+        raise ModelingError("service_regime_continuity_support_requires_declared_coordinate")
+    if outside != continuity["outside"]:
+        raise ModelingError("service_regime_continuity_outside_must_match_response")
+    if function.kind in {"affine", "roofline"} and continuity["outside"] != "analytic":
+        raise ModelingError("service_regime_continuity_outside_must_match_response")
+    coverage, guards = _coverage(rule, coordinates, function, continuity["support"], continuity["outside"])
+    return RuleDomain(
+        rule_id=str(rule["id"]), index=index, match=rule.get("match") or {},
+        coordinates=coordinates, execution_mode=execution_mode, execution=execution,
+        group=continuity["group"], support=continuity["support"],
+        function=function, response=response, outside=continuity["outside"],
+        coverage=coverage, guards=guards)
+
+
+def _agree(group, domains):
+    first = domains[0]
+    for domain in domains[1:]:
+        for field, value in (("match", domain.match), ("coordinates", domain.coordinates)):
+            expected = first.match if field == "match" else first.coordinates
+            if _canonical(value) != _canonical(expected):
+                raise ModelingError("service_regime_domain_members_differ:"
+                                    + group + ":" + field)
+        if domain.execution_mode != first.execution_mode:
+            raise ModelingError("service_regime_domain_members_differ:"
+                                + group + ":execution_mode")
+        if domain.execution_mode == "joint_native" and (
+                _canonical(domain.execution) != _canonical(first.execution)):
+            raise ModelingError("service_regime_domain_members_differ:"
+                                + group + ":native_boundary")
+        if domain.outside != first.outside:
+            raise ModelingError("service_regime_domain_members_differ:"
+                                + group + ":outside")
+        if dict(domain.support) != dict(first.support):
+            raise ModelingError("service_regime_domain_members_differ:"
+                                + group + ":support")
+        if dict(domain.guards) != dict(first.guards):
+            raise ModelingError("service_regime_domain_members_differ:"
+                                + group + ":guards")
+
+
+def _dimension_probes(intervals, support):
+    lower, upper = support.lower, support.upper
+    boundaries = {lower, upper}
+    for interval in intervals:
+        boundaries.add(min(max(interval.lower, lower), upper))
+        boundaries.add(min(max(interval.upper, lower), upper))
+    ordered = sorted(boundaries)
+    probes = set()
+    for position, value in enumerate(ordered):
+        previous = ordered[position - 1] if position else None
+        following = ordered[position + 1] if position + 1 < len(ordered) else None
+        inside_support = support.lower <= value <= support.upper
+        if inside_support and support.contains(value):
+            probes.add(value)
+        left = math.nextafter(value, -math.inf)
+        if left > (previous if previous is not None else -math.inf) and left >= lower:
+            if support.contains(left) or (left == lower and support.lower_inclusive):
+                probes.add(left)
+        right = math.nextafter(value, math.inf)
+        if right < (following if following is not None else math.inf) and right <= upper:
+            if support.contains(right) or (right == upper and support.upper_inclusive):
+                probes.add(right)
+    return tuple(sorted(probes))
+
+
+def _contains(domain, point):
+    return all(interval.contains(point[name])
+               for name, interval in domain.coverage.items())
+
+
+def _owns(domain, point, members):
+    if not _contains(domain, point):
+        return False
+    for name, interval in domain.coverage.items():
+        value = point[name]
+        if value != interval.upper or interval.lower == interval.upper:
+            continue
+        for other in members:
+            if other is domain:
+                continue
+            other_interval = other.coverage[name]
+            if (other_interval.lower == value and other_interval.lower_inclusive
+                    and _contains(other, point)):
+                return False
+    return True
+
+
+def _owners(point, members):
+    return [domain for domain in members if _owns(domain, point, members)]
+
+
+def _probe_coverage(group, domains, support):
+    dimensions = tuple(sorted(support))
+    per_dimension = [_dimension_probes([domain.coverage[name] for domain in domains],
+                                       support[name]) for name in dimensions]
+    total = math.prod(len(probes) for probes in per_dimension)
+    if total > MAX_PROBES:
+        raise ModelingError("service_regime_domain_validation_budget_exceeded:"
+                            + group + ":" + str(total))
+    for combination in product(*per_dimension):
+        point = dict(zip(dimensions, combination))
+        owners = _owners(point, domains)
+        if not owners:
+            raise ModelingError("service_regime_domain_interior_gap:"
+                                + group + ":" + _canonical(point))
+        if len(owners) > 1:
+            raise ModelingError("service_regime_domain_interior_overlap:"
+                                + group + ":" + ",".join(d.rule_id for d in owners))
+    return total
+
+
+def _shared_face(first, second, support):
+    ranges = {}
+    touching = False
+    for name in support:
+        left, right = first.coverage[name], second.coverage[name]
+        lower, upper = max(left.lower, right.lower), min(left.upper, right.upper)
+        if lower > upper:
+            return None
+        if lower == upper and (left.lower < left.upper or right.lower < right.upper):
+            touching = True
+        ranges[name] = (lower, upper)
+    return ranges if touching else None
+
+
+def _face_samples(domains, name, lower, upper):
+    samples = {lower, upper}
+    for domain in domains:
+        for value in domain.function.breakpoints.get(name, ()):
+            if lower <= value <= upper:
+                samples.add(value)
+    ordered = sorted(samples)
+    samples.update((left + right) / 2 for left, right in zip(ordered, ordered[1:]))
+    return sorted(samples)
+
+
+def _rate_dependent(response):
+    if response.get("kind") == "roofline":
+        return True
+    return any(term.get("scale_with") for term in response.get("terms", ()))
+
+
+def _limit(domain, values):
+    try:
+        result = domain.function.evaluate(values)
+    except ModelingError as exc:
+        raise ModelingError("service_regime_domain_seam_response_invalid:"
+                            + domain.rule_id) from exc
+    if result.duration_us is None:
+        raise ModelingError("service_regime_domain_seam_uncovered:" + domain.rule_id)
+    return result.duration_us
+
+
+def _check_seams(group, domains, support):
+    checked = 0
+    for position, first in enumerate(domains):
+        for second in domains[position + 1:]:
+            ranges = _shared_face(first, second, support)
+            if ranges is None:
+                continue
+            if _canonical(first.response) == _canonical(second.response):
+                continue
+            if _rate_dependent(first.response) or _rate_dependent(second.response):
+                raise ModelingError("service_regime_domain_seam_requires_provable_equivalence:"
+                                    + group + ":" + first.rule_id + ":" + second.rule_id)
+            axes = {name: _face_samples((first, second), name, *ranges[name])
+                    for name in ranges}
+            vertices = math.prod(len(samples) for samples in axes.values())
+            if vertices > MAX_FACE_VERTICES:
+                raise ModelingError("service_regime_domain_validation_budget_exceeded:"
+                                    + group + ":seam")
+            names = tuple(axes)
+            for combination in product(*(axes[name] for name in names)):
+                values = dict(zip(names, combination))
+                left, right = _limit(first, values), _limit(second, values)
+                scale = max(abs(left), abs(right))
+                if abs(left - right) > ATOL_US + RTOL * scale:
+                    raise ModelingError("service_regime_domain_seam_limit_mismatch:"
+                                        + group + ":" + first.rule_id + ":" + second.rule_id)
+                checked += 1
+    return checked
+
+
+_MISSING = object()
+
+
+def _match_values_equal(left, right) -> bool:
+    """Mirror runtime axis_equal: list/tuple normalize; mappings match keys."""
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _match_values_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return left.keys() == right.keys() and all(
+            _match_values_equal(left[key], right[key]) for key in left)
+    return left == right
+
+
+def _match_subpath(value, suffix: str):
+    current = value
+    for part in suffix.split("."):
+        if isinstance(current, Mapping):
+            current = current.get(part, _MISSING)
+        elif (isinstance(current, (list, tuple))
+              and part.isdigit() and int(part) < len(current)):
+            current = current[int(part)]
+        else:
+            return _MISSING
+    return current
+
+
+_OPERATOR_IDENTITY_KEYS = (
+    "kernel",
+    "recipe",
+    "family",
+    "metadata.program_kind",
+    "metadata.implementation_scope",
+)
+_MATMUL_FAMILIES = frozenset({"gemm", "grouped_gemm", "matmul"})
+_MC2_DISPATCH_RECIPES = frozenset({"mc2_dispatch", "expert_dispatch"})
+_MC2_COMBINE_RECIPES = frozenset({"mc2_combine", "expert_combine"})
+
+
+def _operator_identity_selectors(match: Mapping) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key in _OPERATOR_IDENTITY_KEYS:
+        val = _resolve_match_value(match, key)
+        if val is not _MISSING:
+            out[key] = val
+    return out
+
+
+_HCCL_FAMILIES = frozenset({"hccl_boundary", "hccl_local"})
+
+
+def _known_native_kernel_compatible(kernel_val, key: str, other_val) -> bool | None:
+    """Return bool for known native HCCL/MC2 kernel namespaces, else None."""
+    if not isinstance(kernel_val, str) or not isinstance(other_val, str):
+        return None
+    if kernel_val.startswith("HCCL_"):
+        if key == "recipe":
+            return other_val == "hccl_entry" or other_val == kernel_val
+        if key == "family":
+            return other_val in _HCCL_FAMILIES
+        return False
+    if kernel_val.startswith("MoeDistributeDispatch"):
+        if key == "recipe":
+            return other_val in _MC2_DISPATCH_RECIPES or other_val == kernel_val
+        if key == "family":
+            return other_val == "mc2_dispatch"
+        return False
+    if kernel_val.startswith("MoeDistributeCombine"):
+        if key == "recipe":
+            return other_val in _MC2_COMBINE_RECIPES or other_val == kernel_val
+        if key == "family":
+            return other_val == "mc2_combine"
+        return False
+    return None
+
+
+def _matmul_family_compatible(matmul_match: Mapping, family_val) -> bool:
+    if family_val not in _MATMUL_FAMILIES:
+        return False
+    if family_val == "grouped_gemm" and _resolve_match_value(matmul_match, "metadata.matrix_groups") == 1:
+        return False
+    return True
+
+
+def _operator_namespaces_overlap(left_match: Mapping, right_match: Mapping) -> bool:
+    """True iff two match selectors can match the same physical operator namespace."""
+    left_ids = _operator_identity_selectors(left_match)
+    right_ids = _operator_identity_selectors(right_match)
+    if not left_ids or not right_ids:
+        return True
+    for side_a, side_b, match_a in (
+        (left_ids, right_ids, left_match),
+        (right_ids, left_ids, right_match),
+    ):
+        if "kernel" in side_a:
+            for key in ("recipe", "family", "metadata.program_kind", "metadata.implementation_scope"):
+                if key in side_b:
+                    compat = _known_native_kernel_compatible(side_a["kernel"], key, side_b[key])
+                    if compat is False:
+                        return False
+        if side_a.get("metadata.program_kind") == "matmul" and "family" in side_b:
+            if not _matmul_family_compatible(match_a, side_b["family"]):
+                return False
+    if left_ids.keys() & right_ids.keys():
+        return True
+    # Disjoint selector keys: only physically valid cross-axis bridges can match one op.
+    for side_a, side_b, match_a in (
+        (left_ids, right_ids, left_match),
+        (right_ids, left_ids, right_match),
+    ):
+        if "kernel" in side_a and "recipe" in side_b:
+            if _match_values_equal(side_a["kernel"], side_b["recipe"]):
+                return True
+            if _known_native_kernel_compatible(side_a["kernel"], "recipe", side_b["recipe"]) is True:
+                return True
+        if "kernel" in side_a and "family" in side_b:
+            compat = _known_native_kernel_compatible(side_a["kernel"], "family", side_b["family"])
+            if compat is True or (compat is None and _match_values_equal(side_a["kernel"], side_b["family"])):
+                return True
+        if "family" in side_a and "recipe" in side_b:
+            if _match_values_equal(side_a["family"], side_b["recipe"]):
+                return True
+        if side_a.get("metadata.program_kind") == "matmul" and "family" in side_b:
+            if _matmul_family_compatible(match_a, side_b["family"]):
+                return True
+    return False
+
+
+def _matches_overlap(left_match, right_match) -> bool:
+    """True iff some axis assignment can satisfy both match selectors."""
+    if not isinstance(left_match, Mapping) or not isinstance(right_match, Mapping):
+        raise ModelingError("service_regime_requires_mapping")
+    for path, left_val in left_match.items():
+        if path in right_match and not _match_values_equal(left_val, right_match[path]):
+            return False
+    for parent_map, child_map in ((left_match, right_match), (right_match, left_match)):
+        for parent_path, parent_val in parent_map.items():
+            prefix = parent_path + "."
+            for child_path, child_val in child_map.items():
+                if not child_path.startswith(prefix):
+                    continue
+                resolved = _match_subpath(parent_val, child_path[len(prefix):])
+                if resolved is _MISSING or not _match_values_equal(resolved, child_val):
+                    return False
+    return _operator_namespaces_overlap(left_match, right_match)
+
+
+_REDUCERS = {
+    "sum": sum,
+    "max": max,
+    "min": min,
+    "len": len,
+    "product": math.prod,
+    "positive_count": lambda xs: sum(v > 0 for v in xs),
+}
+
+
+def _axis_key(spec) -> str:
+    if not isinstance(spec, Mapping):
+        return _canonical(spec)
+    key = {"path": spec.get("path")}
+    if "reduce" in spec:
+        key["reduce"] = spec["reduce"]
+    return _canonical(key)
+
+
+def _resolve_match_value(match: Mapping, path: str):
+    if path in match:
+        return match[path]
+    for parent_path, parent_val in match.items():
+        prefix = parent_path + "."
+        if path.startswith(prefix):
+            return _match_subpath(parent_val, path[len(prefix):])
+    return _MISSING
+
+
+def _eval_coord_value(spec: Mapping, raw):
+    if "reduce" in spec:
+        reducer = _REDUCERS.get(spec["reduce"])
+        if reducer is None or not isinstance(raw, (list, tuple)) or not raw:
+            return _MISSING
+        raw = reducer(raw)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        return _MISSING
+    scale = spec.get("scale", 1)
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
+        return _MISSING
+    return float(raw) * float(scale)
+
+
+def _interval_contains_match(spec: Mapping, interval: Interval, match: Mapping) -> bool:
+    path = spec.get("path")
+    if not isinstance(path, str) or not path:
+        return True
+    raw = _resolve_match_value(match, path)
+    if raw is _MISSING:
+        return True
+    value = _eval_coord_value(spec, raw)
+    return value is not _MISSING and interval.contains(value)
+
+
+def _unscaled_interval(spec: Mapping, interval: Interval) -> Interval | None:
+    scale = spec.get("scale", 1)
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
+        return None
+    scale_f = float(scale)
+    if scale_f == 0.0:
+        return (Interval(interval.name, 0.0, math.inf, True, True)
+                if interval.contains(0.0)
+                else Interval(interval.name, 1.0, 0.0, True, True))
+    if scale_f < 0.0:
+        return None
+    lower = interval.lower / scale_f
+    upper = interval.upper / scale_f if math.isfinite(interval.upper) else math.inf
+    return Interval(interval.name, lower, upper, interval.lower_inclusive, interval.upper_inclusive)
+
+
+def _default_satisfies(spec: Mapping, interval: Interval) -> bool:
+    if "default" not in spec:
+        return False
+    value = _eval_coord_value(spec, spec["default"])
+    return value is not _MISSING and interval.contains(value)
+
+
+def _rule_interval(rule, name):
+    declared = rule.get("domain") or {}
+    if not isinstance(declared, Mapping):
+        raise ModelingError("service_regime_domain_requires_mapping")
+    bounds = declared.get(name)
+    interval = _interval(name, bounds) if bounds is not None else None
+    continuity = rule.get("continuity")
+    if isinstance(continuity, Mapping):
+        support = continuity.get("support")
+        if isinstance(support, Mapping) and name in support:
+            support_interval = _interval(name, support[name], require_max=True)
+            interval = (support_interval if interval is None
+                        else interval.intersect(support_interval))
+    return interval
+
+
+def _overlaps_support(rule, member_raw, domain):
+    if not rules_overlap(rule, member_raw):
+        return False
+    declared = rule.get("domain") or {}
+    rule_coords = rule.get("coordinates") or {}
+    if not isinstance(declared, Mapping):
+        return True
+    for name, interval in domain.support.items():
+        bounds = declared.get(name)
+        if bounds is None:
+            continue
+        if isinstance(rule_coords, Mapping) and name in rule_coords:
+            if _axis_key(rule_coords[name]) != _axis_key(domain.coordinates[name]):
+                continue
+            left_raw = _unscaled_interval(rule_coords[name], _interval(name, bounds))
+            right_raw = _unscaled_interval(domain.coordinates[name], interval)
+            if left_raw is not None and right_raw is not None:
+                if left_raw.intersect(right_raw).empty:
+                    if not (_default_satisfies(rule_coords[name], _interval(name, bounds))
+                            and _default_satisfies(domain.coordinates[name], interval)):
+                        return False
+                continue
+        if _interval(name, bounds).intersect(interval).empty:
+            return False
+    return True
+
+
+def compile_service_regime_domains(declarations):
+    """Compile every declared continuity group and return bounded reports.
+
+    Raises ModelingError when a group is inconsistent, when its support is not
+    partitioned exactly once by member domains and knot support, or when a
+    shared-face limit is not provably continuous.
+    """
+    if isinstance(declarations, Mapping) or not isinstance(declarations, (list, tuple)):
+        raise ModelingError("service_regime_declarations_require_sequence")
+    domains, legacy, identifiers = {}, [], set()
+    for index, rule in enumerate(declarations):
+        if isinstance(rule, Mapping):
+            identifier = rule.get("id")
+            if identifier in identifiers:
+                raise ModelingError("service_regime_requires_unique_id")
+            identifiers.add(identifier)
+        domain = _normalize(declarations, index)
+        if domain is None:
+            legacy.append(rule)
+        else:
+            domains.setdefault(domain.group, []).append(domain)
+    groups = []
+    for group, members in domains.items():
+        _agree(group, members)
+        support = members[0].support
+        probes = _probe_coverage(group, members, support)
+        seams = _check_seams(group, members, support)
+        groups.append({
+            "group": group,
+            "execution_mode": members[0].execution_mode,
+            "response_basis": members[0].response.get("kind", "affine"),
+            "outside": members[0].outside,
+            "support": {name: interval.to_dict() for name, interval in support.items()},
+            "guards": {name: interval.to_dict() for name, interval in members[0].guards.items()},
+            "members": [domain.rule_id for domain in members],
+            "coverage": {domain.rule_id: {name: interval.to_dict()
+                                          for name, interval in domain.coverage.items()}
+                         for domain in members},
+            "probes": probes, "seam_vertices": seams,
+        })
+    group_items = list(domains.items())
+    for position, (group, members) in enumerate(group_items):
+        for other_group, other_members in group_items[position + 1:]:
+            if not _matches_overlap(members[0].match, other_members[0].match):
+                continue
+            if any(_overlaps_support(declarations[other.index], declarations[member.index], member)
+                   and _overlaps_support(declarations[member.index], declarations[other.index], other)
+                   for member in members for other in other_members):
+                raise ModelingError("service_regime_overlapping_domains:"
+                                    + group + "," + other_group)
+    legacy_mappings = [rule for rule in legacy if isinstance(rule, Mapping)]
+    for position, left_rule in enumerate(legacy_mappings):
+        for right_rule in legacy_mappings[position + 1:]:
+            if rules_overlap(left_rule, right_rule):
+                raise ModelingError("service_regime_overlapping_domains:"
+                                    + str(left_rule.get("id")) + ","
+                                    + str(right_rule.get("id")))
+    for rule in legacy_mappings:
+        rule_match = rule.get("match") or {}
+        for group, members in domains.items():
+            if not _matches_overlap(rule_match, members[0].match):
+                continue
+            if any(_overlaps_support(rule, declarations[domain.index], domain)
+                   for domain in members):
+                raise ModelingError("service_regime_domain_requires_coverage_contract:"
+                                    + group + ":" + str(rule.get("id")))
+    return tuple(groups)
+
+
+def validate_service_regime_domains(declarations):
+    """Static compatibility/coverage checker exported for profiler importers."""
+    return compile_service_regime_domains(declarations)
+
+
+def rules_overlap(first, second):
+    """Conservative static overlap of two declarations on shared coordinates."""
+    if not isinstance(first, Mapping) or not isinstance(second, Mapping):
+        raise ModelingError("service_regime_requires_mapping")
+    first_match = first.get("match") or {}
+    second_match = second.get("match") or {}
+    if not _matches_overlap(first_match, second_match):
+        return False
+    left = first.get("coordinates") or {}
+    right = second.get("coordinates") or {}
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        raise ModelingError("service_regime_coordinates_require_mapping")
+    for coords, rule, other_match in ((left, first, second_match), (right, second, first_match)):
+        for name, spec in coords.items():
+            if not isinstance(spec, Mapping):
+                continue
+            interval = _rule_interval(rule, name)
+            if interval is not None and not _interval_contains_match(spec, interval, other_match):
+                return False
+    right_by_axis: dict[str, list[tuple[str, Mapping]]] = {}
+    for name, spec in right.items():
+        if isinstance(spec, Mapping):
+            right_by_axis.setdefault(_axis_key(spec), []).append((name, spec))
+    for left_name, left_spec in left.items():
+        if not isinstance(left_spec, Mapping):
+            continue
+        left_interval = _rule_interval(first, left_name)
+        if left_interval is None:
+            continue
+        left_raw = _unscaled_interval(left_spec, left_interval)
+        for right_name, right_spec in right_by_axis.get(_axis_key(left_spec), ()):
+            right_interval = _rule_interval(second, right_name)
+            if right_interval is None:
+                continue
+            right_raw = _unscaled_interval(right_spec, right_interval)
+            if left_raw is not None and right_raw is not None:
+                if left_raw.intersect(right_raw).empty:
+                    if not (_default_satisfies(left_spec, left_interval)
+                            and _default_satisfies(right_spec, right_interval)):
+                        return False
+    return True

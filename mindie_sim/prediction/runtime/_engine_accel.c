@@ -70,6 +70,19 @@ static bool proxy_less(const msim_ctx *c, int32_t a, int32_t b)
     return x->seq < y->seq;
 }
 
+/* Python fifo_winner(caps, tasks, resource_name): active holder on this
+ * resource (svc > 0), then priority, then actual start, then sequence. */
+static bool fifo_link_less(const msim_ctx *c, int32_t la, int32_t lb)
+{
+    const msim_link *xa = &c->link[la], *xb = &c->link[lb];
+    bool ha = xa->svc > 0.0, hb = xb->svc > 0.0;
+    const msim_task *ta = &c->task[xa->task], *tb = &c->task[xb->task];
+    if (ha != hb) return ha;
+    if (ta->prio != tb->prio) return ta->prio < tb->prio;
+    if (ta->start != tb->start) return ta->start < tb->start;
+    return ta->seq < tb->seq;
+}
+
 /* -- bounded index heaps ------------------------------------------------ */
 enum { HEAP_READY = 0, HEAP_RELEASE = 1, HEAP_COMPL = 2 };
 
@@ -138,43 +151,83 @@ static bool is_consumer(const msim_ctx *c, const msim_link *l)
 {
     if (l->rem <= 0.0) return false;
     if (c->task[l->task].state != 1) return false;
-    if (c->res[l->res].mode == 4 && l->rate <= 0.0) return false;
+    if (l->coupled_comp && l->rate <= 0.0) return false;
     return true;
 }
 
+static bool build_order_greater(const msim_ctx *c, int32_t rmode, int32_t a, int32_t b)
+{
+    const msim_link *pa = &c->link[a], *pb = &c->link[b];
+    if (rmode == 4 || rmode == 3) {
+        if (c->task[pa->task].seq != c->task[pb->task].seq)
+            return c->task[pa->task].seq > c->task[pb->task].seq;
+        return a > b;
+    }
+    if (rmode == 2) {
+        int32_t ga = pa->mode >= 0 ? pa->mode : 0;
+        int32_t gb = pb->mode >= 0 ? pb->mode : 0;
+        if (ga != gb) return ga > gb;
+        if (pa->cap != pb->cap) return pa->cap > pb->cap;
+        if (c->task[pa->task].seq != c->task[pb->task].seq)
+            return c->task[pa->task].seq > c->task[pb->task].seq;
+        return a > b;
+    }
+    if (pa->cap != pb->cap) return pa->cap > pb->cap;
+    if (c->task[pa->task].seq != c->task[pb->task].seq)
+        return c->task[pa->task].seq > c->task[pb->task].seq;
+    return a > b;
+}
+
+/* Sparse per-resource consumer ordering over ``res_lhead[r]`` (no scan of ``act_n``). */
 static int32_t build_order(msim_ctx *c, int32_t r, int32_t *n_out)
 {
-    msim_res *res = &c->res[r];
-    int32_t *order = c->idx, n = 0, i, j;
-    for (i = 0; i < c->nl; i++) {
-        msim_link *l = &c->link[i];
-        if (l->res != r || !is_consumer(c, l)) continue;
-        j = n;
-        while (j > 0) {
-            msim_link *p = &c->link[order[j - 1]];
-            bool less;
-            if (res->mode == 4 || res->mode == 3) {
-                less = c->task[p->task].seq > c->task[l->task].seq;
-            } else if (res->mode == 2) {
-                int32_t gp = p->mode >= 0 ? p->mode : 0;
-                int32_t gl = l->mode >= 0 ? l->mode : 0;
-                if (gp != gl) less = gp > gl;
-                else if (p->cap != l->cap) less = p->cap > l->cap;
-                else less = c->task[p->task].seq > c->task[l->task].seq;
-            } else {
-                if (p->cap != l->cap) less = p->cap > l->cap;
-                else less = c->task[p->task].seq > c->task[l->task].seq;
-            }
-            if (!less) break;
-            order[j] = order[j - 1];
-            j--;
+    int32_t rmode = msim_res_mode_get(c, r);
+    int32_t *order = c->idx, n = 0, li, i;
+    if (c->res_ord_ep[r] == c->ord_epoch) {
+        for (li = c->res_lhead[r]; li >= 0; li = c->link_rnext[li]) {
+            if (n >= MSIM_MAX_L) return MSIM_E_ARITH;
+            order[n++] = li;
         }
-        order[j] = i;
-        n++;
+    }
+    if (n <= 16) {
+        for (i = 1; i < n; i++) {
+            int32_t key = order[i], j = i - 1;
+            while (j >= 0 && build_order_greater(c, rmode, order[j], key)) {
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = key;
+        }
+    } else {
+        for (i = n / 2 - 1; i >= 0; i--) {
+            int32_t root = i;
+            for (;;) {
+                int32_t ch = 2 * root + 1, sw = root;
+                if (ch < n && build_order_greater(c, rmode, order[ch], order[sw])) sw = ch;
+                if (ch + 1 < n && build_order_greater(c, rmode, order[ch + 1], order[sw])) sw = ch + 1;
+                if (sw == root) break;
+                { int32_t tmp = order[root]; order[root] = order[sw]; order[sw] = tmp; }
+                root = sw;
+            }
+        }
+        for (i = n - 1; i > 0; i--) {
+            int32_t tmp = order[0], root = 0;
+            order[0] = order[i]; order[i] = tmp;
+            for (;;) {
+                int32_t ch = 2 * root + 1, sw = root;
+                if (ch < i && build_order_greater(c, rmode, order[ch], order[sw])) sw = ch;
+                if (ch + 1 < i && build_order_greater(c, rmode, order[ch + 1], order[sw])) sw = ch + 1;
+                if (sw == root) break;
+                { int32_t t2 = order[root]; order[root] = order[sw]; order[sw] = t2; }
+                root = sw;
+            }
+        }
     }
     *n_out = n;
     return 0;
 }
 
 #include "_engine_accel_submit.h"
+#include "_engine_accel_terms.h"
+#include "_engine_accel_coupled.h"
 #include "_engine_accel_abi.h"

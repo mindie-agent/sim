@@ -24,7 +24,7 @@
   "num_shared_experts": 0,
   "top_k": 12,
   "routed_scaling_factor": 6.0,
-  "kv_owner_layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+  "dual_sublayers_per_block": true,
   "ngram_embedding": {
     "emb_neighbor_num": 4,
     "emb_split_num": 4,

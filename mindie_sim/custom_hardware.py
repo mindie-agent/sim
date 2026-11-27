@@ -1,50 +1,22 @@
-"""Agent-first custom hardware templates, builders, and a private SKU registry.
+"""Custom hardware SKU registry, archetype templates and machine construction.
 
-[Role]
-  Export neutral structural hardware archetypes, materialize complete machine
-  dictionaries from the handful of specifications an agent actually knows, and
-  keep an in-memory or untracked-file registry of private custom SKUs.
-
-[Invariants]
-  * Public templates contain neutral structural defaults only; no confidential
-    SKU identity or measured private parameter is embedded in this repository.
-  * Every builder result parses through ``Hardware.from_mapping``. Memory is
-    decimal GB, rates are SI units, link capacity is bytes/ms, and all units are
-    documented explicitly in exported templates.
-  * Registered profiles keep caller-supplied values and the chosen archetype.
-    Derived values are recomputed by the builder, so later key-spec overrides
-    still scale dependent rates.
-  * Environment-file discovery reads only the declared path and never
-    overwrites an explicitly registered in-memory SKU.
-
-[Timeouts & Locks]
-  Bounded local metadata reads (under 50 MiB); no network, device context,
-  subprocess, wait, or lock is used.
-
-[Side-Effect Policy]
-  Export, build, parse, and resolve operations are pure. Registry mutations
-  happen only through explicit register/load/unregister/clear calls.
-"""
+[Role] Declare hardware archetype templates and register/resolve/build custom
+  Ascend/NPU hardware SKU definitions for what-if simulations.
+[Invariants] Registry updates remain process-local and reversible via clear/unregister.
+[Timeouts & Locks] Pure in-memory registry and JSON file loading.
+[Side-Effect Policy] Mutates only the in-memory custom SKU registry."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from copy import deepcopy
-import json
-import math
-import os
-from pathlib import Path
+import sys
 from typing import Any
 
-from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.compute_arch import ComputeArchSpec
-from mindie_sim.schema.hardware import Hardware
-from mindie_sim.hardware_derivation import derive_hardware_sku
 
 
 _DEFAULT_ARCHETYPE = "ascend_dual_die_ub"
 _TEMPLATE_SKU = "CUSTOM_SKU_TEMPLATE"
-_MAX_METADATA_BYTES = 50 * 1024**2
 
 
 HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
@@ -59,7 +31,7 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "inter_pod_bw_gbps": 100.0, "intra_node_bw_util": 0.85,
         "inter_node_bw_util": 0.80, "intra_package_latency_us": 0.9,
         "intra_node_latency_us": 1.5, "inter_node_latency_us": 4.5,
-        "inter_pod_latency_us": 10.0, "launch_us": 4.0,
+        "inter_pod_latency_us": 10.0, "launch_us": 4.0, "clock_mhz": 1650.0,
     },
     "ascend_dual_die_server": {
         "arch_family": "Custom_Ascend_Server", "dies_per_package": 2, "ranks_per_node": 16,
@@ -71,7 +43,8 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "intra_bw_8p_gbps": 392.0, "intra_node_bw_gbps": 392.0,
         "inter_node_bw_gbps": 50.0, "intra_node_bw_util": 0.80,
         "inter_node_bw_util": 0.80, "intra_package_latency_us": 1.0,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0, "launch_us": 4.0,
+        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
+        "launch_us": 4.0, "clock_mhz": 1800.0,
     },
     "ascend_single_die": {
         "arch_family": "Custom_Ascend_SingleDie", "dies_per_package": 1,
@@ -82,7 +55,7 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "l0b_kb": 64.0, "l0c_kb": 128.0, "intra_node_bw_gbps": 196.0,
         "inter_node_bw_gbps": 25.0, "intra_node_bw_util": 0.70,
         "inter_node_bw_util": 0.80, "intra_node_latency_us": 2.0,
-        "inter_node_latency_us": 10.0, "launch_us": 4.5,
+        "inter_node_latency_us": 10.0, "launch_us": 4.5, "clock_mhz": 1800.0,
     },
     "gpu_nvlink_server": {
         "arch_family": "Custom_GPU", "dies_per_package": 1, "ranks_per_node": 8,
@@ -92,7 +65,8 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "l0a_kb": 64.0, "l0b_kb": 64.0, "l0c_kb": 128.0,
         "intra_node_bw_gbps": 450.0, "inter_node_bw_gbps": 50.0,
         "intra_node_bw_util": 0.85, "inter_node_bw_util": 0.80,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0, "launch_us": 3.5,
+        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
+        "launch_us": 3.5, "clock_mhz": 1800.0,
     },
     "generic_accelerator": {
         "arch_family": "Custom_Accelerator", "dies_per_package": 1,
@@ -103,7 +77,7 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "l0b_kb": 64.0, "l0c_kb": 128.0, "intra_node_bw_gbps": 300.0,
         "inter_node_bw_gbps": 50.0, "intra_node_bw_util": 0.80,
         "inter_node_bw_util": 0.80, "intra_node_latency_us": 2.0,
-        "inter_node_latency_us": 5.0, "launch_us": 4.0,
+        "inter_node_latency_us": 5.0, "launch_us": 4.0, "clock_mhz": 1650.0,
     },
 }
 
@@ -123,6 +97,7 @@ _FIELD_DOCS: dict[str, str] = {
     "cube_int4_tflops": "Optional INT4 matrix throughput in TFLOPS; sets the int4 peak.",
     "fp4_tflops": "Alias for cube_int4_tflops for agents that label the format FP4.",
     "vector_fp32_tflops": "Declared FP32 vector throughput in 10^12 elementary ops/s.",
+    "clock_mhz": "Core clock frequency in MHz (materialized onto compute_arch.clock_hz).",
     "aic_count": "Matrix compute units per die (cube scheduling owners).",
     "aiv_count": "Vector compute units per die (vector scheduling owners).",
     "l2_mb": "Shared L2 capacity per die in MiB (2^20 bytes).",
@@ -166,6 +141,106 @@ _AGENT_USAGE_HINT = (
 )
 
 
+def _plain_mapping(value: Any, context: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ModelingError(f"custom_hardware_mapping_required:{context}")
+    return {key: item for key, item in value.items()
+            if not str(key).startswith("_")}
+
+
+def _active_archetype_templates() -> Mapping[str, dict[str, Any]]:
+    owner = sys.modules.get("mindie_sim.custom_hardware")
+    if owner is not None and hasattr(owner, "HARDWARE_ARCHETYPE_TEMPLATES"):
+        return owner.HARDWARE_ARCHETYPE_TEMPLATES
+    return HARDWARE_ARCHETYPE_TEMPLATES
+
+
+def _resolve_archetype(
+    spec: Mapping[str, Any], archetype: str | None,
+    *, prefer_spec_archetype: bool = False,
+) -> str:
+    templates = _active_archetype_templates()
+    declared = spec.get("archetype")
+    if archetype is None:
+        chosen = declared or _DEFAULT_ARCHETYPE
+    elif (prefer_spec_archetype and archetype == _DEFAULT_ARCHETYPE
+          and declared in templates):
+        chosen = declared
+    else:
+        chosen = archetype
+    if chosen not in templates:
+        raise ModelingError(f"unknown_hardware_archetype:{chosen}")
+    return str(chosen)
+
+
+def _canonicalize_aliases(mapping: dict[str, Any]) -> dict[str, Any]:
+    result = dict(mapping)
+    if "max_dies" in result:
+        max_dies = result.pop("max_dies")
+        if result.get("superpod_size") is None:
+            result["superpod_size"] = max_dies
+        elif max_dies is not None and result["superpod_size"] != max_dies:
+            raise ModelingError(
+                f"custom_hardware_superpod_size_conflict:{result['superpod_size']}:{max_dies}"
+            )
+    return result
+
+
+def _merge_inputs(
+    spec: Mapping[str, Any], archetype: str | None, overrides: Mapping[str, Any],
+    *, prefer_spec_archetype: bool = False,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    if not isinstance(spec, Mapping):
+        raise ModelingError("custom_hardware_spec_must_be_mapping")
+    explicit = _canonicalize_aliases(_plain_mapping(spec, "spec"))
+    explicit.update(_canonicalize_aliases(_plain_mapping(overrides, "overrides")))
+    resolved = _resolve_archetype(
+        spec, archetype, prefer_spec_archetype=prefer_spec_archetype,
+    )
+    templates = _active_archetype_templates()
+    merged = deepcopy(templates[resolved])
+    merged.update(explicit)
+    merged["archetype"] = resolved
+    return resolved, merged, explicit
+
+
+def export_hardware_sku_template(
+    archetype: str = "ascend_dual_die_ub", *, include_schema_docs: bool = True,
+) -> dict[str, Any]:
+    """Return a fresh, agent-editable template for one structural archetype."""
+    templates = _active_archetype_templates()
+    if archetype not in templates:
+        raise ModelingError(f"unknown_hardware_archetype:{archetype}")
+    template: dict[str, Any] = {
+        "sku": _TEMPLATE_SKU,
+        "archetype": archetype,
+        **deepcopy(templates[archetype]),
+    }
+    if include_schema_docs:
+        template["_field_docs"] = dict(_FIELD_DOCS)
+        template["_agent_usage_hint"] = _AGENT_USAGE_HINT
+    return template
+
+
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+import json
+import math
+import os
+from pathlib import Path
+from typing import Any
+
+from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.compute_arch import ComputeArchSpec
+from mindie_sim.schema.hardware import Hardware
+from mindie_sim.hardware_derivation import derive_hardware_sku
+
+
+
+_MAX_METADATA_BYTES = 50 * 1024**2
+
+
 _CUSTOM_SKU_REGISTRY: dict[str, dict[str, Any]] = {}
 _CUSTOM_SKU_CANONICAL: dict[str, str] = {}
 
@@ -195,47 +270,6 @@ def _utilization(value: Any, name: str) -> float:
             or not math.isfinite(float(value)) or not 0.0 < float(value) <= 1.0):
         raise ModelingError(f"custom_hardware_utilization_out_of_range:{name}:{value}")
     return float(value)
-
-
-def _plain_mapping(value: Any, context: str) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ModelingError(f"custom_hardware_mapping_required:{context}")
-    return {key: item for key, item in value.items()
-            if not str(key).startswith("_")}
-
-
-def _resolve_archetype(
-    spec: Mapping[str, Any], archetype: str | None,
-    *, prefer_spec_archetype: bool = False,
-) -> str:
-    declared = spec.get("archetype")
-    if archetype is None:
-        chosen = declared or _DEFAULT_ARCHETYPE
-    elif (prefer_spec_archetype and archetype == _DEFAULT_ARCHETYPE
-          and declared in HARDWARE_ARCHETYPE_TEMPLATES):
-        chosen = declared
-    else:
-        chosen = archetype
-    if chosen not in HARDWARE_ARCHETYPE_TEMPLATES:
-        raise ModelingError(f"unknown_hardware_archetype:{chosen}")
-    return str(chosen)
-
-
-def _merge_inputs(
-    spec: Mapping[str, Any], archetype: str | None, overrides: Mapping[str, Any],
-    *, prefer_spec_archetype: bool = False,
-) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    if not isinstance(spec, Mapping):
-        raise ModelingError("custom_hardware_spec_must_be_mapping")
-    explicit = _plain_mapping(spec, "spec")
-    explicit.update(_plain_mapping(overrides, "overrides"))
-    resolved = _resolve_archetype(
-        spec, archetype, prefer_spec_archetype=prefer_spec_archetype,
-    )
-    merged = deepcopy(HARDWARE_ARCHETYPE_TEMPLATES[resolved])
-    merged.update(explicit)
-    merged["archetype"] = resolved
-    return resolved, merged, explicit
 
 
 def _rate_from(
@@ -378,6 +412,17 @@ def _derived_device_fields(
     }
 
 
+_CHANNEL_SCOPES: dict[str, str] = {
+    "intra_package": "package",
+    "intra_4p": "node",
+    "intra_8p": "node",
+    "intra_node": "node",
+    "superpod": "cross_node",
+    "inter_pod": "cross_node",
+    "inter_node": "cross_node",
+}
+
+
 def _link(
     channel: str, members: Sequence[int], bw_gbps: float, utilization: float,
     latency_us: float, *, name_prefix: str | None = None,
@@ -394,6 +439,7 @@ def _link(
         "latency_us": float(latency_us),
         "channel": channel,
         "semantics": semantics,
+        "scope": _CHANNEL_SCOPES[channel],
     }
     if not math.isclose(util, 1.0):
         record["bw_utilization"] = util
@@ -416,6 +462,21 @@ def _append_group_links(
                                semantics=semantics))
 
 
+def _append_node_subgroup_links(
+    links: list[dict[str, Any]], *, channel: str, group_size: int,
+    ranks_per_node: int, bw_gbps: Any, utilization: float, latency_us: float,
+    num_devices: int,
+) -> None:
+    if group_size <= 1 or bw_gbps is None or float(bw_gbps) <= 0.0:
+        return
+    for node_start in range(0, num_devices, ranks_per_node):
+        node_end = min(node_start + ranks_per_node, num_devices)
+        for start in range(node_start, node_end, group_size):
+            members = tuple(range(start, min(start + group_size, node_end)))
+            if len(members) > 1:
+                links.append(_link(channel, members, float(bw_gbps), utilization, latency_us))
+
+
 def _materialize_links(
     merged: Mapping[str, Any], *, num_devices: int, dies_per_package: int,
     ranks_per_node: int,
@@ -434,14 +495,16 @@ def _materialize_links(
             num_devices=num_devices, semantics="direct",
         )
     if merged.get("intra_bw_4p_gbps") is not None and dies_per_package > 0:
-        _append_group_links(
+        _append_node_subgroup_links(
             links, channel="intra_4p", group_size=4 * dies_per_package,
+            ranks_per_node=ranks_per_node,
             bw_gbps=merged.get("intra_bw_4p_gbps"), utilization=intra_util,
             latency_us=intra_latency, num_devices=num_devices,
         )
     if merged.get("intra_bw_8p_gbps") is not None and dies_per_package > 0:
-        _append_group_links(
+        _append_node_subgroup_links(
             links, channel="intra_8p", group_size=8 * dies_per_package,
+            ranks_per_node=ranks_per_node,
             bw_gbps=merged.get("intra_bw_8p_gbps"), utilization=intra_util,
             latency_us=intra_latency, num_devices=num_devices,
         )
@@ -454,12 +517,21 @@ def _materialize_links(
     superpod = merged.get("superpod_size", merged.get("max_dies"))
     superpod_size = int(superpod) if superpod is not None else 0
     if superpod_size > 0:
+        superpod_bw = merged.get("superpod_bw_gbps")
+        has_superpod_bw = superpod_bw is not None and float(superpod_bw) > 0.0
         _append_group_links(
             links, channel="superpod", group_size=min(superpod_size, num_devices),
-            bw_gbps=merged.get("superpod_bw_gbps"), utilization=inter_util,
+            bw_gbps=superpod_bw, utilization=inter_util,
             latency_us=node_latency, num_devices=num_devices,
         )
         if num_devices > superpod_size:
+            if not has_superpod_bw:
+                _append_group_links(
+                    links, channel="inter_node", group_size=superpod_size,
+                    bw_gbps=merged.get("inter_node_bw_gbps"), utilization=inter_util,
+                    latency_us=node_latency, num_devices=num_devices,
+                    name_prefix="z_fallback:inter_node",
+                )
             _append_group_links(
                 links, channel="inter_pod", group_size=num_devices,
                 bw_gbps=merged.get("inter_pod_bw_gbps"), utilization=inter_util,
@@ -467,9 +539,12 @@ def _materialize_links(
                 num_devices=num_devices,
             )
         else:
+            inter_bw = merged.get("inter_node_bw_gbps")
+            if inter_bw is not None and has_superpod_bw:
+                inter_bw = min(float(inter_bw), float(superpod_bw))
             _append_group_links(
                 links, channel="inter_node", group_size=num_devices,
-                bw_gbps=merged.get("inter_node_bw_gbps"), utilization=inter_util,
+                bw_gbps=inter_bw, utilization=inter_util,
                 latency_us=node_latency, num_devices=num_devices,
                 name_prefix="z_fallback:inter_node",
             )
@@ -498,6 +573,15 @@ def _device_mapping(
         raise ModelingError("custom_hardware_capability_must_be_mapping")
     else:
         compute_arch = dict(capability)
+    if compute_arch.get("clock_hz") is None:
+        if explicit.get("clock_hz") is not None:
+            compute_arch["clock_hz"] = _positive_float(explicit["clock_hz"], "clock_hz")
+        elif explicit.get("clock_mhz") is not None:
+            compute_arch["clock_hz"] = _positive_float(explicit["clock_mhz"], "clock_mhz") * 1e6
+        elif merged.get("clock_hz") is not None:
+            compute_arch["clock_hz"] = _positive_float(merged["clock_hz"], "clock_hz")
+        elif merged.get("clock_mhz") is not None:
+            compute_arch["clock_hz"] = _positive_float(merged["clock_mhz"], "clock_mhz") * 1e6
     aiv = int(merged["aiv_count"])
     aic = int(merged["aic_count"])
     buffers = {
@@ -529,23 +613,6 @@ def parse_hardware(machine: Mapping[str, Any]) -> Hardware:
     if not isinstance(machine, Mapping):
         raise ModelingError("custom_hardware_machine_must_be_mapping")
     return Hardware.from_mapping(machine)
-
-
-def export_hardware_sku_template(
-    archetype: str = "ascend_dual_die_ub", *, include_schema_docs: bool = True,
-) -> dict[str, Any]:
-    """Return a fresh, agent-editable template for one structural archetype."""
-    if archetype not in HARDWARE_ARCHETYPE_TEMPLATES:
-        raise ModelingError(f"unknown_hardware_archetype:{archetype}")
-    template: dict[str, Any] = {
-        "sku": _TEMPLATE_SKU,
-        "archetype": archetype,
-        **deepcopy(HARDWARE_ARCHETYPE_TEMPLATES[archetype]),
-    }
-    if include_schema_docs:
-        template["_field_docs"] = dict(_FIELD_DOCS)
-        template["_agent_usage_hint"] = _AGENT_USAGE_HINT
-    return template
 
 
 def build_custom_hardware_machine(
@@ -831,15 +898,11 @@ def compose_custom_case(
     machine = build_custom_hardware_machine(
         spec, num_devices=num_devices, **hardware_overrides,
     )
-    # ``compose_case`` validates hardware SKUs against public profiles. Feed it
-    # the already-built neutral resources under a registered placeholder name,
-    # then replace the machine with the private SKU identity.
-    compose_hardware = {**machine, "sku": "Ascend910_9392"}
     from mindie_sim.compose import compose_case
 
     case = compose_case(
         model=model,
-        hardware=compose_hardware,
+        hardware=machine,
         tp=int(tp), dp=int(dp), ep=int(ep), pp=int(pp), pcp=int(pcp),
         dcp=int(cp), num_devices=num_devices,
         quant=quantization,
@@ -850,7 +913,6 @@ def compose_custom_case(
         max_model_len=int(max_model_len),
         async_scheduling=bool(async_scheduling),
     )
-    case["machine"] = machine
     parse_case(case)
     return case
 

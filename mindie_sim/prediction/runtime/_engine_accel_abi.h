@@ -66,8 +66,11 @@ MSIM_EXPORT int32_t msim_ctx_reset(void *ctx)
     if (!ctx_ok(c)) return -1;
     c->nl = 0; c->nu = 0; c->live_n = 0; c->free_n = 0; c->sn = 0;
     c->heap_n = 0; c->rheap_n = 0; c->cheap_n = 0; c->act_n = 0;
+    c->new_ready_n = 0;
     c->resume_compl = 0;
     c->pending_hold = 0;
+    c->obs_count = 0; c->obs_overflow = 0;
+    c->pt_nprogs = 0; c->pt_nterms = 0; c->pt_ndels = 0; c->pt_nctrs = 0;
     if (!msim_grow((void **)&c->free, &c->free_cap, c->task_cap, sizeof(int32_t)))
         return -1;
     for (i = 0; i < c->task_cap; i++) {
@@ -78,6 +81,7 @@ MSIM_EXPORT int32_t msim_ctx_reset(void *ctx)
         c->free[i] = i;
     }
     c->free_n = c->task_cap;
+    msim_reset_epochs(c);
     for (i = 0; i < c->nres; i++) { c->busy[i] = 0.0; c->serv[i] = 0.0; }
     return 0;
 }
@@ -89,26 +93,16 @@ MSIM_EXPORT int32_t msim_ctx_config(void *ctx, const double *rates, const int32_
     size_t i;
     if (st != NULL && nst >= 2) { st[0] = 0; st[1] = 0; }
     if (!ctx_ok(c)) return reject(st, nst, MSIM_E_STATE);
-    if (nres < 1 || nres > (size_t)MSIM_MAX_R) return reject(st, nst, MSIM_E_RANGE);
+    if (nres < 1 || nres > (size_t)MSIM_MAX_RES) return reject(st, nst, MSIM_E_RANGE);
     if (rates == NULL || units == NULL || policy == NULL) return reject(st, nst, MSIM_E_RANGE);
     for (i = 0; i < nres; i++) {
         if (!isfinite(rates[i]) || rates[i] <= 0.0) return reject(st, nst, MSIM_E_VALUE);
         if (policy[i] != 0 && policy[i] != 1) return reject(st, nst, MSIM_E_VALUE);
         if (units[i] < 1 || units[i] > MSIM_MAX_U) return reject(st, nst, MSIM_E_VALUE);
     }
-    if (!msim_grow((void **)&c->res, &c->res_cap, (int32_t)nres, sizeof(msim_res)))
+    if (!msim_res_reserve(c, (int32_t)nres))
         return reject(st, nst, MSIM_E_RANGE);
-    if (c->counter_cap < (int32_t)nres) {
-        int32_t target = nres < 64 ? 64 : (int32_t)nres;
-        double *next_busy = (double *)realloc(c->busy, (size_t)target * sizeof(double));
-        double *next_serv;
-        if (next_busy == NULL) return reject(st, nst, MSIM_E_RANGE);
-        c->busy = next_busy;
-        next_serv = (double *)realloc(c->serv, (size_t)target * sizeof(double));
-        if (next_serv == NULL) return reject(st, nst, MSIM_E_RANGE);
-        c->serv = next_serv;
-        c->counter_cap = target;
-    }
+    msim_reset_epochs(c);
     for (i = 0; i < nres; i++) {
         c->res[i].rate = rates[i];
         c->res[i].units = units[i];
@@ -286,6 +280,21 @@ MSIM_EXPORT int32_t msim_ctx_mark_external(void *ctx, const int32_t *slots, size
     return 0;
 }
 
+#ifndef msim_abi_version
+MSIM_EXPORT int32_t msim_ctx_mark_callback(void *ctx, const int32_t *slots, size_t n,
+                               int32_t *st, size_t nst)
+{
+    msim_ctx *c = (msim_ctx *)ctx;
+    size_t i;
+    if (st != NULL && nst >= 2) { st[0] = 0; st[1] = 0; }
+    if (!ctx_ok(c)) return reject(st, nst, MSIM_E_STATE);
+    if (n > 0 && slots == NULL) return reject(st, nst, MSIM_E_RANGE);
+    for (i = 0; i < n; i++)
+        if (slot_ok(c, slots[i])) c->task[slots[i]].flags |= MSIM_F_CALLBACK;
+    return 0;
+}
+#endif
+
 MSIM_EXPORT int32_t msim_ctx_export(void *ctx, int32_t slot, double *out, size_t nout)
 {
     msim_ctx *c = (msim_ctx *)ctx;
@@ -406,17 +415,18 @@ MSIM_EXPORT int32_t msim_ctx_run(void *ctx, uint64_t *hdr, size_t nhdr, int32_t 
     if (next_rel < now) next_rel = now;
     if (budget < 0) budget = 0;
     if (budget > 1000000) budget = 1000000;
-    for (i = 0; i < c->task_cap; i++) {
-        msim_task *t = &c->task[i];
-        if (t->state != 0 || t->waiting != 0) continue;
-        if (t->ready) continue;
+    for (i = 0; i < c->new_ready_n; i++) {
+        int32_t slot = c->new_ready[i];
+        msim_task *t = &c->task[slot];
+        if (t->state != 0 || t->waiting != 0 || t->ready) continue;
         t->ready = 1;
         if (t->release <= now) {
-            if (!heap_push(c, HEAP_READY, i)) { rc = MSIM_E_RANGE; goto fail; }
+            if (!heap_push(c, HEAP_READY, slot)) { rc = MSIM_E_RANGE; goto fail; }
         } else {
-            if (!heap_push(c, HEAP_RELEASE, i)) { rc = MSIM_E_RANGE; goto fail; }
+            if (!heap_push(c, HEAP_RELEASE, slot)) { rc = MSIM_E_RANGE; goto fail; }
         }
     }
+    c->new_ready_n = 0;
     for (;;) {
         for (round = 0; round < 100000; round++) {
             int32_t idx;
@@ -567,8 +577,8 @@ drain_compl_snapshot:
             double rel = next_rel;
             int32_t j;
             if (c->live_n == 0) { boundary = MSIM_B_IDLE; break; }
-            for (j = 0; j < c->task_cap; j++) {
-                msim_task *t = &c->task[j];
+            for (j = 0; j < c->rheap_n; j++) {
+                msim_task *t = &c->task[c->rheap[j]];
                 if (t->state != 0 || t->waiting != 0) continue;
                 if (t->release < rel) rel = t->release;
             }
@@ -583,48 +593,50 @@ drain_compl_snapshot:
         if (rc != 0) goto fail;
         {
             double dt = horizon - now, rel = next_rel, next_time;
+            int32_t a, k, n_act_res = 0, bad_li = -1, bad_res = 0;
             for (i = 0; i < c->rheap_n; i++) {
                 msim_task *t = &c->task[c->rheap[i]];
                 if (t->waiting == 0 && t->state == 0 && t->release < rel) rel = t->release;
             }
             if (rel - now < dt) dt = rel - now;
-            for (i = 0; i < c->nl; i++) {
-                msim_link *l = &c->link[i];
-                if (l->rate > 0.0 && l->rem > 0.0 && c->task[l->task].state == 1) {
-                    double b = l->rem / l->rate;
-                    if (b < dt) dt = b;
+            for (a = 0; a < c->act_n; a++) {
+                msim_task *t = &c->task[c->act[a]];
+                if (t->state != 1) continue;
+                for (k = 0; k < (int32_t)t->nlink; k++) {
+                    msim_link *l = &c->link[t->lstart + k];
+                    if (l->rate > 0.0 && l->rem > 0.0) {
+                        double b = l->rem / l->rate;
+                        if (b < dt) dt = b;
+                    }
                 }
-            }
-            for (i = 0; i < c->act_n; i++) {
-                msim_task *t = &c->task[c->act[i]];
                 if ((t->flags & MSIM_F_LATENCY) && t->start + t->latency > now) {
                     double b = t->start + t->latency - now;
                     if (b < dt) dt = b;
                 }
             }
             /* Python's representability rule is checked per consumer, never as a
-             * per-resource aggregate.  A fair/partitioned consumer whose share
-             * underflows to 0.0 is an error at this instant.  A FIFO waiter
-             * (mode 1) and a coupled flow omitted from the Python result
-             * (mode 4, link mode untouched) are legitimate back-pressure.
-             * This rule is checked before the integration interval: an
-             * all-zero allocated frontier makes ``dt`` infinite, yet Python
-             * classifies the same state as ``service_rate_underflow`` at t=0
-             * for both a finite and a ``None``/infinite horizon.
-             *
-             * Every earlier sub-step was accepted by the kernel.
-             * The unified epilogue below publishes its clock, starts,
-             * completions and cumulative counters exactly once (the interval
-             * up to ``now``), never the failing step. */
-            for (i = 0; i < c->nl; i++) {
-                msim_link *l = &c->link[i];
-                int32_t mode;
-                if (l->rem <= 0.0 || c->task[l->task].state != 1) continue;
-                if (l->rate > 0.0) continue;
-                mode = c->res[l->res].mode;
-                if (mode == 1) continue;
-                if (mode == 4 && l->mode != 1) continue;
-                fault_res = l->res + 1;
+             * per-resource aggregate.  Pick the lowest link index on tie so
+             * ``fault_res`` matches the ascending link scan bit-for-bit. */
+            for (a = 0; a < c->act_n; a++) {
+                msim_task *t = &c->task[c->act[a]];
+                if (t->state != 1) continue;
+                for (k = 0; k < (int32_t)t->nlink; k++) {
+                    int32_t li = (int32_t)t->lstart + k;
+                    msim_link *l = &c->link[li];
+                    if (l->rem <= 0.0 || l->rate > 0.0) continue;
+                    if (l->coupled_comp) {
+                        if (l->mode != 1) continue;
+                    } else if (c->res[l->res].policy == 1) {
+                        continue;
+                    }
+                    if (bad_li < 0 || li < bad_li) {
+                        bad_li = li;
+                        bad_res = l->res + 1;
+                    }
+                }
+            }
+            if (bad_li >= 0) {
+                fault_res = bad_res;
                 rc = MSIM_E_ARITH;
                 goto fail;
             }
@@ -632,17 +644,66 @@ drain_compl_snapshot:
             next_time = now + dt;
             if (dt > 0.0 && next_time == now) next_time = nextafter(now, INFINITY);
             if (!(next_time > now)) { rc = MSIM_E_STALL; goto fail; }
-            for (i = 0; i < c->nres; i++) {
-                int32_t k2, any = 0;
-                for (k2 = 0; k2 < c->nl; k2++) {
-                    msim_link *l = &c->link[k2];
-                    if (l->res == i && is_consumer(c, l)) { any = 1; break; }
+            if (c->obs_buf != NULL && dt > 0.0) {
+                uint32_t need_obs = 0;
+                for (a = 0; a < c->act_n; a++) {
+                    msim_task *t = &c->task[c->act[a]];
+                    if (t->state != 1) continue;
+                    for (k = 0; k < (int32_t)t->nlink; k++) {
+                        msim_link *l = &c->link[t->lstart + k];
+                        if (l->rate > 0.0 && l->rem > 0.0) {
+                            uint32_t emit_n = l->plen > 0
+                                ? (uint32_t)l->plen
+                                : (c->res[l->res].units > 0 ? (uint32_t)c->res[l->res].units : 1u);
+                            if (emit_n > UINT32_MAX - need_obs) {
+                                rc = MSIM_E_RANGE;
+                                goto fail;
+                            }
+                            need_obs += emit_n;
+                        }
+                    }
                 }
-                if (any) c->busy[i] += dt;
+                if (need_obs > c->obs_cap || c->obs_count > c->obs_cap - need_obs) {
+                    if (need_obs > c->obs_cap) c->obs_overflow = need_obs;
+                    boundary = MSIM_B_OUTPUT; goto done;
+                }
             }
-            for (i = 0; i < c->nres; i++) {
-                int32_t n = 0, k2;
-                rc = build_order(c, i, &n);
+            if (c->nl > 0 && !msim_grow((void **)&c->link_rnext, &c->link_rnext_cap,
+                                        c->nl, sizeof(int32_t))) {
+                rc = MSIM_E_RANGE;
+                goto fail;
+            }
+            msim_next_epoch(&c->seen_epoch, c->res_seen_ep, c->nres);
+            msim_next_epoch(&c->ord_epoch, c->res_ord_ep, c->nres);
+            for (a = 0; a < c->act_n; a++) {
+                msim_task *t = &c->task[c->act[a]];
+                if (t->state != 1) continue;
+                for (k = 0; k < (int32_t)t->nlink; k++) {
+                    int32_t li = (int32_t)t->lstart + k;
+                    msim_link *l = &c->link[li];
+                    int32_t r;
+                    if (!is_consumer(c, l)) continue;
+                    r = l->res;
+                    if (c->res_seen_ep[r] != c->seen_epoch) {
+                        c->res_seen_ep[r] = c->seen_epoch;
+                        c->busy[r] += dt;
+                        c->act_res[n_act_res++] = r;
+                    }
+                    c->link_rnext[li] = -1;
+                    if (c->res_ord_ep[r] != c->ord_epoch) {
+                        c->res_ord_ep[r] = c->ord_epoch;
+                        c->res_lhead[r] = li;
+                        c->res_ltail[r] = li;
+                    } else {
+                        c->link_rnext[c->res_ltail[r]] = li;
+                        c->res_ltail[r] = li;
+                    }
+                }
+            }
+            msim_heapsort_i32(c->act_res, n_act_res);
+            for (i = 0; i < n_act_res; i++) {
+                int32_t r = c->act_res[i], n = 0, k2;
+                rc = build_order(c, r, &n);
                 if (rc != 0) goto fail;
                 for (k2 = 0; k2 < n; k2++) {
                     msim_link *l = &c->link[c->idx[k2]];
@@ -660,6 +721,49 @@ drain_compl_snapshot:
                     l->svc += used;
                     c->serv[l->res] += used;
                     l->rem = residual;
+                    if (c->obs_buf != NULL && dt > 0.0) {
+                        uint64_t seq = c->task[l->task].seq;
+                        uint32_t rid = (uint32_t)l->res;
+                        if (l->plen > 1) {
+                            double prev = 0.0;
+                            double denom = (double)l->plen;
+                            int32_t u;
+                            for (u = 0; u < l->plen; u++) {
+                                double cur = (u + 1 == l->plen)
+                                    ? used
+                                    : used * ((double)(u + 1) / denom);
+                                double share = cur - prev;
+                                prev = cur;
+                                msim_emit_obs_service(
+                                    c, now, next_time, seq, rid,
+                                    c->units[l->pstart + u], share);
+                            }
+                        } else if (l->plen == 1) {
+                            msim_emit_obs_service(
+                                c, now, next_time, seq, rid,
+                                c->units[l->pstart], used);
+                        } else {
+                            uint32_t nu = c->res[rid].units > 0
+                                ? (uint32_t)c->res[rid].units : 1u;
+                            if (nu > 1u) {
+                                double prev = 0.0;
+                                double denom = (double)nu;
+                                uint32_t u;
+                                for (u = 0u; u < nu; u++) {
+                                    double cur = (u + 1u == nu)
+                                        ? used
+                                        : used * ((double)(u + 1u) / denom);
+                                    double share = cur - prev;
+                                    prev = cur;
+                                    msim_emit_obs_service(
+                                        c, now, next_time, seq, rid, u, share);
+                                }
+                            } else {
+                                msim_emit_obs_service(
+                                    c, now, next_time, seq, rid, 0u, used);
+                            }
+                        }
+                    }
                 }
             }
             now = next_time;

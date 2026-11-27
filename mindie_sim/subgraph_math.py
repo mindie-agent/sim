@@ -34,7 +34,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import math
 from dataclasses import dataclass
 from typing import Any, TypedDict
@@ -45,6 +45,7 @@ SEMANTIC_FAMILIES: tuple[str, ...] = (
 )
 ROLE_FAMILIES: dict[str, str] = {
     "attention_residual": "mhc_residual",
+    "attn_res_prefix_point": "mhc_residual",
     "residual": "mhc_residual",
     "hc_pre": "mhc_residual",
     "hc_post": "mhc_residual",
@@ -58,8 +59,11 @@ ROLE_FAMILIES: dict[str, str] = {
     "router_selection": "moe_ffn",
     "grouped_gate_up_situ_quant": "moe_ffn",
     "grouped_gate_up_activation_quant": "moe_ffn",
+    "grouped_gate_up_act": "moe_ffn",
     "situ_quant": "norm_quant",
+    "gated_rmsnorm": "norm_quant",
     "gdn_chunk": "recurrent_gdn_kda",
+    "gdn_recurrent": "recurrent_gdn_kda",
     "kda_recurrent": "recurrent_gdn_kda",
     "kda_chunk": "recurrent_gdn_kda",
 }
@@ -72,6 +76,7 @@ DECLARATION_FAMILIES: dict[str, str] = {
     "pooled_indexer": "indexer",
     "moe": "moe_ffn",
     "situ": "norm_quant",
+    "norm_gate": "norm_quant",
     "mhc": "mhc_residual",
     "gdn": "recurrent_gdn_kda",
     "kda": "recurrent_gdn_kda",
@@ -87,8 +92,10 @@ CANONICAL_DTYPE_FAMILIES = {
 }
 ALGEBRAIC_WORK_UNAVAILABLE = "algebraic_work_unavailable"
 BOUNDARY_LEDGER_UNAVAILABLE = "boundary_access_ledger_unavailable"
+REALIZED_BELOW_BOUNDARY = "realized_hbm_below_minimal_boundary"
 ROLLUP_SCOPE = "declared_semantic_subgraph_union"
 COMM_UNATTRIBUTED = "unattributed"
+_PERSISTENT_STATE_WRITE_FAMILIES = frozenset({"cache_store", "kv_cache_write"})
 
 
 class SubgraphEfficiencyReport(TypedDict):
@@ -304,6 +311,121 @@ def _finite_work(work: Mapping[str, Any], field: str) -> bool:
             and math.isfinite(value) and value >= 0)
 
 
+def _node_input_records(node: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
+    values = node.get("values")
+    if isinstance(values, Mapping) and isinstance(values.get("inputs"), Sequence):
+        return values["inputs"]
+    raw_inputs = node.get("inputs")
+    if isinstance(raw_inputs, Sequence) and not isinstance(raw_inputs, (str, bytes)):
+        return raw_inputs
+    return ()
+
+
+def _producer_aliases(node_id: str, node: Mapping[str, Any] | None) -> set[str]:
+    aliases = {node_id}
+    if "/" in node_id:
+        aliases.add(node_id.split("/", 1)[1])
+    if isinstance(node, Mapping):
+        op_id = node.get("op_id")
+        if op_id:
+            aliases.add(str(op_id))
+        op = node.get("operator")
+        if isinstance(op, Mapping) and op.get("op_id"):
+            aliases.add(str(op["op_id"]))
+    return aliases
+
+
+def _typed_edge_bytes(
+    consumer_node: Mapping[str, Any],
+    producer_id: str,
+    producer_node: Mapping[str, Any] | None = None,
+) -> float | None:
+    """Return declared consumer read bytes from ``producer_id`` when typed values resolve them."""
+    records = _node_input_records(consumer_node)
+    if not records:
+        return None
+    aliases = _producer_aliases(producer_id, producer_node)
+    matched: list[Mapping[str, Any]] = []
+    all_resolved = True
+    for item in records:
+        if not isinstance(item, Mapping):
+            all_resolved = False
+            continue
+        prod = str(item.get("producer") or "")
+        nbytes = item.get("bytes")
+        if prod in aliases:
+            if not isinstance(nbytes, (int, float)) or isinstance(nbytes, bool):
+                return None
+            if item.get("materialized") is False:
+                continue
+            matched.append(item)
+        elif not prod or not isinstance(nbytes, (int, float)) or isinstance(nbytes, bool):
+            all_resolved = False
+    if matched:
+        return sum(max(0.0, float(item["bytes"])) for item in matched)
+    if all_resolved:
+        return 0.0
+    return None
+
+
+def _writes_persistent_state(node: Mapping[str, Any]) -> bool:
+    """True when a node writes persistent cross-step state (e.g. KV or index cache)."""
+    op = node.get("operator") if isinstance(node.get("operator"), Mapping) else {}
+    family = str(node.get("family") or op.get("family") or "").strip().lower()
+    if family in _PERSISTENT_STATE_WRITE_FAMILIES:
+        return True
+    meta = op.get("metadata")
+    if not isinstance(meta, Mapping):
+        return False
+    if bool(meta.get("cache_visible")):
+        return True
+    return str(meta.get("state_value_output") or "").strip().lower() == "persistent_cache"
+
+
+def _shared_external_input_reuse(
+    nodes: Mapping[str, Mapping[str, Any]],
+    members: Sequence[str],
+    member_set: set[str],
+    eliminated_reads_by_member: Mapping[str, float],
+) -> float:
+    """Eliminate duplicate HBM reads of the same external operand across fused members."""
+    member_aliases: set[str] = set()
+    for mid in member_set:
+        member_aliases.update(_producer_aliases(mid, nodes.get(mid)))
+    seen_external: set[tuple[str, str]] = set()
+    saved = 0.0
+    for consumer in members:
+        records = _node_input_records(nodes[consumer])
+        if not records:
+            continue
+        consumer_mte2 = float(nodes[consumer]["physical_work"]["mte2_bytes"])
+        remaining = max(0.0, consumer_mte2 - float(eliminated_reads_by_member.get(consumer, 0.0)))
+        if remaining <= 0.0:
+            continue
+        consumer_keys: set[tuple[str, str]] = set()
+        for item in records:
+            if not isinstance(item, Mapping) or item.get("materialized") is False:
+                continue
+            prod = str(item.get("producer") or "")
+            if not prod or prod in member_aliases:
+                continue
+            nbytes = item.get("bytes")
+            if not isinstance(nbytes, (int, float)) or isinstance(nbytes, bool) or nbytes <= 0:
+                continue
+            out_name = str(item.get("output") or item.get("name") or "")
+            key = (prod, out_name)
+            if key in consumer_keys:
+                continue
+            consumer_keys.add(key)
+            if key in seen_external:
+                credit = min(remaining, float(nbytes))
+                saved += credit
+                remaining -= credit
+            else:
+                seen_external.add(key)
+    return saved
+
+
 def semantic_subgraph_ledger(
     report: Mapping[str, Any], member_ids, *, external_outputs=None,
     realized_hbm_bytes: float | None = None,
@@ -338,16 +460,19 @@ def semantic_subgraph_ledger(
     for member in members:
         work = nodes[member]["physical_work"]
         matrix_flops = work["matrix_flops"]
-        if matrix_flops:
-            for dtype, value in matrix_flops.items():
-                if value > 0:
-                    by_dtype[str(dtype)] += float(value)
+        positive_matrix = {
+            str(dtype): float(value) for dtype, value in matrix_flops.items() if value > 0
+        }
+        if positive_matrix:
+            for dtype, value in positive_matrix.items():
+                by_dtype[dtype] += value
             continue
         flops = float(work["flops"])
         if flops > 0:
             operator = nodes[member].get("operator")
             dtype = (operator.get("dtype") if isinstance(operator, Mapping) else None)
-            by_dtype[str(dtype or "unknown")] += flops
+            if dtype:
+                by_dtype[str(dtype)] += flops
 
     member_set = set(members)
     internal_consumers = {
@@ -365,34 +490,52 @@ def semantic_subgraph_ledger(
             or not internal_consumers[member]
         }
 
+    persistent_writers = {
+        member for member in members
+        if _writes_persistent_state(nodes[member])
+    }
+
     unfused_hbm = sum(
         float(nodes[member]["physical_work"]["hbm_bytes"]) for member in members)
-    internal_producers = {
+    write_eliminable = {
         member for member in members
-        if member not in ext_out and internal_consumers[member]
+        if member not in ext_out
+        and member not in persistent_writers
+        and internal_consumers[member]
+    }
+    read_eliminable = {
+        member for member in members
+        if internal_consumers[member]
     }
     eliminated_writes = sum(
         float(nodes[member]["physical_work"]["mte3_bytes"])
-        for member in internal_producers
+        for member in write_eliminable
     )
-    eliminated_reads = 0.0
+    eliminated_reads_by_member: dict[str, float] = {}
     for consumer in members:
         producers = [dep for dep in nodes[consumer]["deps"]
-                     if dep in internal_producers]
+                     if dep in read_eliminable]
         if not producers:
+            eliminated_reads_by_member[consumer] = 0.0
             continue
         consumer_mte2 = float(nodes[consumer]["physical_work"]["mte2_bytes"])
-        edge_bound = sum(
-            min(float(nodes[producer]["physical_work"]["mte3_bytes"]),
-                consumer_mte2)
-            for producer in producers
-        )
-        eliminated_reads += min(consumer_mte2, edge_bound)
+        edge_bound = 0.0
+        for producer in producers:
+            typed_edge = _typed_edge_bytes(nodes[consumer], producer, nodes.get(producer))
+            producer_mte3 = float(nodes[producer]["physical_work"]["mte3_bytes"])
+            if typed_edge is not None:
+                edge_bound += min(typed_edge, producer_mte3, consumer_mte2)
+            else:
+                edge_bound += min(producer_mte3, consumer_mte2)
+        eliminated_reads_by_member[consumer] = min(consumer_mte2, edge_bound)
+    shared_ext_reads = _shared_external_input_reuse(
+        nodes, members, member_set, eliminated_reads_by_member,
+    )
+    eliminated_reads = sum(eliminated_reads_by_member.values()) + shared_ext_reads
     eliminated_internal = eliminated_writes + eliminated_reads
 
     boundary_hbm = max(0.0, unfused_hbm - eliminated_internal)
-    if realized_hbm_bytes is not None:
-        boundary_hbm = min(boundary_hbm, float(realized_hbm_bytes))
+    del realized_hbm_bytes
     return {
         "algebraic_cube_flops": algebraic_cube_flops,
         "algebraic_cube_flops_by_dtype": dict(sorted(by_dtype.items())),
@@ -472,8 +615,12 @@ def _summary(report: Mapping[str, Any], group: Mapping[str, Any]) -> SubgraphMat
         breakdown = ledger["boundary_breakdown_bytes"]
     overhead = efficiency = None
     if realized is not None and boundary is not None:
-        overhead = max(0.0, realized - boundary)
-        efficiency = boundary / realized if realized > 0 else 1.0
+        if realized + 1e-9 < boundary:
+            reasons = (*reasons, REALIZED_BELOW_BOUNDARY)
+            overhead = realized - boundary
+        else:
+            overhead = max(0.0, realized - boundary)
+            efficiency = boundary / realized if realized > 0 else 1.0
     return SubgraphMathSummary(
         subgraph_id=str(group.get("subgraph_id")),
         subgraph_kind=str(group.get("role") or group.get("family") or "unknown"),
@@ -623,18 +770,24 @@ def evaluate_subgraph_efficiency(
     by_dtype = summary.algebraic_cube_flops_by_dtype
     if by_dtype is not None:
         peaks_by_dtype = hardware_peaks.get("compute_peaks") or {}
-        cube_flops = summary.algebraic_cube_flops or 0.0
-        if not by_dtype and cube_flops == 0.0:
-            # A pure Vector subgraph issues no Cube work: its Cube MFU is a real
-            # observed zero, not an unavailable ledger.
-            cube = 0.0
+        cube_flops = summary.algebraic_cube_flops
+        if not by_dtype:
+            if cube_flops == 0.0:
+                # A pure Vector subgraph issues no Cube work: its Cube MFU is a
+                # real observed zero, not an unavailable ledger.
+                cube = 0.0
         else:
-            terms = [
-                ratio(total(work), _dtype_peak(peaks_by_dtype, str(dtype)))
-                for dtype, work in by_dtype.items()
-            ]
-            if all(term is not None for term in terms):
-                cube = sum(terms)
+            by_dtype_sum = sum(float(work) for work in by_dtype.values())
+            if (by_dtype_sum > 0.0 and (
+                cube_flops is None
+                or math.isclose(by_dtype_sum, float(cube_flops), rel_tol=1e-6, abs_tol=1e-9)
+            )):
+                terms = [
+                    ratio(total(work), _dtype_peak(peaks_by_dtype, str(dtype)))
+                    for dtype, work in by_dtype.items()
+                ]
+                if terms and all(term is not None for term in terms):
+                    cube = sum(terms)
 
     boundary = total(summary.minimal_boundary_hbm_bytes)
     realized = (
@@ -665,7 +818,8 @@ def evaluate_subgraph_efficiency(
 
 
 __all__ = [
-    "ALGEBRAIC_WORK_UNAVAILABLE", "BOUNDARY_LEDGER_UNAVAILABLE", "ROLLUP_SCOPE",
+    "ALGEBRAIC_WORK_UNAVAILABLE", "BOUNDARY_LEDGER_UNAVAILABLE",
+    "REALIZED_BELOW_BOUNDARY", "ROLLUP_SCOPE",
     "SEMANTIC_FAMILIES", "SubgraphEfficiencyReport", "SubgraphMathSummary",
     "attach_subgraph_math", "boundary_bytes", "build_subgraph_math_rollup",
     "compute_subgraph_math_summaries", "effective_physical_work",

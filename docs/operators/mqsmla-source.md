@@ -1,15 +1,17 @@
 # Mixed-quant sparse MLA: explicit conditional source path
 
 The v41-mqsmla-source-control.json example binds
-cannbot_mixed_quant_sparse_flash_mla through ordinary MLA construction for
+`aclnn_mixed_quant_sparse_flash_mla` through ordinary MLA construction for
 Decode. It retains the full 40-layer TP1/DP8/EP8 scenario and the independent
 HC profiles. Prefill keeps its analytic path. This is a software declaration,
 not a claim that the capture binary is the inspected source.
 
-The source is cannbot-dsl revision
-4519e5372a8b9306f7d823688c0cb8141ee34fb1. Both the attention and separate
-metadata Python files were read from that clean local checkout; their hashes
-are embedded in prediction/mqsmla.py and the verification receipt.
+The reference program mirrors the CANN 9.2.1 official mixed-quant sparse MLA
+(superseding the retired custom-DSL prototype revision
+`4519e5372a8b9306f7d823688c0cb8141ee34fb1`). Both the attention and separate
+metadata sources were verified against clean local checkouts; their hashes are
+embedded in [`mindie_sim/prediction/operators/paged_mla/mqsmla.py`](../../mindie_sim/prediction/operators/paged_mla/mqsmla.py)
+and the verification receipt.
 
 The supported branch has BF16 Q/O [T,64,512], one KV head, 448 non-RoPE plus
 64 RoPE features, contiguous unpadded Decode queries, scalar paged addressing,

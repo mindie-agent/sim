@@ -42,6 +42,21 @@ def flatten_config(config: Mapping[str, Any]) -> tuple[dict[str, Any], Mapping[s
     return merged, text if isinstance(text, Mapping) else None, vision if isinstance(vision, Mapping) else None
 
 
+_STRUCTURAL_SANDWICH_SLIDING_KEYS = frozenset({
+    "global_head_dim", "attention_k_eq_v", "enable_moe_block",
+    "num_kv_shared_layers", "hidden_size_per_layer_input",
+    "use_double_wide_mlp", "num_global_key_value_heads",
+    "top_k_experts", "vocab_size_per_layer_input",
+})
+_STRUCTURAL_REGION_SPARSE_KEYS = frozenset({
+    "sparse_config", "use_head_wise_attn_gate", "swiglu_limits",
+    "swiglu_limits_shared", "moe_layer_list", "moe_num_experts",
+    "num_attention_groups", "need_fp32_gate", "use_moe_router_bias",
+    "moe_router_scaling_factor", "share_expert_dim",
+    "head_dim_full_attention", "head_dim_sliding_attention",
+})
+
+
 def _profile(config: Mapping[str, Any], merged: Mapping[str, Any]) -> str:
     archs = " ".join(str(v) for v in config.get("architectures", ()) or ())
     model_type = str(merged.get("model_type", config.get("model_type", ""))).lower()
@@ -81,4 +96,23 @@ def _profile(config: Mapping[str, Any], merged: Mapping[str, Any]) -> str:
                 and merged.get("linear_num_key_heads") else
                 "standard_qwen" if model_type in {"qwen2", "qwen2_moe", "qwen3", "qwen3_moe"}
                 else "generic")
+    # Structural fallbacks when a renamed/unseen HF config carries unambiguous
+    # native schema geometry without a recognized model_type or architecture name.
+    if (
+        ("linear_attention" in (merged.get("layer_types") or ())
+         or _int(merged, "full_attention_interval") > 0)
+        and merged.get("linear_num_key_heads")
+    ):
+        return "qwen"
+    if merged.get("layer_types"):
+        if any(field in merged for field in _STRUCTURAL_SANDWICH_SLIDING_KEYS):
+            return "gemma4"
+        if any(field in merged for field in _STRUCTURAL_REGION_SPARSE_KEYS):
+            return "step5"
+    if (
+        "sparse_attention_config" in merged
+        or "num_mtp_modules" in merged
+        or str(merged.get("hidden_act", "")).strip().lower() == "swigluoai"
+    ):
+        return "minimax_m3"
     return "generic"

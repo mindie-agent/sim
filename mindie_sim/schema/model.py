@@ -22,21 +22,21 @@ from __future__ import annotations
 from copy import deepcopy
 import math
 from dataclasses import dataclass, replace
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from mindie_sim.schema.common import (
-    ModelingError, _DTYPE_BYTES, _int, _mapping, _metadata, _normalize_dtype,
+    ModelingError, _int, _mapping, _metadata, _normalize_dtype,
     _positive_float, _unknown, dtype_bytes,
 )
-
-ZERO = 0
-ZERO_FLOAT = 0.0
 from mindie_sim.catalog.types import (
-    AuxiliarySpec, DraftSpec, EngramSpec, QuantSpec, VisionSpec,
+    AuxiliarySpec, EngramSpec, QuantSpec, VisionSpec,
 )
 from mindie_sim.schema.workload_validation import (
     _request_int, _validate_request, _validate_workload,
 )
+
+if TYPE_CHECKING:
+    from mindie_sim.schema.case import RuntimeSpec
 
 @dataclass(frozen=True)
 class MlaSpec:
@@ -114,11 +114,10 @@ INDEXER_TYPE_ALIASES = {
 }
 INDEXER_TYPES = frozenset({"none", "c4", "full", "shared"})
 Q_OUTPUT_GATE_KINDS = frozenset({"none", "elementwise", "headwise"})
-Q_PROJECTION_PACKED_WIDTH = 2
-Q_PROJECTION_PLAIN_WIDTH = 1
-KV_CACHE_PLANES = 2
 DEFAULT_NORM_EPS = 1e-6
 Q_GATE_PROJECTIONS = frozenset({"packed_q", "separate"})
+HC_FINAL_COLLAPSE_MODES = frozenset({"learned", "mean", "none"})
+GDN_LAYOUTS = frozenset({"standard", "interleaved"})
 ACCOUNTING_SCOPES = frozenset({"text_backbone", "full_checkpoint"})
 
 @dataclass(frozen=True)
@@ -153,6 +152,7 @@ class LayerPlan:
     #: ``mla``/``mla_dsa``, ``swa``/``csa``/``csa2``/``hca``, ``gdn``/``kda``.
     architecture: str = "gqa"
     indexer_type: str = "none"          # none | c4 | full | shared
+    indexer_kind: str = ""              # "" | region_csa | qsa | lightning | msa
     candidate_filter: bool = False
     o_lora_rank: int = 0
     o_groups: int = 0
@@ -210,7 +210,8 @@ class LayerPlan:
     hyper_connections: bool = False
     hc_mult: int = 0
     hc_sinkhorn_iters: int = 0
-    hc_lowrank: int = ZERO
+    hc_lowrank: int = 0
+    hc_final_collapse: str = "learned"
     residual_block_size: int = 0
     native_layer_id: int = -1
     scope: str = "body"                 # body | mtp | dspark | standalone_draft
@@ -247,6 +248,12 @@ class LayerPlan:
     router_noaux_tc: bool = False
     k_eq_v: bool = False
     kda_batch_chunk_norm: bool = False
+    zero_expert_num: int = 0
+    #: Structural norm/attention/linear-attention traits replacing model-name checks (AG014).
+    has_sandwich_norm: bool = False
+    norm_unit_offset: bool = False
+    v_norm: bool = False
+    gdn_layout: str = "standard"
 
     def __post_init__(self) -> None:
         # Normalise the declared indexer role once, so every downstream reader
@@ -258,29 +265,46 @@ class LayerPlan:
             raise ModelingError(f"layer_plan_indexer_type_unknown:{raw}")
         if role != self.indexer_type:
             object.__setattr__(self, "indexer_type", role)
-        kind = self.q_output_gate_kind
-        if kind is None or (kind == "none" and self.q_output_gate):
-            # The legacy boolean is a compatibility alias for a headwise gate.
-            kind = "headwise" if self.q_output_gate else "none"
-        if kind not in Q_OUTPUT_GATE_KINDS:
-            raise ModelingError(f"layer_plan_q_output_gate_kind_unknown:{kind}")
         projection = str(self.q_gate_projection or "packed_q")
         if projection not in Q_GATE_PROJECTIONS:
             raise ModelingError(
                 f"layer_plan_q_gate_projection_unknown:{projection}")
+        kind = self.q_output_gate_kind
+        if kind is None or (kind == "none" and self.q_output_gate):
+            # Legacy boolean q_output_gate=True defaults to elementwise gating when
+            # packed into q_proj (Qwen3-Next/3.5/3.6/3.8), and headwise when routed
+            # to a separate g_proj (matching weight_layer_terms g_proj rows=heads).
+            if self.q_output_gate:
+                kind = "headwise" if projection == "separate" else "elementwise"
+            else:
+                kind = "none"
+        if kind not in Q_OUTPUT_GATE_KINDS:
+            raise ModelingError(f"layer_plan_q_output_gate_kind_unknown:{kind}")
         if kind == "none" and projection != "packed_q":
             raise ModelingError(
                 "layer_plan_q_gate_projection_requires_gate")
         object.__setattr__(self, "q_output_gate_kind", kind)
         object.__setattr__(self, "q_gate_projection", projection)
         object.__setattr__(self, "q_output_gate", kind != "none")
+        collapse = str(self.hc_final_collapse or "learned").strip().lower()
+        if collapse not in HC_FINAL_COLLAPSE_MODES:
+            raise ModelingError(f"layer_plan_hc_final_collapse_unknown:{collapse}")
+        if collapse != self.hc_final_collapse:
+            object.__setattr__(self, "hc_final_collapse", collapse)
+        layout = str(self.gdn_layout or "standard").strip().lower()
+        if layout not in GDN_LAYOUTS:
+            raise ModelingError(f"layer_plan_gdn_layout_unknown:{layout}")
+        if layout != self.gdn_layout:
+            object.__setattr__(self, "gdn_layout", layout)
 
     def q_projection_width(self, local_heads: int, head_dim: int) -> int:
-        if self.q_gate_separate:
-            return int(local_heads) * int(head_dim) * Q_PROJECTION_PLAIN_WIDTH
-        width = (Q_PROJECTION_PACKED_WIDTH if self.q_output_gate
-                 else Q_PROJECTION_PLAIN_WIDTH)
-        return int(local_heads) * int(head_dim) * width
+        width = local_heads * head_dim
+        if self.q_gate_separate or self.q_output_gate_kind == "none":
+            return width
+        if self.q_output_gate_kind == "headwise":
+            return width + local_heads
+        v_dim = int(self.v_head_dim or head_dim)
+        return width + local_heads * v_dim
 
     @property
     def q_gate_separate(self) -> bool:
@@ -308,7 +332,7 @@ class LayerPlan:
             return int(self.kv_lora_rank + self.qk_rope_head_dim)
         # k_eq_v shares projection weights; post-norm/RoPE K and V cache
         # tensors remain distinct planes.
-        return int(KV_CACHE_PLANES * self.num_kv_heads * self.head_dim)
+        return self.num_kv_heads * (self.head_dim + (self.v_head_dim or self.head_dim))
 
     @property
     def state_bytes_total(self) -> float:
@@ -356,6 +380,7 @@ class ModelSpec:
     #: ``text_backbone`` excludes undeclared multimodal towers; a
     #: ``full_checkpoint`` scope requires exact tower/projector declarations.
     accounting_scope: str = "text_backbone"
+    zero_expert_num: int = 0
 
     def __post_init__(self) -> None:
         scope = str(self.accounting_scope or "text_backbone")
@@ -428,7 +453,7 @@ class ModelSpec:
             "ffn_intermediate_size", "vocab_size", "attention", "ffn", "architecture",
             "activation_dtype", "weight_dtype", "kv_dtype", "compute_dtype", "quantization",
             "num_experts", "n_routed_experts", "top_k", "moe_intermediate_size",
-            "num_shared_experts", "expert_routing", "expert_routing_histogram",
+            "num_shared_experts", "zero_expert_num", "expert_routing", "expert_routing_histogram",
             "expert_routing_distribution", "mla", "tie_word_embeddings",
             "catalog_key", "model_catalog_key", "preset", "metadata",
             "accounting_scope",
@@ -438,12 +463,12 @@ class ModelSpec:
             "q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim",
             "v_head_dim", "o_lora_rank", "o_groups", "index_topk", "index_head_dim",
             "index_n_heads", "compress_ratio", "sliding_window",
-            "norm_eps", "layer_plans", "layer_overrides", "auxiliary", "quant",
+            "norm_eps", "layer_plans", "layer_overrides", "auxiliary", "quant", "vision",
         }
         _unknown(raw, allowed, "model")
         catalog_key = raw.get("catalog_key", raw.get("model_catalog_key", raw.get("preset")))
         if catalog_key:
-            from mindie_sim.model_catalog import load_model
+            from mindie_sim.catalog import load_model
 
             model = load_model(str(catalog_key))
             from .serialization import apply_model_overrides
@@ -542,10 +567,12 @@ class ModelSpec:
             num_shared_experts=shared, expert_routing=routing,
             expert_routing_source=routing_source, mla=mla,
             norm_eps=float(raw.get("norm_eps", DEFAULT_NORM_EPS)), quant=quant,
+            vision=VisionSpec(**immutable_sequences(raw["vision"])) if raw.get("vision") else None,
             auxiliary=auxiliary(immutable_sequences(raw["auxiliary"])) if raw.get("auxiliary") else None,
             tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
             metadata=_metadata(raw),
             accounting_scope=str(raw.get("accounting_scope", "text_backbone")),
+            zero_expert_num=_int(raw.get("zero_expert_num", 0), "model.zero_expert_num_invalid"),
         )
 
     @property
@@ -553,7 +580,7 @@ class ModelSpec:
         return self.attention
 
     def weight_bytes(self, parallel) -> float:
-        from mindie_sim.prediction.structure import normalize_model
+        from mindie_sim.catalog import normalize_model
         from mindie_sim.catalog.weights import stage_weight_bytes
         model = normalize_model(self)
         partition = tuple(model.layers // parallel.pp + int(i < model.layers % parallel.pp)
@@ -561,9 +588,14 @@ class ModelSpec:
         return max(stage_weight_bytes(model, parallel, layer_partition=partition))
 
     def parameter_count(self) -> float:
-        from mindie_sim.prediction.structure import normalize_model
+        from mindie_sim.catalog import normalize_model
         from mindie_sim.catalog.weights import body_parameter_count
         return body_parameter_count(normalize_model(self))
+
+    def normalized(self) -> "ModelSpec":
+        from mindie_sim.catalog import normalize_model
+        from mindie_sim.catalog.draft import declare_native_auxiliary_plans
+        return declare_native_auxiliary_plans(normalize_model(self))
 
     def to_dict(self):
         from dataclasses import asdict
@@ -578,9 +610,15 @@ def _quant_weight_dtype(quantization: str) -> str:
         return "fp8"
     if q in {"int8", "w8a8"}:
         return "int8"
-    if q in {"int4", "awq", "gptq"}:
+    if q in {"w4a16", "int4", "awq", "gptq"}:
         return "int4"
-    return "bf16"
+    if q in {"none", "bf16", "bfloat16", "float"}:
+        return "bf16"
+    if q in {"fp16", "float16"}:
+        return "fp16"
+    if q in {"fp32", "float32"}:
+        return "fp32"
+    raise ModelingError(f"unknown_checkpoint_quant_tag:{quantization}")
 
 def _quant_activation_dtype(quantization: str) -> str:
     q = quantization.lower()
@@ -591,9 +629,15 @@ def _quant_activation_dtype(quantization: str) -> str:
     return "bf16"
 
 def _parse_routing(raw: Mapping[str, Any], experts: int) -> tuple[tuple[float, ...], str]:
-    value = raw.get("expert_routing", raw.get("expert_routing_histogram"))
-    if value is None:
-        return (), "uniform"
+    declared = [_normalize_routing(raw[key], experts) for key in
+                ("expert_routing", "expert_routing_histogram", "expert_routing_distribution")
+                if raw.get(key) is not None]
+    if declared and any(routing != declared[0] for routing in declared[1:]):
+        raise ModelingError("model.expert_routing_conflict")
+    return declared[0] if declared else ((), "uniform")
+
+
+def _normalize_routing(value: Any, experts: int) -> tuple[tuple[float, ...], str]:
     if isinstance(value, Mapping):
         entries = [float(value.get(str(i), value.get(i, 0.0))) for i in range(experts)]
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
@@ -602,10 +646,12 @@ def _parse_routing(raw: Mapping[str, Any], experts: int) -> tuple[tuple[float, .
         raise ModelingError("model.expert_routing_invalid")
     if len(entries) != experts or any(not math.isfinite(v) or v < 0 for v in entries):
         raise ModelingError("model.expert_routing_invalid")
-    total = sum(entries)
-    if total <= 0:
+    peak = max(entries, default=0.0)
+    if peak <= 0.0:
         return (), "uniform"
-    return tuple(v / total for v in entries), "declared_histogram"
+    scaled = [v / peak for v in entries]
+    total = sum(scaled)
+    return tuple(v / total for v in scaled), "declared_histogram"
 
 @dataclass(frozen=True)
 class SloSpec:
@@ -669,27 +715,34 @@ class RequestSpec:
                        "chain_id", "gap_ms", "text_prompt_tokens",
                        "prefix_cache_key"}, "workload.request")
         request_id = raw.get("request_id", raw.get("id", f"r{index}"))
-        text_prompt = _request_int("prompt_tokens",
-            raw.get("text_prompt_tokens",
-                    raw.get("text_tokens", raw.get("prompt_tokens", raw.get("prompt_len")))),
-            reason="workload", minimum=0,
-        )
         media_tokens = _request_int("media_tokens", raw.get("media_tokens", 0), reason="workload")
-        # Encoding status may skip vision work, but media positions remain part
-        # of the sequence budget and cache.
-        prompt = text_prompt + media_tokens
-        if ("text_prompt_tokens" in raw or "text_tokens" in raw) and "prompt_tokens" in raw:
-            if _request_int("prompt_tokens", raw["prompt_tokens"], minimum=1, reason="workload") != prompt:
+        for key, label, minimum in (
+            ("prompt_tokens", "prompt_tokens", 1),
+            ("prompt_len", "prompt_tokens", 1),
+            ("text_prompt_tokens", "text_prompt_tokens", 0),
+            ("text_tokens", "text_prompt_tokens", 0),
+        ):
+            if key in raw and raw[key] is None:
+                _request_int(label, None, minimum=minimum, reason="workload")
+        text = raw.get("text_prompt_tokens", raw.get("text_tokens"))
+        total = raw.get("prompt_tokens", raw.get("prompt_len"))
+        if text is None:
+            prompt = _request_int("prompt_tokens", total, minimum=1, reason="workload")
+            text_prompt = max(0, prompt - media_tokens)
+        else:
+            text_prompt = _request_int("text_prompt_tokens", text, reason="workload")
+            prompt = text_prompt + media_tokens
+            if total is not None and _request_int("prompt_tokens", total, minimum=1, reason="workload") != prompt:
                 raise ModelingError("workload.text_media_prompt_mismatch")
         return cls(
             request_id=request_id,
-            arrival_ms=raw.get("arrival_ms", ZERO_FLOAT), prompt_tokens=prompt,
+            arrival_ms=raw.get("arrival_ms", 0.0), prompt_tokens=prompt,
             output_tokens=raw.get("output_tokens", raw.get("output_len")),
-            prefix_tokens=raw.get("prefix_tokens", raw.get("prefix_len", ZERO)),
-            priority=raw.get("priority", ZERO),
+            prefix_tokens=raw.get("prefix_tokens", raw.get("prefix_len", 0)),
+            priority=raw.get("priority", 0),
             text_prompt_tokens=text_prompt, media_tokens=media_tokens,
             media_encoded=raw.get("media_encoded", False),
-            chain_id=raw.get("chain_id", ZERO), gap_ms=raw.get("gap_ms", ZERO_FLOAT),
+            chain_id=raw.get("chain_id", 0), gap_ms=raw.get("gap_ms", 0.0),
             prefix_cache_key=raw.get("prefix_cache_key", ""),
         )
 
@@ -762,7 +815,9 @@ class WorkloadSpec:
                 )
             if request.prompt_tokens > runtime.max_model_len:
                 raise ModelingError("request_prompt_exceeds_max_model_len")
-            if not runtime.enable_chunked_prefill and request.prompt_tokens > runtime.max_num_batched_tokens:
+            uncached = max(1, request.prompt_tokens - request.prefix_tokens)
+            budget = min(runtime.max_num_batched_tokens, runtime.max_num_input_tokens or runtime.max_num_batched_tokens)
+            if not runtime.enable_chunked_prefill and uncached > budget:
                 raise ModelingError("prompt_exceeds_batch_budget_without_chunking")
 
     def to_dict(self) -> dict[str, Any]:

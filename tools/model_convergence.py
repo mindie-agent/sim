@@ -32,10 +32,10 @@ MODELS = (
     ("v41-dp4", "v41-a5-dp4.json"),
 )
 CONTROLS = (
-    ("source-gqa-norm", "gqa-norm-control.json", 4, 17),
     ("source-grouped", "grouped-gemm-control.json", 4, 17),
-    ("source-mla", "mla-decode-control.json", 4, 33),
-    ("source-int8", "dynamic-int8-control.json", 3, 17),
+    ("source-grouped-down", "w4a8-down-msd-control.json", 4, 17),
+    ("source-indexed-mla", "indexed-mla-a3-control.json", 4, 33),
+    ("source-kda", "kda-state-control.json", 4, 17),
 )
 BALANCED_RECIPES = ("balanced_grouped_gate_up", "balanced_grouped_down")
 
@@ -219,7 +219,7 @@ def _runtime_identity():
     return {
         "import_path": str(root), "version": mindie_sim.__version__,
         "package_content_sha256": digest.hexdigest(), "hashed_files": len(files),
-        "matrix_sha256": file_hash(root / "prediction/matrix.py"),
+        "matrix_sha256": file_hash(root / "prediction/operators/matrix/matrix.py"),
     }
 
 

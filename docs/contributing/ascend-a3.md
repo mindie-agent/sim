@@ -15,7 +15,7 @@
 > - **严禁将整包双 Die 的显存（`128 GiB`）、核数（`40/48 AIC`）或共享 L2 容量翻倍填入 `device` 字段**！
 > - `device.memory_bytes`、`compute_units`、`compute_peaks`、`rates` 与 `buffers.l2` 全部按 **单 Die** 计价，且单 Die 内仍严格保持 `buffer_units.l2 = 1`。
 
-[`mindie_sim/compose.py`](../../mindie_sim/compose.py) 中的 A3 硬件与拓扑别名映射如下：
+[`mindie_sim/compose/inputs.py`](../../mindie_sim/compose/inputs.py) 中的 A3 硬件与拓扑别名映射如下：
 - `a3` / `910c` / `910_9392` -> `Ascend910_9392`
 - `910_9382` -> `Ascend910_9382`
 - `800i-a3-8p` -> `("Ascend910_9392", "a3_8p")`（4 物理封装 = `8` 逻辑 Die Rank）

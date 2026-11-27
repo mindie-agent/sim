@@ -1,8 +1,8 @@
 """Cohesive per-layer/per-stage weight formulas for catalog models.
 
 [Role]
-  Build exact logical matrix terms (rows, columns, count, representation) from
-  the heterogeneous layer schedules and sum source/runtime weight bytes under
+  Assemble model-wide and per-PP-stage logical weight terms from per-layer
+  builders in ``weight_layer_terms`` and sum source/runtime weight bytes under
   TP/EP/ETP/PP/node placement.
 
 [Invariants]
@@ -26,51 +26,212 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any, Mapping, Sequence
 
-import math
-from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from mindie_sim.catalog.draft_weights import (
+    draft_terms,
+    draft_weight_summary,
+    require_model_quant,
+)
+from mindie_sim.catalog.types import QuantSpec
+from mindie_sim.catalog.weight_layer_terms import (
+    _attention_terms,
+    _compressor_terms,
+    _ffn_terms,
+    _gemma4_norm_terms,
+    _indexer_terms,
+    _layer_resolved_quant,
+    _mhc_terms,
+    _norm_terms,
+    _tag_projection_roles,
+    gemma4_ple_layer_terms,
+    gemma4_ple_terms,
+    layer_weight_terms,
+)
+from mindie_sim.catalog.weight_terms import (
+    WeightTerm,
+    _ceil_div,
+    _local_groups,
+    _sharded_shape,
+    _t,
+    term_bytes,
+    term_payload_bytes,
+)
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.model import ModelSpec
+from mindie_sim.schema.parallel import ParallelSpec
 
-ZERO = 0
-ZERO_F = 0.0
-ONE = 1
-TWO = 2
-THREE = 3
-FOUR = 4
+MHC_HEAD_STREAMS = 4
+DEFAULT_PLE_CONV_KERNEL = 4
+PLE_STORAGE_KIND = "ple_ngram_conv"
 TARGET_ALIAS_CATEGORIES = frozenset({
     "target_alias_embedding", "target_alias_lm_head",
 })
-
-from mindie_sim.catalog.types import DraftSpec, QuantSpec, VisionSpec
-from mindie_sim.catalog.quant import projection_quant
-from mindie_sim.catalog.weight_terms import WeightTerm, _ceil_div, _local_groups, _sharded_shape, term_bytes, term_payload_bytes, _t
-from mindie_sim.schema.model import LayerPlan, ModelSpec
-from mindie_sim.schema.common import ModelingError, dtype_bytes
-from mindie_sim.schema.parallel import ParallelSpec
+_STAGE0_BODY_HEAD_TERMS = frozenset({
+    "embedding", "ngram_embedding", "ngram_post_proj",
+})
 
 
-def _resident_parallel(term: WeightTerm, parallel: ParallelSpec, shared_expert_dp: bool) -> ParallelSpec:
+def _require_model_quant(model: ModelSpec) -> QuantSpec:
+    return require_model_quant(model)
+
+
+def is_ple_engram(engram: Any) -> bool:
+    """Structural predicate distinguishing per-layer n-gram conv PLE from shared Engram."""
+    if engram is None:
+        return False
+    src = dict(getattr(engram, "source", ()) or ())
+    return src.get("storage_kind") == PLE_STORAGE_KIND or "ple_conv_kernel_size" in src
+
+
+def lowrank_hc_head_terms(model: ModelSpec) -> list[WeightTerm]:
+    """Low-rank gated hyper-connection collapse head terms for body output."""
+    hc = max((p.hc_mult for p in model.layer_plans), default=0)
+    lr = max((p.hc_lowrank for p in model.layer_plans), default=0)
+    hc_dim = hc * model.hidden_size
+    return [
+        _t("hc_head_norm", hc_dim, 1, "norm"),
+        _t("hc_head_down", lr, hc_dim, "linear_param_bf16"),
+        _t("hc_head_up", hc_dim, lr, "linear_param_bf16"),
+    ]
+
+
+def ple_table_terms(model: ModelSpec) -> list[WeightTerm]:
+    """TP-sharded per-layer n-gram embedding table weight terms."""
+    engram = model.engram
+    if engram is None:
+        return []
+    return [
+        WeightTerm(f"ple_table_{table.table_id}", table.rows, table.width, "engram_table", "out_tp", 1)
+        for table in engram.tables
+    ]
+
+
+def ple_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
+    """Per-layer PLE projection, norm, and depthwise conv weight terms."""
+    engram = model.engram
+    if engram is None:
+        return {}
+    hc = max((p.hc_mult for p in model.layer_plans), default=1)
+    h = model.hidden_size
+    hc_h = hc * h
+    embed = engram.columns_per_table * engram.width
+    conv_k = int(dict(engram.source).get("ple_conv_kernel_size", DEFAULT_PLE_CONV_KERNEL))
+    by_layer: dict[int, list[WeightTerm]] = {}
+    for table in engram.tables:
+        by_layer.setdefault(table.layer_id, []).extend([
+            _t("ple_kv_proj", hc_h + h, embed, "ple_proj", count=1),
+            _t("ple_norm_key", hc_h, 1, "norm", count=1),
+            _t("ple_norm_query", hc_h, 1, "norm", count=1),
+            _t("ple_norm_conv", hc_h, 1, "norm", count=1),
+            _t("ple_conv1d", hc_h, conv_k, "conv_weight_bf16", count=1),
+        ])
+    return by_layer
+
+
+def _resident_parallel(
+    term: WeightTerm, parallel: ParallelSpec, shared_expert_dp: bool,
+    *, pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
+) -> ParallelSpec:
     """Placement used for one resident term.
 
     Shared-expert DP executes those matrices with ``tp=1``. Each rank keeps
-    the full shared-expert copy instead of a TP shard.
+    the full shared-expert copy instead of a TP shard.  When
+    ``enable_pcp_o_proj_weight_sharding`` is enabled with ``pcp > 1``, attention
+    output weights (``o_proj`` / ``wo_a`` / ``wo_b``) are sharded across PCP.
+    When ``dcp_q_replicate`` is active, dense MLA Q projection weights
+    (``mla.q_b`` / ``mla.q_proj``) replicate across ``dcp_tp_gather``.
     """
+    placed = parallel
     if shared_expert_dp and term.category == "shared_expert":
-        return replace(parallel, tp=1)
-    return parallel
+        placed = replace(placed, tp=1)
+    if (dcp_q_replicate and term.category in {"mla.q_b", "mla.q_proj"}
+            and int(placed.dcp_tp_gather) > 1
+            and int(placed.dcp_pcp_factor) == 1
+            and int(placed.dcp_dp_width) == 1):
+        eff_tp = max(1, int(placed.tp) // int(placed.dcp_tp_gather))
+        placed = replace(placed, tp=eff_tp, q_proj_tp=1, dcp_linear_tp=1)
+    if (pcp_o_proj_weight_sharding and int(placed.pcp) > 1
+            and term.placement_role == "attention_output"):
+        base_width = max(int(placed.tp), int(placed.effective_o_proj_tp))
+        placed = replace(placed, dcp_linear_tp=1,
+                         o_proj_tp=base_width * int(placed.pcp))
+    return placed
 
 
-def _special_layer_keys(model: ModelSpec) -> set[str]:
+def _expand_resident_terms(
+    term: WeightTerm, parallel: ParallelSpec, shared_expert_dp: bool,
+    *, pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
+    model: ModelSpec | None = None,
+) -> tuple[tuple[WeightTerm, ParallelSpec], ...]:
+    """Return placed ``(term, parallel)`` pairs, splitting ``W_UK_T`` when replicated under DCP."""
+    placed = _resident_parallel(
+        term, parallel, shared_expert_dp,
+        pcp_o_proj_weight_sharding=pcp_o_proj_weight_sharding,
+        dcp_q_replicate=dcp_q_replicate,
+    )
+    if (dcp_q_replicate and term.name == "kv_b" and term.category == "mla_absorb"
+            and int(parallel.dcp_tp_gather) > 1
+            and int(parallel.dcp_pcp_factor) == 1
+            and int(parallel.dcp_dp_width) == 1):
+        if int(term.units) > 0:
+            uk_rows = int(term.units) * int(term.unit_width)
+        else:
+            uk_rows = term.rows // 2
+            if model is not None:
+                mla_plan = next(
+                    (
+                        lp for lp in model.layer_plans
+                        if lp.attention == "mla"
+                        and (lp.qk_nope_head_dim + lp.v_head_dim) > 0
+                        and int(lp.num_heads) * (int(lp.qk_nope_head_dim) + int(lp.v_head_dim)) == term.rows
+                    ),
+                    None,
+                ) or next((lp for lp in model.layer_plans if lp.attention == "mla"), None)
+                if mla_plan is not None and (mla_plan.qk_nope_head_dim + mla_plan.v_head_dim) > 0:
+                    uk_rows = int(mla_plan.num_heads) * int(mla_plan.qk_nope_head_dim)
+        uv_rows = max(0, term.rows - uk_rows)
+        if uk_rows > 0 and uv_rows > 0:
+            eff_tp = max(1, int(placed.tp) // int(parallel.dcp_tp_gather))
+            placed_uk = replace(placed, tp=eff_tp, q_proj_tp=1, dcp_linear_tp=1)
+            return (
+                (replace(term, name="w_uk_t", rows=uk_rows, units=0, unit_width=0), placed_uk),
+                (replace(term, name="w_uv", rows=uv_rows, units=0, unit_width=0), placed),
+            )
+    return ((term, placed),)
+
+
+def _special_layer_keys(model: ModelSpec) -> tuple[set[str], set[str]]:
     meta = dict(model.metadata)
-    found: set[str] = set()
+    by_index: set[str] = set()
+    by_native: set[str] = set()
     for name in ("prepared_mx32_matrix", "mla_head_padding",
-                 "kda_input_projection", "causal_conv_update"):
+                 "kda_input_projection", "causal_conv_update",
+                 "layer_quant_overrides"):
         block = meta.get(name)
-        if isinstance(block, dict):
+        if isinstance(block, Mapping):
             layers = block.get("layers")
-            if isinstance(layers, dict):
-                found.update(str(k) for k in layers)
-    return found
+            if isinstance(layers, Mapping):
+                by_index.update(str(k) for k in layers)
+            elif name == "layer_quant_overrides":
+                by_index.update(str(k) for k in block if k != "native_layers")
+            native_layers = block.get("native_layers")
+            if isinstance(native_layers, Mapping):
+                by_native.update(str(k) for k in native_layers)
+    quant = getattr(model, "quant", None)
+    if quant is not None and getattr(quant, "layer_quant_overrides", ()):
+        q_block = quant.layer_quant_overrides_dict()
+        q_layers = q_block.get("layers")
+        if isinstance(q_layers, Mapping):
+            by_index.update(str(k) for k in q_layers)
+        else:
+            by_index.update(str(k) for k in q_block if k != "native_layers")
+        q_native = q_block.get("native_layers")
+        if isinstance(q_native, Mapping):
+            by_native.update(str(k) for k in q_native)
+    return by_index, by_native
 
 
 def _cache_key(obj: Any) -> Any:
@@ -81,449 +242,209 @@ def _cache_key(obj: Any) -> Any:
         return None
 
 
+def _tag_mla_kv_b_terms(plan: Any, terms: Sequence[WeightTerm]) -> tuple[WeightTerm, ...]:
+    """Attach per-layer ``(num_heads, qk_nope_head_dim)`` to MLA ``kv_b`` terms for DCP split."""
+    if getattr(plan, "attention", "") != "mla":
+        return tuple(terms)
+    if int(getattr(plan, "qk_nope_head_dim", 0) or 0) + int(getattr(plan, "v_head_dim", 0) or 0) <= 0:
+        return tuple(terms)
+    num_heads = int(plan.num_heads)
+    nope_dim = int(plan.qk_nope_head_dim)
+    out: list[WeightTerm] = []
+    for term in terms:
+        if term.name == "kv_b" and term.category == "mla_absorb" and term.shard == "out_tp":
+            out.append(replace(term, units=num_heads, unit_width=nope_dim))
+        else:
+            out.append(term)
+    return tuple(out)
+
+
 def _iter_model_layer_terms(model: ModelSpec):
-    special = _special_layer_keys(model)
+    special_idx, special_native = _special_layer_keys(model)
     memo: dict[Any, tuple[WeightTerm, ...]] = {}
     for plan in model.layer_plans:
-        if str(plan.index) in special:
-            yield plan.index, tuple(layer_weight_terms(plan, model))
+        native_id = int(getattr(plan, "native_layer_id", -1))
+        if str(plan.index) in special_idx or (native_id >= 0 and str(native_id) in special_native):
+            yield plan.index, _tag_mla_kv_b_terms(plan, layer_weight_terms(plan, model))
             continue
-        shares_kv = ZERO <= plan.kv_owner_layer_id < plan.index
-        ck = _cache_key((replace(plan, index=ZERO, native_layer_id=ZERO), shares_kv))
+        shares_kv = 0 <= plan.kv_owner_layer_id < plan.index
+        layer_quant = _layer_resolved_quant(model, plan)
+        ck = _cache_key((replace(plan, index=0, native_layer_id=0), shares_kv, layer_quant))
         cached = memo.get(ck) if ck is not None else None
         if cached is None:
-            cached = tuple(layer_weight_terms(plan, model))
+            cached = _tag_mla_kv_b_terms(plan, layer_weight_terms(plan, model))
             if ck is not None:
                 memo[ck] = cached
         yield plan.index, cached
 
 
 def stage_weight_decomposition(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = ONE, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
+    include_vision: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
+    runtime: Any = None,
 ) -> list[dict[str, float]]:
     """Per-PP-stage weight bytes split into payload and quant metadata."""
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
     stages: list[dict[str, float]] = []
     pair_memo: dict[Any, tuple[float, float]] = {}
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft, include_engram=include_engram,
-        include_engram_tables=include_engram_tables, layer_partition=layer_partition,
+        include_engram_tables=include_engram_tables, include_vision=include_vision,
+        layer_partition=layer_partition, runtime=runtime,
     ):
-        total = ZERO_F
-        payload = ZERO_F
+        total = 0.0
+        payload = 0.0
         for term in terms:
             ck = _cache_key(term)
             pair = pair_memo.get(ck) if ck is not None else None
             if pair is None:
-                placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
-                pair = (term_bytes(term, quant, placed, node_ranks),
-                        term_payload_bytes(term, quant, placed, node_ranks))
+                expanded = _expand_resident_terms(
+                    term, parallel, enable_shared_expert_dp,
+                    pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+                    dcp_q_replicate=dcp_q_replicate, model=model,
+                )
+                pair = (
+                    sum(term_bytes(t_sub, quant, p_sub, node_ranks) for t_sub, p_sub in expanded),
+                    sum(term_payload_bytes(t_sub, quant, p_sub, node_ranks) for t_sub, p_sub in expanded),
+                )
                 if ck is not None:
                     pair_memo[ck] = pair
-            total += pair[ZERO]
-            payload += pair[ONE]
+            total += pair[0]
+            payload += pair[1]
         stages.append({"total_bytes": float(total), "payload_bytes": float(payload),
                        "quant_metadata_bytes": float(total - payload)})
     return stages
 
 
-def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    h = model.hidden_size
-    terms = ([] if plan.hc_lowrank > ZERO else
-             [_t("input_norm", h, ONE, "norm"), _t("post_attn_norm", h, ONE, "norm")])
-    if plan.attention == "mla":
-        if plan.q_lora_rank:
-            terms.append(_t("q_a_norm", plan.q_lora_rank, 1, "norm"))
-        if plan.kv_lora_rank:
-            terms.append(_t("kv_a_norm", plan.kv_lora_rank, 1, "norm"))
-    elif plan.attention == "gqa" and plan.qk_norm:
-        terms.append(_t("q_norm", plan.head_dim, 1, "norm"))
-        if not 0 <= plan.kv_owner_layer_id < plan.index:
-            terms.append(_t("k_norm", plan.head_dim, 1, "norm"))
-    elif plan.attention == "gdn":
-        terms.append(_t("gdn_norm", plan.linear_head_dim, 1, "norm"))
-    if plan.architecture == "gemma4":
-        terms.extend(_gemma4_norm_terms(plan, model))
-    if plan.residual_block_size:
-        terms.extend([
-            _t("attn_res_norm", h, 1, "norm"),
-            _t("attn_res_proj", 1, h, "norm"),
-            _t("mlp_res_norm", h, 1, "norm"),
-            _t("mlp_res_proj", 1, h, "norm"),
-        ])
-    return terms
+def _vision_tp(
+    vision: Any,
+    parallel: ParallelSpec | None,
+    runtime: Any = None,
+) -> int:
+    """Resolve effective vision encoder TP width matching ``catalog/media.py``."""
+    if runtime is not None:
+        meta = dict(getattr(runtime, "metadata", ()) or ())
+        if str(meta.get("mm_encoder_tp_mode", "") or "").strip().lower() == "data":
+            return 1
+    if parallel is None:
+        return 1
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    if tp > 1 and int(vision.num_heads) % tp != 0:
+        return 1
+    return tp
 
 
-def _gemma4_norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    """Gemma-4 declares four dense norms and seven MoE norms plus scales."""
-    h = model.hidden_size
-    terms = [_t("pre_ffn_norm", h, ONE, "norm"),
-             _t("post_ffn_norm", h, ONE, "norm")]
-    if plan.ffn == "moe":
-        terms.extend([_t("pre_experts_norm", h, ONE, "norm"),
-                      _t("post_experts_norm", h, ONE, "norm"),
-                      _t("router_norm", h, ONE, "norm"),
-                      _t("router_scale", h, ONE, "param_fp32"),
-                      _t("expert_scale", int(plan.num_experts), ONE, "param_fp32")])
-    return terms
-
-
-def gemma4_ple_terms(model: ModelSpec) -> list[WeightTerm]:
-    """Nonzero per-layer-embedding tables and their projection/norm."""
-    facts = dict(model.catalog_facts)
-    width = int(facts.get("gemma4_ple_width", ZERO) or ZERO)
-    if not facts.get("gemma4_ple") or width <= ZERO:
-        return []
-    layers = max(ONE, int(model.layers))
-    vocab = int(facts.get("gemma4_ple_vocab", model.vocab_size) or model.vocab_size)
-    h = model.hidden_size
-    return [_t("ple_embedding", vocab, layers * width, "ple_table", "embedding"),
-            _t("ple_model_projection", layers * width, h, "ple_projection"),
-            _t("ple_projection_norm", width, ONE, "norm")]
-
-
-def gemma4_ple_layer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    facts = dict(model.catalog_facts)
-    width = int(facts.get("gemma4_ple_width", ZERO) or ZERO)
-    if not facts.get("gemma4_ple") or width <= ZERO:
-        return []
-    h = model.hidden_size
-    return [_t("ple_gate", width, h, "ple_gate"),
-            _t("ple_projection", h, width, "ple_gate"),
-            _t("ple_norm", h, ONE, "norm")]
-
-
-def _mhc_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    if not plan.hyper_connections or plan.hc_mult <= ZERO:
-        return []
-    if plan.hc_lowrank > ZERO:
-        from mindie_sim.catalog.qwen4_exp import lowrank_hc_layer_terms
-        return lowrank_hc_layer_terms(plan, model)
-    h, mix, hc_dim = model.hidden_size, (TWO + plan.hc_mult) * plan.hc_mult, plan.hc_mult * model.hidden_size
-    terms = []
-    for part in ("attn", "ffn"):
-        terms.extend([_t(f"hc_{part}_fn", mix, hc_dim, "mhc"), _t(f"hc_{part}_base", mix, ONE, "param_fp32"),
-                      _t(f"hc_{part}_scale", THREE, ONE, "param_fp32")])
-    return terms
-
-
-def _indexer_terms(plan, model):
-    if not (plan.owns_index_k or plan.owns_topk or plan.indexer or plan.index_query_per_layer):
-        return []
-    if plan.index_heads <= ZERO or plan.index_dim <= ZERO:
-        raise ModelingError(f"indexer_dimensions_missing:{plan.index}")
-    if plan.attention == "gqa" and plan.index_kpool > ONE:
-        from mindie_sim.catalog.qwen4_exp import qsa_indexer_terms
-        return qsa_indexer_terms(plan, model)
-    terms = []
-    if plan.owns_index_k:
-        width = plan.head_dim if plan.index_input == "compressed" else model.hidden_size
-        if plan.index_input == "hidden" and plan.compress_ratio > 1:
-            expanded = plan.compressor_width * plan.index_dim
-            terms.extend([
-                _t("indexer_wk", expanded, width, "compressor_bf16_runtime"),
-                _t("indexer_gate", expanded, width, "compressor_bf16_runtime"),
-                _t("indexer_ape", plan.compress_ratio, expanded, "ape"),
-                _t("indexer_k_norm", plan.index_dim, 1,
-                   "compressor_fp32_runtime" if plan.compressor_norm_dtype == "fp32" else "norm"),
-            ])
-        else:
-            terms.extend([_t("indexer_wk", plan.index_dim, width,
-                             "linear_param_bf16" if plan.index_kpool > 1 else "indexer_fp8"),
-                          _t("indexer_k_norm", plan.index_dim, 1,
-                             "param_fp32" if plan.index_kpool > 1 else "norm"),
-                          _t("indexer_k_norm_bias", plan.index_dim, 1,
-                             "param_fp32" if plan.index_kpool > 1 else "norm")])
-            if plan.index_kpool > 1:
-                terms.extend([
-                    _t("indexer_pool_gate", plan.index_dim, width, "linear_param_bf16"),
-                    _t("indexer_pool_ape", plan.index_kpool, plan.index_dim, "param_fp32"),
-                ])
-    if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
-        terms.extend([_t("indexer_wq", plan.index_heads * plan.index_dim,
-                         plan.q_lora_rank or model.hidden_size, "indexer_fp8"),
-                      _t("indexer_weights", plan.index_heads, model.hidden_size,
-                         "linear_param_bf16" if plan.index_kpool > 1 else "indexer.weights")])
-    if plan.index_kpool > 1:
-        # process_weights_after_loading retains the BF16 parameter objects
-        # and registers FP32 execution copies. Explicit alternative formats
-        # retain the same source parameters and their own prepared bytes.
-        quant = projection_quant(model.quant or QuantSpec("bf16"), plan)
-        roles = {"indexer_wk": "indexer.pool_projection", "indexer_weights": "indexer.weights",
-                 "indexer_pool_gate": "indexer.pool_gate"}
-        if "native_keypool_caller" in dict(model.metadata):
-            # Native CANN preserves BF16 WK/gate and only prepares FP32
-            # head weights; the fallback's FP32 K/gate copies do not exist.
-            roles = {"indexer_weights": "indexer.weights"}
-        copies = [replace(term, name=term.name + "_prepared_" + quant.format_for(roles[term.name]),
-                          category=roles[term.name], source_owned=False, runtime_quant=quant)
-                  for term in terms if term.name in roles
-                  and quant.format_for(roles[term.name]) != "bf16"]
-        terms.extend(copies)
-    return terms
-
-
-def _compressor_terms(plan, model):
-    if not plan.owns_long_kv or not plan.compress_ratio:
-        return []
-    d = plan.head_dim * plan.compressor_width
-    terms = [_t("compressor_wkv", d, model.hidden_size, "compressor_bf16_runtime")]
-    if plan.compress_ratio > ONE:
-        # A C1 layer has no gated pooling: ``wgate`` and its APE parameters do
-        # not exist in the checkpoint and must not be priced.
-        terms.extend([_t("compressor_gate", d, model.hidden_size,
-                         "compressor_bf16_runtime"),
-                      _t("compressor_ape", plan.compress_ratio, d, "ape")])
-    terms.append(_t("compressor_norm", plan.head_dim, 1,
-                    "compressor_fp32_runtime" if plan.compressor_norm_dtype == "fp32" else "norm"))
-    return terms
-
-
-def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    h = model.hidden_size
-    heads = plan.num_heads
+def _vision_projector_terms(
+    vision: Any,
+    *,
+    aligner_sharded: bool,
+    merger_sharded: bool,
+) -> list[WeightTerm]:
+    """Final spatial-merge projector plus optional DeepStack tap merger weights."""
+    aligner_in = vision.aligner_input_width
+    aligner_out = "out_tp" if aligner_sharded else "replicated"
+    aligner_in_shard = "in_tp" if aligner_sharded else "replicated"
+    merger_out = "out_tp" if merger_sharded else "replicated"
+    merger_in_shard = "in_tp" if merger_sharded else "replicated"
+    deepstack_taps = len(getattr(vision, "deepstack_visual_indexes", ()) or ())
     terms: list[WeightTerm] = []
-    if plan.attention == "mla":
-        qk = plan.qk_nope_head_dim + plan.qk_rope_head_dim
-        if plan.mla_variant == "latent_mqa":
-            if plan.q_lora_rank:
-                terms.extend([
-                    _t("q_a", plan.q_lora_rank, h, "mla"),
-                    _t("q_b", heads * qk, plan.q_lora_rank, "mla", "out_tp"),
-                    _t("wkv", plan.kv_lora_rank, h, "mla"),
-                ])
-            else:
-                terms.extend([
-                    _t("q_proj", heads * qk, h, "mla.q_proj", "out_tp"),
-                    _t("wkv", plan.kv_lora_rank, h, "mla"),
-                ])
-            if plan.o_groups > 0:
-                group_width = heads * plan.head_dim // plan.o_groups
-                terms.extend([
-                    _t("wo_a", plan.o_groups * plan.o_lora_rank, group_width,
-                       "mla.o_a", "group_out", groups=plan.o_groups),
-                    _t("wo_b", h, plan.o_groups * plan.o_lora_rank,
-                       "mla.o_b", "group_in", groups=plan.o_groups),
-                ])
-            else:
-                terms.append(_t("o_proj", h, heads * plan.head_dim, "mla", "in_tp"))
-        else:  # latent_mla (Kimi / GLM)
-            if plan.q_lora_rank:
-                terms.extend([
-                    _t("q_a", plan.q_lora_rank, h, "mla.q_a"),
-                    _t("q_b", heads * qk, plan.q_lora_rank, "mla.q_b", "out_tp"),
-                ])
-            else:
-                terms.append(_t("q_proj", heads * qk, h, "mla.q_proj", "out_tp"))
+    if vision.aligner_hidden_size > 0 and vision.bias:
+        terms.extend([
+            _t("aligner_norm", aligner_in, 1, "norm"),
+            _t("aligner_w1", vision.out_hidden_size, aligner_in, "projector", aligner_out),
+            _t("aligner_w1_bias", vision.out_hidden_size, 1, "vision", aligner_out),
+            _t("aligner_w2", vision.out_hidden_size, vision.out_hidden_size, "projector", aligner_in_shard),
+            _t("aligner_w2_bias", vision.out_hidden_size, 1, "vision"),
+        ])
+        if deepstack_taps > 0:
             terms.extend([
-                _t("kv_a", plan.kv_lora_rank + plan.qk_rope_head_dim, h, "mla.kv_a"),
-                _t("kv_b", heads * (plan.qk_nope_head_dim + plan.v_head_dim),
-                   plan.kv_lora_rank, "mla_absorb", "out_tp"),
+                _t("vision_deepstack_aligner_norm", aligner_in, 1, "norm", count=deepstack_taps),
+                _t("vision_deepstack_aligner_w1", vision.out_hidden_size, aligner_in,
+                   "projector", aligner_out, count=deepstack_taps),
+                _t("vision_deepstack_aligner_w1_bias", vision.out_hidden_size, 1,
+                   "vision", aligner_out, count=deepstack_taps),
+                _t("vision_deepstack_aligner_w2", vision.out_hidden_size, vision.out_hidden_size,
+                   "projector", aligner_in_shard, count=deepstack_taps),
+                _t("vision_deepstack_aligner_w2_bias", vision.out_hidden_size, 1,
+                   "vision", count=deepstack_taps),
             ])
-            if plan.mla_output_gate:
-                terms.append(_t("mla_g", heads * plan.v_head_dim, h,
-                                "mla.g", "out_tp"))
-            if plan.o_groups > 0:
-                group_width = heads * plan.v_head_dim // plan.o_groups
-                terms.extend([
-                    _t("wo_a", plan.o_groups * plan.o_lora_rank, group_width,
-                       "mla.o_a", "group_out", groups=plan.o_groups),
-                    _t("wo_b", h, plan.o_groups * plan.o_lora_rank,
-                       "mla.o_b", "group_in", groups=plan.o_groups),
-                ])
-            else:
-                terms.append(_t("o_proj", h, heads * plan.v_head_dim, "mla.o", "in_tp"))
-        prepared = dict(model.metadata).get("mla_head_padding", {}).get("layers", {}).get(str(plan.index))
-        if prepared:
-            # Source process_weights_after_loading creates these separate NZ
-            # tensors while retained-prefill mode keeps the checkpoint weights.
-            physical = prepared["physical_heads"] * prepared["tp"]
-            copies = [
-                _t("mlapo_prepared_q_a", plan.q_lora_rank, h, "mla.q_a"),
-                _t("mlapo_prepared_kv_a", plan.kv_lora_rank + plan.qk_rope_head_dim, h, "mla.kv_a"),
-                _t("mlapo_prepared_q_b", physical * qk, plan.q_lora_rank, "mla.q_b", "out_tp"),
-                # process_weights_after_loading retains kv_b_proj and creates
-                # separate contiguous UK/UV tensors before prolog UK padding.
-                _t("mlapo_prepared_uk_unpadded", heads * (
-                    plan.qk_nope_head_dim + plan.v_head_dim
-                    if prepared["logical_heads"] == 1 else plan.qk_nope_head_dim),
-                   plan.kv_lora_rank, "mla_absorb", "out_tp"),
-                _t("mlapo_prepared_uv", heads * plan.v_head_dim,
-                   plan.kv_lora_rank, "mla_absorb", "out_tp"),
-            ]
-            if prepared["physical_heads"] != prepared["logical_heads"]:
-                copies.append(_t("mlapo_prepared_uk", physical * plan.qk_nope_head_dim,
-                                 plan.kv_lora_rank, "mla_absorb", "out_tp"))
-            terms.extend(replace(term, source_owned=False, runtime_dtype="bf16") for term in copies)
         return terms
-    if plan.attention == "unmodeled":
-        return []
-    if plan.attention in {"gqa", "projection_only"}:
-        gate_separate = plan.q_gate_separate
-        q_width = plan.q_projection_width(heads, plan.head_dim)
-        kv_width = plan.num_kv_heads * plan.head_dim
+    if vision.aligner_hidden_size > 0:
+        # Native MoonViT PatchMergerV2 uses ReplicatedLinear for both projections.
         terms.extend([
-            _t("q_proj", q_width, h, "attn.qkv", "out_tp"),
-            _t("k_proj", kv_width, h, "attn.qkv", "kv_out",
-               units=plan.num_kv_heads, unit_width=plan.head_dim),
+            _t("projector_w0", vision.aligner_hidden_size, aligner_in, "projector"),
+            _t("projector_w2", vision.out_hidden_size, vision.aligner_hidden_size, "projector"),
+            _t("projector_norm", vision.out_hidden_size, 1, "norm"),
         ])
-        if not plan.k_eq_v:
-            terms.append(_t("v_proj", kv_width, h, "attn.qkv", "kv_out",
-                            units=plan.num_kv_heads, unit_width=plan.head_dim))
-        if gate_separate:
-            terms.append(_t("g_proj", heads, h, "attn.gate", "out_tp"))
-        terms.append(_t("o_proj", h, heads * plan.head_dim, "attn.o", "in_tp"))
-        if 0 <= plan.kv_owner_layer_id < plan.index:
-            terms = [term for term in terms if term.name not in {"k_proj", "v_proj"}]
+        if deepstack_taps > 0:
+            terms.extend([
+                _t("vision_deepstack_projector_w0", vision.aligner_hidden_size, aligner_in,
+                   "projector", count=deepstack_taps),
+                _t("vision_deepstack_projector_w2", vision.out_hidden_size, vision.aligner_hidden_size,
+                   "projector", count=deepstack_taps),
+                _t("vision_deepstack_projector_norm", vision.out_hidden_size, 1,
+                   "norm", count=deepstack_taps),
+            ])
         return terms
-    if plan.attention in {"kda", "mamba", "gla", "deltanet", "lightning", "retnet"}:
-        d = (plan.linear_value_heads or plan.linear_heads) * plan.linear_head_dim
-        dk = plan.linear_key_head_dim or plan.linear_head_dim
-        k_dim = (plan.linear_key_heads or plan.linear_heads) * dk
-        decay_dim = (plan.linear_value_heads or plan.linear_heads) * dk
-        terms.extend([
-            _t("kda_q", k_dim, h, "kda.q", "out_tp"),
-            _t("kda_k", k_dim, h, "kda.k", "out_tp"),
-            _t("kda_v", d, h, "kda.v", "out_tp"),
-            _t("kda_b", plan.linear_value_heads or plan.linear_heads, h, "kda.b", "out_tp"),
-            _t("kda_f_a", dk, h, "kda.f_a"),
-            _t("kda_f_b", decay_dim, dk, "kda.f_b", "out_tp"),
-            _t("kda_q_conv", k_dim, plan.conv_kernel, "conv_weight_f32", "out_tp"),
-            _t("kda_k_conv", k_dim, plan.conv_kernel, "conv_weight_f32", "out_tp"),
-            _t("kda_v_conv", d, plan.conv_kernel, "conv_weight_f32", "out_tp"),
-            _t("kda_A_log", plan.linear_value_heads or plan.linear_heads, 1, "a_log", "out_tp"),
-            _t("kda_dt_bias", decay_dim, 1, "dt_bias", "out_tp"),
-            _t("kda_o_norm", plan.linear_head_dim, 1, "param_fp32"),
-            _t("kda_o", h, d, "kda.o", "in_tp"),
-        ])
-        if plan.gate_rank:
-            terms.extend([_t("kda_g_a", plan.gate_rank, h, "kda.g_a"),
-                          _t("kda_g_b", d, plan.gate_rank, "kda.g_b", "out_tp")])
-        else:
-            terms.append(_t("kda_g", d, h, "kda.g", "out_tp"))
-        prepared_projection = dict(model.metadata).get("kda_input_projection", {}).get("layers", {}).get(str(plan.index))
-        if prepared_projection:
-            # The loader retains both low-rank factors after composing F.
-            # B and G already own their slices in the packed BFG allocation.
-            terms.append(replace(
-                _t("kda_composed_f", decay_dim, h, "kda.f", "out_tp"),
-                source_owned=False, runtime_dtype=prepared_projection["dtype"]))
-        prepared_conv = dict(model.metadata).get("causal_conv_update", {}).get("layers", {}).get(str(plan.index))
-        if prepared_conv:
-            # The source registers a separate activation-dtype W x 3C tensor;
-            # process_weights_after_loading keeps the FP32 conv1d parameter.
-            terms.append(replace(
-                _t("kda_prepared_conv", 2 * k_dim + d, plan.conv_kernel, "conv_weight_bf16", "out_tp"),
-                source_owned=False, runtime_dtype=prepared_conv["dtype"]))
-        return terms
-    if plan.attention == "gdn":
-        key_w = plan.linear_key_heads * plan.linear_key_head_dim
-        value_w = plan.linear_value_heads * plan.linear_head_dim
-        conv_w = plan.conv_width or (2 * key_w + value_w)
-        terms.extend([
-            _t("gdn_qkvz", conv_w + value_w, h, "gdn.qkvz", "out_tp"),
-            _t("gdn_ba", 2 * plan.linear_value_heads, h, "gdn.beta_alpha", "out_tp"),
-            _t("gdn_conv", conv_w, plan.conv_kernel, "conv_weight_bf16", "out_tp"),
-            _t("gdn_o", h, value_w, "gdn.o", "in_tp"),
-            _t("gdn_A_log", plan.linear_value_heads, 1, "linear_param_bf16", "out_tp"),
-            _t("gdn_dt_bias", plan.linear_value_heads, 1, "linear_param_bf16", "out_tp"),
-            _t("gdn_norm", plan.linear_head_dim, 1, "norm"),
-        ])
-        return terms
-    raise ModelingError(f"catalog_attention_kind_unsupported:{plan.attention}")
-
-
-def _ffn_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    h = model.hidden_size
-    terms: list[WeightTerm] = []
-    if plan.ffn == "dense":
-        i = plan.intermediate_size
-        terms.extend([
-            _t("dense_gate", i, h, "dense_mlp", "dense_up"),
-            _t("dense_up", i, h, "dense_mlp", "dense_up"),
-            _t("dense_down", h, i, "dense_mlp", "dense_down"),
-        ])
-        return terms
-    if plan.num_experts <= 0 or plan.moe_intermediate_size <= 0:
-        raise ModelingError(f"catalog_moe_dims_missing:layer{plan.index}")
-    expert_input = plan.expert_latent_size or h
-    expert_output = plan.expert_latent_size or h
+    # Final Qwen PatchMerger runs pre-shuffle norm via vision_final_norm (no extra merger_norm).
     terms.extend([
-        replace(_t("router", plan.num_experts, plan.router_input_size or h, "router"),
-                runtime_dtype="" if plan.router_precast_weight_copy else plan.router_dtype),
-        _t("expert_gate", plan.moe_intermediate_size, expert_input,
-           "routed_expert", "expert_gate_up", count=plan.num_experts),
-        _t("expert_up", plan.moe_intermediate_size, expert_input,
-           "routed_expert", "expert_gate_up", count=plan.num_experts),
-        _t("expert_down", expert_output, plan.moe_intermediate_size,
-           "routed_expert", "expert_down", count=plan.num_experts),
+        _t("merger_w1", aligner_in, aligner_in, "projector", merger_out),
+        _t("merger_w1_bias", aligner_in, 1, "vision", merger_out),
+        _t("merger", vision.out_hidden_size, aligner_in, "projector", merger_in_shard),
+        _t("merger_bias", vision.out_hidden_size, 1, "vision"),
     ])
-    if plan.router_noaux_tc:
-        # The noaux_tc correction bias is an FP32 parameter of every MoE layer,
-        # including draft layers; it is read once per routing invocation.
-        terms.append(_t("router_correction_bias", plan.num_experts, ONE, "param_fp32"))
-    if plan.router_precast_weight_copy and plan.router_dtype:
-        terms.append(replace(
-            _t("router_precast", plan.num_experts, plan.router_input_size or h, "router"),
-            source_owned=False, runtime_dtype=plan.router_dtype))
-    if plan.expert_latent_size:
-        r = plan.expert_latent_size
+    if deepstack_taps > 0:
+        # Each DeepStack tap applies post-shuffle norm on aligner_in before its 2-layer merger.
+        terms.append(_t("vision_deepstack_merger_norm", aligner_in, 1, "norm", count=deepstack_taps))
+        if vision.norm_type == "layernorm":
+            terms.append(_t("vision_deepstack_merger_norm_bias", aligner_in, 1, "norm", count=deepstack_taps))
         terms.extend([
-            _t("latent_down", r, h, "latent_moe"),
-            _t("latent_norm", r, 1, "norm"),
-            _t("latent_up", h, r, "latent_moe"),
+            _t("vision_deepstack_merger_w1", aligner_in, aligner_in,
+               "projector", merger_out, count=deepstack_taps),
+            _t("vision_deepstack_merger_w1_bias", aligner_in, 1,
+               "vision", merger_out, count=deepstack_taps),
+            _t("vision_deepstack_merger", vision.out_hidden_size, aligner_in,
+               "projector", merger_in_shard, count=deepstack_taps),
+            _t("vision_deepstack_merger_bias", vision.out_hidden_size, 1,
+               "vision", count=deepstack_taps),
         ])
-    shared_i = plan.shared_intermediate_size or (
-        plan.num_shared_experts * plan.moe_intermediate_size
-    )
-    if shared_i > 0:
-        terms.extend([
-            _t("shared_gate", shared_i, h, "shared_expert", "dense_up"),
-            _t("shared_up", shared_i, h, "shared_expert", "dense_up"),
-            _t("shared_down", h, shared_i, "shared_expert", "dense_down"),
-        ])
-    if plan.shared_expert_gate:
-        terms.append(_t("shared_router", 1, h, "router"))
     return terms
 
 
-def _tag_projection_roles(terms, plan, *, scope="target"):
-    from mindie_sim.catalog.projection_placement import projection_role
-    return [replace(term, placement_role=projection_role(
-        plan, term.name, scope=scope)) for term in terms]
-
-
-def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    quant = projection_quant(model.quant or QuantSpec("bf16"), plan)
-    attention = [replace(term, quant=quant) for term in _attention_terms(plan, model)]
-    prepared = dict(model.metadata).get("prepared_mx32_matrix", {}).get("layers", {}).get(str(plan.index), ())
-    if prepared:
-        # Only explicit post-load declarations change resident scales. The
-        # term's checkpoint quant remains untouched for source=True callers.
-        attention = [replace(term, runtime_quant=replace(
-                         quant.for_category("mla.q_b" if term.name == "q_b" else term.category),
-                         weight_block=(1, 32), scale_format="fp8_e8m0", scale_bytes=1))
-                     if term.name in prepared else term for term in attention]
-    return _tag_projection_roles(
-        _norm_terms(plan, model)
-        + gemma4_ple_layer_terms(plan, model)
-        + attention
-        + _mhc_terms(plan, model)
-        + [replace(term, quant=quant) for term in _indexer_terms(plan, model)]
-        + _compressor_terms(plan, model)
-        + _ffn_terms(plan, model),
-        plan,
-    )
-
-
-def vision_weight_terms(model: ModelSpec) -> list[WeightTerm]:
+def vision_weight_terms(
+    model: ModelSpec,
+    *,
+    include_vision: bool | None = None,
+    parallel: ParallelSpec | None = None,
+    runtime: Any = None,
+) -> list[WeightTerm]:
     vision = model.vision
-    if vision is None or (model.auxiliary is not None and not model.auxiliary.include_vision_weights):
+    if vision is None:
         return []
+    if include_vision is False:
+        return []
+    if include_vision is None and (model.auxiliary is not None and not model.auxiliary.include_vision_weights):
+        return []
+    if parallel is None:
+        meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+        data_parallel = str(meta.get("mm_encoder_tp_mode", "") or "").strip().lower() == "data"
+        attn_sharded = mlp_sharded = aligner_sharded = merger_sharded = not data_parallel
+    else:
+        v_tp = _vision_tp(vision, parallel, runtime)
+        attn_sharded = v_tp > 1
+        mlp_sharded = v_tp > 1 and vision.intermediate_size % v_tp == 0
+        aligner_sharded = v_tp > 1 and vision.out_hidden_size % v_tp == 0
+        merger_sharded = v_tp > 1 and vision.aligner_input_width % v_tp == 0
+    attn_out = "out_tp" if attn_sharded else "replicated"
+    attn_in = "in_tp" if attn_sharded else "replicated"
+    mlp_out = "out_tp" if mlp_sharded else "replicated"
+    mlp_in = "in_tp" if mlp_sharded else "replicated"
     terms = [
         _t("vision_patch", vision.hidden_size, vision.patch_input_width, "vision"),
         _t("vision_pos", max(1, vision.pos_embed_tokens or 1), vision.hidden_size, "vision_pos"),
@@ -531,19 +452,20 @@ def vision_weight_terms(model: ModelSpec) -> list[WeightTerm]:
     if vision.bias:
         terms.append(_t("vision_patch_bias", vision.hidden_size, 1, "vision"))
     per = [
-        _t("vision_qkv", vision.qkv_width, vision.hidden_size, "vision"),
-        _t("vision_wo", vision.hidden_size, vision.query_width, "vision"),
+        _t("vision_qkv", vision.qkv_width, vision.hidden_size, "vision", attn_out),
+        _t("vision_wo", vision.hidden_size, vision.query_width, "vision", attn_in),
         _t("vision_fc0", (2 if vision.gated_mlp else 1) * vision.intermediate_size,
-           vision.hidden_size, "vision"),
-        _t("vision_fc1", vision.hidden_size, vision.intermediate_size, "vision"),
+           vision.hidden_size, "vision", mlp_out),
+        _t("vision_fc1", vision.hidden_size, vision.intermediate_size, "vision", mlp_in),
         _t("vision_norm1", vision.hidden_size, 1, "norm"),
         _t("vision_norm2", vision.hidden_size, 1, "norm"),
     ]
     if vision.bias:
         per.extend([
-            _t("vision_qkv_bias", vision.qkv_width, 1, "vision"),
+            _t("vision_qkv_bias", vision.qkv_width, 1, "vision", attn_out),
             _t("vision_wo_bias", vision.hidden_size, 1, "vision"),
-            _t("vision_fc0_bias", (2 if vision.gated_mlp else 1) * vision.intermediate_size, 1, "vision"),
+            _t("vision_fc0_bias", (2 if vision.gated_mlp else 1) * vision.intermediate_size,
+               1, "vision", mlp_out),
             _t("vision_fc1_bias", vision.hidden_size, 1, "vision"),
         ])
     if vision.norm_type == "layernorm":
@@ -557,51 +479,74 @@ def vision_weight_terms(model: ModelSpec) -> list[WeightTerm]:
     terms.append(_t("vision_final_norm", vision.hidden_size, 1, "norm"))
     if vision.norm_type == "layernorm":
         terms.append(_t("vision_final_norm_bias", vision.hidden_size, 1, "norm"))
-    aligner_in = vision.aligner_input_width
-    if vision.kind == "deepseek_v41":
-        terms.extend([
-            _t("aligner_norm", aligner_in, 1, "norm"),
-            _t("aligner_w1", vision.out_hidden_size, aligner_in, "projector"),
-            _t("aligner_w1_bias", vision.out_hidden_size, 1, "vision"),
-            _t("aligner_w2", vision.out_hidden_size, vision.out_hidden_size, "projector"),
-            _t("aligner_w2_bias", vision.out_hidden_size, 1, "vision"),
-        ])
-    elif vision.kind == "kimi_k3":
-        terms.extend([
-            _t("projector_w0", vision.aligner_hidden_size, aligner_in, "projector"),
-            _t("projector_w2", vision.out_hidden_size, vision.aligner_hidden_size, "projector"),
-            _t("projector_norm", vision.out_hidden_size, 1, "norm"),
-        ])
-    else:
-        terms.extend([
-            _t("merger_norm", aligner_in, 1, "norm"),
-            _t("merger_norm_bias", aligner_in, 1, "norm"),
-            _t("merger_w1", aligner_in, aligner_in, "projector"),
-            _t("merger_w1_bias", aligner_in, 1, "vision"),
-            _t("merger", vision.out_hidden_size, aligner_in, "projector"),
-            _t("merger_bias", vision.out_hidden_size, 1, "vision"),
-        ])
+    terms.extend(_vision_projector_terms(
+        vision, aligner_sharded=aligner_sharded, merger_sharded=merger_sharded,
+    ))
     for name in ("image_start", "image_end", "image_newline"):
         terms.append(_t(name, model.hidden_size, 1, "image_token"))
     return terms
 
 
+def _output_res_quant(model: ModelSpec) -> QuantSpec:
+    base = _require_model_quant(model)
+    explicit = {key: dict(val) for key, val in base.category_overrides}
+    if "attn_res_proj" in explicit:
+        return base
+    merged = dict(explicit)
+    merged["attn_res_proj"] = {
+        "weight_format": base.native_format,
+        "activation_format": base.native_format,
+    }
+    return replace(base, category_overrides=merged)
+
+
+def _ngram_embedding_terms(model: ModelSpec) -> list[WeightTerm]:
+    """LongCat-Flash-Lite packed N-gram embedding tables and replicated post-projection."""
+    cfg = dict(getattr(model, "metadata", ()) or ()).get("ngram_embedding")
+    if not isinstance(cfg, Mapping):
+        return []
+    ratio = int(cfg.get("ngram_vocab_size_ratio") or 0)
+    neighbors = int(cfg.get("emb_neighbor_num") or 0)
+    splits = int(cfg.get("emb_split_num") or 0)
+    if ratio <= 0 or neighbors <= 1 or splits <= 0:
+        return []
+    num_tables = splits * (neighbors - 1)
+    table_width = max(1, int(model.hidden_size) // num_tables)
+    base_rows = int(model.vocab_size) * ratio
+    total_rows = sum(base_rows + 2 * i + 1 for i in range(num_tables))
+    return [
+        _t("ngram_embedding", total_rows, table_width, "embedding", "out_tp"),
+        _t("ngram_post_proj", table_width, int(model.hidden_size), "embedding", "replicated", count=num_tables),
+    ]
+
+
 def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
     h = model.hidden_size
-    lowrank_hc = any(plan.hc_lowrank > ZERO for plan in model.layer_plans)
-    terms = [] if lowrank_hc else [_t("final_norm", h, ONE, "norm")]
+    lowrank_hc = any(plan.hc_lowrank > 0 for plan in model.layer_plans)
+    terms = [] if lowrank_hc else [_t("final_norm", h, 1, "norm")]
     if not model.is_standalone_draft:
-        terms.insert(ZERO, _t("embedding", model.vocab_size, h, "embedding", "embedding"))
+        terms.insert(0, _t("embedding", model.vocab_size, h, "embedding", "embedding"))
+        terms.extend(_ngram_embedding_terms(model))
         if not model.tie_word_embeddings:
             terms.append(replace(_t("lm_head", model.vocab_size, h, "lm_head", "out_tp"), placement_role="logits"))
     if any(plan.residual_block_size for plan in model.layer_plans):
-        terms.extend([_t("output_attn_res_norm", h, ONE, "norm"), _t("output_attn_res_proj", ONE, h, "norm")])
+        res_quant = _output_res_quant(model)
+        terms.extend([
+            _t("output_attn_res_norm", h, 1, "norm"),
+            replace(_t("output_attn_res_proj", 1, h, "attn_res_proj"), quant=res_quant),
+        ])
     if lowrank_hc:
-        from mindie_sim.catalog.qwen4_exp import lowrank_hc_head_terms
         terms.extend(lowrank_hc_head_terms(model))
-    elif any(plan.hyper_connections for plan in model.layer_plans):
-        terms.extend([_t("hc_head_fn", FOUR, FOUR * h, "mhc"), _t("hc_head_base", FOUR, ONE, "param_fp32"),
-                      _t("hc_head_scale", ONE, ONE, "param_fp32")])
+    elif any(
+        plan.hyper_connections
+        and getattr(plan, "hc_final_collapse", "learned") == "learned"
+        for plan in model.layer_plans
+    ):
+        terms.extend([
+            _t("hc_head_fn", MHC_HEAD_STREAMS, MHC_HEAD_STREAMS * h, "mhc"),
+            _t("hc_head_base", MHC_HEAD_STREAMS, 1, "param_fp32"),
+            _t("hc_head_scale", 1, 1, "param_fp32"),
+        ])
     return terms
 
 
@@ -609,20 +554,30 @@ def engram_table_terms(model: ModelSpec) -> list[WeightTerm]:
     engram = model.engram
     if engram is None:
         return []
-    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_table_terms
-    if is_qwen4_exp_ple(engram):
+    if is_ple_engram(engram):
         return ple_table_terms(model)
-    return [WeightTerm(f"engram_table_{table.table_id}", table.rows, table.width, "engram_table", "node", ONE)
-            for table in engram.tables]
+    return [
+        WeightTerm(f"engram_table_{table.table_id}", table.rows, table.width, "engram_table", "node", 1)
+        for table in engram.tables
+    ]
 
 
 def engram_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
     engram = model.engram
     if engram is None:
         return {}
-    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_gate_terms_by_layer
-    if is_qwen4_exp_ple(engram):
-        return ple_gate_terms_by_layer(model)
+    if is_ple_engram(engram):
+        raw_ple = ple_gate_terms_by_layer(model)
+        plans_by_idx = {int(p.index): p for p in model.layer_plans}
+        base_quant = _require_model_quant(model)
+        resolved_ple: dict[int, list[WeightTerm]] = {}
+        for layer_id, layer_terms in raw_ple.items():
+            plan = plans_by_idx.get(int(layer_id))
+            lquant = _layer_resolved_quant(model, plan) if plan is not None else base_quant
+            resolved_ple[int(layer_id)] = [
+                replace(term, quant=term.quant or lquant) for term in layer_terms
+            ]
+        return resolved_ple
     hc = max((p.hc_mult for p in model.layer_plans), default=0)
     columns = engram.columns_per_table
     by_layer: dict[int, list[WeightTerm]] = {}
@@ -642,8 +597,6 @@ def engram_weight_terms(model: ModelSpec) -> list[WeightTerm]:
         terms.extend(layer_terms)
     return terms
 
-
-from mindie_sim.catalog.draft_weights import draft_terms, draft_weight_summary
 
 def _body_terms(model: ModelSpec, *, include_engram: bool = True) -> list[WeightTerm]:
     terms: list[WeightTerm] = []
@@ -683,14 +636,71 @@ def _partition_stage_of(partition: tuple[int, ...]) -> Any:
     return stage
 
 
+def _draft_routed_terms_for_rank(
+    draft: Any,
+    model: ModelSpec,
+    parallel: ParallelSpec,
+    *,
+    slot_plans: Mapping[Any, Any] | None,
+    ep_rank: int | None,
+) -> list[WeightTerm]:
+    """Resolve draft terms with per-EP-rank expert IDs when mixed-quant or sharded unevenly."""
+    raw_terms = [
+        term for term in draft_terms(draft, model, ep=parallel.ep)
+        if term.category not in TARGET_ALIAS_CATEGORIES
+    ]
+    num_experts = int(getattr(draft, "num_experts", 0) or 0)
+    if num_experts <= 0:
+        return raw_terms
+    from mindie_sim.catalog.expert_slots import ROUTED_TERMS, routed_expert_weight_terms
+    if not any(term.name in ROUTED_TERMS for term in raw_terms):
+        return raw_terms
+    target_ep = 0 if ep_rank is None else int(ep_rank)
+    if slot_plans:
+        for key in (f"draft:{getattr(draft, 'kind', '')}", getattr(draft, "kind", ""), "draft"):
+            slots = slot_plans.get(key)
+            if slots is not None and int(getattr(slots, "logical_experts", 0) or 0) == num_experts:
+                return list(routed_expert_weight_terms(raw_terms, slots, ep_rank=target_ep))
+    ep = max(1, int(parallel.ep))
+    base_quant = _require_model_quant(model)
+    has_mixed = any(
+        term.name in ROUTED_TERMS
+        and bool(getattr(
+            (term.runtime_quant or term.quant or base_quant).for_category(term.category),
+            "expert_quant_overrides",
+            (),
+        ))
+        for term in raw_terms
+    )
+    non_divisible = ep > 1 and num_experts > ep and num_experts % ep != 0
+    if not has_mixed and not non_divisible:
+        return raw_terms
+    if target_ep < 0 or target_ep >= ep:
+        raise ModelingError(f"expert_slot_ep_rank_invalid:{target_ep}")
+    if ep <= num_experts:
+        quotient, remainder = divmod(num_experts, ep)
+        base_count = quotient + (1 if target_ep < remainder else 0)
+        start = target_ep * quotient + min(target_ep, remainder)
+        draft_ids = tuple(range(start, start + base_count))
+    else:
+        draft_ids = (target_ep % num_experts,)
+    return [
+        replace(term, resident_count=len(draft_ids), expert_ids=draft_ids)
+        if term.name in ROUTED_TERMS else term
+        for term in raw_terms
+    ]
+
+
 def stage_weight_terms(
     model: ModelSpec, parallel: ParallelSpec, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
+    include_vision: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     draft_kind: str | None = None,
     slot_plans: Mapping[int, Any] | None = None,
     ep_rank: int | None = None,
+    runtime: Any = None,
 ) -> list[list[WeightTerm]]:
     pp = max(1, parallel.pp)
     if layer_partition is None:
@@ -698,8 +708,6 @@ def stage_weight_terms(
             raise ModelingError(f"layers_not_divisible_by_pp:{model.layers}%{pp}")
         stage_of = lambda layer_id: _stage_of(layer_id, pp, model.layers)
     else:
-        # A handed-over PP plan declares the physical split; the weight ledger
-        # must charge the same stages the execution lowering assigns.
         partition = tuple(int(value) for value in layer_partition)
         if len(partition) != pp:
             raise ModelingError(f"pp_partition_count:{len(partition)}!={pp}")
@@ -715,20 +723,42 @@ def stage_weight_terms(
         if slots is not None:
             from mindie_sim.catalog.expert_slots import routed_expert_weight_terms
             terms = routed_expert_weight_terms(
-                layer_terms, slots, ep_rank=ZERO if ep_rank is None else int(ep_rank))
+                layer_terms, slots, ep_rank=0 if ep_rank is None else int(ep_rank))
         stages[stage_of(layer_idx)].extend(terms)
     for term in body_head_terms(model):
-        stages[ZERO if term.name == "embedding" else pp - ONE].append(term)
+        stages[0 if term.name in _STAGE0_BODY_HEAD_TERMS else pp - 1].append(term)
+    if pp > 1 and not model.is_standalone_draft and model.tie_word_embeddings:
+        stages[pp - 1].append(
+            replace(_t("lm_head", model.vocab_size, model.hidden_size, "lm_head", "out_tp"),
+                    placement_role="logits")
+        )
+    for term in gemma4_ple_terms(model):
+        if term.name == "ple_model_projection":
+            col_term = replace(term, shard="out_tp")
+            for stage in stages:
+                stage.append(col_term)
+        elif term.name == "ple_projection_norm":
+            for stage in stages:
+                stage.append(term)
+        else:
+            stages[0].append(term)
     if model.vision is not None:
-        stages[0].extend(vision_weight_terms(model))
+        stages[0].extend(
+            vision_weight_terms(
+                model, include_vision=include_vision, parallel=parallel, runtime=runtime,
+            )
+        )
     tables_in_hbm = include_engram if include_engram_tables is None else include_engram_tables
     if include_engram:
         if tables_in_hbm:
-            tables = engram_table_terms(model)
-            for stage in stages:
-                stage.extend(tables)
-        # The query/gate projections consume the gathered rows and are ordinary
-        # device weights; only the tables themselves move under CPU offload.
+            engram = model.engram
+            if engram is not None and is_ple_engram(engram):
+                for table, term in zip(engram.tables, ple_table_terms(model)):
+                    stages[stage_of(table.layer_id)].append(term)
+            else:
+                tables = engram_table_terms(model)
+                for stage in stages:
+                    stage.extend(tables)
         for layer_id, gate_terms in engram_gate_terms_by_layer(model).items():
             stages[stage_of(layer_id)].extend(gate_terms)
     if model.is_standalone_draft:
@@ -739,43 +769,56 @@ def stage_weight_terms(
         )
     if include_draft and model.auxiliary is not None and not model.auxiliary.standalone_draft:
         from mindie_sim.catalog.draft import optional_draft_spec
-        selected = ((optional_draft_spec(model, draft_kind),) if draft_kind else
-                    (model.auxiliary.mtp, model.auxiliary.dspark))
-        for draft in selected:
-            if draft is not None:
-                # A target alias is not an extra draft copy.  Runtime-owned
-                # prepared matrices (FP32 router precast, indexer copies) are
-                # resident and belong in the ledger.
-                stages[pp - 1].extend(
-                    term for term in draft_terms(draft, model)
-                    if term.category not in TARGET_ALIAS_CATEGORIES
+        raw_selected = (
+            (optional_draft_spec(model, draft_kind),)
+            if draft_kind else (model.auxiliary.mtp, model.auxiliary.dspark)
+        )
+        seen_drafts: list[Any] = []
+        for draft in raw_selected:
+            if draft is None or any(draft is prev or draft == prev for prev in seen_drafts):
+                continue
+            seen_drafts.append(draft)
+            stages[pp - 1].extend(
+                _draft_routed_terms_for_rank(
+                    draft, model, parallel, slot_plans=slot_plans, ep_rank=ep_rank,
                 )
+            )
     return stages
 
 
 def stage_weight_bytes(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = ONE, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
+    include_vision: bool | None = None,
     source: bool = False, layer_partition: Sequence[int] | None = None,
     draft_kind: str | None = None, enable_shared_expert_dp: bool = False,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
     slot_plans: Mapping[int, Any] | None = None, ep_rank: int | None = None,
+    runtime: Any = None,
 ) -> list[float]:
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
     result: list[float] = []
     byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft, draft_kind=draft_kind,
         include_engram=include_engram, include_engram_tables=include_engram_tables,
-        layer_partition=layer_partition, slot_plans=slot_plans, ep_rank=ep_rank,
+        include_vision=include_vision, layer_partition=layer_partition,
+        slot_plans=slot_plans, ep_rank=ep_rank, runtime=runtime,
     ):
-        stage_total = ZERO_F
+        stage_total = 0.0
         for term in terms:
             ck = _cache_key(term)
             val = byte_memo.get(ck) if ck is not None else None
             if val is None:
-                val = term_bytes(term, quant, _resident_parallel(term, parallel, enable_shared_expert_dp),
-                                 node_ranks, source=source)
+                expanded = _expand_resident_terms(
+                    term, parallel, enable_shared_expert_dp,
+                    pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+                    dcp_q_replicate=dcp_q_replicate, model=model,
+                )
+                val = sum(term_bytes(t_sub, quant, p_sub, node_ranks, source=source)
+                          for t_sub, p_sub in expanded)
                 if ck is not None:
                     byte_memo[ck] = val
             stage_total += val
@@ -783,46 +826,112 @@ def stage_weight_bytes(
     return result
 
 
+def _has_expert_quant_overrides(model: ModelSpec) -> bool:
+    for plan in model.layer_plans:
+        if plan.ffn != "moe" or int(plan.num_experts) <= 0:
+            continue
+        resolved = _layer_resolved_quant(model, plan)
+        if getattr(resolved, "expert_quant_overrides", ()) or getattr(
+            resolved.for_category("routed_expert"), "expert_quant_overrides", ()
+        ):
+            return True
+    quant = getattr(model, "quant", None)
+    if quant is not None and (
+        getattr(quant, "expert_quant_overrides", ())
+        or getattr(quant.for_category("routed_expert"), "expert_quant_overrides", ())
+    ):
+        return True
+    return False
+
+
+def _default_slot_plans(
+    model: ModelSpec, parallel: ParallelSpec, *, ep_rank: int | None = None,
+) -> dict[int, Any] | None:
+    """Build per-layer expert slot plans when redundancy or rank-sensitive EP placement applies."""
+    redundant = int(getattr(parallel, "redundant_experts_per_rank", 0) or 0)
+    ep = max(1, int(getattr(parallel, "ep", 1) or 1))
+    need_slots = redundant > 0 or (
+        ep > 1 and (ep_rank is not None or _has_expert_quant_overrides(model))
+    )
+    if not need_slots:
+        return None
+    moe_plans = [
+        plan for plan in model.layer_plans
+        if plan.ffn == "moe" and int(plan.num_experts) > 0
+    ]
+    if not moe_plans:
+        return None
+    from mindie_sim.catalog.expert_slots import expert_slot_plan
+    return {plan.index: expert_slot_plan(model, plan, parallel) for plan in moe_plans}
+
+
 def sharded_weight_bytes(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = ONE, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
-    include_engram_tables: bool = True, enable_shared_expert_dp: bool = False,
+    include_engram_tables: bool = True, include_vision: bool | None = None,
+    enable_shared_expert_dp: bool = False,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
+    slot_plans: Mapping[int, Any] | None = None,
+    ep_rank: int | None = None,
+    runtime: Any = None,
 ) -> float:
-    return float(max(stage_weight_bytes(
-        model, parallel, node_ranks, include_draft=include_draft,
-        include_engram=include_engram,
-        include_engram_tables=include_engram_tables,
-        enable_shared_expert_dp=enable_shared_expert_dp,
-    )))
+    resolved_slots = (
+        slot_plans if slot_plans is not None
+        else _default_slot_plans(model, parallel, ep_rank=ep_rank)
+    )
+    ep = max(1, int(getattr(parallel, "ep", 1) or 1))
+    if resolved_slots and ep_rank is None and ep > 1 and _has_expert_quant_overrides(model):
+        ranks = range(ep)
+    else:
+        ranks = (ep_rank,)
+    peak = 0.0
+    for rank in ranks:
+        stage_peak = max(stage_weight_bytes(
+            model, parallel, node_ranks, include_draft=include_draft,
+            include_engram=include_engram,
+            include_engram_tables=include_engram_tables,
+            include_vision=include_vision,
+            enable_shared_expert_dp=enable_shared_expert_dp,
+            enable_pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+            dcp_q_replicate=dcp_q_replicate,
+            slot_plans=resolved_slots,
+            ep_rank=rank,
+            runtime=runtime,
+        ), default=0.0)
+        if stage_peak > peak:
+            peak = stage_peak
+    return float(peak)
 
 
 def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
-    """Per-layer cache row width using the declared cache representation.
-
-    The row width is a declaration, not a fixed BF16 or K-only constant: a KV
-    representation swap must move the catalog facts as well as the runtime
-    cache model, and shared K/V projection weights still store two cache
-    planes.
-    """
+    """Per-layer cache row width using each layer's resolved cache ABI."""
     from mindie_sim.catalog.cache import packed_region_row_bytes
-    from mindie_sim.catalog.cache_format import cache_format
-    mla = cache_format(model, "mla_kv")
-    gqa = cache_format(model, "gqa_kv")
+    from mindie_sim.catalog.cache_format import gqa_kv_formats
+    from mindie_sim.catalog.cache_pools import _packed_mla_row_bytes
     rows = []
     for plan in model.layer_plans:
         if (plan.attention in {"gqa", "projection_only"} and plan.cache_kind == "dense"
-                and not ZERO <= plan.kv_owner_layer_id < plan.index):
-            row = gqa.row_bytes(plan.cache_row_elements)
+                and not 0 <= plan.kv_owner_layer_id < plan.index):
+            key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=plan)
+            if is_shared:
+                row = key_fmt.row_bytes(plan.cache_row_elements)
+            else:
+                side = int(plan.num_kv_heads) * int(plan.head_dim)
+                row = key_fmt.row_bytes(side) + val_fmt.row_bytes(side)
         elif plan.attention == "mla":
             if plan.cache_kind == "dense":
-                row = mla.row_bytes(plan.cache_row_elements)
-            elif plan.window > ZERO:
-                row = packed_region_row_bytes(model, "window", plan.cache_row_elements)
+                row = _packed_mla_row_bytes(model, plan)
+            elif plan.window > 0:
+                row = packed_region_row_bytes(
+                    model, "window", plan.cache_row_elements, plan=plan,
+                )
             elif plan.owns_long_kv:
                 row = packed_region_row_bytes(
-                    model, "compressed_kv", plan.cache_row_elements)
+                    model, "compressed_kv", plan.cache_row_elements, plan=plan,
+                )
             else:
-                row = ZERO
+                row = 0
         else:
             row = 0
         rows.append((plan.index, int(row)))
@@ -830,17 +939,24 @@ def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
 
 
 def weight_breakdown(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = ONE, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_engram_tables: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
+    slot_plans: Mapping[int, Any] | None = None,
+    ep_rank: int | None = None,
 ) -> dict[str, float]:
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
+    resolved_slots = (
+        slot_plans if slot_plans is not None
+        else _default_slot_plans(model, parallel, ep_rank=ep_rank)
+    )
     groups: dict[str, float] = {}
     byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(
         model, parallel, include_engram=True,
         include_engram_tables=include_engram_tables, layer_partition=layer_partition,
+        slot_plans=resolved_slots, ep_rank=ep_rank,
     ):
         for term in terms:
             ck = _cache_key(term)
@@ -850,7 +966,7 @@ def weight_breakdown(
                 val = term_bytes(term, quant, placed, node_ranks)
                 if ck is not None:
                     byte_memo[ck] = val
-            groups[term.category] = groups.get(term.category, ZERO_F) + val
+            groups[term.category] = groups.get(term.category, 0.0) + val
     return groups
 
 
@@ -868,4 +984,8 @@ __all__ = [
     "stage_weight_decomposition", "term_payload_bytes",
     "cache_row_bytes_by_layer", "weight_breakdown", "term_bytes",
     "external_shared_weight_terms", "external_shared_weight_bytes",
+    "gemma4_ple_terms", "gemma4_ple_layer_terms",
+    "_norm_terms", "_gemma4_norm_terms", "_mhc_terms", "_indexer_terms",
+    "_compressor_terms", "_attention_terms", "_ffn_terms",
+    "_tag_projection_roles", "_ceil_div", "_local_groups", "_sharded_shape",
 ]

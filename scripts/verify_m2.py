@@ -26,9 +26,9 @@ MODELS = (
     "deepseek-v3", "deepseek-r1", "deepseek-v3.2", "glm-5.3",
     "glm-5.3-flash", "glm-5.1", "glm-5.2", "kimi-k3", "kimi-k3.1",
     "kimi-k3-dspark", "kimi-k3-dspark-block5", "kimi-k2", "kimi-k2-thinking",
-    "kimi-k2.5", "qwen3-30b-a3b", "qwen3-32b", "qwen3-235b-a22b",
+    "kimi-k2.5", "kimi-k2.6", "qwen3-30b-a3b", "qwen3-32b", "qwen3-235b-a22b",
     "qwen3-next-80b-a3b", "qwen3.5-27b", "qwen3.5-35b-a3b",
-    "qwen3.5-397b-a17b", "qwen3.6-27b", "qwen3.8-2.4t-a95b", "qwen3.8-27b",
+    "qwen3.5-122b-a10b", "qwen3.5-397b-a17b", "qwen3.6-27b", "qwen3.8-2.4t-a95b", "qwen3.8-27b",
     "minimax-m3", "minimax-m3.1-flash", "gemma-4-26b-a4b", "gemma-4-31b",
     "qwen3.6-35b-a3b", "qwen3.8-flash-next", "step-5-preview",
 )

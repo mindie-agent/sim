@@ -27,16 +27,21 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import gc
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import statistics
+import subprocess
 import sys
 import time
 
 SIM_ROOT = Path(__file__).resolve().parents[1]
+if str(SIM_ROOT) not in sys.path:
+    sys.path.insert(0, str(SIM_ROOT))
 DEFAULT_OUTPUT = SIM_ROOT / "state" / "m1"
 CATALOG_MODELS = (
     "deepseek-v4-10t", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813",
@@ -44,9 +49,10 @@ CATALOG_MODELS = (
     "deepseek-v3", "deepseek-r1", "deepseek-v3.2", "glm-5.3",
     "glm-5.3-flash", "glm-5.1", "glm-5.2", "kimi-k3", "kimi-k3.1",
     "kimi-k3-dspark", "kimi-k3-dspark-block5", "kimi-k2", "kimi-k2-thinking",
-    "kimi-k2.5", "qwen3-30b-a3b", "qwen3-32b", "qwen3-235b-a22b",
+    "kimi-k2.5", "kimi-k2.6", "qwen3-30b-a3b", "qwen3-32b", "qwen3-235b-a22b",
     "qwen3-next-80b-a3b", "qwen3.5-27b", "qwen3.5-35b-a3b",
-    "qwen3.5-397b-a17b", "qwen3.6-27b", "qwen3.8-2.4t-a95b", "qwen3.8-27b",
+    "qwen3.5-122b-a10b", "qwen3.5-397b-a17b", "qwen3.6-27b",
+    "qwen3.8-2.4t-a95b", "qwen3.8-27b",
     "minimax-m3", "minimax-m3.1-flash", "gemma-4-26b-a4b", "gemma-4-31b",
     "qwen3.6-35b-a3b", "qwen3.8-flash-next", "step-5-preview",
 )
@@ -61,6 +67,14 @@ FORBIDDEN_MODULES = ("opflow", "op_formulas", "prediction.piecewise",
                      "prediction.subgraphs")
 PRIVATE_PREFIX = "/Users" + "/maoxx241"
 IMAGE_MARKERS = ("docker" + ".io/", "swr" + ".cn-", "@sha" + "256:")
+PRODUCER_FILTER_NAMES = frozenset({
+    "min_mib", "min_size_mib", "min_payload_mib", "min_m", "min_n", "min_k",
+    "min_bytes", "min_payload_bytes", "min_tokens", "skip_small_shapes", "steady_coll_min_bytes",
+})
+PRODUCER_SHAPE_NAMES = PRODUCER_FILTER_NAMES | frozenset({
+    "m", "n", "k", "tokens", "seq_len", "batch", "batch_size", "payload_bytes",
+    "mib", "size_mib", "payload_mib", "swa", "swa_window", "bytes", "shape", "sh",
+})
 
 
 def _output(path: str | None, payload: dict) -> None:
@@ -86,14 +100,141 @@ def _climb(start: Path, name: str) -> Path | None:
     return None
 
 
+SKIP_SCAN_DIRS = frozenset({
+    ".venv", "venv", ".git", "__pycache__", ".pytest_cache",
+    ".mypy_cache", "build", "dist", ".ruff_cache", "site-packages", "node_modules",
+})
+
+
 def _python_files(root: Path):
-    for path in sorted(root.rglob("*.py")):
+    """Repository sources only; prune excluded subtrees relative to ``root``."""
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [name for name in sorted(dirs) if name not in SKIP_SCAN_DIRS]
+        for name in sorted(files):
+            if not name.endswith(".py"):
+                continue
+            path = Path(directory) / name
+            try:
+                if path.stat().st_size > STREAM_LIMIT:
+                    continue
+            except OSError:
+                continue
+            yield path
+
+
+def _numeric_literal(node: ast.expr) -> int | float | None:
+    sign = 1
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        sign = -1 if isinstance(node.op, ast.USub) else 1
+        node = node.operand
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        return sign * node.value
+    return None
+
+
+def _shape_operand_names(operand: ast.expr) -> set[str]:
+    names = set()
+    for node in ast.walk(operand):
+        if isinstance(node, ast.Name):
+            names.add(node.id.lower())
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr.lower())
+        elif isinstance(node, ast.Subscript):
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                names.add(node.slice.value.lower())
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and node.args:
+            key = node.args[0]
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                names.add(key.value.lower())
+    return names
+
+
+def _has_shape_cutoff(test: ast.expr) -> bool:
+    for comparison in ast.walk(test):
+        if not isinstance(comparison, ast.Compare):
+            continue
+        for left, op, right in zip(
+            (comparison.left, *comparison.comparators), comparison.ops, comparison.comparators,
+        ):
+            if isinstance(op, (ast.In, ast.NotIn)) and isinstance(left, ast.Constant):
+                if isinstance(left.value, str) and re.search(r"_[A-Za-z]\d+$", left.value):
+                    return True
+            if (_shape_operand_names(left) | _shape_operand_names(right)) & PRODUCER_FILTER_NAMES:
+                return True
+            if any(_shape_operand_names(shape) & PRODUCER_SHAPE_NAMES and _numeric_literal(limit) is not None
+                   for shape, limit in ((left, right), (right, left))):
+                return True
+    return False
+
+
+def _producer_filter_tests(tree: ast.Module):
+    for guard in _producer_continue_guards(tree):
+        yield guard.test
+    for node in ast.walk(tree):
+        if isinstance(node, ast.comprehension):
+            yield from node.ifs
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "filter":
+            if node.args and isinstance(predicate := node.args[0], ast.Lambda):
+                yield predicate.body
+        elif isinstance(node, ast.If):
+            for stmt in node.body:
+                if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+                    continue
+                name = getattr(stmt.value.func, "id", "") or getattr(stmt.value.func, "attr", "")
+                if name in {"add", "append", "extend", "collect", "score", "evaluate"}:
+                    yield node.test
+                    break
+
+
+def _producer_continue_guards(tree: ast.Module) -> set[ast.If]:
+    """Find if statements guarding a continue in the same loop body."""
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    guards: set[ast.If] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Continue):
+            continue
+        branch: ast.AST = node
+        enclosing = []
+        while (parent := parents.get(branch)) is not None:
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)) and branch in parent.body:
+                guards.update(enclosing)
+                break
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                break
+            if isinstance(parent, ast.If):
+                enclosing.append(parent)
+            branch = parent
+    return guards
+
+
+def _producer_shape_filters(root: Path) -> list[str]:
+    """Inspect verification producers without importing or executing their code."""
+    findings = []
+    for path in sorted((root / "data" / "verification").glob("*.producer.py")):
+        relative = path.relative_to(root).as_posix()
         try:
             if path.stat().st_size > STREAM_LIMIT:
+                findings.append(f"{relative}:producer_source_too_large")
                 continue
-        except OSError:
+            tree = ast.parse(path.read_bytes(), filename=relative)
+        except (OSError, SyntaxError, ValueError) as error:
+            location = f":{error.lineno}" if isinstance(error, SyntaxError) else ""
+            findings.append(f"{relative}{location}:producer_source_{type(error).__name__}")
             continue
-        yield path
+        lines = {test.lineno for test in _producer_filter_tests(tree) if _has_shape_cutoff(test)}
+        findings.extend(f"{relative}:{line}:shape_size_filter" for line in sorted(lines))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = _numeric_literal(node.value)
+            for target in targets:
+                if not isinstance(target, ast.Name) or target.id.lower() not in PRODUCER_FILTER_NAMES:
+                    continue
+                enabled = target.id.lower() == "skip_small_shapes" and isinstance(node.value, ast.Constant) and node.value.value is True
+                if enabled or (value is not None and value > 0):
+                    findings.append(f"{relative}:{node.lineno}:shape_size_filter_constant:{target.id}")
+    return findings
 
 
 def hygiene(args) -> dict:
@@ -144,6 +285,31 @@ def hygiene(args) -> dict:
     except Exception as error:  # pragma: no cover - import failure detail
         imports_ok = False
         detail = f"{type(error).__name__}:{error}"
+    scripts_dir = SIM_ROOT / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    import check_arch_governance as arch_gov
+
+    arch_gov_base = "c1bc55e59facc21a6a775da346e7ad7ae4909cfd"
+    raw_gov = arch_gov.scan_repository(sim)
+    has_base = subprocess.run(
+        ["git", "-C", str(sim), "cat-file", "-e", f"{arch_gov_base}^{{commit}}"],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    if has_base:
+        base_gov = arch_gov.scan_repository(sim, revision=arch_gov_base)
+        base_non_ag015 = tuple(item for item in base_gov if not item.rule.startswith("AG015"))
+        gov_active = arch_gov.new_violations(raw_gov, base_non_ag015)
+    else:
+        gov_active = arch_gov.filter_allowlisted(raw_gov)
+    gov_list = [
+        f"{item.path.as_posix()}:{item.line}:{item.rule}:{item.message}"
+        for item in gov_active
+    ]
+    import mindie_sim.templates.registry as templates_registry
+
+    default_cube_peak_present = hasattr(templates_registry, "default_cube_peak")
+    producer_shape_filters = _producer_shape_filters(sim)
     metrics = {
         "deleted_paths_present": present,
         "sidecar_imports": sidecar_imports,
@@ -151,8 +317,13 @@ def hygiene(args) -> dict:
         "image_literals": image_literals,
         "canonical_imports": imports_ok,
         "canonical_import_detail": detail,
+        "arch_governance_violations": gov_list,
+        "arch_governance_ok": not gov_list,
+        "default_cube_peak_removed": not default_cube_peak_present,
+        "producer_shape_filters": producer_shape_filters,
     }
-    if present or sidecar_imports or private_paths or image_literals or not imports_ok:
+    if (present or sidecar_imports or private_paths or image_literals
+            or not imports_ok or gov_list or default_cube_peak_present or producer_shape_filters):
         return _fail("hygiene", "hygiene_violation", **metrics)
     return _pass("hygiene", **metrics)
 
@@ -169,7 +340,7 @@ def _oracle_modules():
     tests_dir = SIM_ROOT / "tests"
     if str(tests_dir) not in sys.path:
         sys.path.insert(0, str(tests_dir))
-    from reference import cache_meta_oracle, catalog_meta_oracle
+    from _oracles import cache_meta_oracle, catalog_meta_oracle
     return catalog_meta_oracle, cache_meta_oracle
 
 
@@ -247,6 +418,13 @@ def _auxiliary_summary(model) -> dict:
     return {}
 
 
+def _manifest_reference_label(manifest_path: Path) -> str:
+    """Repository-relative manifest label; never leak the host worktree path."""
+    if manifest_path.is_relative_to(SIM_ROOT):
+        return manifest_path.relative_to(SIM_ROOT).as_posix()
+    return manifest_path.name
+
+
 def catalog_meta(args) -> dict:
     from mindie_sim.model_catalog import load_model
     from mindie_sim.schema.parallel import ParallelSpec
@@ -256,8 +434,9 @@ def catalog_meta(args) -> dict:
         return _fail("catalog-meta",
                      f"catalog_model_set_size:{len(CATALOG_MODELS)}!={required}")
     manifest_path = Path(args.references or DEFAULT_MANIFEST).resolve()
+    reference_label = _manifest_reference_label(manifest_path)
     if not manifest_path.is_file():
-        return _fail("catalog-meta", f"reference_manifest_missing:{manifest_path}")
+        return _fail("catalog-meta", f"reference_manifest_missing:{reference_label}")
     try:
         manifest = catalog.load_manifest(manifest_path)
         models = catalog.manifest_models(manifest)
@@ -272,7 +451,7 @@ def catalog_meta(args) -> dict:
             required_models=required, manifest_models=len(models),
             missing_references=missing[:REPORT_SHAPES],
             extra_references=extra[:REPORT_SHAPES],
-            references=str(manifest_path), references_sha256=manifest_digest)
+            references=reference_label, references_sha256=manifest_digest)
     rows = []
     failures = []
     parameter_total = 0
@@ -373,7 +552,7 @@ def catalog_meta(args) -> dict:
         "manifest_models": len(models),
         "completed_models": len(rows),
         "failed_models": len(failures),
-        "references": str(manifest_path),
+        "references": reference_label,
         "references_sha256": manifest_digest,
         "parameter_total": parameter_total,
         "parameter_reference_total": reference_parameter_total,
@@ -415,7 +594,7 @@ def _rss_mib() -> float | None:
 
 
 def _count_constructions() -> dict:
-    from mindie_sim.prediction.cost import CostModel
+    from mindie_sim.prediction.efficiency.cost import CostModel
     from mindie_sim.prediction.evaluation import ExecutionBindings
     counts = {"cost_models": 0, "bindings": 0}
     original_cost = CostModel.__init__
@@ -516,7 +695,7 @@ def main(argv=None) -> int:
 
     catalog_parser = sub.add_parser("catalog-meta")
     catalog_parser.add_argument("--references", default=str(DEFAULT_MANIFEST))
-    catalog_parser.add_argument("--require-models", type=int, default=37)
+    catalog_parser.add_argument("--require-models", type=int, default=39)
     catalog_parser.add_argument("--output", default=None)
 
     spine_parser = sub.add_parser("spine-benchmark")

@@ -10,16 +10,39 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import re
 from typing import Any, Mapping, Sequence
 
 from .config import flatten_config
+from .hf_value_formats import (
+    _plan_matrix_roles,
+    _role_value_formats,
+    declared_weight_dtype,
+    model_value_formats,
+    native_dtype,
+    normalize_declared_format,
+    resolve_native_formats,
+)
 from .types import QuantSpec
 from mindie_sim.schema.common import ModelingError
 
 _NON_LINEAR_EXCLUSION_ROLES = frozenset({
     "lm_head", "embedding", "norm", "router", "indexer_weights", "mtp",
+    "vision", "projector",
 })
-_REGEX_META_CHARS = frozenset("|()[]?+{}")
+_DENSE_MLP_PROJECTION_ROLES = frozenset({
+    "dense_mlp.gate", "dense_mlp.up", "dense_mlp.down",
+})
+_FP8_APPLICABLE_EXCLUSION_ROLES = (
+    _NON_LINEAR_EXCLUSION_ROLES
+    | _DENSE_MLP_PROJECTION_ROLES
+    | frozenset({"dense_mlp"})
+)
+_EXCLUSION_ROLE_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "dense_mlp.gate_up": ("dense_mlp.gate", "dense_mlp.up"),
+}
+_REGEX_META_CHARS = frozenset("[]?+{}")
+_PARAM_LEAF_SEGMENTS = frozenset({"weight", "bias"})
 
 _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
     ("lm_head", ("lm_head", "shared_head.head"), frozenset({"lm_head", "shared_head", "head"})),
@@ -27,6 +50,25 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
         "embedding",
         ("embed_tokens", "embedding", "wte", "word_embeddings"),
         frozenset({"embed_tokens", "embedding", "wte", "word_embeddings"}),
+    ),
+    (
+        "vision",
+        ("vision_tower", "visual", "vision_model", "vision_encoder", "vision"),
+        frozenset({
+            "vision_tower", "visual", "vision_model", "vision_encoder", "vision",
+            "blocks", "encoder", "patch_embed", "attn", "mlp", "norm", "norm0",
+            "norm1", "norm2", "proj", "qkv", "wqkv", "wo", "fc0", "fc1",
+            "linear_fc1", "linear_fc2", "pos_emb", "pos_embed", "final_layernorm",
+            "merger", "patch_merger", "spatial_merge", "deepstack_merger_list",
+        }),
+    ),
+    (
+        "projector",
+        ("mm_projector", "multi_modal_projector", "visual_projector", "projector"),
+        frozenset({
+            "mm_projector", "multi_modal_projector", "visual_projector",
+            "projector", "proj", "post_norm", "linear_1", "linear_2", "merger",
+        }),
     ),
     (
         "norm",
@@ -44,11 +86,12 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
     (
         "router",
         (
-            "mlp.gate", "mlp.shared_expert_gate", "shared_expert_gate",
-            "mlp.gate.e_score_correction_bias", "router",
+            "mlp.gate", "block_sparse_moe.gate", "mlp.shared_expert_gate",
+            "shared_expert_gate", "mlp.gate.e_score_correction_bias", "router",
         ),
         frozenset({
-            "mlp", "gate", "shared_expert_gate", "e_score_correction_bias", "router",
+            "mlp", "block_sparse_moe", "gate", "shared_expert_gate",
+            "e_score_correction_bias", "router",
         }),
     ),
     (
@@ -61,7 +104,48 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
         ("eh_proj",),
         frozenset({"eh_proj", "mtp"}),
     ),
-    ("attention", ("self_attn", "attention"), frozenset({"self_attn", "attention"})),
+    (
+        "attention",
+        ("self_attn", "attention"),
+        frozenset({
+            "self_attn", "attention", "q_proj", "k_proj", "v_proj", "o_proj",
+            "qkv_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
+            "wq_a", "wq_b", "wkv_a", "wkv_b", "wo",
+        }),
+    ),
+    (
+        "dense_mlp.gate",
+        ("mlp.gate_proj", "ffn.gate_proj", "mlp.w1", "ffn.w1", "dense_mlp.gate"),
+        frozenset({"mlp", "ffn", "gate_proj", "w1", "dense_mlp", "gate"}),
+    ),
+    (
+        "dense_mlp.up",
+        ("mlp.up_proj", "ffn.up_proj", "mlp.w3", "ffn.w3", "dense_mlp.up"),
+        frozenset({"mlp", "ffn", "up_proj", "w3", "dense_mlp", "up"}),
+    ),
+    (
+        "dense_mlp.down",
+        ("mlp.down_proj", "ffn.down_proj", "mlp.w2", "ffn.w2", "dense_mlp.down"),
+        frozenset({"mlp", "ffn", "down_proj", "w2", "dense_mlp", "down"}),
+    ),
+    (
+        "dense_mlp.gate_up",
+        ("mlp.gate_up_proj", "ffn.gate_up_proj", "dense_mlp.gate_up"),
+        frozenset({"mlp", "ffn", "gate_up_proj", "dense_mlp", "gate_up"}),
+    ),
+    (
+        "dense_mlp",
+        ("dense_mlp",),
+        frozenset({"dense_mlp"}),
+    ),
+    (
+        "gdn",
+        ("linear_attn",),
+        frozenset({
+            "linear_attn", "in_proj_qkv", "in_proj_qkvz", "in_proj_z",
+            "in_proj_ba", "out_proj", "conv1d",
+        }),
+    ),
     (
         "shared_expert",
         ("shared_experts", "shared_expert"),
@@ -75,18 +159,28 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
 )
 
 
-def _classify_exclusion_pattern(pattern: str) -> str | None:
-    raw = str(pattern).strip()
-    if not raw or any(ch in raw for ch in _REGEX_META_CHARS):
+def _expand_simple_alternation(text: str) -> tuple[str, ...] | None:
+    """Expand at most one simple ``(a|b|...)`` regex alternation group cleanly."""
+    if "(" not in text and ")" not in text and "|" not in text:
+        return (text,)
+    open_idx = text.find("(")
+    close_idx = text.find(")", open_idx + 1) if open_idx >= 0 else -1
+    if open_idx < 0 or close_idx < 0:
         return None
-    cleaned = raw[3:] if raw.startswith("re:") else raw
-    lower = cleaned.lower().replace("\\.", ".")
-    if "\\" in lower:
+    prefix, body, suffix = text[:open_idx], text[open_idx + 1:close_idx], text[close_idx + 1:]
+    if any(ch in prefix or ch in suffix for ch in "()|") or "(" in body or ")" in body:
         return None
+    parts = [part.strip() for part in body.split("|") if part.strip()]
+    return tuple(f"{prefix}{part}{suffix}" for part in parts) if parts else None
+
+
+def _classify_plain_exclusion(lower: str) -> str | None:
     segments = [
         seg for seg in lower.strip("^$").replace("*", ".").split(".")
-        if seg and seg not in {"model", "layers"} and not seg.isdigit()
+        if seg and seg not in {"model", "language_model", "text_model", "layers"} and not seg.isdigit()
     ]
+    if len(segments) > 1 and segments[-1] in _PARAM_LEAF_SEGMENTS:
+        segments = segments[:-1]
     if not segments:
         return None
     joined = ".".join(segments)
@@ -100,6 +194,177 @@ def _classify_exclusion_pattern(pattern: str) -> str | None:
     return matched[0] if len(matched) == 1 else None
 
 
+def _classify_exclusion_pattern(pattern: str) -> tuple[str, ...]:
+    raw = str(pattern).strip()
+    if not raw:
+        return ()
+    is_regex = raw.startswith("re:")
+    cleaned = raw[3:] if is_regex else raw
+    lower = (
+        cleaned.lower()
+        .replace("\\.", ".")
+        .replace("\\d+", "*")
+        .replace("\\d*", "*")
+        .replace("[0-9]+", "*")
+        .replace("[0-9]*", "*")
+        .replace("\\d", "*")
+    )
+    if any(ch in lower for ch in _REGEX_META_CHARS) or "\\" in lower:
+        return ()
+    if not is_regex and any(ch in lower for ch in "()|"):
+        return ()
+    variants = _expand_simple_alternation(lower) if is_regex else (lower,)
+    if not variants:
+        return ()
+    expanded: list[str] = []
+    for variant in variants:
+        role = _classify_plain_exclusion(variant)
+        if role is None:
+            return ()
+        for item in _EXCLUSION_ROLE_EXPANSIONS.get(role, (role,)):
+            if item not in expanded:
+                expanded.append(item)
+    if _DENSE_MLP_PROJECTION_ROLES.issubset(expanded):
+        collapsed = [item for item in expanded if item not in _DENSE_MLP_PROJECTION_ROLES]
+        if "dense_mlp" not in collapsed:
+            collapsed.append("dense_mlp")
+        return tuple(collapsed)
+    return tuple(expanded)
+
+
+_INDEXED_LAYER_ATTN_RE = re.compile(
+    r"(?:^|\.)layers\.(\d+)\.(?:self_attn|linear_attn|attention)(?:\.|$)"
+)
+_INDEXED_LAYER_PATH_RE = re.compile(
+    r"^(?:(?:model|language_model|text_model)\.)*layers\.(\d+)\.(.+)$"
+)
+_INDEXED_SKIP_ROLES = frozenset({
+    "norm", "router", "lm_head", "embedding", "vision", "projector",
+})
+_FP32_SCALE_BYTES = 4
+
+
+def _is_indexed_layer_attention_exclusion(pattern: str) -> bool:
+    """True for concrete per-layer attention exclusions without wildcards."""
+    raw = str(pattern).strip().lower()
+    if not raw or "*" in raw or any(ch in raw for ch in _REGEX_META_CHARS):
+        return False
+    return _INDEXED_LAYER_ATTN_RE.search(raw) is not None
+
+
+def _indexed_subpath_categories(
+    raw_lower: str,
+    subpath: str,
+    *,
+    has_mla: bool,
+    has_kda: bool,
+) -> tuple[str, ...]:
+    if subpath in {"self_attn", "attention", "attn"}:
+        if has_mla:
+            return ("mla", "mla_absorb")
+        return ("kda",) if has_kda else ("attn",)
+    if subpath == "linear_attn":
+        return ("gdn",)
+    if subpath in {"mlp", "ffn"}:
+        return ("dense_mlp", "shared_expert", "routed_expert")
+    if subpath in {"mlp.experts", "moe.experts", "block_sparse_moe.experts", "experts"}:
+        return ("routed_expert",)
+    if subpath in {"mlp.shared_experts", "mlp.shared_expert", "share_expert", "shared_experts", "shared_expert"}:
+        return ("shared_expert",)
+    from .checkpoint_reader import classify_tensor_categories
+
+    return tuple(
+        cat for cat in classify_tensor_categories(raw_lower, has_mla=has_mla, has_kda=has_kda)
+        if cat not in _INDEXED_SKIP_ROLES
+    )
+
+
+_INDEXED_LAYER_EXPERT_RE = re.compile(r"\bexperts\.(\d+)(?:\.|$)")
+
+
+def resolve_indexed_layer_exclusions(
+    patterns: Sequence[str],
+    *,
+    native: str,
+    has_mla: bool = False,
+    has_kda: bool = False,
+    num_experts: int = 0,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Map concrete per-layer module exclusions onto ``layer_quant_overrides.native_layers``."""
+    native_layers: dict[str, dict[str, Any]] = {}
+    partial_experts: dict[tuple[int, str], set[int]] = {}
+    remaining: list[str] = []
+    float_fields = {"weight_format": native, "activation_format": native}
+    for item in patterns or ():
+        pattern = str(item)
+        raw = pattern.strip()
+        lower = raw.lower()
+        if (
+            not lower
+            or lower.startswith("re:")
+            or "*" in lower
+            or "\\" in lower
+            or any(ch in lower for ch in _REGEX_META_CHARS)
+            or any(ch in lower for ch in "()|")
+        ):
+            remaining.append(pattern)
+            continue
+        match = _INDEXED_LAYER_PATH_RE.match(lower)
+        if match is None:
+            remaining.append(pattern)
+            continue
+        layer_idx = int(match.group(1))
+        subpath = match.group(2)
+        for suffix in (".weight", ".bias"):
+            if subpath.endswith(suffix):
+                subpath = subpath[:-len(suffix)]
+        if _classify_plain_exclusion(subpath) in _NON_LINEAR_EXCLUSION_ROLES:
+            remaining.append(pattern)
+            continue
+        cats = _indexed_subpath_categories(lower, subpath, has_mla=has_mla, has_kda=has_kda)
+        if not cats:
+            remaining.append(pattern)
+            continue
+        exp_match = _INDEXED_LAYER_EXPERT_RE.search(subpath)
+        if exp_match is not None:
+            eid = int(exp_match.group(1))
+            for cat in cats:
+                partial_experts.setdefault((layer_idx, cat), set()).add(eid)
+            continue
+        entry = native_layers.setdefault(str(layer_idx), {"category_overrides": {}})
+        for cat in cats:
+            entry["category_overrides"][cat] = dict(float_fields)
+    for entry in native_layers.values():
+        cat_map = entry["category_overrides"]
+        if _DENSE_MLP_PROJECTION_ROLES.issubset(cat_map):
+            sub_vals = [cat_map[sub] for sub in ("dense_mlp.gate", "dense_mlp.up", "dense_mlp.down")]
+            if sub_vals[0] == sub_vals[1] == sub_vals[2]:
+                for sub in _DENSE_MLP_PROJECTION_ROLES:
+                    cat_map.pop(sub, None)
+                cat_map["dense_mlp"] = dict(sub_vals[0])
+    for (layer_idx, cat), eids in sorted(partial_experts.items()):
+        sorted_ids = sorted(eids)
+        count = max(int(num_experts or 0), sorted_ids[-1] + 1)
+        entry = native_layers.setdefault(str(layer_idx), {"category_overrides": {}})
+        cat_entry = dict(entry["category_overrides"].get(cat) or {})
+        cat_entry["expert_quant_count"] = count
+        cat_entry["expert_quant_overrides"] = [
+            {"expert_indices": sorted_ids, "fields": dict(float_fields)},
+        ]
+        entry["category_overrides"][cat] = cat_entry
+    layer_overrides = {"native_layers": native_layers} if native_layers else {}
+    return layer_overrides, tuple(remaining)
+
+
+def _config_arch_flags(c: Mapping[str, Any]) -> tuple[bool, bool]:
+    has_mla = bool(c.get("kv_lora_rank"))
+    sched = c.get("layer_attention_schedule", c.get("layer_types")) or ()
+    has_kda = str(c.get("attention_type", "")).lower() == "kda" or any(
+        "kda" in str(item).lower() for item in sched
+    )
+    return has_mla, has_kda
+
+
 def resolve_role_exclusions(
     patterns: Sequence[str],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -108,11 +373,13 @@ def resolve_role_exclusions(
     unresolved: list[str] = []
     for item in patterns or ():
         pattern = str(item)
-        role = _classify_exclusion_pattern(pattern)
-        if role is None:
+        matched = _classify_exclusion_pattern(pattern)
+        if not matched:
             unresolved.append(pattern)
-        elif role not in roles:
-            roles.append(role)
+            continue
+        for role in matched:
+            if role not in roles:
+                roles.append(role)
     return tuple(roles), tuple(unresolved)
 
 
@@ -127,7 +394,8 @@ ALIASES = {
     "n_routed_experts": ("num_routed_experts", "num_local_experts",
                          "num_experts", "moe_num_experts"),
     "num_experts_per_tok": ("top_k", "num_experts_per_token", "moe_top_k",
-                            "top_k_experts"),
+                            "moe_topk", "top_k_experts"),
+    "moe_intermediate_size": ("expert_ffn_hidden_size", "expert_intermediate_size"),
     "n_shared_experts": ("num_shared_experts",),
     "first_k_dense_replace": ("first_k_dense_layers",),
     "shared_expert_intermediate_size": ("shared_intermediate_size", "share_expert_dim"),
@@ -210,7 +478,8 @@ NATIVE_ADAPTER_FIELDS = set("""
 activation_situ_beta activation_situ_linear_beta attn_res_block_size
 candidate_block_size candidate_source_layer_id candidate_topk_blocks compress_ratios
 deepstack_visual_indexes dflash_config downsample_ratio dspark_block_size
-dspark_markov_rank dspark_n_routed_experts dspark_num_experts_per_tok
+dspark_config dspark_ffn_hidden_size dspark_markov_rank dspark_n_routed_experts
+dspark_num_experts_per_tok dspark_num_hidden_layers dspark_sliding_window
 dspark_target_layer_ids enable_confidence_head engram_head_dim engram_layer_ids
 engram_max_ngram_size engram_n_heads engram_num_embeddings engram_pad_token_id
 engram_storage_mode expert_dtype hc_mult hc_sinkhorn_iters image_token_id
@@ -281,8 +550,17 @@ def _native_quant_gaps(c, quant):
             gaps.append("native_quant_kv_cache_scheme_unresolved:retained_plan_proxy")
     excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
     if excluded:
-        resolved_roles, unresolved_patterns = resolve_role_exclusions(excluded)
-        if unresolved_patterns or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES):
+        has_mla, has_kda = _config_arch_flags(c)
+        _, global_excluded = resolve_indexed_layer_exclusions(
+            excluded, native=quant.native_format, has_mla=has_mla, has_kda=has_kda,
+        )
+        resolved_roles, unresolved_patterns = resolve_role_exclusions(global_excluded)
+        truly_unresolved = tuple(
+            p for p in unresolved_patterns if not _is_indexed_layer_attention_exclusion(p)
+        )
+        if truly_unresolved or not set(resolved_roles).issubset(
+            _NON_LINEAR_EXCLUSION_ROLES | set(quant.exclusions)
+        ):
             gaps.append("quant_module_exclusions_unresolved")
     return gaps
 
@@ -388,301 +666,6 @@ def declared_context(config: Mapping[str, Any]) -> dict[str, Any]:
         if value is not None:
             record[key] = value
     return record
-
-
-_STORAGE_FORMATS = frozenset({
-    "bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2", "int8",
-    "mxfp4", "fp4", "int4", "w4a8",
-})
-
-
-def normalize_declared_format(value: Any, *, expert: bool = False) -> str:
-    """Canonicalise one explicitly declared representation, or return empty.
-
-    This helper never invents a format.  It only maps spelling aliases that
-    the source configs already use and rejects everything else so the caller
-    can retain an explicit coverage gap.
-    """
-    if value is None:
-        return ""
-    text = str(value).strip().lower().replace("-", "_")
-    text = {
-        "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
-        "float8_e4m3": "fp8_e4m3", "float8_e4m3fn": "fp8_e4m3",
-        "float8_e5m2": "fp8_e5m2", "fp8": "fp8_e4m3",
-    }.get(text, text)
-    if expert:
-        text = {"fp4": "mxfp4", "fp8": "fp8_e4m3"}.get(text, text)
-    return text if text in _STORAGE_FORMATS else ""
-
-
-def declared_weight_dtype(config: Mapping[str, Any]) -> str:
-    c, _, _ = flatten_config(config)
-    return normalize_declared_format(c.get("weight_dtype"))
-
-
-def resolve_native_formats(quant, config: Mapping[str, Any]):
-    """Bind declared native stream and independent storage formats.
-
-    The activation stream may inherit a declared FP16/FP32/FP8 native format
-    only for the unquantized default representation.  Explicit KV, weight,
-    expert, index and scale declarations stay independent: equality with the
-    old native spelling is never used as proof of inheritance.  A quantized
-    plan keeps every weight/expert/scale field; only its native stream label
-    and an explicitly declared KV format are updated.
-    """
-    c, _, _ = flatten_config(config)
-    native = normalize_declared_format(native_dtype(c))
-    if quant is None:
-        return quant
-    raw_quant = c.get("quantization_config")
-    quantized = isinstance(raw_quant, Mapping) and bool(raw_quant)
-    explicit_weight = normalize_declared_format(c.get("weight_dtype"))
-    explicit_expert = normalize_declared_format(c.get("expert_dtype"), expert=True)
-    explicit_kv = normalize_declared_format(c.get("kv_dtype"))
-    kv_from_quant = (isinstance(raw_quant, Mapping)
-                     and raw_quant.get("kv_cache_scheme") is not None)
-    changes: dict[str, Any] = {}
-    if native and quant.native_format != native:
-        changes["native_format"] = native
-    if explicit_kv and not kv_from_quant and explicit_kv != quant.kv_dtype:
-        changes["kv_dtype"] = explicit_kv
-    high = {"bf16", "fp16", "fp32"}
-    if not quantized:
-        if explicit_weight in high:
-            changes["weight_format"] = explicit_weight
-            changes["expert_weight_format"] = explicit_weight
-        if explicit_expert in high:
-            changes["expert_weight_format"] = explicit_expert
-        if native:
-            # An unquantized plan carries native defaults for these four
-            # representations.  Explicit declarations have already been
-            # applied above; no field is inherited just because its spelling
-            # equals the old native value.
-            if "weight_format" not in changes and not explicit_weight:
-                changes["weight_format"] = native
-            if "activation_format" not in changes:
-                changes["activation_format"] = native
-            if ("expert_weight_format" not in changes
-                    and not explicit_weight and not explicit_expert):
-                changes["expert_weight_format"] = native
-            if "kv_dtype" not in changes and not explicit_kv:
-                changes["kv_dtype"] = native
-    return replace(quant, **changes) if changes else quant
-
-
-_MATRIX_VALUE_ROLES = (
-    "attn.q", "attn.kv", "attn.o", "mla", "mla_absorb", "dense_mlp",
-    "routed_expert", "shared_expert", "router", "indexer", "mtp",
-)
-
-
-def _role_value_formats(quant, role: str, *, native: str,
-                        compute_override: str = "",
-                        output_override: str = "") -> dict[str, Any]:
-    """Resolve one matrix role through its effective category QuantSpec."""
-    from .ops import compute_dtype_for, matrix_output_format
-
-    resolved = quant.for_category(role)
-    compute, activation = compute_dtype_for(quant, role)
-    weight_storage = resolved.source_format_for(role)
-    weight_runtime = resolved.format_for(role)
-    output = matrix_output_format(
-        quant, role, activation_dtype=activation, prequant=native)
-    if compute_override:
-        compute = compute_override
-    if output_override:
-        output = output_override
-    high = {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32", ""}
-    return {
-        "weight_storage": weight_storage,
-        "weight_runtime": weight_runtime,
-        "activation": activation,
-        "compute": compute,
-        "output": output,
-        "weight_scale": ("" if weight_runtime in high
-                         else resolved.execution_weight_scale_format()),
-        "activation_scale": ("" if activation in high
-                             else resolved.execution_activation_scale_format()),
-    }
-
-
-_ATTENTION_MATRIX_ROLES = {
-    "gqa": ("attn.qkv", "attn.o"),
-    "mha": ("attn.qkv", "attn.o"),
-    "mqa": ("attn.qkv", "attn.o"),
-    "projection_only": ("attn.qkv", "attn.o"),
-    "gdn": ("gdn.qkvz", "gdn.o", "gdn.beta_alpha"),
-    "kda": ("kda.q", "kda.k", "kda.v", "kda.b", "kda.f_a", "kda.f_b",
-            "kda.g", "kda.g_a", "kda.g_b", "kda.o"),
-}
-
-
-def _plan_matrix_roles(plan) -> set[str]:
-    """Actual matrix categories reachable from one parsed LayerPlan."""
-    roles: set[str] = set()
-    attention = str(getattr(plan, "attention", "") or "")
-    if attention == "mla":
-        roles.add("mla")
-        if int(getattr(plan, "q_lora_rank", 0) or 0):
-            roles.update(("mla.q_a", "mla.q_b"))
-        else:
-            roles.add("mla.q_proj")
-        roles.add("mla.kv_a")
-        roles.add("mla_absorb")
-        if int(getattr(plan, "o_groups", 0) or 0):
-            roles.update(("mla.o_a", "mla.o_b"))
-        else:
-            roles.add("mla.o")
-        if bool(getattr(plan, "mla_output_gate", False)):
-            roles.add("mla.g")
-    else:
-        roles.update(_ATTENTION_MATRIX_ROLES.get(attention, ()))
-    ffn = str(getattr(plan, "ffn", "") or "")
-    if ffn == "moe":
-        roles.update(("router", "routed_expert"))
-        if int(getattr(plan, "num_shared_experts", 0) or 0):
-            roles.add("shared_expert")
-        if int(getattr(plan, "expert_latent_size", 0) or 0):
-            roles.add("latent_moe")
-    elif ffn == "dense":
-        roles.add("dense_mlp")
-    if (bool(getattr(plan, "indexer", False))
-            or bool(getattr(plan, "owns_topk", False))
-            or bool(getattr(plan, "index_query_per_layer", False))):
-        roles.update(("indexer.weights", "indexer_fp8"))
-        if int(getattr(plan, "index_kpool", 0) or 0) > 1:
-            roles.update(("indexer.pool_projection", "indexer.pool_gate"))
-    if str(getattr(plan, "scope", "") or "") == "mtp":
-        roles.add("mtp")
-    return roles
-
-
-def model_value_formats(model) -> dict[str, Any]:
-    """Project one resolved ModelSpec into per-layer/role value formats.
-
-    Every layer uses the same pure chain as execution:
-    ``projection_quant(model.quant, plan)`` -> ``for_category(category)`` ->
-    the shared ``matrix_output_format`` rule.  A role summary is shared only
-    when every applicable layer resolves the same complete record; otherwise
-    the caller receives the per-layer binding.  QuantSpec explicit output,
-    caller override, MX/4-bit and the normal matrix default are all resolved by
-    the same helper used by ``gemm_op``.
-    """
-    from .quant import projection_quant
-    from .types import QuantSpec
-
-    native = str(getattr(model, "activation_dtype", "") or "bf16")
-    quant = getattr(model, "quant", None)
-    compute_override = ""
-    if quant is None:
-        weight = (normalize_declared_format(getattr(model, "weight_dtype", ""))
-                  or native)
-        kv = (normalize_declared_format(getattr(model, "kv_dtype", ""))
-              or native)
-        activation = str(getattr(model, "activation_dtype", "") or native)
-        compute_override = str(getattr(model, "compute_dtype", "") or activation)
-        quant = QuantSpec(
-            name="declared", weight_format=weight, activation_format=activation,
-            expert_weight_format=weight, kv_dtype=kv, index_dtype=native,
-            native_format=activation,
-        )
-    plans = tuple(getattr(model, "layer_plans", ()) or ())
-    metadata = dict(getattr(model, "metadata", ()) or ())
-    roles = {
-        role: _role_value_formats(quant, role, native=native,
-                                  compute_override=compute_override)
-        for role in _MATRIX_VALUE_ROLES
-    }
-    layer_records: dict[str, dict[int, dict[str, Any]]] = {}
-    for plan in plans:
-        layer_quant = projection_quant(quant, plan)
-        layer_index = int(getattr(plan, "index", 0))
-        for role in _plan_matrix_roles(plan):
-            record = _role_value_formats(
-                layer_quant, role, native=native,
-                compute_override=compute_override)
-            if role == "router":
-                router_dtype = str(getattr(plan, "router_dtype", "") or "")
-                router_output = str(getattr(plan, "router_output_dtype", "") or "")
-                if router_dtype:
-                    record.update(weight_storage=router_dtype,
-                                  weight_runtime=router_dtype,
-                                  activation=router_dtype, compute=router_dtype,
-                                  weight_scale="", activation_scale="")
-                if router_output:
-                    record["output"] = router_output
-                elif router_dtype:
-                    record["output"] = router_dtype
-            layer_records.setdefault(role, {})[layer_index] = record
-    for role, records in layer_records.items():
-        if not records:
-            continue
-        variants = {tuple(sorted(record.items())) for record in records.values()}
-        if len(variants) == 1:
-            summary = dict(next(iter(records.values())))
-            summary["layers"] = tuple(sorted(records))
-            roles[role] = summary
-        else:
-            roles[role] = {
-                "heterogeneous": True,
-                "by_layer": {layer: dict(records[layer])
-                             for layer in sorted(records)},
-            }
-    rope = metadata.get("rope_parameters")
-    if not isinstance(rope, Mapping):
-        unconsumed = metadata.get("unconsumed_config_fields")
-        rope = (unconsumed.get("rope_parameters")
-                if isinstance(unconsumed, Mapping) else None)
-    rope = dict(rope) if isinstance(rope, Mapping) else {}
-    for key in ("rope_theta", "partial_rotary_factor", "mrope_section",
-                "mrope_interleaved", "mla_use_nope"):
-        if key not in rope and key in metadata:
-            rope[key] = metadata[key]
-    partial = rope.get("partial_rotary_factor", 1.0)
-    try:
-        partial = float(partial)
-    except (TypeError, ValueError):
-        partial = 1.0
-    mla = getattr(model, "mla", None)
-    model_head_dim = int(getattr(model, "head_dim", 0) or 0)
-    rotary = {}
-    for plan in plans:
-        attention = str(getattr(plan, "attention", "") or "gqa")
-        head_dim = int(getattr(plan, "head_dim", 0) or model_head_dim)
-        if attention == "mla":
-            dim = int(getattr(plan, "qk_rope_head_dim", 0)
-                      or (mla.qk_rope_head_dim if mla is not None else 0))
-        elif 0.0 < partial < 1.0:
-            dim = int(round(head_dim * partial))
-        else:
-            dim = head_dim
-        rotary.setdefault(attention, set()).add(dim)
-    return {
-        "activation_stream": native,
-        "compute": str(getattr(model, "compute_dtype", "") or native),
-        "output_stream": native,
-        "kv_cache": str(quant.kv_dtype),
-        "index": str(quant.index_dtype),
-        "index_scale": str(quant.index_scale_dtype),
-        "weight_scale": quant.execution_weight_scale_format(),
-        "activation_scale": quant.execution_activation_scale_format(),
-        "matrix_roles": roles,
-        "heads": {
-            "num_attention_heads": int(getattr(model, "num_heads", 0) or 0),
-            "num_key_value_heads": int(getattr(model, "num_kv_heads", 0) or 0),
-            "head_dim": int(getattr(model, "head_dim", 0) or 0),
-            "mla": (mla.to_dict() if mla is not None else None),
-        },
-        "rotary": {
-            "rope_parameters": rope,
-            "partial_rotary_factor": partial,
-            "rotary_dim_by_attention": {
-                key: tuple(sorted(values)) for key, values in sorted(rotary.items())
-            },
-            "max_position_embeddings": int(metadata.get("max_position_embeddings", 0) or 0),
-        },
-    }
 
 
 def native_coverage(config, gaps, *, plans, quant):
@@ -804,11 +787,6 @@ def normalize_config(config):
     return c
 
 
-def native_dtype(c):
-    name = str(c.get("activation_dtype", c.get("torch_dtype", c.get("dtype", "bf16"))))
-    return {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(name, name)
-
-
 def resolve_quant(c):
     """Return a declared plan plus any explicit representation degradation."""
     native = native_dtype(c)
@@ -827,9 +805,20 @@ def resolve_quant(c):
     weight = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(weight, weight)
     if not raw and weight == native:
         return base, gaps
+    has_mla, has_kda = _config_arch_flags(c)
+    num_exp = int(
+        c.get("n_routed_experts")
+        or c.get("num_routed_experts")
+        or c.get("num_local_experts")
+        or c.get("num_experts")
+        or c.get("moe_num_experts")
+        or 0
+    )
     if method == "compressed-tensors":
         from .compressed_int4 import resolve_compressed_int4
-        resolved = resolve_compressed_int4(raw, base)
+        resolved = resolve_compressed_int4(
+            raw, base, has_mla=has_mla, has_kda=has_kda, num_experts=num_exp,
+        )
         if resolved is not None:
             return resolved, gaps
     if method == "fp8":
@@ -845,10 +834,13 @@ def resolve_quant(c):
                 gaps.append(f"quant_scale_format_unmodeled:{scale}:{native}_proxy")
                 return base, gaps
             excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
-            resolved_roles, unresolved_patterns = resolve_role_exclusions(excluded)
-            exclusions_unresolved = bool(excluded) and (
+            layer_overrides, global_excluded = resolve_indexed_layer_exclusions(
+                excluded, native=native, has_mla=has_mla, has_kda=has_kda, num_experts=num_exp,
+            )
+            resolved_roles, unresolved_patterns = resolve_role_exclusions(global_excluded)
+            exclusions_unresolved = bool(global_excluded) and (
                 bool(unresolved_patterns)
-                or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES)
+                or not set(resolved_roles).issubset(_FP8_APPLICABLE_EXCLUSION_ROLES)
             )
             if exclusions_unresolved:
                 gaps.append("quant_module_exclusions_unresolved")
@@ -858,11 +850,12 @@ def resolve_quant(c):
                 name="hf_fp8_block", weight_format="fp8_e4m3",
                 expert_weight_format="fp8_e4m3", activation_format="fp8_e4m3",
                 weight_block=tuple(int(v) for v in block),
-                scale_format=scale, scale_bytes=4 if scale == "fp32" else 1,
+                scale_format=scale, scale_bytes=_FP32_SCALE_BYTES if scale == "fp32" else 1,
                 activation_group_size=int(block[1]), activation_scale_format=scale,
                 kv_dtype=base.kv_dtype, index_dtype=base.index_dtype,
                 index_scale_dtype="none", native_format=native,
                 exclusions=merged_exclusions,
+                layer_quant_overrides=layer_overrides,
             )
             if exclusions_unresolved:
                 # Preserve the model with an explicit whole-matrix native

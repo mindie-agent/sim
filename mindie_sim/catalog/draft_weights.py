@@ -19,6 +19,59 @@ MULTI_TARGET_CONCAT_MIN = 2
 #: ``WeightTerm.groups``/``units``/``unit_width`` for a term with no grouping.
 
 
+def require_model_quant(model: ModelSpec) -> QuantSpec:
+    """Return normalized ``model.quant`` or construct strictly from declared native dtypes."""
+    quant = getattr(model, "quant", None)
+    if quant is not None:
+        return quant
+    w_dt = str(getattr(model, "weight_dtype", "") or "").strip().lower()
+    a_dt = str(getattr(model, "activation_dtype", "") or "").strip().lower()
+    kv_dt = str(getattr(model, "kv_dtype", "") or a_dt or w_dt).strip().lower()
+    if not w_dt or not a_dt:
+        raise ModelingError("model_quant_missing")
+    return QuantSpec(
+        name=str(getattr(model, "quantization", "") or w_dt),
+        weight_format=w_dt,
+        activation_format=a_dt,
+        expert_weight_format=w_dt,
+        kv_dtype=kv_dt,
+        index_dtype=kv_dt,
+        native_format=a_dt,
+    )
+
+
+def lowrank_hc_draft_terms(draft: DraftSpec) -> list[WeightTerm]:
+    """Low-rank gated hyper-connection weight terms for one draft layer."""
+    if draft.mhc_mult <= ZERO or draft.mhc_lowrank <= ZERO:
+        return []
+    hc_dim = draft.mhc_mult * draft.hidden_size
+    terms: list[WeightTerm] = []
+    for part in ("attn", "ffn"):
+        terms.extend([
+            _t(f"draft_hc_{part}_norm", hc_dim, ONE, "norm"),
+            _t(
+                f"draft_hc_{part}_down_inject",
+                draft.mhc_lowrank + draft.mhc_mult,
+                hc_dim,
+                "linear_param_bf16",
+            ),
+            _t(f"draft_hc_{part}_up", hc_dim, draft.mhc_lowrank, "linear_param_bf16"),
+        ])
+    return terms
+
+
+def lowrank_hc_draft_head_terms(draft: DraftSpec) -> list[WeightTerm]:
+    """Low-rank gated hyper-connection collapse head terms for a draft model."""
+    if draft.mhc_mult <= ZERO or draft.mhc_lowrank <= ZERO:
+        return []
+    hc_dim = draft.mhc_mult * draft.hidden_size
+    return [
+        _t("draft_hc_head_norm", hc_dim, ONE, "norm"),
+        _t("draft_hc_head_down", draft.mhc_lowrank, hc_dim, "linear_param_bf16"),
+        _t("draft_hc_head_up", hc_dim, draft.mhc_lowrank, "linear_param_bf16"),
+    ]
+
+
 def _resolved_input_width(draft: DraftSpec) -> int:
     targets = tuple(getattr(draft, "target_layer_ids", ()) or ())
     if len(targets) >= MULTI_TARGET_CONCAT_MIN:
@@ -119,7 +172,7 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
         terms.extend([
             _t("draft_enorm", h, ONE, "linear_param_bf16"),
             _t("draft_hnorm", h, ONE, "linear_param_bf16"),
-            _t("draft_eh_proj", h, 2 * h, "linear_param_bf16", "replicated"),
+            _t("draft_eh_proj", h, 2 * h, "linear_param_bf16", "out_tp"),
         ])
     if draft.mhc_lowrank <= ZERO:
         terms.extend([_t("draft_input_norm", h, ONE, "norm"),
@@ -163,12 +216,11 @@ def _draft_ffn_terms(
     else:
         i = draft.intermediate_size
         terms.extend([
-            _t("draft_gate", i, h, "dense_mlp", "dense_up"),
-            _t("draft_up", i, h, "dense_mlp", "dense_up"),
-            _t("draft_down", h, i, "dense_mlp", "dense_down"),
+            _t("draft_gate", i, h, "dense_mlp.gate", "dense_up"),
+            _t("draft_up", i, h, "dense_mlp.up", "dense_up"),
+            _t("draft_down", h, i, "dense_mlp.down", "dense_down"),
         ])
     if draft.mhc_lowrank > ZERO:
-        from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_terms
         terms.extend(lowrank_hc_draft_terms(draft))
     elif draft.mhc_mult:
         mix = (2 + draft.mhc_mult) * draft.mhc_mult
@@ -180,7 +232,9 @@ def _draft_ffn_terms(
     return terms
 
 
-def _draft_plan_terms(plan, draft: DraftSpec, model: ModelSpec) -> list[WeightTerm]:
+def _draft_plan_terms(
+    plan, draft: DraftSpec, model: ModelSpec, *, dq: QuantSpec | None = None,
+) -> list[WeightTerm]:
     """Resident matrices owned by one declared draft ``LayerPlan``.
 
     Draft attention/FFN geometry is declared once by ``DraftSpec``, but an
@@ -188,12 +242,13 @@ def _draft_plan_terms(plan, draft: DraftSpec, model: ModelSpec) -> list[WeightTe
     plan.  They are counted here rather than synthesized from a donor layer.
     """
     terms: list[WeightTerm] = []
+    resolved_dq = dq or draft_quant(model, draft)
     if (plan.owns_index_k or plan.owns_topk or plan.indexer
             or plan.index_query_per_layer):
         from mindie_sim.catalog.weights import _indexer_terms
         draft_model = replace(
             model, hidden_size=int(draft.hidden_size),
-            quant=draft_quant(model, draft))
+            quant=resolved_dq)
         terms.extend(_indexer_terms(plan, draft_model))
     if (plan.ffn == "moe" and plan.router_precast_weight_copy
             and plan.router_dtype):
@@ -204,16 +259,30 @@ def _draft_plan_terms(plan, draft: DraftSpec, model: ModelSpec) -> list[WeightTe
     return terms
 
 
+def _feature_proj_sharding(draft: DraftSpec) -> str:
+    """Match frontend ``_replicated_feature_proj`` sharding for draft input projections."""
+    replicated = bool(
+        draft.kind in {"eagle", "eagle3"}
+        or (draft.kind in {"dspark", "mtp_dspark", "standalone_draft"} and draft.attention_kind == "gqa")
+    )
+    return "replicated" if replicated else "out_tp"
+
+
 def draft_terms(
     draft: DraftSpec, model: ModelSpec, *, standalone_heads_only: bool = False,
     ep: int = ONE,
 ) -> list[WeightTerm]:
     h = draft.hidden_size
+    resolved_model = model if getattr(model, "quant", None) is not None else replace(
+        model, quant=require_model_quant(model),
+    )
+    dq = draft_quant(resolved_model, draft)
+    feature_sharding = _feature_proj_sharding(draft)
     terms: list[WeightTerm] = []
     if standalone_heads_only and draft.kind == "standalone_draft":
         # The standalone draft always consumes concatenated target features.
         terms.append(_t("draft_input_proj", h, draft.input_width,
-                        draft.input_projection_category, "out_tp"))
+                        draft.input_projection_category, feature_sharding))
         terms.extend([_t("draft_input_norm", h, 1, "norm"),
                       _t("draft_final_norm", h, 1, "norm")])
         if draft.target_shared_embedding:
@@ -235,7 +304,7 @@ def draft_terms(
             # from two independent H x H projections, so it must not be modelled
             # as ``dual_normalized``.
             terms.append(_t("draft_main_proj", h, _resolved_input_width(draft),
-                            draft.input_projection_category, "out_tp"))
+                            draft.input_projection_category, feature_sharding))
             terms.append(_t("draft_main_norm", h, ONE, "norm"))
         elif draft.input_mode == "dual_normalized":
             # Deployed V4 MTP input: enorm(decoder h) + hnorm(target h), then two
@@ -245,9 +314,9 @@ def draft_terms(
                             "replicated"))
             terms.append(_t("draft_h_proj", h, h, "linear_param_bf16",
                             "replicated"))
-        else:
+        elif draft.input_mode != "normalized_concat":
             terms.append(_t("draft_input_proj", h, draft.input_width,
-                            draft.input_projection_category, "out_tp"))
+                            draft.input_projection_category, feature_sharding))
         if draft.embedding_owned and int(draft.embedding_count) > ZERO:
             terms.append(WeightTerm(
                 "draft_embedding", draft.vocab_size, h, "embedding",
@@ -255,20 +324,19 @@ def draft_terms(
                 False, True))
         plans = tuple(getattr(draft, "layer_plans", ()) or ())
         for index in range(max(ZERO, draft.layers)):
-            terms.extend(_draft_attention_terms(draft, model.quant or QuantSpec("bf16")))
+            terms.extend(_draft_attention_terms(draft, dq))
             terms.extend(_draft_ffn_terms(draft, model, ep=ep))
             if index < len(plans):
-                terms.extend(_draft_plan_terms(plans[index], draft, model))
+                terms.extend(_draft_plan_terms(plans[index], draft, resolved_model, dq=dq))
             if draft.output_head_owned:
                 terms.append(_t("draft_output_norm", h, ONE, "norm"))
                 if int(draft.output_head_count) > ZERO:
                     terms.append(WeightTerm(
                         "draft_output_head", draft.vocab_size, h, "lm_head",
-                        "replicated", ONE, 0, 0, 0, False, True))
+                        "out_tp", ONE, 0, 0, 0, False, True))
         if draft.mhc_lowrank > ZERO:
-            from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_head_terms
             terms.extend(lowrank_hc_draft_head_terms(draft))
-    if draft.kind == "mtp" and draft.target_shared_lm_head:
+    if draft.kind in {"mtp", "eagle3"} and draft.target_shared_lm_head:
         terms.append(WeightTerm(
             "target_lm_head_alias", draft.vocab_size, h,
             "target_alias_lm_head", "replicated", 1, 0, 0, 0, True, False,
@@ -282,7 +350,7 @@ def draft_terms(
             width = draft.confidence_input_width or (h + draft.markov_rank)
             terms.append(_t("confidence_head", 1, width, "norm"))
     from mindie_sim.catalog.projection_placement import projection_role
-    return [replace(term, quant=draft_quant(model, draft),
+    return [replace(term, quant=dq,
                     placement_role=projection_role(
                         None, term.name, scope="draft"))
             for term in terms]
@@ -293,7 +361,7 @@ def draft_weight_summary(
 ) -> tuple[float, float]:
     if model.auxiliary is None:
         return 0.0, 0.0
-    quant = model.quant or QuantSpec("bf16")
+    quant = require_model_quant(model)
     parallel = ParallelSpec()
     drafts: list[DraftSpec] = []
     aux = model.auxiliary
@@ -304,7 +372,7 @@ def draft_weight_summary(
     else:
         if aux.mtp is not None:
             drafts.append(aux.mtp)
-        if aux.dspark is not None and aux.dspark is not aux.mtp:
+        if aux.dspark is not None and aux.dspark != aux.mtp:
             drafts.append(aux.dspark)
     params = 0.0
     weights = 0.0

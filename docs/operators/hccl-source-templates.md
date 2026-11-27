@@ -122,7 +122,7 @@ duration is reproduced.
   start-order is a concurrent-slot micro-order residual, not an exact claim.
 - No measured primitive rate, local startup, inclusive remote-reduce rate,
   coarse control rate or whole-collective alpha is imported. Unsupported rate
-  fields fail visibly. The existing `observations/a5_comm_binding.py` A5 capture
+  fields fail visibly. The existing `observations/communication/binding.py` A5 capture
   service seam remains separate; this structural recipe adds no capture registry.
 - The source-compatible declaration is not deployed-binary identity. Phase
   local work and network exchange overlap as the public lowering's phase

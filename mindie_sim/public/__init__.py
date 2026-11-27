@@ -28,6 +28,11 @@ from .contracts import (
 )
 from .environment import ExecutionEnvironment
 from .errors import GAP_SCHEMA, CapabilityGap, ExtensionError
+from .formula_sdk import (
+    FormulaKernelEvaluation, FormulaKernelSpec, FormulaTensorSpec,
+    bind_kernel_implementation, evaluate_formula_kernel,
+    model_target_ceiling, simulate_formula_kernel,
+)
 from .profiles import (
     PROFILE_SCHEMA, USER_PROFILE_SCHEMA, UserProfile, load_user_profile,
 )
@@ -45,6 +50,9 @@ __all__ = [
     "ExtensionError", "CapabilityGap", "load_extensions", "load_user_profile",
     "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
     "simulate_graph", "simulate_model", "simulate_service",
+    "FormulaTensorSpec", "FormulaKernelSpec", "FormulaKernelEvaluation",
+    "evaluate_formula_kernel", "simulate_formula_kernel",
+    "bind_kernel_implementation", "model_target_ceiling",
     "SubgraphEfficiencyReport", "SubgraphMathSummary",
     "compute_subgraph_math_summaries", "evaluate_subgraph_efficiency",
 ]

@@ -1,0 +1,670 @@
+{
+  "schema_version": "mindie-tilelang-api-calibration/1",
+  "arch_preset": "npu_arch_3510",
+  "observed_silicon": "Ascend950DT_9582",
+  "tilelang_version": "0.1.15",
+  "bisheng_target": "dav-3510",
+  "ascendc_l0_envelope_sha256": "d288dd2f012a4879d6d131d78c0e9bd7ac9ba0d2968458e38ce023c121afb0d0",
+  "ascendc_l0_reference_p50": {
+    "P01_hbm_read_gbps": 3813.65,
+    "P01_hbm_rw11_gbps": 3192.0,
+    "P01_hbm_rw21_gbps": 3244.76,
+    "P06_bf16_cube_tflops": 431.4,
+    "P06_bf16_e2e_tflops": 427.76,
+    "P06_fp8_cube_tflops": 863.18,
+    "P06_mxfp8_cube_tflops": 862.76,
+    "P06_mxfp8_e2e_tflops": 847.61,
+    "P06_fp32_cube_tflops": 27.01,
+    "P06_hf32_cube_tflops": 215.74,
+    "P07_vec_alu_gops_per_aiv": 91.67,
+    "P08_vec_sfu_gops_per_aiv": 77.27,
+    "P09_vec_reduce_gops_per_aiv": 73.46,
+    "P09_cast_gbps_per_aiv": 402.18,
+    "P11_simt_scalar_gflops_per_aiv": 105.56,
+    "P12_flag_ns": 2.4247,
+    "P15_host_submit_us": 7.1762,
+    "P15_npugraph_issue_us": 0.9236
+  },
+  "onchip_ub_ceilings_bytes": {
+    "total_ub_per_aiv": 262144,
+    "simd_usable_ub_bytes": 253952,
+    "simt_usable_ub_bytes": 221184,
+    "simt_recommended_user_ub_bytes": 212992,
+    "empirical_simt_launch_fail_dyn_ubuf_bytes": 259072
+  },
+  "attainment_ratios_vs_ascendc_l0": {
+    "eta_copy_rw11_stages1": 0.7469,
+    "eta_copy_rw11_stages2": 0.9466,
+    "eta_copy_rw11_stages3": 0.9665,
+    "eta_copy_rw21_simt": 0.9793,
+    "eta_copy_rw21_simd": 1.0164,
+    "eta_cube_bf16_fixpipe": 0.9892,
+    "eta_cube_bf16_dualcopy_fp32": 0.9717,
+    "eta_cube_bf16_atomic_fp32": 0.9838,
+    "eta_cube_fp8_fixpipe": 0.9793,
+    "eta_cube_fp8_dualcopy_fp32": 0.9777,
+    "eta_cube_fp32_ieee": 0.9968,
+    "eta_cube_hf32": 0.9645,
+    "eta_cube_mxfp8_blockscaled": 0.9681,
+    "eta_simt_reg_fma_vs_p11": 1.001,
+    "eta_simt_ub_fma_vs_p11": 0.1241,
+    "eta_simd_sfu_exp_vs_p08": 0.9113
+  },
+  "levels": {
+    "L0_dispatch": {
+      "jit_compile_ms": 5022.2,
+      "jit_compile_second_variant_ms": 286.6,
+      "eager_tvm_ffi_callee_alloc_us": {
+        "n_samples": 20,
+        "p05": 15.0308,
+        "p50": 15.7746,
+        "p95": 22.2207,
+        "p99": 22.3911,
+        "cv_pct": 19.137
+      },
+      "eager_tvm_ffi_prealloc_us": {
+        "n_samples": 20,
+        "p05": 11.4604,
+        "p50": 11.7728,
+        "p95": 12.6743,
+        "p99": 16.7934,
+        "cv_pct": 13.725
+      },
+      "aclgraph_capture": {
+        "supported": true,
+        "per_kernel_issue_us": {
+          "n_samples": 20,
+          "p05": 0.6101,
+          "p50": 0.6117,
+          "p95": 0.6138,
+          "p99": 0.6186,
+          "cv_pct": 0.372
+        }
+      }
+    },
+    "L1_dma_copy": {
+      "cold_rw11_stages_1_gbps": {
+        "n_samples": 20,
+        "p05": 1672.4741,
+        "p50": 2383.9607,
+        "p95": 2496.3263,
+        "p99": 2496.6087,
+        "cv_pct": 10.307
+      },
+      "cold_rw11_stages_2_gbps": {
+        "n_samples": 20,
+        "p05": 1933.4385,
+        "p50": 3021.6164,
+        "p95": 3096.6819,
+        "p99": 3115.0754,
+        "cv_pct": 14.128
+      },
+      "cold_rw11_stages_3_gbps": {
+        "n_samples": 20,
+        "p05": 1905.5543,
+        "p50": 3085.1046,
+        "p95": 3166.0821,
+        "p99": 3171.7631,
+        "cv_pct": 20.214
+      },
+      "cold_rw21_vecadd_simt_gbps": {
+        "n_samples": 20,
+        "p05": 2256.3323,
+        "p50": 3177.6991,
+        "p95": 3207.1925,
+        "p99": 3216.4362,
+        "cv_pct": 12.625
+      },
+      "cold_rw21_vecadd_simd_gbps": {
+        "n_samples": 20,
+        "p05": 3133.715,
+        "p50": 3298.1281,
+        "p95": 3330.5549,
+        "p99": 3335.6938,
+        "cv_pct": 6.729
+      },
+      "warm_l2_rw11_aggregate_gbps": {
+        "n_samples": 20,
+        "p05": 3667.3533,
+        "p50": 6649.9932,
+        "p95": 6711.6674,
+        "p99": 6718.4349,
+        "cv_pct": 17.339
+      },
+      "row_32fp32_aligned_gbps": {
+        "n_samples": 20,
+        "p05": 919.2353,
+        "p50": 1807.7381,
+        "p95": 2021.2437,
+        "p99": 4231.3868,
+        "cv_pct": 42.555
+      },
+      "row_30fp32_pad_value_gbps": {
+        "n_samples": 20,
+        "p05": 893.4706,
+        "p50": 3764.458,
+        "p95": 3846.7311,
+        "p99": 3852.7534,
+        "cv_pct": 40.626
+      },
+      "row_30fp32_data_select_gbps": {
+        "n_samples": 20,
+        "p05": 854.0089,
+        "p50": 1625.7051,
+        "p95": 1776.716,
+        "p99": 1808.733,
+        "cv_pct": 27.363
+      }
+    },
+    "L2_vector_simt_vs_simd": {
+      "simt_ub_fma_t256": {
+        "ms_lo_p50": 0.1948,
+        "ms_hi_p50": 1.4814,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 10.9607,
+          "p50": 11.409,
+          "p95": 11.8807,
+          "p99": 11.887,
+          "cv_pct": 2.515
+        }
+      },
+      "simt_ub_fma_t1024": {
+        "ms_lo_p50": 0.17,
+        "ms_hi_p50": 1.2894,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 13.016,
+          "p50": 13.0979,
+          "p95": 13.7471,
+          "p99": 13.7472,
+          "cv_pct": 2.478
+        }
+      },
+      "simt_ub_exp_t512": {
+        "ms_lo_p50": 0.1651,
+        "ms_hi_p50": 1.3152,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 6.335,
+          "p50": 6.6658,
+          "p95": 6.7875,
+          "p99": 6.9131,
+          "cv_pct": 2.83
+        }
+      },
+      "simd_alu_chain8": {
+        "ms_lo_p50": 0.1035,
+        "ms_hi_p50": 0.8027,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 162.3076,
+          "p50": 174.5558,
+          "p95": 175.2718,
+          "p99": 175.2923,
+          "cv_pct": 3.62
+        }
+      },
+      "simd_sfu_vexp_chain3": {
+        "ms_lo_p50": 0.0974,
+        "ms_hi_p50": 0.7703,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 65.1517,
+          "p50": 70.417,
+          "p95": 72.8596,
+          "p99": 76.5944,
+          "cv_pct": 5.259
+        }
+      },
+      "simd_ub_stream_vadd": {
+        "ms_lo_p50": 0.0782,
+        "ms_hi_p50": 0.3321,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 48.608,
+          "p50": 57.7441,
+          "p95": 77.5145,
+          "p99": 78.7526,
+          "cv_pct": 13.584
+        }
+      },
+      "simd_vcvt_bf16_roundtrip": {
+        "ms_lo_p50": 0.0771,
+        "ms_hi_p50": 0.2187,
+        "cast_gbps_per_aiv": {
+          "n_samples": 16,
+          "p05": 927.2766,
+          "p50": 1248.1157,
+          "p95": 1755.096,
+          "p99": 2414.7507,
+          "cv_pct": 30.364
+        }
+      },
+      "simt_reducer_sum_row4096": {
+        "ms_lo_p50": 0.0572,
+        "ms_hi_p50": 0.4189,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 8.9057,
+          "p50": 10.2062,
+          "p95": 11.8948,
+          "p99": 11.9376,
+          "cv_pct": 8.442
+        },
+        "us_per_row4096": {
+          "n_samples": 16,
+          "p05": 0.3444,
+          "p50": 0.4013,
+          "p95": 0.4599,
+          "p99": 0.4605,
+          "cv_pct": 8.37
+        }
+      },
+      "simt_reg_fma_t1024": {
+        "ms_lo_p50": 0.0545,
+        "ms_hi_p50": 0.3288,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 94.9943,
+          "p50": 105.6613,
+          "p95": 126.2908,
+          "p99": 126.6384,
+          "cv_pct": 10.169
+        }
+      },
+      "simt_reg_exp_t1024": {
+        "ms_lo_p50": 0.0247,
+        "ms_hi_p50": 0.1392,
+        "gops_per_s_per_aiv": {
+          "n_samples": 16,
+          "p05": 49.9165,
+          "p50": 62.7667,
+          "p95": 114.3957,
+          "p99": 152.7251,
+          "cv_pct": 36.739
+        }
+      }
+    },
+    "L3_cube_gemm_and_blockscaled": {
+      "bf16_fixpipe_bf16": {
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "tflops_die": {
+          "n_samples": 16,
+          "p05": 418.7196,
+          "p50": 426.7391,
+          "p95": 427.6382,
+          "p99": 427.719,
+          "cv_pct": 0.862
+        },
+        "tflops_per_aic_p50": 13.3356,
+        "latency_us_p50": 2576.54
+      },
+      "bf16_dualcopy_fp32": {
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "tflops_die": {
+          "n_samples": 16,
+          "p05": 418.7286,
+          "p50": 419.1706,
+          "p95": 427.5672,
+          "p99": 427.612,
+          "cv_pct": 1.002
+        },
+        "tflops_per_aic_p50": 13.0991,
+        "latency_us_p50": 2623.07
+      },
+      "bf16_atomic_fp32": {
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "tflops_die": {
+          "n_samples": 16,
+          "p05": 414.0973,
+          "p50": 424.4114,
+          "p95": 424.9093,
+          "p99": 424.9193,
+          "cv_pct": 0.941
+        },
+        "tflops_per_aic_p50": 13.2629,
+        "latency_us_p50": 2590.67
+      },
+      "fp8_e4m3_dualcopy_fp32": {
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "tflops_die": {
+          "n_samples": 16,
+          "p05": 812.3386,
+          "p50": 843.9354,
+          "p95": 845.3456,
+          "p99": 845.5628,
+          "cv_pct": 1.741
+        },
+        "tflops_per_aic_p50": 26.373,
+        "latency_us_p50": 1302.84
+      },
+      "fp8_e4m3_fixpipe_bf16": {
+        "shape": [
+          8192,
+          8192,
+          8192
+        ],
+        "tflops_die": {
+          "n_samples": 16,
+          "p05": 814.3762,
+          "p50": 845.3496,
+          "p95": 846.714,
+          "p99": 846.763,
+          "cv_pct": 1.304
+        },
+        "tflops_per_aic_p50": 26.4172,
+        "latency_us_p50": 1300.66
+      },
+      "fp32_ieee": {
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "tflops_die": {
+          "n_samples": 16,
+          "p05": 26.6527,
+          "p50": 26.9247,
+          "p95": 26.9284,
+          "p99": 26.9284,
+          "cv_pct": 0.449
+        },
+        "tflops_per_aic_p50": 0.8414,
+        "latency_us_p50": 5104.57
+      },
+      "fp32_hf32_even": {
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "tflops_die": {
+          "n_samples": 16,
+          "p05": 193.2874,
+          "p50": 208.0816,
+          "p95": 208.7437,
+          "p99": 208.7439,
+          "cv_pct": 3.225
+        },
+        "tflops_per_aic_p50": 6.5026,
+        "latency_us_p50": 660.51
+      },
+      "bf16_llm_4096x7168_cold_m_curve": {
+        "M16_tm16_tn128": {
+          "M": 16,
+          "tile_m": 16,
+          "tile_n": 128,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 23.4808,
+            "p50": 24.0793,
+            "p95": 59.5129,
+            "p99": 70.27,
+            "cv_pct": 46.569
+          },
+          "tflops_die_p50": 39.02,
+          "effective_hbm_gbps_p50": 2453.6,
+          "rel_max_err": 0.0015
+        },
+        "M32_tm32_tn128": {
+          "M": 32,
+          "tile_m": 32,
+          "tile_n": 128,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 35.4991,
+            "p50": 37.4359,
+            "p95": 73.4587,
+            "p99": 73.5714,
+            "cv_pct": 33.731
+          },
+          "tflops_die_p50": 50.19,
+          "effective_hbm_gbps_p50": 1587.8,
+          "rel_max_err": 0.00124
+        },
+        "M64_tm64_tn128": {
+          "M": 64,
+          "tile_m": 64,
+          "tile_n": 128,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 36.4924,
+            "p50": 38.1316,
+            "p95": 75.4798,
+            "p99": 75.8508,
+            "cv_pct": 33.088
+          },
+          "tflops_die_p50": 98.56,
+          "effective_hbm_gbps_p50": 1577.7,
+          "rel_max_err": 0.00243
+        },
+        "M128_tm128_tn128": {
+          "M": 128,
+          "tile_m": 128,
+          "tile_n": 128,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 35.7662,
+            "p50": 37.5874,
+            "p95": 74.9294,
+            "p99": 76.1727,
+            "cv_pct": 36.172
+          },
+          "tflops_die_p50": 199.97,
+          "effective_hbm_gbps_p50": 1639.0,
+          "rel_max_err": 0.00238
+        },
+        "M256_tm256_tn256": {
+          "M": 256,
+          "tile_m": 256,
+          "tile_n": 256,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 74.9846,
+            "p50": 75.2741,
+            "p95": 101.1952,
+            "p99": 101.3987,
+            "cv_pct": 13.617
+          },
+          "tflops_die_p50": 199.7,
+          "effective_hbm_gbps_p50": 856.7,
+          "rel_max_err": 0.0026
+        },
+        "M512_tm256_tn256": {
+          "M": 512,
+          "tile_m": 256,
+          "tile_n": 256,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 75.3135,
+            "p50": 75.4716,
+            "p95": 100.6348,
+            "p99": 100.7807,
+            "cv_pct": 12.257
+          },
+          "tflops_die_p50": 398.36,
+          "effective_hbm_gbps_p50": 930.9,
+          "rel_max_err": 0.00213
+        },
+        "M1024_tm256_tn256": {
+          "M": 1024,
+          "tile_m": 256,
+          "tile_n": 256,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 146.1029,
+            "p50": 146.2473,
+            "p95": 147.0576,
+            "p99": 147.0822,
+            "cv_pct": 0.218
+          },
+          "tflops_die_p50": 411.15,
+          "effective_hbm_gbps_p50": 559.3,
+          "rel_max_err": 0.00229
+        },
+        "M2048_tm256_tn256": {
+          "M": 2048,
+          "tile_m": 256,
+          "tile_n": 256,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 287.5424,
+            "p50": 287.802,
+            "p95": 314.4362,
+            "p99": 314.9751,
+            "cv_pct": 3.566
+          },
+          "tflops_die_p50": 417.85,
+          "effective_hbm_gbps_p50": 364.3,
+          "rel_max_err": 0.00431
+        },
+        "M4096_tm256_tn256": {
+          "M": 4096,
+          "tile_m": 256,
+          "tile_n": 256,
+          "latency_us": {
+            "n_samples": 16,
+            "p05": 568.3808,
+            "p50": 569.7355,
+            "p95": 595.0375,
+            "p99": 595.3217,
+            "cv_pct": 2.184
+          },
+          "tflops_die_p50": 422.16,
+          "effective_hbm_gbps_p50": 265.0,
+          "rel_max_err": 0.00216
+        }
+      },
+      "mxfp8_blockscaled_8192": {
+        "verified_dot_val": 8192.0,
+        "latency_us_p50": 1316.44,
+        "tflops_die_p05": 814.87,
+        "tflops_die_p50": 835.22,
+        "tflops_die_p95": 835.82,
+        "tflops_per_aic_p50": 26.1006,
+        "cv_pct": 0.972
+      }
+    },
+    "L4_sync_primitives": {
+      "v_mte3_set_wait_pair_ns": {
+        "ms_with_flags_p50": 1.1243,
+        "ms_without_flags_p50": 0.5069,
+        "ns_per_flag_pair": {
+          "n_samples": 16,
+          "p05": 8.6437,
+          "p50": 9.4245,
+          "p95": 9.6698,
+          "p99": 10.1417,
+          "cv_pct": 3.833
+        }
+      }
+    },
+    "L5_composite_anchors": {
+      "rmsnorm_simt_B64_D7168": {
+        "latency_us": {
+          "n_samples": 16,
+          "p05": 17.1103,
+          "p50": 18.4276,
+          "p95": 66.8057,
+          "p99": 68.9488,
+          "cv_pct": 66.341
+        },
+        "effective_gbps_p50": 200.7,
+        "max_abs_err": 1e-06
+      },
+      "rmsnorm_simt_B256_D7168": {
+        "error": "RuntimeError: aclrtLaunchKernelWithHostArgs failed for main_kernel with ACL error 107000, grid=64, dyn_ubuf_bytes=259072: [PID: 4009557] 2026-11-23-17:31:07.231.541 Invalid_A"
+      },
+      "rmsnorm_simt_B1024_D7168": {
+        "error": "RuntimeError: aclrtLaunchKernelWithHostArgs failed for main_kernel with ACL error 107000, grid=64, dyn_ubuf_bytes=259072: [PID: 4009557] 2026-11-23-17:31:14.235.113 Invalid_A"
+      },
+      "rmsnorm_simt_B4096_D7168": {
+        "error": "RuntimeError: aclrtLaunchKernelWithHostArgs failed for main_kernel with ACL error 107000, grid=64, dyn_ubuf_bytes=259072: [PID: 4009557] 2026-11-23-17:31:20.018.920 Invalid_A"
+      },
+      "fp8_group128_quant_simt_M128_D7168": {
+        "latency_us": {
+          "n_samples": 16,
+          "p05": 30.2755,
+          "p50": 31.6457,
+          "p95": 60.6088,
+          "p99": 60.7964,
+          "cv_pct": 31.106
+        },
+        "effective_gbps_p50": 145.9
+      },
+      "fp8_group128_quant_simd_M128_D7168": {
+        "latency_us": {
+          "n_samples": 16,
+          "p05": 30.2602,
+          "p50": 31.4564,
+          "p95": 61.4599,
+          "p99": 61.6794,
+          "cv_pct": 34.284
+        },
+        "effective_gbps_p50": 146.7
+      },
+      "fp8_group128_quant_simt_M1024_D7168": {
+        "latency_us": {
+          "n_samples": 16,
+          "p05": 30.1523,
+          "p50": 32.4435,
+          "p95": 60.6264,
+          "p99": 61.5977,
+          "cv_pct": 32.413
+        },
+        "effective_gbps_p50": 1138.3
+      },
+      "fp8_group128_quant_simd_M1024_D7168": {
+        "latency_us": {
+          "n_samples": 16,
+          "p05": 11.9317,
+          "p50": 31.2977,
+          "p95": 60.5857,
+          "p99": 60.8318,
+          "cv_pct": 44.517
+        },
+        "effective_gbps_p50": 1179.9
+      },
+      "fp8_group128_quant_simt_M4096_D7168": {
+        "latency_us": {
+          "n_samples": 16,
+          "p05": 57.9988,
+          "p50": 58.7943,
+          "p95": 78.6336,
+          "p99": 79.1385,
+          "cv_pct": 13.895
+        },
+        "effective_gbps_p50": 2512.5
+      },
+      "fp8_group128_quant_simd_M4096_D7168": {
+        "latency_us": {
+          "n_samples": 16,
+          "p05": 36.5175,
+          "p50": 37.1965,
+          "p95": 66.1395,
+          "p99": 66.8821,
+          "cv_pct": 28.549
+        },
+        "effective_gbps_p50": 3971.3
+      }
+    }
+  },
+  "envelope_sha256": "b19cc4d48a11aa4ec41a715276828c31dc709d0bd94f73760a0211e2d9ade0ae"
+}

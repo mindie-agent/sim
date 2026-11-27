@@ -10,17 +10,19 @@ from copy import deepcopy
 from dataclasses import replace
 from collections.abc import Mapping
 
-from .analysis_inputs import (
+from mindie_sim.schema.common import ModelingError
+
+from .graph_analysis import (
     FIRST_PARTICIPANT, UNIFORM_COUNT_CARDINALITY,
-    analysis_view, rebind_analysis_requests,
+    analysis_view, rebind_analysis_requests, rebind_analysis_requests_many,
 )
-from .cohort_traffic import bind_cohort_traffic
-from .frontend_features import FeatureConfig
-from .local_tp_groups import local_tp_spans_dp
+from .execution.cohort_traffic import bind_cohort_traffic
+from .frontend.features import FeatureConfig
+from .sharding.local_tp import local_tp_spans_dp
 from .structure import parse_case, parse_model
 from .body_defaults import (TargetGraphSet, TargetOperators,
                             effective_body_declaration)
-from .operator_replay import (
+from .execution.operator_replay import (
     cohort_operator_costs, operator_costs, physical_id, physical_signature,
     requires_collective_cohort, _replay_scope,
 )
@@ -41,7 +43,7 @@ def _analysis_prefix_fields(case, index: int, context: int) -> dict:
 
 
 def _selected_group(case, selected_replica=None, cohort=None):
-    from mindie_sim.prediction.dispatch import cohorts
+    from mindie_sim.prediction.execution.dispatch import cohorts
     groups = [tuple(group) for group in cohorts(case.runtime.parallel, case.machine)]
     if cohort is not None:
         selected = tuple(int(value) for value in cohort)
@@ -62,6 +64,8 @@ def _selected_group(case, selected_replica=None, cohort=None):
 def _group_sequences(sequences, group, parallel):
     if type(sequences) is int:
         return sequences
+    if not isinstance(sequences, (list, tuple)):
+        raise ValueError("cohort_sequences_require_positive_scalar_or_complete_nonnegative_counts")
     values = tuple(sequences)
     if len(values) == len(group):
         return values
@@ -138,25 +142,43 @@ class ModelGraphSet(dict):
         return self._attached[key]
 
 
+_UNSET = object()
+
+
 def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body",
                      media_tokens_per_sequence=None, resource_fusion=True,
                      draft_prepare=False, apply_body_defaults=True,
                      routing_views=None, physical_rank=None, query_position=None,
                      selected_replica=None, cohort=None, pure_model=False,
                      layer_limit=None):
-    from .dispatch import cohorts
-
     case = parse_model(case) if pure_model else parse_case(case)
-    _check_geometry(phase, tokens, sequences, context, scope)
+    _check_geometry(phase, tokens, 1, context, scope)
     case, selection = effective_body_declaration(
         case, phase, tokens=tokens, scope=scope, enabled=apply_body_defaults)
     _check_draft_preparation(case, phase, scope, draft_prepare)
     group = _selected_group(case, selected_replica, cohort)
     sequences = _group_sequences(sequences, group, case.runtime.parallel)
+    counts = cohort_sequence_counts(sequences, group)
     selected = (int(selected_replica) if selected_replica is not None
                 else group[0])
-    view_count = (int(sequences) if type(sequences) is int else
-                  int(sequences[group.index(selected)]))
+    if len(group) > 1:
+        # Any coupled multi-DP cohort (EP spanning DP, rank tables, SP,
+        # Local-TP, or cross-DP DCP) must share one cohort routing owner.
+        graphs = target_graphs(
+            case, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope,
+            media_tokens_per_sequence=media_tokens_per_sequence,
+            resource_fusion=resource_fusion, draft_prepare=draft_prepare,
+            apply_body_defaults=False, routing_views=routing_views,
+            physical_rank=physical_rank, query_position=query_position,
+            selected_replica=selected_replica, cohort=group,
+            pure_model=pure_model, layer_limit=layer_limit,
+        )
+        result = tuple(op for op in graphs[selected] if op.family != "barrier")
+        return (TargetOperators(result, kernels=case.runtime.kernels,
+                                selection=selection, scope=scope)
+                if scope == "body" else result)
+    view_count = counts[selected]
     views = tuple(
         analysis_view(
             case, f"analysis{index}", tokens, context, scope, phase,
@@ -166,33 +188,15 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
         for index in range(max(0, view_count))
     )
     case = _media_case(case, views, scope, media_tokens_per_sequence)
-    from .local_tp_groups import local_tp_spans_dp
-    if (len(group) > 1
-            and (case.runtime.enable_dbo or case.runtime.kernels.get("sequence_parallel")
-                 or local_tp_spans_dp(case.runtime.parallel))):
-        # A single rank cannot resolve cross-DP SP without the complete
-        # cohort's query totals. Delegate only the cohort graph binding.
-        graphs = target_graphs(
-            case, phase=phase, tokens=tokens, context=context,
-            sequences=sequences, scope=scope,
-            media_tokens_per_sequence=media_tokens_per_sequence,
-            resource_fusion=resource_fusion, draft_prepare=draft_prepare,
-            apply_body_defaults=False, routing_views=routing_views,
-            physical_rank=physical_rank, query_position=query_position,
-            selected_replica=selected_replica, cohort=group,
-            layer_limit=layer_limit,
-        )
-        selected = (int(selected_replica) if selected_replica is not None
-                    else group[0])
-        result = tuple(op for op in graphs[selected] if op.family != "barrier")
-        return (TargetOperators(result, kernels=case.runtime.kernels,
-                                selection=selection, scope=scope)
-                if scope == "body" else result)
     replica = selected
-    physical = physical_rank if physical_rank is not None else _physical_rank_for(case, replica)
+    explicit_rank = physical_rank is not None
+    physical = physical_rank if explicit_rank else _physical_rank_for(case, replica)
     result = tuple(op for op in _target_ops(
         case, views, scope, resource_fusion=resource_fusion,
-        routing_views=routing_views, physical_rank=physical,
+        routing_views=routing_views,
+        cohort_views_by_replica={replica: views},
+        physical_rank=physical,
+        explicit_physical_rank=explicit_rank,
         query_position=query_position, replica=replica, layer_limit=layer_limit)
                    if op.family != "barrier")
     return (TargetOperators(result, kernels=case.runtime.kernels,
@@ -231,14 +235,45 @@ def _check_draft_preparation(case, phase, scope, enabled):
         optional_draft_spec(case.model, mode)
 
 
+def _slice_model_for_layer_limit(model, runtime, layer_limit):
+    """Apply ``layer_limit`` consistently to ``model`` and PP stage mapping."""
+    if layer_limit is None:
+        return model, runtime
+    total_layers = len(model.layer_plans) or int(model.layers)
+    limit = min(total_layers, max(1, int(layer_limit)))
+    if limit >= total_layers:
+        return model, runtime
+    sliced_model = replace(
+        model,
+        layers=limit,
+        layer_plans=tuple(model.layer_plans[:limit]),
+    )
+    sliced_runtime = runtime
+    pp = int(getattr(runtime.parallel, "pp", 1) or 1)
+    if runtime.pp_layer_partition or pp > 1:
+        base_counts = runtime.pp_layer_partition or tuple(
+            total_layers // pp + int(i < total_layers % pp)
+            for i in range(pp)
+        )
+        remaining = limit
+        sliced_counts = []
+        for count in base_counts:
+            take = min(int(count), remaining)
+            sliced_counts.append(take)
+            remaining -= take
+        sliced_runtime = replace(runtime, pp_layer_partition=tuple(sliced_counts))
+    return sliced_model, sliced_runtime
+
+
 def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
-                cohort_tokens=None, phase=None, replica=0, active_rows=None,
+                cohort_tokens=_UNSET, phase=None, replica=0, active_rows=None,
                 source_rows_by_replica=None, routing_global_tokens=None,
                 routing_views=None, cohort_views_by_replica=None,
-                physical_rank=None, query_position=None,
+                physical_rank=None, explicit_physical_rank: bool = False,
+                query_position=None,
                 model_programs=None, layer_limit=None):
     from mindie_sim.schema.workload import IterationPlan
-    from .attention import AttentionPolicy
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
     from .frontend import Frontend
     from .transforms import lower_implementations
     from .implementation_selection import resolve, annotate
@@ -248,12 +283,15 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     frontend = Frontend(
         attention_policy=AttentionPolicy(**case.runtime.attention_policy),
         features=features)
-    global_tokens = (cohort_tokens if cohort_tokens is not None else
-                     sum(v.q_len + v.draft_proposal_tokens for v in global_views)
-                     if global_views is not None else None)
+    if cohort_tokens is _UNSET:
+        global_tokens = (sum(v.q_len + v.draft_proposal_tokens for v in global_views)
+                         if global_views is not None else None)
+    else:
+        global_tokens = cohort_tokens
     if scope == "model":
+        model, runtime = _slice_model_for_layer_limit(case.model, case.runtime, layer_limit)
         program = frontend.program(
-            IterationPlan(views), case.model, case.runtime, case.machine,
+            IterationPlan(views), model, runtime, case.machine,
             assembly="model", global_tokens=global_tokens,
             global_views=global_views, resource_fusion=resource_fusion,
             replica=replica, source_rows_by_replica=source_rows_by_replica,
@@ -261,6 +299,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
             routing_views=routing_views,
             cohort_views_by_replica=cohort_views_by_replica,
             physical_rank=physical_rank,
+            explicit_physical_rank=explicit_physical_rank,
             query_position=query_position)
         if model_programs is not None:
             model_programs[replica] = program
@@ -286,7 +325,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     from .frontend import mark_analytical_runtime
     runtime = mark_analytical_runtime(runtime, selections)
     case = replace(case, runtime=runtime)
-    from .dbo_ledger import selected_lane
+    from .execution.rank_ledger import selected_lane
     local, local_tokens, pcp_prefill = frontend.partition_views(
         views, case.runtime, padded_tokens, model=case.model,
         lane=selected_lane(case.runtime.parallel, case.machine, replica, physical_rank))
@@ -305,6 +344,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
                           routing_views=routing_views,
                           cohort_views_by_replica=cohort_views_by_replica,
                           physical_rank=physical_rank,
+                          explicit_physical_rank=explicit_physical_rank,
                           query_position=query_position,
                           machine=case.machine, layer_limit=layer_limit)
     # Source lowerings consume the same active/storage distinction as the
@@ -379,8 +419,18 @@ def _rebind_ep_owner(ops, owner):
     result = []
     for op in ops:
         metadata = dict(op.metadata)
+        changed = False
         if "ep_rank" in metadata:
             metadata["ep_rank"] = int(owner)
+            changed = True
+        if (
+            "routing_price_owner" in metadata
+            and isinstance(metadata["routing_price_owner"], int)
+            and not isinstance(metadata["routing_price_owner"], bool)
+        ):
+            metadata["routing_price_owner"] = int(owner)
+            changed = True
+        if changed:
             op = replace(op, metadata=tuple(sorted(metadata.items())))
         result.append(op)
     return tuple(result)
@@ -390,7 +440,7 @@ def _build_topology(case):
     from .topology import Topology
     try:
         return Topology(case.machine, case.runtime.parallel)
-    except Exception:
+    except (ModelingError, ValueError, KeyError, IndexError):
         return None
 
 
@@ -400,7 +450,7 @@ def _physical_rank_for(case, replica, topology=None):
         return None
     try:
         return active.ranks(replica, FIRST_PARTICIPANT)[FIRST_PARTICIPANT]
-    except Exception:
+    except (ModelingError, ValueError, KeyError, IndexError):
         return None
 
 
@@ -412,74 +462,105 @@ def _routing_views_for(value, replica):
     return value
 
 
-def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
-                  media_tokens_per_sequence=None, resource_fusion=True,
-                  draft_prepare=False, apply_body_defaults=True,
-                  padded_idle=False, routing_views=None, physical_rank=None,
-                  query_position=None, selected_replica=None, cohort=None,
-                  pure_model=False, layer_limit=None):
-    """One DP cohort; scalar sequences repeat, lists declare every replica.
-
-    ``padded_idle`` retains the declared physical capture rows for a replica
-    whose logical sequence count is zero.  The logical ledger stays empty; the
-    physical padding view launches the actual graph bucket and EP kernel
-    participation without inventing a logical request.
-    """
+def synchronize_moe_allgather_cohort(
+    case, phase: str, logical_views: Mapping[int, tuple], *, pad_idle: bool,
+    default_context: int = 0, prefix: str = "analysis",
+) -> tuple[dict[int, tuple], int | None]:
+    """Synchronize DP replica extents for captured idle lanes and MoE collectives."""
     from mindie_sim.schema.workload import RequestView
-    from .dispatch import cohorts
+    from .graph import GraphPolicy
 
-    case = parse_model(case) if pure_model else parse_case(case)
-    _check_geometry(phase, tokens, 1, context, scope)
-    case, selection = effective_body_declaration(
-        case, phase, tokens=tokens, scope=scope, enabled=apply_body_defaults)
-    _check_draft_preparation(case, phase, scope, draft_prepare)
-    participants = _selected_group(case, selected_replica, cohort)
-    sequences = _group_sequences(sequences, participants, case.runtime.parallel)
-    counts = cohort_sequence_counts(sequences, participants)
-    pad_idle = padded_idle or graph_padded_idle(case, phase, counts)
-    logical_views = {}
-    views = {}
-    for replica in participants:
-        count = counts[replica]
-        logical_views[replica] = tuple(
-            analysis_view(
-                case, f"analysis{replica}:{i}", tokens, context, scope,
-                phase, index=i, draft_prepare=draft_prepare,
-                **_analysis_prefix_fields(case, i, context),
-            ) for i in range(count))
-        if count == 0 and pad_idle:
-            # A physical graph row is not a logical request.  A zero-length
-            # padded view lets GraphPolicy select the declared capture bucket;
-            # the frontend then lowers that many physical rows while the
-            # logical ledger remains zero.
-            from .graph import GraphPolicy
-            probe = RequestView(
-                f"analysis{replica}:bucket_probe", 0, context, False, phase,
-                padding=True, draft_verify=False, draft_prepare=False,
-            )
-            bucket, _replay = GraphPolicy().select(
-                (probe,), case.runtime)
-            physical = int(bucket or 0)
-            views[replica] = ((RequestView(
-                f"analysis{replica}:padding", physical, context, False, phase,
-                padding=True, draft_verify=False, draft_prepare=False,
-            ),) if physical else ())
-        else:
-            views[replica] = logical_views[replica]
-    active_rows_by_replica = {
-        replica: sum(v.q_len + v.draft_proposal_tokens
-                     for v in logical_views[replica])
-        for replica in participants
+    gp = GraphPolicy()
+    participants = tuple(logical_views.keys())
+    active_rows = {
+        r: sum(v.q_len + v.draft_proposal_tokens for v in logical_views[r])
+        for r in participants
     }
-    case = _media_case(case, tuple(v for group in logical_views.values() for v in group),
-                       scope, media_tokens_per_sequence)
-    global_views = (tuple(v for group in logical_views.values() for v in group)
-                    if len(logical_views) > 1 else None)
-    padded_cohort = None
+    cohort_bucket = 0
+    if pad_idle:
+        for r in participants:
+            if logical_views[r]:
+                b_sel, _ = gp.select(logical_views[r], case.runtime)
+                cohort_bucket = max(cohort_bucket, int(b_sel or active_rows[r]))
+    non_sp_allgather = False
+    requires_nonzero_local = False
+    if (len(participants) > 1
+            and int(getattr(case.model, "num_experts", 0) or 0) > 0
+            and int(getattr(case.runtime.parallel, "ep", 1) or 1) > 1
+            and any(active_rows.values())):
+        from mindie_sim.prediction.operators.mc2.mc2_graph import select_common as select_moe_comm
+        moe_features = FeatureConfig.from_runtime(
+            case.runtime, case.model, machine=case.machine)
+        sel = select_moe_comm(
+            case.runtime, moe_features,
+            tokens=max(active_rows.values(), default=0),
+            top_k=case.model.top_k, experts=case.model.num_experts,
+            ep=case.runtime.parallel.ep,
+        )
+        sel_kind = str(sel.get("kind") or "") if isinstance(sel, Mapping) else ""
+        rmeta = dict(getattr(case.runtime, "metadata", ()) or ())
+        if "sequence_parallel" not in case.runtime.kernels:
+            non_sp_allgather = bool(
+                sel_kind == "allgather_comm"
+                or str(rmeta.get("moe_comm_mode") or "").strip().lower() == "allgather"
+            )
+        requires_nonzero_local = bool(
+            (sel_kind == "arch22_v2_caller" and not sel.get("global_bs"))
+            or (isinstance(sel, Mapping) and sel.get("requires_nonzero_local_tokens"))
+            or bool(rmeta.get("eager_dp_dummy_run"))
+        )
+    max_dp_rows = (
+        max(cohort_bucket, max(active_rows.values(), default=0))
+        if pad_idle else max(active_rows.values(), default=0)
+    )
+    eager_dp_dummy = (
+        not pad_idle and not non_sp_allgather
+        and phase == "decode"
+        and any(active_rows.values())
+        and bool(case.runtime.parallel.ep_spans_dp)
+        and requires_nonzero_local
+    )
+    views: dict[int, tuple] = {}
+    for r in participants:
+        cur = logical_views[r]
+        cur_rows = active_rows[r]
+        if not cur and pad_idle:
+            probe = RequestView(
+                f"{prefix}{r}:bucket_probe", 0, default_context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False)
+            b0, _ = gp.select((probe,), case.runtime)
+            phys = int(cohort_bucket or b0 or 0)
+            views[r] = ((RequestView(
+                f"{prefix}{r}:padding", phys, default_context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False),)
+                if phys else ())
+        elif non_sp_allgather and cur_rows < max_dp_rows:
+            pad_q = max_dp_rows - cur_rows
+            views[r] = (*cur, RequestView(
+                f"{prefix}{r}:dp_allgather_pad", pad_q, default_context, False,
+                phase, padding=True, draft_verify=False, draft_prepare=False))
+        elif not cur and eager_dp_dummy:
+            views[r] = (RequestView(
+                f"{prefix}{r}:dummy_run", 1, default_context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False),)
+        else:
+            views[r] = cur
+    padded_total = (
+        len(participants) * max_dp_rows
+        if (non_sp_allgather and max_dp_rows > 0) else None
+    )
+    return views, padded_total
+
+
+def _cohort_routing_geometry(
+    case, participants, logical_views, global_views, active_rows_by_replica,
+    allgather_padded_cohort,
+):
+    padded_cohort = allgather_padded_cohort
     sp_padding = case.runtime.kernels.get("sequence_parallel", {}).get("padding")
     if len(logical_views) > 1 and (case.runtime.routing.get("policy") == "balanced"
                                    or sp_padding == "right_to_tp"):
-        from .balanced_routing import cohort_padded_tokens
+        from .sharding.routing import cohort_padded_tokens
         padded_cohort = cohort_padded_tokens(logical_views.values(), case.runtime)
     # The ordinary selector consumes the source rows each physical EP rank
     # actually owns.  With SP, valid_per_tp is that exact ownership; flattening
@@ -487,7 +568,6 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     # DP-scoped and the lowering keeps its declared uniform peer policy.
     source_rows_by_replica = tuple(
         active_rows_by_replica[p] for p in participants)
-    cohort_views_by_replica = logical_views
     routing_global_tokens = (
         padded_cohort if padded_cohort is not None
         else (sum(active_rows_by_replica.values())
@@ -495,7 +575,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     if (len(participants) > UNIFORM_COUNT_CARDINALITY and "sequence_parallel" in case.runtime.kernels
             and case.runtime.parallel.rank_table is None):
         from .graph import GraphPolicy
-        from .sequence_parallel import select as select_sp
+        from .sharding.sequence_parallel import select as select_sp
         total_global = (padded_cohort if padded_cohort is not None
                         else sum(active_rows_by_replica.values()))
         physical_rows = []
@@ -515,19 +595,26 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                 physical_rows.extend(plan.valid_per_tp)
         if physical_rows:
             source_rows_by_replica = tuple(physical_rows)
+    return padded_cohort, source_rows_by_replica, routing_global_tokens
+
+
+def _can_reuse_replica_graph(
+    case, scope, counts, participants, views, routing_views, query_position,
+):
     explicit_routing = any(
         isinstance(item, Mapping) and any(key in item for key in (
             "requests", "request_views", "expert_placement", "source_owners",
             "source_owner", "query_position"))
         for item in (case.runtime.routing.get("realizations") or ()))
-    uniform_replicas = (
-        not case.runtime.enable_dbo and case.runtime.parallel.rank_table is None
+    return (
+        case.machine.homogeneous
+        and case.runtime.parallel.rank_table is None
+        and not case.runtime.parallel.cp_spans_dp
+        and not case.runtime.kernels.get("force_eplb_source")
+        and not isinstance(routing_views, Mapping)
         and len(set(counts.values())) <= UNIFORM_COUNT_CARDINALITY
         and (scope != "model" or (
-            case.machine.homogeneous
-            and case.runtime.parallel.rank_table is None
-            and not case.runtime.routing
-            and not case.runtime.kernels.get("force_eplb_source")
+            not case.runtime.routing
             and not local_tp_spans_dp(case.runtime.parallel)
             and routing_views is None
             and query_position is None
@@ -546,43 +633,185 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
              or int(getattr(case.runtime.parallel, "ep", 1) or 1) <= 0
              or int(case.model.num_experts)
              % max(1, int(case.runtime.parallel.ep)) == 0)
+        and (int(getattr(case.runtime.parallel, "ep", 1) or 1) <= UNIFORM_COUNT_CARDINALITY
+             or len(set(getattr(case.model, "expert_routing", ()) or ())) <= UNIFORM_COUNT_CARDINALITY)
         and not explicit_routing
         and not any(
             isinstance(item, Mapping) and "replica" in item
             for item in (case.runtime.routing.get("realizations") or ())
         )
     )
+
+
+def _ep_owner_for_replica(case, replica, topology=None):
+    """Resolve ``replica``'s EP group ordinal from its physical rank position."""
+    from .execution.rank_ledger import ep_groups
+    p = case.runtime.parallel
+    phys_rank = _physical_rank_for(case, replica, topology)
+    ep_degree = max(UNIFORM_COUNT_CARDINALITY, int(p.ep))
+    if phys_rank is None:
+        return int(replica) % ep_degree
+    try:
+        _, groups = ep_groups(p, case.machine, replica, FIRST_PARTICIPANT)
+    except (ModelingError, ValueError, KeyError, IndexError):
+        return int(phys_rank) % ep_degree
+    group = next((g for g in groups if phys_rank in g), ())
+    return group.index(phys_rank) if group else int(phys_rank) % ep_degree
+
+
+def _ep_routing_geometry_by_replica(
+    case, participants, logical_views, active_rows_by_replica,
+    allgather_padded_cohort,
+):
+    """Compute EP-group-scoped routing geometry for each replica in ``participants``."""
+    from .execution.rank_ledger import ep_replica_group
+
+    cache: dict[tuple[int, ...], tuple] = {}
+    by_replica: dict[int, tuple] = {}
+    for replica in participants:
+        ep_reps = ep_replica_group(
+            case.runtime.parallel, case.machine, participants, replica)
+        if ep_reps not in cache:
+            ep_logical = {d: logical_views[d] for d in ep_reps}
+            ep_active = {d: active_rows_by_replica[d] for d in ep_reps}
+            ep_global_views = (
+                tuple(v for d in ep_reps for v in ep_logical[d])
+                if len(ep_reps) > 1 else None
+            )
+            ep_allgather = (
+                allgather_padded_cohort
+                if ep_reps == participants
+                else (len(ep_reps) * max(ep_active.values(), default=0)
+                      if (allgather_padded_cohort is not None and len(ep_reps) > 1)
+                      else None)
+            )
+            padded_ep, source_rows, routing_tokens = _cohort_routing_geometry(
+                case, ep_reps, ep_logical, ep_global_views, ep_active, ep_allgather)
+            cohort_tokens = (
+                padded_ep if padded_ep is not None
+                else (sum(ep_active.values()) if len(ep_reps) > 1 else None)
+            )
+            cache[ep_reps] = (cohort_tokens, source_rows, routing_tokens)
+        by_replica[replica] = cache[ep_reps]
+    return by_replica
+
+
+def _finalize_target_graph_set(case, graphs, views, *, scope, selection,
+                               uniform_replicas, participants, model_programs,
+                               program_bindings, program_owners,
+                               padded_tokens, layout):
+    if scope == "body":
+        graph_set = TargetGraphSet(graphs, kernels=case.runtime.kernels,
+                                   selection=selection, scope=scope)
+    else:
+        if uniform_replicas and participants:
+            base_program = model_programs[participants[0]]
+            program_seeds = {replica: base_program for replica in participants}
+        else:
+            program_seeds = dict(model_programs)
+        graph_set = ModelGraphSet(graphs, programs=program_seeds,
+                                  bindings=program_bindings, owners=program_owners,
+                                  kernels=case.runtime.kernels, selection=selection)
+    graph_set.request_views = dict(views)
+    graph_set.padded_tokens = int(padded_tokens or 0)
+    graph_set.sequence_layout = str(layout or "")
+    return graph_set
+
+
+def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
+                  media_tokens_per_sequence=None, resource_fusion=True,
+                  draft_prepare=False, apply_body_defaults=True,
+                  padded_idle=False, routing_views=None, physical_rank=None,
+                  query_position=None, selected_replica=None, cohort=None,
+                  pure_model=False, layer_limit=None,
+                  requests=(), padded_tokens=0, layout=""):
+    """One DP cohort; scalar sequences repeat, lists declare every replica.
+
+    ``padded_idle`` retains the declared physical capture rows for a replica
+    whose logical sequence count is zero.  The logical ledger stays empty; the
+    physical padding view launches the actual graph bucket and EP kernel
+    participation without inventing a logical request.
+    """
+    case = parse_model(case) if pure_model else parse_case(case)
+    _check_geometry(phase, tokens, 1, context, scope)
+    case, selection = effective_body_declaration(
+        case, phase, tokens=tokens, scope=scope, enabled=apply_body_defaults)
+    _check_draft_preparation(case, phase, scope, draft_prepare)
+    participants = _selected_group(case, selected_replica, cohort)
+    explicit_requests = tuple(requests or ())
+    if explicit_requests:
+        counts = {replica: len(explicit_requests) for replica in participants}
+        pad_idle = padded_idle or graph_padded_idle(case, phase, counts)
+        logical_views = {replica: explicit_requests for replica in participants}
+    else:
+        sequences = _group_sequences(sequences, participants, case.runtime.parallel)
+        counts = cohort_sequence_counts(sequences, participants)
+        pad_idle = padded_idle or graph_padded_idle(case, phase, counts)
+        logical_views = {
+            replica: tuple(
+                analysis_view(
+                    case, f"analysis{replica}:{i}", tokens, context, scope,
+                    phase, index=i, draft_prepare=draft_prepare,
+                    **_analysis_prefix_fields(case, i, context),
+                ) for i in range(counts[replica]))
+            for replica in participants
+        }
+    views, allgather_padded_cohort = synchronize_moe_allgather_cohort(
+        case, phase, logical_views, pad_idle=pad_idle,
+        default_context=context, prefix="analysis",
+    )
+    active_rows_by_replica = {
+        replica: sum(v.q_len + v.draft_proposal_tokens
+                     for v in logical_views[replica])
+        for replica in participants
+    }
+    case = _media_case(case, tuple(v for group in logical_views.values() for v in group),
+                       scope, media_tokens_per_sequence)
+    global_views = (tuple(v for group in logical_views.values() for v in group)
+                    if len(logical_views) > 1 else None)
+    ep_routing_by_r = _ep_routing_geometry_by_replica(
+        case, participants, logical_views, active_rows_by_replica,
+        allgather_padded_cohort)
+    uniform_replicas = (
+        physical_rank is None
+        and _can_reuse_replica_graph(
+            case, scope, counts, participants, views, routing_views, query_position)
+    )
     model_programs = {}
     program_bindings = {}
     program_owners = {}
     cohort_topology = _build_topology(case)
-    ep_degree = max(UNIFORM_COUNT_CARDINALITY, int(case.runtime.parallel.ep))
     if uniform_replicas and participants:
         first_r = participants[FIRST_PARTICIPANT]
+        first_cohort_tokens, first_source_rows, first_routing_tokens = ep_routing_by_r[first_r]
         base_ops = _target_ops(
             case, views[first_r], scope, global_views=global_views,
-            resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
+            resource_fusion=resource_fusion, cohort_tokens=first_cohort_tokens,
             phase=phase, replica=first_r,
             active_rows=active_rows_by_replica[first_r],
-            source_rows_by_replica=source_rows_by_replica,
-            routing_global_tokens=routing_global_tokens,
+            source_rows_by_replica=first_source_rows,
+            routing_global_tokens=first_routing_tokens,
             routing_views=_routing_views_for(routing_views, first_r),
-            cohort_views_by_replica=cohort_views_by_replica,
+            cohort_views_by_replica=logical_views,
             physical_rank=_physical_rank_for(case, first_r, cohort_topology),
             query_position=query_position,
             model_programs=model_programs, layer_limit=layer_limit,
         )
         raw_graphs = {first_r: base_ops}
-        for r in participants[UNIFORM_COUNT_CARDINALITY:]:
-            owner_rank = int(
-                _physical_rank_for(case, r, cohort_topology) or r) % ep_degree
+        peer_replicas = participants[UNIFORM_COUNT_CARDINALITY:]
+        rebound_by_r = (
+            rebind_analysis_requests_many(
+                base_ops, views[first_r], {r: views[r] for r in peer_replicas},
+            )
+            if (scope == "model" and peer_replicas) else {}
+        )
+        for r in peer_replicas:
+            owner_rank = _ep_owner_for_replica(case, r, cohort_topology)
             if scope == "model":
                 # Only the graph is rebound here.  The attached program is
                 # materialized from this replica's final cohort-bound graph on
                 # first ``program(r)`` access.
-                raw_graphs[r] = _rebind_ep_owner(
-                    rebind_analysis_requests(base_ops, views[first_r], views[r]),
-                    owner_rank)
+                raw_graphs[r] = _rebind_ep_owner(rebound_by_r[r], owner_rank)
                 program_bindings[r] = (views[first_r], views[r])
                 program_owners[r] = owner_rank
             else:
@@ -594,45 +823,42 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     else:
         raw_graphs = {
             r: _target_ops(case, group, scope, global_views=global_views,
-                           resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
+                           resource_fusion=resource_fusion,
+                           cohort_tokens=ep_routing_by_r[r][0],
                            phase=phase, replica=r,
                            active_rows=active_rows_by_replica[r],
-                           source_rows_by_replica=source_rows_by_replica,
-                           routing_global_tokens=routing_global_tokens,
+                           source_rows_by_replica=ep_routing_by_r[r][1],
+                           routing_global_tokens=ep_routing_by_r[r][2],
                            routing_views=_routing_views_for(routing_views, r),
-                           cohort_views_by_replica=cohort_views_by_replica,
+                           cohort_views_by_replica=logical_views,
                             physical_rank=(physical_rank if r == (participants[0] if selected_replica is None else selected_replica) and
                                            physical_rank is not None else
                                            _physical_rank_for(case, r, cohort_topology)),
+                            explicit_physical_rank=(physical_rank is not None and r == (participants[0] if selected_replica is None else selected_replica)),
                            query_position=query_position,
                            model_programs=model_programs,
                            layer_limit=layer_limit)
             for r, group in views.items()
         }
-    from .local_projection_tp import lower_local_projection_tp_cohort
+    from .sharding.local_tp import lower_local_projection_tp_cohort
     graphs = bind_cohort_traffic(case, raw_graphs)
     graphs = lower_local_projection_tp_cohort(
         graphs, model=case.model, runtime=case.runtime, machine=case.machine)
     reuse_mode = str(getattr(case.runtime, "homogeneous_graph_reuse", "off"))
-    if len(graphs) > 1 and reuse_mode != "off":
+    if len(graphs) > 1 and reuse_mode != "off" and not (uniform_replicas and reuse_mode == "auto"):
         # The same ordinary cohort producer proves and rebinds replicas; a
         # "require" declaration therefore fails before pricing an unproved
         # asymmetric cohort instead of silently running full duplicates.
-        from .cohort_reuse import prepare_cohort_graphs
+        from .execution.cohort_reuse import prepare_cohort_graphs
         prepared = prepare_cohort_graphs(case, graphs, reuse=reuse_mode)
         graphs = {replica: tuple(prepared.graphs[replica])
                   for replica in graphs}
-    if scope == "body":
-        return TargetGraphSet(graphs, kernels=case.runtime.kernels,
-                              selection=selection, scope=scope)
-    if uniform_replicas and participants:
-        base_program = model_programs[participants[0]]
-        program_seeds = {replica: base_program for replica in participants}
-    else:
-        program_seeds = dict(model_programs)
-    return ModelGraphSet(graphs, programs=program_seeds,
-                         bindings=program_bindings, owners=program_owners,
-                         kernels=case.runtime.kernels, selection=selection)
+    return _finalize_target_graph_set(
+        case, graphs, views, scope=scope, selection=selection,
+        uniform_replicas=uniform_replicas, participants=participants,
+        model_programs=model_programs, program_bindings=program_bindings,
+        program_owners=program_owners, padded_tokens=padded_tokens, layout=layout,
+    )
 
 
 def model_graphs(value, *, phase, tokens, context=0, sequences=1, scope="model",
@@ -661,7 +887,7 @@ def model_program(value, *, phase, tokens, context=0, sequences=1,
     replay scope and named outputs for model/body consumers.
     """
     from mindie_sim.schema.workload import IterationPlan
-    from .attention import AttentionPolicy
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
     from .frontend import Frontend
 
     case = parse_model(value)
@@ -669,6 +895,7 @@ def model_program(value, *, phase, tokens, context=0, sequences=1,
     case, _selection = effective_body_declaration(
         case, phase, tokens=tokens, scope="model", enabled=apply_body_defaults)
     participants = _selected_group(case, selected_replica, cohort)
+    sequences = _group_sequences(sequences, participants, case.runtime.parallel)
     counts = cohort_sequence_counts(sequences, participants)
     selected = (int(selected_replica) if selected_replica is not None
                 else participants[0])
@@ -685,13 +912,17 @@ def model_program(value, *, phase, tokens, context=0, sequences=1,
     global_views = (tuple(view for replica in participants
                           for view in views_by_replica[replica])
                     if len(participants) > 1 else None)
-    features = FeatureConfig.from_runtime(case.runtime, case.model,
+    if len(participants) > 1 and "cohort_views_by_replica" not in options:
+        options = {**options, "cohort_views_by_replica": views_by_replica}
+    layer_limit = options.pop("layer_limit", None)
+    model, runtime = _slice_model_for_layer_limit(case.model, case.runtime, layer_limit)
+    features = FeatureConfig.from_runtime(runtime, model,
                                            machine=case.machine)
     frontend = Frontend(
-        attention_policy=AttentionPolicy(**case.runtime.attention_policy),
+        attention_policy=AttentionPolicy(**runtime.attention_policy),
         features=features)
     program = frontend.program(
-        plan, case.model, case.runtime, case.machine, assembly=assembly,
+        plan, model, runtime, case.machine, assembly=assembly,
         global_views=global_views,
         global_tokens=(sum(v.q_len + v.draft_proposal_tokens
                            for v in global_views) if global_views else None),

@@ -20,11 +20,6 @@ from mindie_sim.schema.physical_mechanisms import MemoryHierarchySpec
 
 
 DEFAULT_QUERY_TILE = 128
-DEFAULT_A5_L2_BYTES = 134217728
-DEFAULT_L2_FRACTION = 0.75
-DEFAULT_CACHE_LINE = 128
-BYTES_PER_ELEMENT = {"bf16": 2, "fp16": 2, "fp32": 4, "int8": 1,
-                     "fp8": 1, "fp8_e4m3": 1, "fp8_e5m2": 1}
 
 
 #: Declared attention traffic phases.  A speculative draft step reads and
@@ -59,6 +54,8 @@ class AttentionAccessSpec:
     window: int = 0
     noncausal: bool = False
     selected_rows_known: bool = False
+    unique_rows_known: bool = False
+    refill_rows_known: bool = False
 
     def __post_init__(self):
         if len(self.q_lengths) != len(self.context_lengths):
@@ -182,7 +179,8 @@ def _causal_pairs(q_len: int, context: int, window: int, noncausal: bool,
         if topk > 0:
             return float(q_len * min(horizon, topk))
         if window > 0:
-            return float(q_len * min(horizon, window))
+            # Upstream dsa_v41.py:1523,1684: trailing context window + whole current draft block.
+            return float(q_len * min(horizon, window + q_len))
         return float(q_len * horizon)
     total = 0
     for index in range(q_len):
@@ -207,27 +205,45 @@ def plan_attention_traffic(access: AttentionAccessSpec,
     pairs = math.fsum(
         _causal_pairs(int(q), int(c), access.window, access.noncausal, access.topk)
         for q, c in zip(access.q_lengths, access.context_lengths))
-    if access.unique_rows > 0:
-        unique_rows = int(access.unique_rows)
+    if access.unique_rows_known or access.unique_rows > 0:
+        unique_rows = max(0, int(access.unique_rows))
     else:
-        unique_rows = sum(int(c) + int(q)
-                          for q, c in zip(access.q_lengths, access.context_lengths))
-        if access.window > 0 and not access.noncausal:
-            unique_rows = sum(min(int(c) + int(q), access.window)
-                              for q, c in zip(access.q_lengths, access.context_lengths))
-    logical_rows = float(access.refill_rows) if access.refill_rows > 0 else pairs
-    if access.selected_rows > 0:
-        logical_rows = float(access.selected_rows)
+        if access.window > 0:
+            if access.noncausal:
+                unique_rows = sum(
+                    0 if int(q) <= 0 else min(int(c) + int(q), access.window + int(q))
+                    for q, c in zip(access.q_lengths, access.context_lengths)
+                )
+            else:
+                unique_rows = sum(
+                    0 if int(q) <= 0 else min(int(c) + int(q), access.window + int(q) - 1)
+                    for q, c in zip(access.q_lengths, access.context_lengths)
+                )
+        else:
+            unique_rows = sum(
+                0 if int(q) <= 0 else int(c) + int(q)
+                for q, c in zip(access.q_lengths, access.context_lengths)
+            )
+        if access.selected_rows_known:
+            unique_rows = min(unique_rows, max(0, int(access.selected_rows)))
+    if access.selected_rows_known or access.selected_rows > 0:
+        logical_rows = float(max(0, access.selected_rows))
+    elif access.refill_rows_known or access.refill_rows > 0:
+        logical_rows = float(max(0, access.refill_rows))
+    else:
+        logical_rows = pairs
     logical = logical_rows * row_bytes
     working_set = float(unique_rows) * row_bytes
     private_refill = logical
     effective_l2 = hierarchy.effective_l2_bytes
-    sparse_decode = (access.topk > 0 and access.phase in {"decode", "draft"}
-                     and not access.selected_rows_known)
-    if sparse_decode:
+    unknown_sparse = access.topk > 0 and not access.selected_rows_known
+    if unknown_sparse:
         hbm_kv = logical
         basis = "unknown_dynamic_topk_per_query_gather"
-    elif working_set <= effective_l2 and schedule.resident:
+    elif not schedule.resident:
+        hbm_kv = logical
+        basis = "nonresident_streaming_schedule"
+    elif working_set <= effective_l2:
         hbm_kv = working_set
         basis = "dense_unique_working_set_resident"
     else:
@@ -258,19 +274,22 @@ def plan_index_key_traffic(access: IndexAccessSpec,
     """Plan shared dense prefix keys once and private per-query keys once."""
     hierarchy = _hierarchy(hierarchy)
     private = float(sum(max(0, int(value)) for value in access.private_tokens))
-    logical_rows = (float(access.prefix_tokens) * max(1, access.query_rows)
-                    + private)
+    queries = float(access.query_rows)
+    prefix_active = float(access.prefix_tokens) if access.query_rows > 0 else 0.0
+    logical_rows = float(access.prefix_tokens) * queries + private
     logical = logical_rows * access.row_bytes
+    working_set = (prefix_active + private) * access.row_bytes
     if access.dynamic_selection:
         selected = float(access.selected_rows) if access.selected_rows > 0 else logical_rows
         hbm = selected * access.row_bytes
+        if access.selected_rows > 0:
+            working_set = min(working_set, hbm)
         basis = "unknown_dynamic_selection_per_query"
     elif schedule.batch_tile and schedule.shared_key_scan:
-        unique_rows = float(access.prefix_tokens) + private
-        hbm = unique_rows * access.row_bytes
-        if hbm > hierarchy.effective_l2_bytes:
-            spill = max(0.0, 1.0 - hierarchy.effective_l2_bytes / hbm)
-            hbm += (logical - hbm) * spill
+        hbm = working_set
+        if working_set > hierarchy.effective_l2_bytes and working_set > 0.0:
+            spill = max(0.0, 1.0 - hierarchy.effective_l2_bytes / working_set)
+            hbm += max(0.0, logical - working_set) * spill
         basis = "shared_prefix_batch_tile_scan"
     else:
         hbm = logical
@@ -284,31 +303,23 @@ def plan_index_key_traffic(access: IndexAccessSpec,
         private_refill_bytes=logical,
         index_bytes=float(access.index_bytes),
         scale_bytes=float(access.scale_bytes),
-        working_set_bytes=hbm,
+        working_set_bytes=working_set,
         residency_basis=basis,
     )
 
 
-def apply_traffic_plan(op, traffic: TrafficPlan):
-    """Replace one operator's external traffic with a typed physical plan."""
-    metadata = dict(getattr(op, "metadata", ()) or ())
-    metadata["traffic_plan"] = traffic.to_dict()
-    metadata["traffic_plan_basis"] = traffic.residency_basis
-    return replace(
-        op,
-        hbm_bytes=traffic.hbm_read_bytes + traffic.hbm_write_bytes,
-        mte2_bytes=traffic.private_refill_bytes + traffic.index_bytes
-        + traffic.scale_bytes,
-        metadata=tuple(sorted(metadata.items())),
-    )
-
-
-def default_hierarchy(*, l2_capacity_bytes: int = DEFAULT_A5_L2_BYTES) -> MemoryHierarchySpec:
-    """Frontend declaration when no device cohort is attached yet."""
-    return MemoryHierarchySpec(
-        l2_capacity_bytes=l2_capacity_bytes,
-        l2_effective_fraction=DEFAULT_L2_FRACTION,
-        cache_line_bytes=DEFAULT_CACHE_LINE,
-        write_allocate=True,
-        provenance={"basis": "frontend_default_a5_l2", "calibrated": False},
-    )
+def require_machine_memory_hierarchy(
+    machine, *, hierarchy: MemoryHierarchySpec | None = None,
+) -> MemoryHierarchySpec:
+    """Return explicit machine/caller memory hierarchy or fail closed."""
+    if hierarchy is not None:
+        if not isinstance(hierarchy, MemoryHierarchySpec) or hierarchy.l2_capacity_bytes < 0:
+            raise ModelingError("machine_memory_hierarchy_missing")
+        return hierarchy
+    if machine is not None and getattr(machine, "dies", ()):
+        die_hierarchy = getattr(
+            machine.dies[0].physical_mechanisms, "memory_hierarchy", None
+        )
+        if isinstance(die_hierarchy, MemoryHierarchySpec) and die_hierarchy.l2_capacity_bytes >= 0:
+            return die_hierarchy
+    raise ModelingError("machine_memory_hierarchy_missing")

@@ -34,14 +34,13 @@ from mindie_sim.catalog.qwen import (
     _aux_dspark, _aux_qwen, _dspark_plans, _qwen_normalization, _qwen_plans,
 )
 from mindie_sim.catalog.types import (
-    AuxiliarySpec, DraftSpec, EngramSpec, QuantSpec, VisionSpec, merge_source,
+    AuxiliarySpec, EngramSpec, QuantSpec, VisionSpec, merge_source,
 )
 from mindie_sim.catalog.vision import _engram, _vision_kimi, _vision_qwen, _vision_v41
 from mindie_sim.schema.model import LayerPlan, ModelSpec
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.common import ModelingError
 
 
-ZERO = 0
 DEEPSEEK_V4_COMPRESS_RATIO = 4
 DEEPSEEK_V41_COMPRESS_RATIO = 2
 DEEPSEEK_V4_COMPRESSOR_WIDTH = 2
@@ -66,195 +65,74 @@ def _set_facts(model: ModelSpec, facts: Sequence[tuple[str, Any]]) -> None:
 def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
     """Lower one raw config and declare its native auxiliary plans once."""
     from .draft import declare_native_auxiliary_plans
-    return declare_native_auxiliary_plans(_build_model_spec(key, config))
+    model = _build_model_spec(key, config)
+    c, _text, _vision = flatten_config(config)
+    facts = dict(model.catalog_facts)
+    if "normalization" not in facts and (
+            bool(c.get("use_gemma_norm")) or bool(c.get("apply_layernorm_1p"))):
+        # Gemma-style ``(1 + gamma)`` normalization is a declared model
+        # semantic regardless of the family adapter that assembled the plans.
+        _set_facts(model, list(model.catalog_facts) + [(
+            "normalization",
+            {"norm_weight_offset": 1.0,
+             "norm_multiply_before_output_cast": True,
+             "source": {"declaration": "use_gemma_norm_or_apply_layernorm_1p"}},
+        )])
+    return declare_native_auxiliary_plans(model)
 
 
-def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
-    c, text, vision_raw = flatten_config(config)
-    family = _profile(config, c)
-    if family in {"gemma4", "minimax_m3", "step5"}:
-        from .fleet import build_fleet_model
-        return build_fleet_model(key, config, family)
-    if family == "generic" or family.startswith("standard_"):
-        from .composable import build_composable
-        return build_composable(key, config, family)
+def _dispatch_family_adapter(
+    family: str, config: Mapping[str, Any], c: Mapping[str, Any],
+    vision_raw: Any,
+) -> tuple[list[LayerPlan], QuantSpec, str, str, AuxiliarySpec | None, VisionSpec | None, EngramSpec | None]:
+    """Select and run the native family adapter for one catalog profile."""
     if family == "deepseek_v41":
-        plans = _deepseek_plans(c, v41=True)
-        quant = _quant_deepseek(c, v41=True)
-        attention, ffn = "mla", "moe"
-        aux = _aux_deepseek(c, v41=True, d=_deepseek_dims(c, v41=True))
-        vision = _vision_v41(config, c) if vision_raw else None
-        engram = _engram(c)
-    elif family == "deepseek_v4":
-        plans = _deepseek_plans(c, v41=False)
-        quant = _quant_deepseek(c, v41=False)
-        attention, ffn = "mla", "moe"
-        aux = _aux_deepseek(c, v41=False, d=_deepseek_dims(c, v41=False))
-        vision = None
-        engram = None
-    elif family == "kimi":
-        plans = _kimi_plans(config)
-        quant = _quant_kimi(c)
-        attention, ffn = "mla", "moe"
-        aux = _aux_kimi(c, config)
-        vision = _vision_kimi(config, c) if vision_raw else None
-        engram = None
-    elif family == "kimi_dspark":
-        plans = _dspark_plans(c)
-        quant = _quant_bf16(c, name="bf16_dspark")
-        attention = plans[0].attention if plans else "gqa"
-        ffn = "dense"
-        aux = _aux_dspark(c)
-        vision = None
-        engram = None
-    elif family == "glm":
-        plans = _glm_plans(c)
-        quant = _quant_glm(c)
-        attention, ffn = "mla", "moe"
-        aux = _aux_glm(c)
-        vision = None
-        engram = None
-    elif family == "qwen":
-        plans = _qwen_plans(c)
-        quant = _quant_bf16(c, name="bf16_qwen")
-        attention = "gdn"
-        ffn = "moe" if _int(c, "num_experts") else "dense"
-        aux = _aux_qwen(c)
-        vision = _vision_qwen(config, c) if vision_raw else None
-        engram = _engram(c)
-    else:
-        raise ModelingError(f"model_catalog_profile_unsupported:{family}")
-    if bool(config.get("language_model_only", c.get("language_model_only", False))):
-        aux = replace(aux, include_vision_weights=False) if aux else AuxiliarySpec(include_vision_weights=False)
-    from .hf_config import (
-        declared_context, declared_rope, declared_weight_dtype, native_coverage,
-        resolve_native_formats, resolve_quant,
-    )
-    from .composable import shared_owners
-    coverage_gaps = []
-    declared_quant = c.get("quantization_config") or {}
-    quant_method = str(declared_quant.get("quant_method", ""))
-    if declared_quant and (family == "qwen" or quant_method not in {"fp8", "compressed-tensors"}):
-        quant, quant_gaps = resolve_quant(c)
-        coverage_gaps.extend(quant_gaps)
-    # The declared native float dtype is the model stream; quantized matrix
-    # operands remain in QuantSpec.  Do not keep a BF16 proxy for FP16/FP32.
-    quant = resolve_native_formats(quant, c)
-    declared_weight = declared_weight_dtype(c)
-    # Native adapters resolve structure once. Execution consumes only these
-    # explicit mechanisms, and never dispatches on a checkpoint/family label.
-    plans = [replace(
-        plan,
-        cache_kind="window_compressed" if family in {"deepseek_v4", "deepseek_v41"} else "dense",
-        compressor_kind=("gated_ring" if family == "deepseek_v41" else "weighted_pool")
-                        if plan.compress_ratio else "none",
-        compressor_width=(DEEPSEEK_V4_COMPRESSOR_WIDTH
-                          if family == "deepseek_v4"
-                          and plan.compress_ratio == DEEPSEEK_V4_COMPRESS_RATIO else 1),
-        compressor_state_rows=(
-            DEEPSEEK_V41_COMPRESSOR_STATE_ROWS
-            if family == "deepseek_v41"
-            and plan.compress_ratio == DEEPSEEK_V41_COMPRESS_RATIO
-            else plan.compress_ratio
-            * (COMPRESSED_STATE_ROW_FACTOR
-               if plan.compress_ratio == DEEPSEEK_V4_COMPRESS_RATIO else 1)),
-        index_input="compressed" if family == "deepseek_v41" else "hidden",
-        index_query_per_layer=family == "glm" and plan.attention == "mla" and plan.indexer,
-        index_heads=plan.index_heads or _int(c, "index_n_heads"),
-        index_dim=plan.index_dim or _int(c, "index_head_dim"),
-        index_topk=plan.index_topk or _int(c, "index_topk"),
-        candidate_block_size=max(1, _int(c, "candidate_block_size",
-                                                DEFAULT_CANDIDATE_BLOCK_SIZE)),
-        candidate_topk_blocks=_int(c, "candidate_topk_blocks",
-                                               DEFAULT_CANDIDATE_TOPK_BLOCKS),
-        qk_norm=(plan.qk_norm or (family == "qwen" and plan.attention == "gqa"))
-        if family == "qwen" else False,
-    ) for plan in plans]
-    if family == "kimi" and c.get("dsa_config"):
-        plans = [replace(plan, index_query_per_layer=plan.indexer) for plan in plans]
-    # V4.1 uses source-layer sets for compressed KV; its adapter has already
-    # resolved them. The dense helper expects one owner entry per layer.
-    owner_config = c
-    if family == "deepseek_v41":
-        owner_config = {key: value for key, value in c.items() if key != "kv_source_layer_ids"}
-    plans = shared_owners(owner_config, plans, coverage_gaps)
-    if engram is not None:
-        engram_layers = {table.layer_id for table in engram.tables}
-        plans = [
-            replace(plan, engram=True) if plan.index in engram_layers else plan
-            for plan in plans
-        ]
-    body_layers = len(plans)
-    if body_layers <= 0:
-        raise ModelingError("model_catalog_body_layers_empty")
-    h = int(_require(c, "hidden_size"))
-    heads = int(_require(c, "num_attention_heads"))
-    head_dim = int(c.get("head_dim", 0) or (h // max(1, heads)))
-    kv_heads = int(c.get("num_key_value_heads", heads) or heads)
-    vocab = int(_require(c, "vocab_size"))
-    intermediate = int(c.get("intermediate_size", 0) or c.get("moe_intermediate_size", 0) or 0)
-    experts = _int(c, "n_routed_experts", _int(c, "num_experts"))
-    top_k = _int(c, "num_experts_per_tok", _int(c, "num_experts_per_token"))
-    moe_i = _int(c, "moe_intermediate_size")
-    shared = _int(c, "n_shared_experts", _int(c, "num_shared_experts"))
-    mla = None
-    mla_plans = [p for p in plans if p.attention == "mla"]
-    if mla_plans:
-        from mindie_sim.schema.model import MlaSpec
-        p = mla_plans[0]
-        if p.kv_lora_rank <= 0:
-            raise ModelingError("model_catalog_mla_dims_incomplete")
-        mla = MlaSpec(
-            p.q_lora_rank, p.kv_lora_rank, p.qk_nope_head_dim,
-            p.qk_rope_head_dim, p.v_head_dim,
-            o_lora_rank=p.o_lora_rank, o_groups=p.o_groups,
-            index_topk=p.index_topk, index_head_dim=p.index_dim,
-            index_n_heads=p.index_heads, compress_ratio=p.compress_ratio,
-            sliding_window=p.window,
+        return (
+            _deepseek_plans(c, v41=True), _quant_deepseek(c, v41=True), "mla", "moe",
+            _aux_deepseek(c, v41=True, d=_deepseek_dims(c, v41=True)),
+            _vision_v41(config, c) if vision_raw else None, _engram(c),
         )
-    state_bytes = float(sum(plan.state_bytes_total for plan in plans))
-    if engram is not None and quant is not None:
-        storage_mode = str(c.get("engram_storage_mode", quant.engram_table_mode))
-        if storage_mode not in {"device_bf16", "device_int8_fp32", "host_fp8_e8m0"}:
-            raise ModelingError(f"model_config_engram_storage_mode_unsupported:{storage_mode}")
-        quant = replace(quant, engram_table_mode=storage_mode)
-        engram = replace(engram, storage_mode=storage_mode)
-    model = ModelSpec(
-        name=key, layers=body_layers, hidden_size=h, num_heads=heads,
-        head_dim=head_dim, intermediate_size=intermediate or (moe_i or 1),
-        vocab_size=vocab, attention=attention, ffn=ffn, num_kv_heads=kv_heads,
-        activation_dtype=str(quant.native_format or "bf16"),
-        weight_dtype=(declared_weight
-                      if declared_weight in {"bf16", "fp16", "fp32"}
-                      and not declared_quant else str(quant.native_format or "bf16")),
-        kv_dtype=quant.kv_dtype,
-        compute_dtype=str(quant.native_format or "bf16"),
-        norm_eps=float(c.get("rms_norm_eps", 1e-6) or 1e-6),
-        quantization=quant.name, num_experts=experts, top_k=top_k,
-        moe_intermediate_size=moe_i, num_shared_experts=shared,
-        expert_routing=(), mla=mla, layer_plans=tuple(plans),
-        state_bytes_per_request=state_bytes,
-        body_layers=body_layers, quant=quant, vision=vision,
-        engram=engram, auxiliary=aux,
-        tie_word_embeddings=bool(c.get("tie_word_embeddings", False)),
-        metadata=native_coverage(config, coverage_gaps, plans=plans, quant=quant),
-    )
-    if family == "kimi" and c.get("dsa_config"):
-        model = replace(model, metadata=model.metadata + (
-            ("cache_allocator", "paired_sfa"),
-            ("attention_execution", {
-                "dcp_query_gather": True, "dcp_indexer_sharded": True,
-                "dcp_output_merge": "alltoall", "recurrent_context_sharded": False,
-                "index_rope_dim": int(c["dsa_config"].get("index_rope_dim", ZERO)),
-            }),
-        ))
-    # Set the activation dtype only for vector/residual math. Quantized GEMM
-    # ops carry their own activation/compute dtype explicitly.
+    if family == "deepseek_v4":
+        return (
+            _deepseek_plans(c, v41=False), _quant_deepseek(c, v41=False), "mla", "moe",
+            _aux_deepseek(c, v41=False, d=_deepseek_dims(c, v41=False)), None, None,
+        )
+    if family == "kimi":
+        return (
+            _kimi_plans(config), _quant_kimi(c), "mla", "moe",
+            _aux_kimi(c, config), _vision_kimi(config, c) if vision_raw else None, None,
+        )
+    if family == "kimi_dspark":
+        plans = _dspark_plans(c)
+        return (
+            plans, _quant_bf16(c, name="bf16_dspark"),
+            plans[0].attention if plans else "gqa", "dense", _aux_dspark(c), None, None,
+        )
+    if family == "glm":
+        return (_glm_plans(c), _quant_glm(c), "mla", "moe", _aux_glm(c), None, None)
+    if family == "qwen":
+        return (
+            _qwen_plans(c), _quant_bf16(c, name="bf16_qwen"), "gdn",
+            "moe" if _int(c, "num_experts") else "dense", _aux_qwen(c),
+            _vision_qwen(config, c) if vision_raw else None, _engram(c),
+        )
+    raise ModelingError(f"model_catalog_profile_unsupported:{family}")
+
+
+def _assemble_catalog_facts(
+    *, family: str, config: Mapping[str, Any], c: Mapping[str, Any],
+    plans: Sequence[LayerPlan], quant: QuantSpec, vision_raw: Any,
+    vision: VisionSpec | None, engram: EngramSpec | None,
+    aux: AuxiliarySpec | None, state_bytes: float,
+) -> list[tuple[str, Any]]:
+    """Build the canonical catalog_facts list for one lowered ModelSpec."""
+    from .hf_config import declared_context, declared_rope
+
     facts = [
         ("profile", family),
         ("model_type", str(c.get("model_type", ""))),
         ("architectures", tuple(str(v) for v in config.get("architectures", ()) or ())),
-        ("body_layers", body_layers),
+        ("body_layers", len(plans)),
         ("norm_eps", float(c.get("rms_norm_eps", 1e-6) or 1e-6)),
         ("normalization", _qwen_normalization(c) if family == "qwen" else {}),
         ("native_one_based_attention", family == "kimi"),
@@ -269,6 +147,10 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         ("dense_layers", sum(1 for p in plans if p.ffn == "dense")),
         ("moe_layers", sum(1 for p in plans if p.ffn == "moe")),
         ("latent_moe_layers", sum(1 for p in plans if p.expert_latent_size > 0)),
+        ("routed_expert_hidden_size", (
+            None if c.get("routed_expert_hidden_size") is None
+            else int(c["routed_expert_hidden_size"])
+        )),
         ("indexer_layers", sum(1 for p in plans if p.indexer)),
         ("indexer_full_layers", sum(1 for p in plans if p.indexer and p.indexer_type in {"full", "c4"})),
         ("indexer_shared_layers", sum(1 for p in plans if p.indexer_type == "shared")),
@@ -314,8 +196,157 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         ("dspark_num_experts_per_tok", _int(c, "dspark_num_experts_per_tok")),
         ("auxiliary", aux.to_dict() if aux else None),
         ("source_scope", "structural_config_no_latency_labels"),
+        ("hc_lowrank", max((p.hc_lowrank for p in plans), default=0)),
     ]
-    facts.append(("hc_lowrank", max((p.hc_lowrank for p in plans), default=ZERO)))
+    return facts
+
+
+def _normalize_family_plans(
+    family: str, c: Mapping[str, Any], plans: list[LayerPlan],
+    engram: EngramSpec | None, coverage_gaps: list[str],
+) -> list[LayerPlan]:
+    """Attach canonical cache, compressor, indexer, shared-owner, and Engram fields."""
+    from .composable import shared_owners
+
+    plans = [replace(
+        plan,
+        cache_kind="window_compressed" if family in {"deepseek_v4", "deepseek_v41"} else "dense",
+        compressor_kind=("gated_ring" if family == "deepseek_v41" else "weighted_pool")
+                        if plan.compress_ratio else "none",
+        compressor_width=(DEEPSEEK_V4_COMPRESSOR_WIDTH
+                          if family == "deepseek_v4"
+                          and plan.compress_ratio == DEEPSEEK_V4_COMPRESS_RATIO else 1),
+        compressor_state_rows=(
+            DEEPSEEK_V41_COMPRESSOR_STATE_ROWS
+            if family == "deepseek_v41"
+            and plan.compress_ratio == DEEPSEEK_V41_COMPRESS_RATIO
+            else plan.compress_ratio
+            * (COMPRESSED_STATE_ROW_FACTOR
+               if plan.compress_ratio == DEEPSEEK_V4_COMPRESS_RATIO else 1)),
+        index_input="compressed" if family == "deepseek_v41" else "hidden",
+        index_query_per_layer=family == "glm" and plan.attention == "mla" and plan.indexer,
+        index_heads=plan.index_heads or _int(c, "index_n_heads"),
+        index_dim=plan.index_dim or _int(c, "index_head_dim"),
+        index_topk=plan.index_topk or _int(c, "index_topk"),
+        candidate_block_size=max(1, _int(c, "candidate_block_size",
+                                                DEFAULT_CANDIDATE_BLOCK_SIZE)),
+        candidate_topk_blocks=_int(c, "candidate_topk_blocks",
+                                               DEFAULT_CANDIDATE_TOPK_BLOCKS),
+        qk_norm=(plan.qk_norm or (family == "qwen" and plan.attention == "gqa")),
+    ) for plan in plans]
+    if family == "kimi" and c.get("dsa_config"):
+        plans = [replace(plan, index_query_per_layer=plan.indexer) for plan in plans]
+    owner_config = ({k: v for k, v in c.items() if k != "kv_source_layer_ids"}
+                    if family == "deepseek_v41" else c)
+    plans = shared_owners(owner_config, plans, coverage_gaps)
+    if engram is not None:
+        engram_layers = {table.layer_id for table in engram.tables}
+        plans = [
+            replace(plan, engram=True) if plan.index in engram_layers else plan
+            for plan in plans
+        ]
+    return plans
+
+
+def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
+    c, _text, vision_raw = flatten_config(config)
+    family = _profile(config, c)
+    if family in {"gemma4", "minimax_m3", "step5"}:
+        from .fleet import build_fleet_model
+        return build_fleet_model(key, config, family)
+    if family == "generic" or family.startswith("standard_"):
+        from .composable import build_composable
+        return build_composable(key, config, family)
+    plans, quant, attention, ffn, aux, vision, engram = _dispatch_family_adapter(
+        family, config, c, vision_raw,
+    )
+    if bool(config.get("language_model_only", c.get("language_model_only", False))):
+        aux = replace(aux, include_vision_weights=False) if aux else AuxiliarySpec(include_vision_weights=False)
+    from .hf_config import (
+        declared_weight_dtype, native_coverage, resolve_native_formats,
+        resolve_quant,
+    )
+    coverage_gaps: list[str] = []
+    declared_quant = c.get("quantization_config") or {}
+    quant_method = str(declared_quant.get("quant_method", ""))
+    if declared_quant and (family == "qwen" or quant_method not in {"fp8", "compressed-tensors"}):
+        quant, quant_gaps = resolve_quant(c)
+        coverage_gaps.extend(quant_gaps)
+    quant = resolve_native_formats(quant, c)
+    declared_weight = declared_weight_dtype(c)
+    plans = _normalize_family_plans(family, c, plans, engram, coverage_gaps)
+    body_layers = len(plans)
+    if body_layers <= 0:
+        raise ModelingError("model_catalog_body_layers_empty")
+    h = int(_require(c, "hidden_size"))
+    heads = int(_require(c, "num_attention_heads"))
+    head_dim = int(c.get("head_dim", 0) or (h // max(1, heads)))
+    kv_heads = int(c.get("num_key_value_heads", heads) or heads)
+    vocab = int(_require(c, "vocab_size"))
+    intermediate = int(c.get("intermediate_size", 0) or c.get("moe_intermediate_size", 0) or 0)
+    experts = _int(c, "n_routed_experts", _int(c, "num_experts"))
+    top_k = _int(c, "num_experts_per_tok", _int(c, "num_experts_per_token"))
+    moe_i = _int(c, "moe_intermediate_size")
+    shared = _int(c, "n_shared_experts", _int(c, "num_shared_experts"))
+    mla = None
+    mla_plans = [p for p in plans if p.attention == "mla"]
+    if mla_plans:
+        from mindie_sim.schema.model import MlaSpec
+        p = mla_plans[0]
+        if p.kv_lora_rank <= 0:
+            raise ModelingError("model_catalog_mla_dims_incomplete")
+        mla = MlaSpec(
+            p.q_lora_rank, p.kv_lora_rank, p.qk_nope_head_dim,
+            p.qk_rope_head_dim, p.v_head_dim,
+            o_lora_rank=p.o_lora_rank, o_groups=p.o_groups,
+            index_topk=p.index_topk, index_head_dim=p.index_dim,
+            index_n_heads=p.index_heads, compress_ratio=p.compress_ratio,
+            sliding_window=p.window,
+        )
+    state_bytes = float(sum(plan.state_bytes_total for plan in plans))
+    if engram is not None and quant is not None:
+        storage_mode = str(c.get("engram_storage_mode", quant.engram_table_mode))
+        if storage_mode not in {"device_bf16", "device_int8_fp32", "host_fp8_e8m0"}:
+            raise ModelingError(f"model_config_engram_storage_mode_unsupported:{storage_mode}")
+        quant = replace(quant, engram_table_mode=storage_mode)
+        engram = replace(engram, storage_mode=storage_mode)
+    resolved_intermediate = intermediate or moe_i
+    if resolved_intermediate <= 0:
+        raise ModelingError("model_config_intermediate_size_missing")
+    model = ModelSpec(
+        name=key, layers=body_layers, hidden_size=h, num_heads=heads,
+        head_dim=head_dim, intermediate_size=resolved_intermediate,
+        vocab_size=vocab, attention=attention, ffn=ffn, num_kv_heads=kv_heads,
+        activation_dtype=str(quant.native_format or "bf16"),
+        weight_dtype=(declared_weight
+                      if declared_weight in {"bf16", "fp16", "fp32"}
+                      and not declared_quant else str(quant.native_format or "bf16")),
+        kv_dtype=quant.kv_dtype,
+        compute_dtype=str(quant.native_format or "bf16"),
+        norm_eps=float(c.get("rms_norm_eps", 1e-6) or 1e-6),
+        quantization=quant.name, num_experts=experts, top_k=top_k,
+        moe_intermediate_size=moe_i, num_shared_experts=shared,
+        expert_routing=(), mla=mla, layer_plans=tuple(plans),
+        state_bytes_per_request=state_bytes,
+        body_layers=body_layers, quant=quant, vision=vision,
+        engram=engram, auxiliary=aux,
+        tie_word_embeddings=bool(c.get("tie_word_embeddings", False)),
+        metadata=native_coverage(config, coverage_gaps, plans=plans, quant=quant),
+    )
+    if family == "kimi" and c.get("dsa_config"):
+        model = replace(model, metadata=model.metadata + (
+            ("cache_allocator", "paired_sfa"),
+            ("attention_execution", {
+                "dcp_indexer_sharded": True,
+                "dcp_output_merge": "alltoall", "recurrent_context_sharded": False,
+                "index_rope_dim": int(c["dsa_config"].get("index_rope_dim", 0)),
+            }),
+        ))
+    facts = _assemble_catalog_facts(
+        family=family, config=config, c=c, plans=plans, quant=quant,
+        vision_raw=vision_raw, vision=vision, engram=engram, aux=aux,
+        state_bytes=state_bytes,
+    )
     _set_facts(model, facts)
     from mindie_sim.schema.parallel import ParallelSpec as _ParallelSpec
     from mindie_sim.catalog.weights import (
@@ -328,7 +359,7 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         term.logical_parameters for term in external_shared_weight_terms(model)
     )
     external_bytes = external_shared_weight_bytes(model, _ParallelSpec())
-    facts_extra = [
+    _set_facts(model, list(model.catalog_facts) + [
         ("parameter_count_body", total_params),
         ("resident_weight_bytes_body", total_bytes),
         ("parameter_count_optional_draft", draft_params),
@@ -336,8 +367,7 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         ("external_shared_parameters", external_params),
         ("external_shared_weight_bytes", external_bytes),
         ("cache_row_bytes_by_layer", cache_row_bytes_by_layer(model)),
-    ]
-    _set_facts(model, list(model.catalog_facts) + facts_extra)
+    ])
     return model
 
 

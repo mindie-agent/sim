@@ -1,0 +1,165 @@
+"""Selected MC2 source-operation counts, attached to existing physical phases.
+
+[Role] Count known UB scalar accesses, prefix arithmetic, SFF and pipe barriers.
+[Invariants] Counts denote source calls, not complete compiled ISA. Successful
+  flag checks are work; unobserved retries and arrival waits are not invented.
+  Owners follow the existing source/conditional row mapping without idle lanes.
+[Timeouts & Locks] O(owners * phase steps); no I/O, locks or measurement access.
+[Side-Effect Policy] Pure inventories; rates and availability belong to hardware.
+"""
+import math
+
+from mindie_sim.prediction.instructions import PrimitiveInventory
+from .mc2_fullmesh import COMBINE_FLAG_ELEMS_PER_BLOCK, COMBINE_FLAG_MASK_LANES, EXPAND_IDX_VALUES_PER_ROW
+
+_COUNT_REDUCTION_PIPE_BARRIERS = 4
+_COUNT_PREFIX_FIXED_UB_ACCESSES = 3
+_EXPERT_PER_HISTO_GROUP = 254
+_EXPERT_HISTO_BIN_NUM = 256
+_VECTOR_LANES_PER_INSTRUCTION = 64
+_HISTO_PREP_OPS = 4
+_HISTO_LANES_PER_ELEM = 6
+_HISTO_INSTRUCTIONS_PER_REPEAT = 2
+_HISTO_BIN_SAVE_MERGE_UB_ACCESSES = 5
+_INT32_BYTES = 4
+_UINT16_BYTES = 2
+
+SOURCE_RANGES = {
+    'dispatch': {
+        'source_id_and_prefix': (652, 804), 'triple_store': (472, 478),
+        'count': (1810, 1883), 'receive_count': (1087, 1122),
+        'prefix': (1024, 1083, 1126, 1162), 'ready': (1221, 1246),
+    },
+    'combine': {'return_metadata': (855, 896), 'frame': (938, 951),
+                'successful_mask': (958, 993), 'weight': (1385, 1402)},
+}
+
+
+def _mask_count(raw):
+    """Source maskCnt: activeMaskBsCnt*axisK or expertIdsCnt."""
+    declared = raw.get("mask_count")
+    if declared is not None:
+        return max(1, int(declared))
+    active = raw.get("active_mask_bs_count")
+    if active is not None:
+        return max(1, int(active) * int(raw["top_k"]))
+    return max(1, int(raw["source_assignments"]))
+
+
+def _dispatch_phase_events(add, raw, phase, owner, rows):
+    phase_name = phase.name
+    if phase_name == 'send_read_quantize':
+        ids, k = raw['source_tokens'] * raw['top_k'], raw['top_k']
+        if ids == raw['source_assignments'] and float(ids).is_integer():
+            p = len(phase.owner_domain)
+            prefix = max(0, (int(ids) - 1 - (k + (owner - k) % p)) // p + 1)
+            add('before', 'assignment_prefix_scan', scalar_ub_access=rows)
+            add('after', 'assignment_prefix_scan', scalar_ub_access=prefix,
+                pipe_barrier=_COUNT_REDUCTION_PIPE_BARRIERS * prefix)
+        return
+    if phase_name == 'frame_payload':
+        add('before', 'service', scalar_ub_access=EXPAND_IDX_VALUES_PER_ROW * rows)
+        return
+    if phase_name == 'count_compute':
+        count = len(phase.owner_domain)
+        index = phase.owner_domain.index(owner)
+        n = raw['experts'] // count + int(index < raw['experts'] % count)
+        # CalExpertCntByHistogram + GetExpertFreq bins expert frequencies
+        # in groups of 254 experts per UB chunk and CalExpertCnt reads each
+        # bin directly with zero software ReduceSum reductions.
+        active = n > 0 and raw['source_assignments'] > 0
+        mask = _mask_count(raw) if active else 0
+        groups = math.ceil(n / _EXPERT_PER_HISTO_GROUP) if active else 0
+        chunk_elems = int(raw.get("chunk_recompute_elems") or 0)
+        chunk_scan = chunk_elems if chunk_elems > 0 else mask
+        chunks = math.ceil(mask / chunk_scan) if (groups and mask) else 0
+        bins_per_chunk = (n + groups) if groups else 0
+        if n > 0:
+            add('after', 'service',
+                scalar_ub_access=(
+                    n
+                    + (n if active else 0)
+                    + chunks * _HISTO_BIN_SAVE_MERGE_UB_ACCESSES * bins_per_chunk
+                ),
+                scalar_alu_issue=chunks * bins_per_chunk,
+                pipe_barrier=1 + groups * chunks)
+        if groups and mask:
+            full_chunks, tail_len = divmod(mask, chunk_scan)
+            prep_issues = (
+                full_chunks * _HISTO_PREP_OPS * math.ceil(chunk_scan / _VECTOR_LANES_PER_INSTRUCTION)
+                + (_HISTO_PREP_OPS * math.ceil(tail_len / _VECTOR_LANES_PER_INSTRUCTION) if tail_len else 0)
+            )
+            histo_repeats = (
+                full_chunks * math.ceil(chunk_scan / _EXPERT_HISTO_BIN_NUM)
+                + (math.ceil(tail_len / _EXPERT_HISTO_BIN_NUM) if tail_len else 0)
+            )
+            histo_issues = _HISTO_INSTRUCTIONS_PER_REPEAT * histo_repeats
+            add('after', 'service',
+                pipe_v_lanes=groups * _HISTO_LANES_PER_ELEM * mask,
+                pipe_v_issue=groups * (prep_issues + histo_issues),
+                ub_read_bytes=groups * _INT32_BYTES * mask,
+                ub_write_bytes=groups * chunks * _EXPERT_HISTO_BIN_NUM * _UINT16_BYTES)
+        return
+    if phase_name == 'receive_counts':
+        add('before', 'read_status', scalar_ub_access=1)  # gather pattern SetValue
+        add('after', 'check_status', scalar_ub_access=1)  # one successful GetValue
+        add('after', 'sum_counts', scalar_ub_access=1)  # sumOfRecvCnt
+        return
+    if phase_name == 'prefix_counts':
+        count = len(phase.owner_domain)
+        index = phase.owner_domain.index(owner)
+        n = raw['experts'] // count + int(index < raw['experts'] % count)
+        add('before', 'read_sums', scalar_ub_access=1)  # gather pattern
+        # GetCumSum success + output store, extra prefix result/pattern for
+        # nonzero owners; CalRecv preSum + every count read/prefix store.
+        add('after', 'check_and_prefix',
+            scalar_ub_access=_COUNT_PREFIX_FIXED_UB_ACCESSES + 2 * int(index > 0) + 2 * n,
+            scalar_alu_issue=n, pipe_barrier=1 + int(index > 0))
+        return
+    if phase_name == 'prefix_ready':
+        add('after', 'check_ready', scalar_ub_access=1)
+
+
+def _combine_phase_events(add, raw, phase, layout, rows, tokens):
+    phase_name = phase.name
+    if phase_name == 'return_read_frame':
+        add('after', 'read', scalar_ub_access=EXPAND_IDX_VALUES_PER_ROW * rows)
+        add('after', 'frame', pipe_barrier=rows)
+        return
+    if phase_name == 'receive_flags':
+        words = math.ceil(raw['top_k'] * layout.blocks * COMBINE_FLAG_ELEMS_PER_BLOCK / COMBINE_FLAG_MASK_LANES)
+        add('after', 'initialize_flags', pipe_barrier=tokens)
+        add('after', 'compare_flags', scalar_ub_access=tokens * words,
+            scalar_alu_issue=tokens * words,
+            ub_uint64_mask_reads=tokens * words,
+            scalar_sff_calls=tokens * words,
+            compare_sum_ops=tokens * words,
+            get_sff_value_u64_i64=tokens * words)  # one typed PIPE_S call per source op
+        return
+    if phase_name == 'weighted_reduce':
+        for slot in range(raw['top_k']):
+            add('before', f'slot{slot}_read', scalar_ub_access=tokens)
+
+
+def phase_events(raw, phase, owner, weight, layout):
+    """Per-owner inserts keyed before/after the existing aggregate phase step.
+
+    Pipe barriers inside a whole vector phase are conservatively retired after
+    that vector service, not reconstructed as a compiled instruction schedule.
+    """
+    result = {}
+
+    def add(position, step, **counts):
+        key = position + ':' + step
+        values = result.setdefault(key, {})
+        for role, count in counts.items():
+            if count:
+                values[role] = values.get(role, 0) + count
+
+    rows = raw['source_assignments'] * weight
+    tokens = raw['source_tokens'] * weight
+    if raw['kind'] == 'dispatch':
+        _dispatch_phase_events(add, raw, phase, owner, rows)
+    else:
+        _combine_phase_events(add, raw, phase, layout, rows, tokens)
+    return {key: PrimitiveInventory(value) for key, value in result.items()}

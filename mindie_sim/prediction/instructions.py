@@ -15,13 +15,6 @@ from .mechanism import Work
 
 # Units are operations of the declared source/compiled boundary. These names
 # do not assert one API call lowers to one hardware instruction.
-PRIMITIVE_UNITS = {
-    **dict.fromkeys(("scalar_ub_access", "scalar_gm_access", "scalar_alu_issue",
-                    "pipe_barrier", "cross_core_sync"), "calls"),
-    "mte2_descriptor_issue": "descriptors", "mte3_descriptor_issue": "descriptors",
-    "simt_warp_issue": "warps", "simt_atomic_rmw": "transactions",
-    "vbitsort32": "blocks32", "vmrgsort4v2": "merges4",
-}
 
 
 @dataclass(frozen=True)

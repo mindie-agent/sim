@@ -3,7 +3,7 @@
 Development-run reports cited below are historical context and are not shipped. Current acceptance is documented in [verification](../verification.md).
 
 The 2026-10-30 integration is covered by
-[`test_balanced_catalog_generalization.py`](../../tests/test_balanced_catalog_generalization.py)
+[`test_model_catalog_conservation.py`](../../tests/schema/test_model_catalog_conservation.py)
 and the bounded full-model report.
 The tests use real catalog `LayerPlan` dimensions and the public parser, ordinary
 FFN lowerings and shared Engine. They do not replace catalog layers with mocked

@@ -1,0 +1,1061 @@
+"""Live end-to-end single-spine execution-trace locks and physics regressions.
+
+[Role] Enforce Lock C (100% governed operator dispatch, single per-die
+  ``AdmissionMemoryView`` per step, and exact canonical ``RequestView`` tuple
+  propagation across Dense GQA, MLA/MQSMLA, GDN/linear, and MoE+MC2 in ragged
+  and padded ``TND``/``BSND`` layouts) plus clock-domain, bounded-streaming,
+  mixed-HBM, cohort-split, and ``DAV_2201`` guard invariants.
+[Invariants] Tier-0 in-memory execution with zero device contexts or host I/O.
+  All models and SKUs sweep via canonical registries and ``_support.axes``.
+[Timeouts & Locks] Bounded 1-layer replays and synthetic micro-graphs; no locks.
+[Side-Effect Policy] Pure read-only simulation assertions; monkeypatches are
+  automatically restored per test.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+from functools import partial, wraps
+import hashlib
+from inspect import isroutine
+import json
+from types import FunctionType, MethodType, SimpleNamespace
+
+import pytest
+
+from _support.axes import REPRESENTATIVE_SKUS
+from _support.linear_cases import execute_one, gdn_decode_source_case
+from mindie_sim import graph_costs
+from mindie_sim.compose import compose_case
+from mindie_sim.observations.multilevel import verify_capture_file_consistency
+from mindie_sim.observations.comparison import (
+    apply_capture_observed_clock,
+    extract_observed_aicore_freq_mhz,
+)
+from mindie_sim.prediction.execution.context import _ContextMixin
+from mindie_sim.prediction.execution.submission import is_zero_kernel_view
+from mindie_sim.prediction.mechanism import Geometry, OperatorPlan
+from mindie_sim.prediction.operators import attention, linear_attention
+from mindie_sim.prediction.operators.attention.attention_pipeline import TiledAttentionRecipe
+from mindie_sim.prediction.operators.attention.common import AttentionContract, sequence_layout_spans
+from mindie_sim.prediction.operators.matrix.refill_steady import peer_group_can_compact
+from mindie_sim.prediction.operators.paged_mla import indexed_quant_attention
+from mindie_sim.prediction.program import RecipeBook, RecipeContext
+from mindie_sim.prediction.results import ReplayOptions, StepRequest
+from mindie_sim.prediction.runtime import engine_submit, l2_residency
+from mindie_sim.prediction.runtime.engine import Engine
+from mindie_sim.prediction.runtime.engine_types import Resource
+from mindie_sim.prediction.runtime.memory_physics import HbmBusSpec
+from mindie_sim.prediction.spine import PredictionSpine
+from mindie_sim.schema.case import Case
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.compute_arch import ComputeArchSpec
+from mindie_sim.schema.operators import OpSpec
+from mindie_sim.prediction.results import LoweringRequest
+from mindie_sim.schema.workload import RequestView
+from scripts._arch_governance_runtime import (
+    _NON_DEVICE_INFRA_RECIPES, _OWNER_MODULE_PREFIXES, _binding_module,
+    _is_governed_module, _is_shared_transport_lowering,
+)
+
+pytestmark = pytest.mark.tier0
+
+SEQUENCE_FAMILIES = frozenset({
+    "attention", "mla", "paged_mla", "mla_prolog", "indexer", "index_pool",
+    "compressed_attention", "recurrent_local", "recurrent_output",
+    "triangular_solve", "gdn_prepare", "gdn_state", "gdn_output", "gdn_gating",
+})
+RAGGED_TND_VIEWS = (
+    RequestView("req_short", q_len=1, context=128, samples=True, phase="decode"),
+    RequestView("req_long", q_len=1, context=512, samples=True, phase="decode"),
+    RequestView("req_pad", q_len=1, context=0, samples=False, phase="decode", padding=True),
+)
+RAGGED_BSND_VIEWS = (
+    RequestView(
+        "req_a", q_len=1, context=64, samples=True, phase="decode",
+        padded_q_len=4, padded_seq_len=256,
+    ),
+    RequestView(
+        "req_b", q_len=2, context=192, samples=True, phase="decode",
+        padded_q_len=4, padded_seq_len=256,
+    ),
+    RequestView(
+        "req_pad", q_len=0, context=0, samples=False, phase="decode",
+        padding=True, padded_q_len=4, padded_seq_len=256,
+    ),
+)
+CLOCK_SCALE_RATIO = 0.75
+BUS_READ_BPMS = 1024.0
+BUS_WRITE_BPMS = 1024.0
+BUS_REBIND_READ_BPMS = 128.0
+BUS_ALPHA = 0.5
+TOTAL_BYTES = 16384.0
+ASYMM_BYTES = 8192.0
+
+
+def _is_allowed_recipe_owner(recipe) -> bool:
+    cls = recipe if isinstance(recipe, type) else type(recipe)
+    if (cls.__module__, cls.__name__) in _NON_DEVICE_INFRA_RECIPES:
+        return True
+    module = _binding_module(recipe)
+    return module.startswith(_OWNER_MODULE_PREFIXES) or _is_shared_transport_lowering(recipe, module)
+
+
+def _program_owners(program, probe):
+    pending = [program]
+    seen = set()
+    while pending:
+        callback = pending.pop()
+        if id(callback) in seen:
+            continue
+        seen.add(id(callback))
+        if getattr(callback, "_lock_c_probe", None) is probe:
+            pending.append(callback.__wrapped__)
+            continue
+        if isinstance(callback, partial):
+            pending.append(callback.func)
+            continue
+        if isinstance(callback, MethodType):
+            callback = callback.__func__
+        if not isroutine(callback):
+            callback = type(callback).__call__
+        module = getattr(callback, "__globals__", {}).get(
+            "__name__", getattr(callback, "__module__", type(callback).__module__))
+        yield module
+        wrapped = getattr(callback, "__wrapped__", None)
+        if wrapped is not None:
+            pending.append(wrapped)
+        for cell in getattr(callback, "__closure__", None) or ():
+            try:
+                captured = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(captured, partial) or isroutine(captured):
+                pending.append(captured)
+
+
+@pytest.fixture
+def traced_plan_programs(monkeypatch):
+    """Check callbacks at invocation, including plans invoked by another plan."""
+    executed = set()
+    get_attribute = OperatorPlan.__getattribute__
+
+    def traced_get_attribute(self, name):
+        callback = get_attribute(self, name)
+        if name != "program" or getattr(callback, "_lock_c_probe", None) is executed:
+            return callback
+
+        @wraps(callback)
+        def checked(context):
+            outside = [module for module in _program_owners(callback, executed)
+                       if not _is_governed_module(module)]
+            assert not outside, f"OperatorPlan.program outside governed packages: {outside}"
+            executed.add(context.op.family)
+            return callback(context)
+
+        checked._lock_c_probe = executed
+        return checked
+
+    monkeypatch.setattr(OperatorPlan, "__getattribute__", traced_get_attribute)
+    return executed
+
+
+@pytest.mark.parametrize(
+    "model_key,sku_alias,parallel,views,layout,padded_tokens",
+    [
+        ("qwen3-32b", "a5", {"tp": 1}, RAGGED_TND_VIEWS, "TND", 4),
+        ("qwen3-32b", "a5", {"tp": 1}, RAGGED_BSND_VIEWS, "BSND", 12),
+        ("deepseek-v4-flash", "a5", {"tp": 1}, RAGGED_TND_VIEWS, "TND", 4),
+        ("qwen3.5-35b-a3b", "a5", {"tp": 1}, RAGGED_TND_VIEWS, "TND", 4),
+        ("qwen3-235b-a22b", "a5", {"tp": 2, "ep": 2}, RAGGED_TND_VIEWS, "TND", 4),
+        ("qwen3-32b", "a3", {"tp": 1}, RAGGED_BSND_VIEWS, "BSND", 12),
+    ],
+)
+def test_single_spine_live_execution_trace_across_architectures(
+    monkeypatch, traced_plan_programs, model_key, sku_alias, parallel, views, layout, padded_tokens,
+):
+    """Lock C: 100% governed operator execution, single per-die L2 view, exact RequestView tuple."""
+    case = Case.from_mapping(
+        compose_case(model_key, hardware=REPRESENTATIVE_SKUS[sku_alias], layers=1, **parallel)
+    )
+    step_req = StepRequest(
+        phase="decode",
+        tokens=sum(v.q_len for v in views if not v.padding) or 1,
+        context=max((v.context for v in views if not v.padding), default=64),
+        sequences=len(views),
+        scope="body",
+        requests=views,
+        padded_tokens=padded_tokens,
+        layout=layout,
+    )
+
+    dispatched_recipes: list[tuple[str, str, object]] = []
+    seen_prepare_views = []
+    seen_context_views = []
+    seen_seq_requests: list[tuple[str, tuple[RequestView, ...]]] = []
+    serviced_operators: set[str] = set()
+
+    orig_prepare = RecipeBook.prepare
+    orig_context = _ContextMixin._context
+    orig_complete = Engine._complete
+
+    def traced_prepare(self, op, geometry):
+        selected = self.select(op)
+        prepared, recipe = orig_prepare(self, op, geometry)
+        dispatched_recipes.append((op.family, op.recipe, selected))
+        seen_prepare_views.append(geometry.admission_memory_view)
+        if op.family in SEQUENCE_FAMILIES:
+            seen_seq_requests.append((op.op_id, geometry.requests))
+        return prepared, recipe
+
+    def traced_context(self, op, replica, scope, *, recipe=None):
+        ctx = orig_context(self, op, replica, scope, recipe=recipe)
+        seen_context_views.append(ctx.admission_memory_view)
+        if op.family in SEQUENCE_FAMILIES:
+            seen_seq_requests.append((op.op_id, tuple(ctx.requests)))
+        return ctx
+
+    def traced_complete(self, task, moment=None, native=False):
+        orig_complete(self, task, moment, native)
+        if any(amount > 0.0 for amount in task.service.values()):
+            # Device task names extend the replica:iteration:operator prefix.
+            serviced_operators.add(":".join(task.event.name.split(":", 3)[:3]))
+
+    spine = PredictionSpine()
+    prepared = spine.lower(case, LoweringRequest(step=step_req, tier="mainline"))
+    monkeypatch.setattr(RecipeBook, "prepare", traced_prepare)
+    monkeypatch.setattr(_ContextMixin, "_context", traced_context)
+    monkeypatch.setattr(Engine, "_complete", traced_complete)
+    evaluation = spine.run_step(prepared, ReplayOptions(isolated=False))
+
+    assert evaluation.span_ms > 0.0
+    timeline = {(row.occurrence.replica, row.occurrence.op_id): row for row in evaluation.operators}
+    for rank_ops in prepared.graph.executable:
+        for op in rank_ops.ops:
+            key = (rank_ops.replica, op.op_id)
+            assert key in timeline, f"operator {key} missing from the engine timeline"
+            row = timeline[key]
+            assert row.start_ms is not None and row.end_ms is not None, f"operator {key} did not complete"
+            if op.family == "barrier" or is_zero_kernel_view(op):
+                continue
+            assert row.end_ms - row.start_ms > 0.0, f"operator {key} had no positive engine duration"
+            assert f"r{rank_ops.replica}:i0:{op.op_id}" in serviced_operators, (
+                f"operator {key} completed without positive engine resource service"
+            )
+    assert dispatched_recipes, "expected live operator dispatches during step replay"
+    assert traced_plan_programs, "expected executed OperatorPlan.program callbacks"
+    outside = [
+        (fam, rec, _binding_module(obj))
+        for fam, rec, obj in dispatched_recipes
+        if not _is_allowed_recipe_owner(obj)
+    ]
+    assert outside == [], f"executed device operators outside governed packages: {outside}"
+    assert seen_context_views, "expected live execution contexts"
+    shared = seen_context_views[0]
+    assert isinstance(shared, l2_residency.AdmissionMemoryView)
+    assert all(view is shared for view in seen_context_views)
+    assert seen_prepare_views, "expected live preparation contexts"
+    assert all(view is shared for view in seen_prepare_views)
+    assert seen_seq_requests, "expected sequence operators during step replay"
+    for op_id, received in seen_seq_requests:
+        assert received == views, f"sequence op {op_id} dropped canonical RequestView tuple"
+        assert all(actual is expected for actual, expected in zip(received, views, strict=True))
+
+
+@pytest.mark.parametrize("family", ("short_convolution", "gdn_gating"))
+def test_live_dispatch_rejects_flat_program_callbacks(monkeypatch, traced_plan_programs, family):
+    from mindie_sim.prediction import call_builders as call_builders_operators
+    from mindie_sim.prediction.operators.linear_attention import _gdn_decode_programs
+
+    case, views, ops = gdn_decode_source_case((1,))
+    op = next(op for op in ops if op.family == family)
+    _, span = execute_one(case, views, op)
+    assert span > 0 and family in traced_plan_programs
+    prepare = RecipeBook.prepare
+
+    def route_to_flat(self, op, geometry):
+        prepared, plan = prepare(self, op, geometry)
+        original = plan.program
+
+        def program(_self, context):
+            return original(context)
+
+        flat = FunctionType(program.__code__, vars(call_builders_operators), closure=program.__closure__)
+        delegate = partial(MethodType(flat, self))
+
+        def governed_closure(context):
+            return delegate(context)
+
+        callback = FunctionType(governed_closure.__code__, vars(_gdn_decode_programs),
+                                closure=governed_closure.__closure__)
+        return prepared, replace(plan, program=callback)
+
+    monkeypatch.setattr(RecipeBook, "prepare", route_to_flat)
+    with pytest.raises(AssertionError, match=r"OperatorPlan\.program.*prediction\.call_builders"):
+        execute_one(case, views, op)
+
+
+def test_addressed_attention_binds_the_live_admission_view(monkeypatch):
+    """Replay addressed KV reads through the engine's live memory binder."""
+    case = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1)
+    request = RAGGED_TND_VIEWS[0]
+    contract = AttentionContract(
+        request.q_len, 1, 1, 128, 128, sequences=((request.q_len, request.kv_len),),
+        kv_layout="PA_BLK_BSND", kv_tensor_id="lock-c-kv", block_table=((0, 2),),
+    )
+    op = attention.make_attention_op(contract, op_id="addressed_attention", requests=(request.request_id,))
+    seen_plans = []
+    seen_bind_views = []
+    orig_prepare = RecipeBook.prepare
+    orig_bind = engine_submit.bind_memory_access
+
+    def traced_prepare(self, op, geometry):
+        seen_plans.append((geometry.requests, geometry.admission_memory_view))
+        return orig_prepare(self, op, geometry)
+
+    def traced_bind(pattern, state, *args, **kwargs):
+        seen_bind_views.append(state)
+        return orig_bind(pattern, state, *args, **kwargs)
+
+    monkeypatch.setattr(RecipeBook, "prepare", traced_prepare)
+    monkeypatch.setattr(engine_submit, "bind_memory_access", traced_bind)
+    report = graph_costs(case, (op,), isolated=False, request_views=(request,))
+
+    assert report["duration_ms"] > 0.0
+    assert seen_plans, "expected live FIA preparation"
+    shared = seen_plans[0][1]
+    assert isinstance(shared, l2_residency.AdmissionMemoryView)
+    for requests, view in seen_plans:
+        assert len(requests) == 1 and requests[0] is request
+        assert view is shared
+    assert seen_bind_views, "expected live memory binder callbacks for addressed KV"
+    assert all(view is shared for view in seen_bind_views)
+
+
+@pytest.mark.parametrize("qk_dim,v_dim", ((128, 32), (32, 128)))
+def test_attention_matrix_phases_preserve_asymmetric_tensor_work(qk_dim, v_dim):
+    heads, keys = 4, 32
+    contract = AttentionContract(1, heads, heads, qk_dim, v_dim, sequences=((1, keys),))
+    op = attention.make_attention_op(contract, op_id="asymmetric_attention")
+    ctx = RecipeContext(op, {"cube": op.flops}, {"cube": "cube"}, {"cube": 1.0}, 1)
+    recipe = TiledAttentionRecipe()
+    for program in (recipe.lower(ctx), recipe.lower_single(ctx)):
+        work = {stage.name: stage.work.get("cube", 0) for stage in program.stages}
+        assert work["qk"] == 2 * heads * keys * qk_dim
+        assert work["pv"] == 2 * heads * keys * v_dim
+        assert sum(work.values()) == op.flops
+
+
+def test_chunk_timing_rejects_an_unrecognized_declared_isa():
+    geometry = Geometry(1, compute_arch=ComputeArchSpec(preset="unrecognized"))
+    with pytest.raises(ModelingError, match="linear_attention_arch_unsupported:unrecognized"):
+        linear_attention.chunk32_timing_policy(geometry, None, 0)
+
+
+def test_ragged_and_padding_request_views_preserve_zero_macs_and_layout_strides():
+    """Verify padding slots carry 0 logical KV/Q work while BSND vs TND advance distinct GM strides."""
+    pad_view = RequestView("pad0", q_len=4, context=1024, samples=False, phase="decode", padding=True)
+    assert pad_view.logical_q_len == 0
+    assert pad_view.kv_len == 0
+
+    tnd_spans = sequence_layout_spans(RAGGED_TND_VIEWS, padded_tokens=4, layout="TND")
+    assert len(tnd_spans) == len(RAGGED_TND_VIEWS)
+    assert tnd_spans[0] == (1, 129, 0, 0, False)
+    assert tnd_spans[1] == (1, 513, 1, 129, False)
+    assert tnd_spans[2] == (0, 0, 2, 642, True)
+
+    bsnd_spans = sequence_layout_spans(RAGGED_BSND_VIEWS, padded_tokens=12, layout="BSND")
+    assert bsnd_spans[0] == (1, 65, 0, 0, False)
+    assert bsnd_spans[1] == (2, 194, 4, 256, False)
+    assert bsnd_spans[2] == (0, 0, 8, 512, True)
+
+
+def test_observed_aicore_clock_scales_core_domains_only_and_extracts_capture_freq():
+    """Observed clock scaling scales core-coupled domains and leaves HBM/links/scalar store fixed."""
+    from mindie_sim.backends.ascend import profiles
+
+    sku = REPRESENTATIVE_SKUS["a5"]
+    profile = profiles()[sku]
+    nominal_mhz = float(profile["source"]["declaration"]["configured_clock_mhz"])
+    assert nominal_mhz > 0.0
+    observed_mhz = nominal_mhz * CLOCK_SCALE_RATIO
+    capture = {"metadata": {"observed_aicore_freq_mhz": observed_mhz}}
+    assert extract_observed_aicore_freq_mhz(capture) == pytest.approx(observed_mhz)
+
+    raw_case = compose_case("qwen3-32b", hardware=sku, layers=1, tp=2)
+    aligned_raw = apply_capture_observed_clock(raw_case, capture)
+    base_machine = Case.from_mapping(raw_case).machine
+    scaled_machine = Case.from_mapping(aligned_raw).machine
+    base_die, scaled_die = base_machine.dies[0], scaled_machine.dies[0]
+
+    assert scaled_die.observed_aicore_freq_mhz == pytest.approx(observed_mhz)
+    assert scaled_die.peak("bf16") == pytest.approx(base_die.peak("bf16") * CLOCK_SCALE_RATIO)
+    base_rates, scaled_rates = dict(base_die.rates), dict(scaled_die.rates)
+    assert scaled_rates["vector"] == pytest.approx(base_rates["vector"] * CLOCK_SCALE_RATIO)
+    assert scaled_rates["hbm"] == pytest.approx(base_rates["hbm"])
+    if "scalar_store_issue" in base_rates:
+        assert scaled_rates["scalar_store_issue"] == pytest.approx(base_rates["scalar_store_issue"])
+    base_modes = {name: mode[1] for name, mode in base_die.service_modes}
+    scaled_modes = {name: mode[1] for name, mode in scaled_die.service_modes}
+    if "mte2_aic_dram" in base_modes:
+        assert scaled_modes["mte2_aic_dram"] == pytest.approx(base_modes["mte2_aic_dram"])
+    for b_link, s_link in zip(base_machine.links, scaled_machine.links, strict=True):
+        assert s_link.capacity_bytes_per_ms == pytest.approx(b_link.capacity_bytes_per_ms)
+
+
+def test_mixed_hbm_accounting_asymmetric_cohort_split_and_streaming_capture_guard(tmp_path):
+    """Regression locks for mixed-direction HBM rebind, asymmetric cohort split, and streaming verifier."""
+    for backend in ("python", "c"):
+        bus = HbmBusSpec(0, BUS_READ_BPMS, BUS_WRITE_BPMS, BUS_ALPHA, row_r="hbm:r", row_w="hbm:w")
+        eng = Engine(
+            [Resource("hbm", BUS_READ_BPMS), Resource("mte2_aic", BUS_READ_BPMS * 8.0), Resource("mte3", BUS_WRITE_BPMS * 8.0)],
+            backend=backend,
+        )
+        eng.add_hbm_bus(bus)
+        ev_r = eng.submit(
+            "mixed_r", {"hbm": TOTAL_BYTES, "mte2_aic": TOTAL_BYTES},
+            deliveries=(("hbm_r", TOTAL_BYTES),),
+        )
+        ev_w = eng.submit("mixed_w", {"hbm": TOTAL_BYTES, "mte3": TOTAL_BYTES})
+        eng.advance(horizon=8.0)
+        mid_r = eng.delivered["hbm_r"]
+        assert 0.0 < mid_r < TOTAL_BYTES
+        eng.bind_hbm_bus(HbmBusSpec(0, BUS_REBIND_READ_BPMS, BUS_WRITE_BPMS, BUS_ALPHA, row_r="hbm:r", row_w="hbm:w"))
+        eng.advance(until=(ev_r, ev_w), first=False)
+        assert ev_r.time > 8.0
+        assert eng.delivered["hbm_r"] == pytest.approx(TOTAL_BYTES)
+        assert eng.serviced["hbm"] == pytest.approx(TOTAL_BYTES * 2.0)
+
+        eng2 = Engine([Resource("hbm", BUS_READ_BPMS), Resource("mte2_aic", BUS_READ_BPMS * 8.0)], backend=backend)
+        bus2 = HbmBusSpec(0, BUS_READ_BPMS, BUS_WRITE_BPMS, BUS_ALPHA, row_r="hbm:r", row_w="hbm:w")
+        eng2.add_hbm_bus(bus2)
+        c0 = eng2.submit(
+            "cohort_a", {"hbm": ASYMM_BYTES, "mte2_aic": ASYMM_BYTES},
+            deliveries=(("hbm_r", ASYMM_BYTES),),
+        )
+        eng2.advance(horizon=3.0)
+        assert eng2.delivered["hbm_r"] == pytest.approx(3072.0)
+        eng2.bind_hbm_bus(HbmBusSpec(0, BUS_READ_BPMS * 0.5, BUS_WRITE_BPMS, BUS_ALPHA, row_r="hbm:r", row_w="hbm:w"))
+        eng2.advance(until=(c0,))
+        assert c0.time == pytest.approx(13.0)
+        assert eng2.delivered["hbm_r"] == pytest.approx(ASYMM_BYTES)
+
+    cap_path = tmp_path / "capture.jsonl"
+    cap_bytes = (
+        json.dumps({"event_id": "start", "clock_operator": "device_event"}) + "\n"
+        + json.dumps({"event_id": "end", "clock_operator": "host_wall"}) + "\n"
+    ).encode("utf-8")
+    cap_path.write_bytes(cap_bytes)
+    boundary = SimpleNamespace(
+        raw_sha256=hashlib.sha256(cap_bytes).hexdigest(),
+        start_event="start",
+        end_event="end",
+        event_ids=(),
+        device_ranks=(0,),
+        clock_domain="device",
+        clock_operator="device_event",
+    )
+    with pytest.raises(ModelingError, match="capture_clock_operator_mismatch"):
+        verify_capture_file_consistency("case0", boundary, cap_path)
+
+
+def test_peer_compaction_requires_uniform_groups():
+    assert peer_group_can_compact((16, 16, 16), slots=2, threshold=8) is True
+    assert peer_group_can_compact((16, 4, 16), slots=2, threshold=8) is False
+
+
+@pytest.mark.parametrize("sku_alias,supported", (("a3", False), ("a5", True)))
+def test_packed_schedule_checks_declared_isa_without_datapath(sku_alias, supported):
+    case = Case.from_mapping(
+        compose_case("deepseek-v4-flash", hardware=REPRESENTATIVE_SKUS[sku_alias], layers=1, tp=1)
+    )
+    geometry = replace(Geometry.from_devices(case.machine.dies), datapath=None)
+    op = OpSpec(
+        "packed_attention", "mla", "decode", 0, 0, ("r0",),
+        (1, 16, 512), (1, 16, 512), (1, 16, 512), (1, 16, 512),
+        dtype="bf16", recipe="indexed_attention_packed_int8",
+        metadata=((
+            "indexed_attention_geometry",
+            {
+                "query_dtype": "bf16", "cache_dtype": "int8", "latent": 512, "rope": 64,
+                "window": 0, "compression_ratio": 1, "cp": 1, "heads": 16,
+                "sequences": ((1, 128),), "topk": 128,
+            },
+        ),),
+    )
+    schedule = indexed_quant_attention.SCHEDULE_ARCH35
+    if supported:
+        plan = indexed_quant_attention.build(op, geometry, scratch_policy="offchip", schedule=schedule)
+        assert plan.metadata["kernel_schedule"] == schedule
+        assert plan.work.matrix["bf16"] == 2 * 16 * 128 * (512 + 64 + 512)
+    else:
+        with pytest.raises(ModelingError, match=f"arch35_unsupported_on_{geometry.compute_arch.preset}"):
+            indexed_quant_attention.build(op, geometry, scratch_policy="offchip", schedule=schedule)
+
+
+def test_oneshot_collective_physics_and_waveplan_multigroup():
+    """Verify hardware-derived OneShotCollective physics, Ring crossover, and multi-group WavePlan."""
+    from mindie_sim.prediction.collectives import (
+        OneShotCollective,
+        OneShotPlan,
+        Topology,
+        api_bytes_from_link_volume,
+    )
+    from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
+    from mindie_sim.prediction.collectives.waves import WaveGroup, WavePlan
+    from mindie_sim.prediction.program import KernelProgram
+
+    def _run_plan(topo, plan):
+        eng = Engine(topo.resources())
+        start = eng.submit("start")
+        done = plan.start(eng, "coll", start)
+        eng.advance(until=(done,))
+        return done.time
+
+    case_a5 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, tp=8))
+    case_a3 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], layers=1, tp=8))
+    topo_a5 = Topology(case_a5.machine, case_a5.runtime.parallel)
+    topo_a3 = Topology(case_a3.machine, case_a3.runtime.parallel)
+
+    recipe = OneShotCollective()
+    assert recipe.algorithm == "oneshot"
+    assert recipe.path_model == "store_forward"
+
+    # Hardware-derived startup_ms matches declared vector minimum_ms without chip-name branching.
+    vec_a5 = dict(case_a5.machine.dies[0].kernel_invocations).get("vector")
+    expected_a5_ms = float(getattr(vec_a5, "minimum_ms", 0.0) or 0.0)
+    assert topo_a5._oneshot_startup_ms() == pytest.approx(expected_a5_ms)
+
+    # Small allreduce (16 KiB API tensor, stale ring steps=14 tolerated): OneShot beats Ring on both A3 & A5.
+    small_api = 16 * 1024.0
+    small_ring_vol = small_api * 2.0 * 7.0 / 8.0
+    op_ar_small = OpSpec(
+        "ar_small", "allreduce", "decode", 0, 0, ("r0",), (1, 128), (1, 128), (1, 128), (1, 128),
+        link_bytes=small_ring_vol,
+        metadata=(("group_axis", "tp"), ("collective", "allreduce"), ("steps", 14)),
+    )
+    for topo in (topo_a5, topo_a3):
+        os_plan = topo.oneshot_plan(op_ar_small, 0)
+        rg_plan = topo.joint_plan(op_ar_small, {0: small_ring_vol}, algorithm="ring")
+        assert isinstance(os_plan, OneShotPlan)
+        assert len(os_plan.groups) == 1 and len(os_plan.groups[0].messages) == 8 * 7
+        expected_peer = api_bytes_from_link_volume("allreduce", 8, small_ring_vol, dict(op_ar_small.metadata))
+        assert all(m.flow.useful_bytes == pytest.approx(expected_peer) for m in os_plan.groups[0].messages)
+        assert _run_plan(topo, os_plan) < _run_plan(topo, rg_plan)
+
+    # Large allreduce (64 MiB API tensor) on switched fabric: Ring beats OneShot broadcast on bandwidth.
+    big_api = 64.0 * 1024.0 * 1024.0
+    big_ring_vol = big_api * 2.0 * 7.0 / 8.0
+    op_ar_big = replace(op_ar_small, op_id="ar_big", link_bytes=big_ring_vol)
+    assert _run_plan(topo_a3, topo_a3.joint_plan(op_ar_big, {0: big_ring_vol}, algorithm="ring")) < _run_plan(
+        topo_a3, topo_a3.oneshot_plan(op_ar_big, 0)
+    )
+
+    # AllGather conserves exact per-rank TX bytes (each peer gets vol / (G - 1)) and beats Ring on small msg.
+    ag_vol = 28 * 1024.0
+    op_ag = OpSpec(
+        "ag_small", "allgather", "decode", 0, 0, ("r0",), (1, 128), (1, 128), (1, 128), (1, 128),
+        link_bytes=ag_vol,
+        metadata=(("group_axis", "tp"), ("collective", "allgather"), ("steps", 7)),
+    )
+    ag_plan = topo_a5.oneshot_plan(op_ag, 0)
+    tx_by_src: dict[int, float] = {}
+    for msg in ag_plan.groups[0].messages:
+        tx_by_src[msg.flow.source] = tx_by_src.get(msg.flow.source, 0.0) + msg.flow.useful_bytes
+    assert len(tx_by_src) == 8 and all(val == pytest.approx(ag_vol) for val in tx_by_src.values())
+    assert _run_plan(topo_a5, ag_plan) < _run_plan(topo_a5, topo_a5.joint_plan(op_ag, {0: ag_vol}, algorithm="ring"))
+
+    # alltoallv requires explicit PeerTraffic and emits exact directed payloads when declared.
+    op_a2av_missing = OpSpec(
+        "a2av_bad", "alltoallv", "decode", 0, 0, ("r0",), (1, 128), (1, 128), (1, 128), (1, 128),
+        link_bytes=1024.0, metadata=(("group_axis", "tp"), ("collective", "alltoallv")),
+    )
+    with pytest.raises(ModelingError, match="oneshot_collective_alltoallv_requires_explicit_peer_matrix"):
+        topo_a5.oneshot_plan(op_a2av_missing, 0)
+
+    case_tp2 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, tp=2))
+    topo_tp2 = Topology(case_tp2.machine, case_tp2.runtime.parallel)
+    pt_raw = {"kind": "matrix", "payload_bytes": ((0.0, 2048.0), (2048.0, 0.0))}
+    assert PeerTraffic.from_mapping(pt_raw, size=2).row_total(0) == pytest.approx(2048.0)
+    op_a2av = OpSpec(
+        "a2av_ok", "alltoallv", "decode", 0, 0, ("r0",), (1, 128), (1, 128), (1, 128), (1, 128),
+        link_bytes=2048.0,
+        metadata=(("group_axis", "tp"), ("collective", "alltoallv"), ("peer_traffic", pt_raw)),
+    )
+    a2av_plan = topo_tp2.oneshot_plan(op_a2av, 0)
+    assert sorted((m.flow.source, m.flow.destination, m.flow.useful_bytes) for m in a2av_plan.groups[0].messages) == [
+        (0, 1, 2048.0),
+        (1, 0, 2048.0),
+    ]
+
+    # OneShotCollective.lower validates transport-only work and binds Stage("oneshot").
+    ctx_ok = SimpleNamespace(native_work={"link": 2048.0}, minimum_ms=0.0, collective_plan=lambda: a2av_plan)
+    prog = recipe.lower(ctx_ok)
+    assert isinstance(prog, KernelProgram) and len(prog.stages) == 1 and prog.stages[0].name == "oneshot"
+    ctx_bad = SimpleNamespace(native_work={"link": 2048.0, "vector": 1.0}, minimum_ms=0.0, collective_plan=lambda: a2av_plan)
+    with pytest.raises(ModelingError, match="oneshot_collective_requires_transport_only_work"):
+        recipe.lower(ctx_bad)
+
+    # WavePlan.start_participants executes cleanly across 2 disjoint rank groups.
+    case_dp2 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=2, tp=2))
+    topo_dp2 = Topology(case_dp2.machine, case_dp2.runtime.parallel)
+    wave_plan = WavePlan(
+        "alltoall",
+        (
+            WaveGroup((0, 1), ((0, 4096.0), (1, 4096.0)), 1, topo_dp2),
+            WaveGroup((2, 3), ((2, 4096.0), (3, 4096.0)), 1, topo_dp2),
+        ),
+    )
+    wave_eng = Engine(topo_dp2.resources())
+    wave_ready = {r: wave_eng.submit(f"w_r{r}") for r in (0, 1, 2, 3)}
+    wave_done = wave_plan.start_participants(wave_eng, "multi_wave", wave_ready)
+    wave_eng.advance(until=tuple(wave_done.values()), first=False)
+    assert set(wave_done) == {0, 1, 2, 3} and all(ev.time > 0.0 for ev in wave_done.values())
+
+
+def test_rank_group_indexing_comm_axis_and_unfused_sp_mc2():
+    """Verify etp/external_dp/DCP-TP group indexing, structured comm_axis, and unfused SP MC2."""
+    from mindie_sim.prediction.collectives import Topology
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.sharding.local_tp import (
+        expert_tp_groups,
+        local_tp_cohorts,
+        rank_zero_graph_reuse,
+    )
+    from mindie_sim.prediction.sharding.routing import balanced_realization
+    from mindie_sim.prediction.sharding.sequence_parallel import (
+        DECLARATION as SP_DECL,
+        IMPLEMENTATION as SP_IMPL,
+        sequence_parallel_enabled,
+    )
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    # 1) Topology.groups("ep") with etp=2 uses ep_tp_w = tp // etp, orthogonal to expert_tp_groups.
+    base_8 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, tp=8))
+    p_dp_etp = ParallelSpec(dp=4, tp=2, pp=1, ep=4, expert_tp=2)
+    topo_dp_etp = Topology(base_8.machine, p_dp_etp)
+    ep_groups_1 = topo_dp_etp.groups("ep", 0, 0)
+    etp_groups_1 = expert_tp_groups(topo_dp_etp, replica=0, stage=0)
+    assert ep_groups_1 == ((0, 2, 4, 6), (1, 3, 5, 7))
+    assert etp_groups_1 == ((0, 1),)
+    assert all(len(set(eg) & set(tg)) <= 1 for eg in ep_groups_1 for tg in etp_groups_1)
+    assert rank_zero_graph_reuse(p_dp_etp, 4, False) is False
+    realized = balanced_realization(
+        SimpleNamespace(parallel=p_dp_etp, moe_recipe="alltoall"),
+        SimpleNamespace(num_experts=8, top_k=2),
+        tokens=4, valid_tokens=4, global_tokens=16, replica=3,
+    )
+    assert realized.represented_ranks == (3,) and realized.representative_rank == 3
+
+    p_pcp_etp = ParallelSpec(dp=1, tp=4, pp=1, pcp=2, ep=4, expert_tp=2)
+    topo_pcp_etp = Topology(base_8.machine, p_pcp_etp)
+    ep_groups_2 = topo_pcp_etp.groups("ep", 0, 0)
+    etp_groups_2 = expert_tp_groups(topo_pcp_etp, replica=0, stage=0)
+    assert ep_groups_2 == ((0, 1, 4, 5), (2, 3, 6, 7))
+    assert etp_groups_2 == ((0, 2), (1, 3), (4, 6), (5, 7))
+    assert all(len(set(eg) & set(tg)) <= 1 for eg in ep_groups_2 for tg in etp_groups_2)
+
+    # 2) external_dp > 1 with pcp > 1: local_tp_cohorts and Topology.groups("dp") stay inside external domain.
+    base_16 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], layers=1, dp=2, tp=8))
+    p_ext = ParallelSpec(dp=2, tp=2, pp=1, ep=2, pcp=2, external_dp=2)
+    topo_ext = Topology(base_16.machine, p_ext)
+    cohorts_ext = local_tp_cohorts(base_16.machine, p_ext)
+    assert sum(len(c) for c in cohorts_ext) == 16
+    dp_ext0 = topo_ext.groups("dp", 0, 0)
+    dp_ext1 = topo_ext.groups("dp", 2, 0)
+    assert all(max(g) < 8 for g in dp_ext0) and all(min(g) >= 8 for g in dp_ext1)
+
+    # 3) DCP <-> TP co-domain when PCP == 1: dcp reuses tp ranks.
+    p_dcp_tp = ParallelSpec(dp=2, tp=4, pp=1, ep=8, dcp=4, pcp=1)
+    topo_dcp_tp = Topology(base_8.machine, p_dcp_tp)
+    assert topo_dcp_tp.groups("dcp", 0, 0) == topo_dcp_tp.groups("tp", 0, 0) == ((0, 1, 2, 3),)
+
+    # 4) Sequence-parallel canonical implementation name + structured comm_axis + unfused MC2.
+    assert SP_IMPL == "vllm_ascend_sequence_parallel"
+    assert sequence_parallel_enabled({"sequence_parallel": dict(SP_DECL)}, 4) is True
+    assert sequence_parallel_enabled(
+        {"sequence_parallel": {**SP_DECL, "implementation": "unknown_legacy_sp"}}, 4
+    ) is False
+
+    raw_sp = compose_case(
+        "kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], layers=4,
+        dp=1, tp=4, dcp=4, ep=4, role="pd_decode", feature_track="shipping",
+        prompt_tokens=4096, output_tokens=64,
+    )
+    assert raw_sp["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 0
+    case_sp = Case.from_mapping(raw_sp)
+    case_sp = replace(
+        case_sp,
+        runtime=replace(
+            case_sp.runtime,
+            kernels={**dict(case_sp.runtime.kernels), "sequence_parallel": {**SP_DECL, "padding": "right_to_tp"}},
+        ),
+    )
+    graph_sp = target_graphs(case_sp, phase="decode", tokens=4, context=4096, sequences=4, scope="body")[0]
+    sp_gathers = [op for op in graph_sp if op.family == "allgather" and dict(op.metadata).get("comm_axis") == "tp_sp"]
+    sp_scatters = [op for op in graph_sp if op.family == "reduce_scatter" and dict(op.metadata).get("comm_axis") == "tp_sp"]
+    dcp_comms = [op for op in graph_sp if dict(op.metadata).get("comm_axis") == "dcp"]
+    assert sp_gathers and all(dict(op.metadata)["comm_group_size"] == 4 for op in sp_gathers)
+    assert sp_scatters and all(dict(op.metadata)["comm_group_size"] == 4 for op in sp_scatters)
+    assert dcp_comms and all(dict(op.metadata)["comm_group_size"] == 4 for op in dcp_comms)
+    assert not any(op.family in {"all_gather_matmul", "matmul_reduce_scatter"} for op in graph_sp)
+
+
+def test_dominant_role_classifies_memory_bound_gemm_and_stage_clock_reconciles():
+    from mindie_sim.prediction.efficiency.analysis import analyze_network_efficiency
+    from mindie_sim.prediction.efficiency.exposed_breakdown import ExposedClocks, finish_breakdown
+    from mindie_sim.prediction.graph_analysis import ROLE_CUBE, ROLE_MEMORY, _dominant_role
+
+    rates = {"compute_peaks": {"bf16": 400e12}, "vector": 6e12, "hbm": 4e12, "link": 400e9}
+    decode_gemm = OpSpec("d", "gemm", "decode", 0, 0, ("r0",), (1, 4096), (1, 4096),
+                         (1, 4096), (1, 4096), dtype="bf16", flops=2 * 4096 * 4096,
+                         hbm_bytes=2 * 4096 * 4096)
+    prefill_gemm = replace(decode_gemm, op_id="p", flops=2 * 2048 * 4096 * 4096)
+    assert _dominant_role(decode_gemm, stage_rates=rates) == ROLE_MEMORY
+    assert _dominant_role(prefill_gemm, stage_rates=rates) == ROLE_CUBE
+    zero_bd = finish_breakdown(ExposedClocks(0.0, 0.0, 0.0, 0.0), duration_ms=1e-4, boundary="device_step")
+    assert zero_bd["exposed_breakdown_basis"]["available"] is True
+
+    case = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=2, tp=2)
+    eff = analyze_network_efficiency(case, phase="decode", tokens=1, context=1024, sequences=1, scope="body")
+    sc = eff["attribution"]["stage_clock_attribution"]
+    assert sc["available"] is True
+    assert abs(sc["modeled_span_ms"] - sc["reported_span_ms"]) <= 1e-3 * max(1e-6, sc["reported_span_ms"])
+    assert sc["buckets"]["hbm"]["exposed_ms"] > sc["buckets"]["cube"]["exposed_ms"]
+
+
+def test_efficiency_scope_defaults_to_model_when_speculative_active():
+    from mindie_sim.prediction.efficiency.analysis import analyze_network_efficiency
+
+    base = compose_case("kimi-k3", hardware=REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, ep=2, layers=2,
+                        prompt_tokens=256, output_tokens=16, concurrency=1, mtp_proposal_tokens=0)
+    spec = compose_case("kimi-k3", hardware=REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, ep=2, layers=2,
+                        prompt_tokens=256, output_tokens=16, concurrency=1,
+                        mtp_proposal_tokens=3, mtp_acceptance_length=3.0)
+    assert analyze_network_efficiency(base, phase="decode", tokens=1, context=256, sequences=1)["geometry"]["scope"] == "body"
+    assert analyze_network_efficiency(spec, phase="decode", tokens=4, context=256, sequences=1)["geometry"]["scope"] == "model"
+    assert analyze_network_efficiency(spec, phase="decode", tokens=4, context=256, sequences=1, scope="body")["geometry"]["scope"] == "body"
+
+
+@pytest.mark.parametrize("track", ("shipping", "proposed"))
+def test_primitive_table_perturbation_scales_monotonically_without_dropping(track):
+    from mindie_sim.prediction.efficiency.analysis import analyze_network_efficiency
+    from mindie_sim.prediction.evaluation import EvaluationContext, PRIMITIVE_RESCALED_WARNING
+    from mindie_sim.primitives.loader import load_manifest
+
+    sku = next(
+        name for name, entry in load_manifest()["tables"].items()
+        if entry.get("calibrated") and entry.get("arch_preset") == "npu_arch_3510"
+    )
+    durations = []
+    for hbm_tb in (4.0, 1.6, 1.4):
+        raw = compose_case("qwen3-32b", hardware=sku, layers=2, tp=2, feature_track=track,
+                           hbm_peak_bytes_per_s=hbm_tb * 1e12)
+        parsed = Case.from_mapping(raw)
+        ctx = EvaluationContext.create(parsed)
+        table = ctx.bindings.primitive_table
+        assert table is not None
+        if hbm_tb < 4.0:
+            assert PRIMITIVE_RESCALED_WARNING in table.warnings
+        eff = analyze_network_efficiency(parsed, phase="decode", tokens=1, context=1024, sequences=1, scope="body")
+        durations.append(eff["graph_duration_ms"])
+    assert durations[0] < durations[1] < durations[2]
+    shrunk = Case.from_mapping(compose_case("qwen3-32b", hardware=sku, layers=1, tp=1, aic_count=28, aiv_count=56))
+    shrunk_table = EvaluationContext.create(shrunk).bindings.primitive_table
+    assert shrunk_table is not None and shrunk_table.provenance.silicon_fingerprint.aic_count == 28
+    assert EvaluationContext.create(shrunk, primitive_table=False).bindings.primitive_table is None
+
+
+def test_advance_periodic_clock_matches_literal_loop_and_skips_billions_in_ologn():
+    import math
+    import time
+    from mindie_sim.prediction.engine_periodic.frontier import _advance_periodic_clock
+
+    def literal(now, steps, cycles):
+        for _ in range(cycles):
+            for dt in steps:
+                after = now + dt
+                now = math.nextafter(now, math.inf) if dt > 0.0 and after == now else after
+        return now
+
+    cases = [
+        (0.0, (1e-6, 3e-7), 500),
+        (1.0, (0.5 * math.ulp(1.0),), 1000),
+        (1.0, (1.5 * math.ulp(1.0), 0.5 * math.ulp(1.0)), 1000),
+        (math.nextafter(2.0, 0.0) - 5 * math.ulp(1.0), (0.3 * math.ulp(1.0), 1.5 * math.ulp(1.0)), 200),
+        (1e-320, (1e-322, 1e-321), 500),
+        (7.0, (0.0, 1e-18, 0.002425), 500),
+    ]
+    for now, steps, cycles in cases:
+        assert _advance_periodic_clock(now, steps, cycles) == literal(now, steps, cycles)
+
+    t0 = time.perf_counter()
+    huge = _advance_periodic_clock(7.0, (1e-6, 2.5e-6), 1 << 31)
+    assert time.perf_counter() - t0 < 0.25 and math.isfinite(huge) and huge > 7.0
+
+
+def test_primitive_table_rebind_rescales_fixpipe_out_p05_ws_sweep_and_mte1():
+    from mindie_sim.prediction.evaluation import EvaluationContext, PRIMITIVE_RESCALED_WARNING
+    from mindie_sim.primitives.loader import load_manifest
+
+    sku = next(
+        name for name, entry in load_manifest()["tables"].items()
+        if entry.get("calibrated") and entry.get("arch_preset") == "npu_arch_3510"
+    )
+    base_case = Case.from_mapping(compose_case("qwen3-32b", hardware=sku, layers=1, tp=1))
+    base_tbl = EvaluationContext.create(base_case).bindings.primitive_table
+    assert base_tbl is not None
+    d0 = base_case.machine.dies[0]
+    rates0 = dict(d0.rates)
+
+    # 1) Halve fixpipe & mte1 -> P03 fixpipe_in/fixpipe_out and P02 l1_to_l0a/l0b all halve.
+    half_pipes = replace(
+        base_case,
+        machine=replace(
+            base_case.machine,
+            dies=tuple(
+                replace(
+                    die,
+                    rates=tuple(
+                        (r, v * 0.5 if r in {"fixpipe", "mte1"} else v)
+                        for r, v in die.rates
+                    ),
+                )
+                for die in base_case.machine.dies
+            ),
+        ),
+    )
+    tbl_pipes = EvaluationContext.create(half_pipes).bindings.primitive_table
+    assert tbl_pipes is not None and PRIMITIVE_RESCALED_WARNING in tbl_pipes.warnings
+    for pid, metric in (
+        ("P03_fixpipe", "fixpipe_in_bytes_per_s_per_aic"),
+        ("P03_fixpipe", "fixpipe_out_bytes_per_s_per_aic"),
+        ("P02_load_data", "l1_to_l0a_bytes_per_s_per_aic"),
+        ("P02_load_data", "l1_to_l0b_bytes_per_s_per_aic"),
+    ):
+        assert tbl_pipes.cell(pid).band(metric).p50 == pytest.approx(
+            base_tbl.cell(pid).band(metric).p50 * 0.5, rel=1e-9
+        )
+
+    # 2) Halve HBM + L2 -> every P05 ws_sweep_bytes_per_s sample (incl. 256MiB) halves.
+    half_mem = replace(
+        base_case,
+        machine=replace(
+            base_case.machine,
+            dies=tuple(
+                replace(
+                    die,
+                    rates=tuple(
+                        (r, v * 0.5 if r in {"hbm", "l2"} else v)
+                        for r, v in die.rates
+                    ),
+                    hbm_read_bytes_per_s=(
+                        die.hbm_read_bytes_per_s * 0.5
+                        if die.hbm_read_bytes_per_s is not None
+                        else rates0.get("hbm", 0.0) * 0.5
+                    ),
+                    hbm_write_bytes_per_s=(
+                        die.hbm_write_bytes_per_s * 0.5
+                        if die.hbm_write_bytes_per_s is not None
+                        else rates0.get("hbm", 0.0) * 0.5
+                    ),
+                )
+                for die in base_case.machine.dies
+            ),
+        ),
+    )
+    tbl_mem = EvaluationContext.create(half_mem).bindings.primitive_table
+    assert tbl_mem is not None and PRIMITIVE_RESCALED_WARNING in tbl_mem.warnings
+    base_ws = base_tbl.cell("P05_l2_residency_reuse").parameters["ws_sweep_bytes_per_s"]
+    new_ws = tbl_mem.cell("P05_l2_residency_reuse").parameters["ws_sweep_bytes_per_s"]
+    assert "256MiB" in base_ws
+    for key, val in base_ws.items():
+        assert new_ws[key] == pytest.approx(val * 0.5, rel=1e-9)
+
+
+def test_anti_two_skin_calibration_basis_and_serving_parity() -> None:
+    """Calibrated/derived/datasheet SKUs expose honest calibration_basis and serving==step PrimitiveTable parity."""
+    from mindie_sim import api as sdk_api
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.api import predict
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.results import StepRequest
+    from mindie_sim.prediction.structure import parse_case
+
+    # Derived Ascend950DT_425_96 binds & rescales calibrated Ascend950DT_9582 table.
+    derived = parse_case(compose_case("qwen3-32b", "Ascend950DT_425_96", layers=1, tp=1))
+    summary_derived = EvaluationContext.create(derived).cost.summary()
+    assert "calibration_basis" not in summary_derived
+    pp_derived = summary_derived["primitive_provenance"]
+    assert pp_derived["primitive_table_sku"] == "Ascend950DT_9582"
+    assert "primitive_table_rescaled_to_declared_die" in pp_derived["warnings"]
+
+    # Unmeasured datasheet SKU emits clean primitive_provenance (zero uncalibrated_* strings).
+    uncal = parse_case(compose_case("qwen3-32b", "Ascend910_9392", layers=1, tp=1))
+    summary_uncal = EvaluationContext.create(uncal).cost.summary()
+    assert "calibration_basis" not in summary_uncal
+    pp_uncal = summary_uncal["primitive_provenance"]
+    assert pp_uncal["declared_sku"] == "Ascend910_9392"
+    assert not any("uncalibrated" in str(w).lower() for w in pp_uncal["warnings"])
+
+    # Serving mode & step mode on calibrated A3 SKU both auto-bind identical PrimitiveTable.
+    raw = compose_case(
+        "qwen3-32b", "Ascend910_9362", tp=1, dp=1, layers=1,
+        prompt_tokens=64, output_tokens=2, concurrency=1,
+        mtp_proposal_tokens=0, mtp_acceptance_length=1.0,
+    )
+    body = predict(raw, scope="body", phase="decode", tokens=1, context=64, sequences=1)
+    step_ev = sdk_api.evaluate_step(raw, StepRequest(phase="decode", tokens=1, context=64, sequences=1, scope="body"))
+    assert float(step_ev.span_ms) == pytest.approx(float(body["duration_ms"]), rel=1e-9)
+    srv = predict(raw, scope="serving")
+    srv_raw = predict(raw, scope="serving", primitive_table=False)
+    assert srv["parameters"]["primitive_provenance"]["primitive_table_sku"] == "Ascend910_9362"
+    assert srv_raw["parameters"]["primitive_provenance"]["primitive_table_sku"] is None
+    assert float(srv["metrics"]["makespan_ms"]) != float(srv_raw["metrics"]["makespan_ms"])
+    ev_srv = sdk_api.evaluate_service(raw)
+    assert float(ev_srv.span_ms) == pytest.approx(float(srv["metrics"]["makespan_ms"]), rel=1e-9)
+
+
+def test_namespaced_topology_preserves_primitive_table_and_sha_mismatch_propagates(monkeypatch) -> None:
+    """#478 Items 1 & 2: namespaced Topology keeps primitive_table; SHA mismatch fails closed."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.evaluation import EvaluationContext, _bundled_calibrated_primitive_table
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.primitives import loader as prim_loader
+    from mindie_sim.schema.common import ModelingError
+
+    # Item 1: namespaced Execution (disaggregated prefill:/decode: pools) preserves primitive_table on Topology.
+    parsed = parse_case(compose_case("qwen3-32b", "Ascend950DT_9582", tp=2, dp=1, layers=1))
+    ev = EvaluationContext.create(parsed)
+    assert ev.bindings.primitive_table is not None
+    exec_ns = Execution(
+        parsed, ev.cost, ledger=ev.cost.ledger, namespace="decode:",
+        bindings=ev.bindings, evaluation=ev,
+    )
+    assert exec_ns.topology._has_primitive_table is True
+    assert exec_ns.topology.p18_startup_us == ev.bindings.topology.p18_startup_us
+    assert exec_ns.topology._p16_stream_event_us == ev.bindings.topology._p16_stream_event_us
+
+    # Item 2: _bundled_calibrated_primitive_table propagates integrity errors instead of masking them as None.
+    _bundled_calibrated_primitive_table.cache_clear()
+    try:
+        def _tampered(*_args, **_kwargs):
+            raise ModelingError("primitive_table_sha256_mismatch")
+
+        monkeypatch.setattr(prim_loader, "load_primitives", _tampered)
+        with pytest.raises(ModelingError, match="primitive_table_sha256_mismatch"):
+            _bundled_calibrated_primitive_table("Ascend950DT_9582")
+    finally:
+        _bundled_calibrated_primitive_table.cache_clear()
+
+
+def test_asymmetric_rank_table_pp_tail_idle_lowering_and_substage_readiness() -> None:
+    """Lock explicit tp_lane forwarding, sliced PP tail handoff, mixed-idle export, and sub-stage readiness."""
+    from mindie_sim.prediction.collectives.readiness import SCHEMA as C7_SCHEMA
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import IterationPlan
+
+    # 1. Multi-group asymmetric rank_table=((0,1),(3,2)): rank 3 has ep_owner=0 but tp_lane=1.
+    from mindie_sim.prediction.operator_analysis import target_operators
+
+    raw_asym = compose_case("qwen3-235b-a22b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=2, tp=2, ep=2, sp=True)
+    raw_asym["runtime"]["rank_table"] = [[0, 1], [3, 2]]
+    raw_asym["runtime"]["kernels"]["sequence_parallel"]["padding"] = "right_to_tp"
+    ops_r0 = target_operators(
+        raw_asym, scope="body", phase="prefill", tokens=3,
+        selected_replica=0, physical_rank=0, apply_body_defaults=False,
+    )
+    ops_r3 = target_operators(
+        raw_asym, scope="body", phase="prefill", tokens=3,
+        selected_replica=1, physical_rank=3, apply_body_defaults=False,
+    )
+    pack_r0 = next(op for op in ops_r0 if op.recipe == "route_pack")
+    pack_r3 = next(op for op in ops_r3 if op.recipe == "route_pack")
+    assert pack_r0.vector_ops == pytest.approx(2.0 * pack_r3.vector_ops)
+    assert pack_r0.mte2_bytes == pytest.approx(2.0 * pack_r3.mte2_bytes)
+    assert pack_r3.vector_ops > 0.0
+
+    # 2. Sliced model scope with pp=2, pp_layer_partition=(1,1), layer_limit=1 emits PP handoff to stage 1,
+    #    and sliced body scope with pp_layer_partition=(2,1), sp=True keeps sp_output_gather on stage 0.
+    raw_pp = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=2, tp=1, pp=2)
+    raw_pp["runtime"]["pp_layer_partition"] = [1, 1]
+    ops_pp = target_graphs(parse_case(raw_pp), phase="decode", tokens=1, context=16, sequences=1, scope="model", layer_limit=1)[0]
+    pp_ops = [op for op in ops_pp if op.family == "pp_p2p"]
+    assert len(pp_ops) == 1
+    assert pp_ops[0].stage == 0 and dict(pp_ops[0].metadata)["destination_stage"] == 1
+    assert pp_ops[0].link_bytes > 0.0
+    final_norm = next(op for op in ops_pp if op.op_id == "final_norm")
+    assert final_norm.stage == 1 and pp_ops[0].op_id in final_norm.deps
+
+    raw_sp_pp = compose_case("qwen3-235b-a22b", hardware=REPRESENTATIVE_SKUS["a5"], layers=3, dp=1, tp=2, ep=2, pp=2, pp_layer_partition=(2, 1), sp=True)
+    ops_sp_pp = target_operators(raw_sp_pp, scope="body", phase="prefill", tokens=4, layer_limit=1, apply_body_defaults=False, resource_fusion=False)
+    sp_by_id = {op.op_id: op for op in ops_sp_pp}
+    sp_gather = sp_by_id["sp_output_gather"]
+    assert (sp_by_id[sp_gather.deps[0]].stage, sp_gather.stage) == (0, 0)
+
+    # 3. PredictionSpine.lower with active + genuinely idle (padded_tokens=0) replicas exports cleanly.
+    case_dp2 = parse_case(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=2, tp=1))
+    spine = PredictionSpine()
+    prep_dec_idle = spine.lower(
+        case_dp2,
+        LoweringRequest(iterations=(
+            (0, IterationPlan((RequestView("r0", q_len=1, context=16, samples=True, phase="decode"),))),
+            (1, IterationPlan(())),
+        )),
+    )
+    assert prep_dec_idle.structure_payload["execution"]["phase"] == "decode"
+    prep_mix_idle = spine.lower(
+        case_dp2,
+        LoweringRequest(iterations=(
+            (0, IterationPlan((
+                RequestView("r0", q_len=4, context=0, samples=False, phase="prefill"),
+                RequestView("r1", q_len=1, context=16, samples=True, phase="decode"),
+            ))),
+            (1, IterationPlan(())),
+        )),
+    )
+    assert prep_mix_idle.structure_payload["execution"]["phase"] == "mixed"
+
+    # 4. observe_collective_readiness binds exact communicator groups, rejects mismatched partitions,
+    #    and accepts multi-group subsets when communicators are named.
+    def _c7_report(rank_comms, *, collective="all_reduce", typed_bytes=8192, rank_size=2):
+        entries = rank_comms.items() if isinstance(rank_comms, dict) else [(rk, None) for rk in rank_comms]
+        return {
+            "schema": C7_SCHEMA,
+            "calls": [
+                {
+                    "call_id": "c0", "rank_index": rk, "rank_id": f"rank_{rk}",
+                    "operation": {
+                        "collective": collective, "dtype": "bf16",
+                        "typed_bytes": typed_bytes, "rank_size": rank_size,
+                        **({"communicator": comm} if comm is not None else {}),
+                    },
+                    "entry": {"start_ns": 100}, "completion": {"end_ns": 200},
+                }
+                for rk, comm in entries
+            ],
+        }
+
+    ar_tp = OpSpec(
+        "ar_tp", "allreduce", "prefill", 0, 0, ("r0",), (4, 1024), (4, 1024), (4, 1024), (4, 1024),
+        link_bytes=8192.0, dtype="bf16",
+        metadata=(("collective", "allreduce"), ("group_axis", "tp"), ("payload_dtype", "bf16")),
+    )
+    raw_ok = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=1, tp=2, pcp=2)
+    raw_ok["runtime"]["metadata"]["collective_readiness"] = _c7_report((0, 1), rank_size=2)
+    res_ok = graph_costs(raw_ok, {0: (ar_tp,)}, include_submission=False)
+    assert res_ok["execution"]["collective_readiness_unresolved"] == []
+    assert [o["ready_by_rank"] for o in res_ok["execution"]["collective_readiness_observations"]] == [(0, 1)]
+
+    raw_wrong_part = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=1, tp=2, pcp=2)
+    raw_wrong_part["runtime"]["metadata"]["collective_readiness"] = _c7_report({0: "pcp0", 2: "pcp0", 1: "pcp1", 3: "pcp1"}, rank_size=2)
+    res_wrong = graph_costs(raw_wrong_part, {0: (ar_tp,)}, include_submission=False)
+    assert res_wrong["execution"]["collective_readiness_observations"] == []
+    assert res_wrong["execution"]["collective_readiness_unresolved"]
+
+    raw_sub = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=1, tp=2, pcp=4)
+    raw_sub["runtime"]["metadata"]["collective_readiness"] = _c7_report({0: "tp0", 1: "tp0", 2: "tp1", 3: "tp1"}, rank_size=2)
+    res_sub = graph_costs(raw_sub, {0: (ar_tp,)}, include_submission=False)
+    assert res_sub["execution"]["collective_readiness_unresolved"] == []
+    assert [o["ready_by_rank"] for o in res_sub["execution"]["collective_readiness_observations"]] == [(0, 1), (2, 3)]

@@ -1,0 +1,721 @@
+"""Explicit packed-cache INT8 sparse MLA adaptation on the shared pipeline.
+
+[Role] Expand declared per-128 FP32-scaled INT8 rows before BF16 QK/PV.
+[Invariants] K and V alias one packed cache. A row contains 512 INT8 values,
+  four FP32 scales and zero or 64 BF16 rotary values. UB padding is local.
+  The arch22 source admits rope64; rope0 is an analytic adaptation. Query
+  ownership spans the batch, never a separate whole-call charge per sequence.
+[Timeouts & Locks] Pure finite phase planning; common bounded query pipeline.
+[Side-Effect Policy] No captures, timing fits, hardware operations or I/O.
+"""
+from dataclasses import replace
+from functools import lru_cache, partial
+from typing import Literal
+
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
+from .indexed_attention import (
+    SINGLE_AIV_HEAD_LIMIT, _align, bind_sustained_dram, build_pipeline, owner_row_tiles, _phases,
+)
+from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="8c30e4f491f73cba737a1dacc522894e437cdf3d",
+        relative_path="csrc/attention/kv_quant_sparse_flash_attention/op_kernel/kv_quant_sparse_flash_attention_service_vector_mla.h",
+        source_sha256="3eed5ab746e056319bf873a488a3306cffbabe8dd19f70294da85685f4e3cfd3",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/kv_quant_sparse_flash_attention/op_host/kv_quant_sparse_flash_attention_tiling.cpp",
+        source_sha256="2c75acce70974165d5b087416d724bcd0d09909b2e8dd693370b5860de9dbc6e",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_vector_mla_arch35.h",
+        source_sha256="f315c56c898a05fb57a47559df399fabb05f389b3374c68483cbe0e214269c4e",
+    ),
+)
+
+
+AIV_KEY_GROUP_ALIGNMENT = 4
+AIV_STORE_HEADER_BYTES = 512
+#: Blocked typed vector widths in kv_quant_sparse_flash_attention_service_vector_mla.h:2609-2667:
+#: Cast(i8->f16, 128-wide=0.5) + Cast(f16->f32, 1.0) + Mul(f32, 1.0) + Cast(f32->bf16, 1.0) + Copy(bf16, 0.5) = 4.0;
+#: Brcb issues 1 vector repeat per 4 scales; rotary Copy is 128-wide BF16 (0.5 FP32-eq op/lane).
+DEQUANT_OPS_PER_SCALE = 1
+DEQUANT_OPS_PER_VALUE = 4
+DEQUANT_ROPE_COPY_DIVISOR = 2
+GATHER_INDEX_BYTES_PER_KEY = 8
+INDEXED_LATENT_DIM = 512
+INDEXED_ROPE_DIM = 64
+KV_SCALE_ELEMENT_BYTES = 4
+KV_SCALE_GROUP_SIZE = 128
+MAX_QUANT_INDEXED_HEADS = 128
+
+
+VECTOR_BUFFER_BYTES = (64 + 32 + 32 + 4 + 32 + 8 + 8) * 1024 + (3 * 3 + 2) * 512
+
+
+SOURCE = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+    "caller": "vllm_ascend/attention/utils.py:69-80; attention/sfa_v1.py:1215-1276",
+    "phase_reference": "csrc/attention/kv_quant_sparse_flash_attention/op_kernel/"
+                       "kv_quant_sparse_flash_attention_service_vector_mla.h:652-851",
+    "phase_sha256": "3eed5ab746e056319bf873a488a3306cffbabe8dd19f70294da85685f4e3cfd3",
+    "scope": "arch22_packed_latent512_rope64; rope0_is_analytic_adaptation",
+    "capture_binary": "not_established",
+}
+#: CANN 9.2.1 ``arch35`` sparse scheduler on the same service template.
+ARCH35_SOURCE = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "cann-9.2.1-arch35-sfa",
+    "caller": "torch_npu.npu_kv_quant_sparse_flash_attention(tile_size=128)",
+    "phase_reference": "op_kernel/"
+                       "kv_quant_sparse_flash_attention_service_vector_mla.h:652-851",
+    "scope": "arch35_c8_tile128_656B_row; sparse_block_size1; one_1c2v_group_per_query_row",
+    "capture_binary": "not_established",
+}
+#: Explicit schedule names; the arch22 512-key three-slot review stays the default.
+SCHEDULE_ARCH22 = "arch22_key512_slots3"
+SCHEDULE_ARCH35 = "arch35_c8_tile128_slots2"
+#: Declared packed row: 512 INT8 payload, four FP32 scales, 64 BF16 rotary lanes.
+C8_PAYLOAD_BYTES = 512
+C8_SCALE_BYTES = 16
+C8_SCALE_GROUP = 128
+C8_PACKED_ROW_BYTES = C8_PAYLOAD_BYTES + C8_SCALE_BYTES + 64 * 2
+#: Declared row alignment and the bounded pure-phase caches.
+ROW_ALIGNMENT_BYTES = 32
+C8_TILE_CACHE_SIZE = 4096
+OWNER_TILE_CACHE_SIZE = 8
+#: ``IS_SPLIT_G`` triple-buffered GM KV workspace slots (tiling.cpp:517).
+C8_SPLIT_G_WS_SLOTS = 3
+#: ``sparse_indices -> block_table`` resolves two dependent INT32 scalar reads.
+C8_ADDRESS_LOOKUPS = 2
+C8_ADDRESS_ENTRY_BYTES = 4
+#: ``arch35`` C8 key tile, two KV/accumulator slots, and single-core head cap.
+C8_KEY_TILE = 128
+C8_TILE_SLOTS = 2
+C8_MAX_SINGLE_CORE_HEADS = 64
+#: C8 INT8 -> FP16 -> FP32 * scale -> BF16 -> ND-to-NZ vector service.
+#: Weights are active lanes per value element of one declared source call; the
+#: rotary lanes are copied, not dequantized.
+C8_DEQUANT_PASSES = (
+    ("int8_unpack", 2), ("int8_widen", 2), ("int8_to_fp16", 1),
+    ("fp16_to_fp32", 1), ("scale_broadcast", 1), ("fp32_scale_mul", 1),
+    ("fp32_to_bf16", 1), ("nz_lane_permute", 2),
+)
+#: Online softmax per score pair: exponent, running max, running sum and the
+#: rescale fold.  The output rescale is the accumulator lane pass, not a repeat.
+C8_SOFTMAX_PAIR_OPS = 4
+C8_SOFTMAX_ROW_OPS = 26
+C8_ACCUM_FIRST_OPS = 1
+C8_ACCUM_PASS_OPS = 2
+C8_FP32_BYTES = 4
+C8_BF16_BYTES = 2
+C8_HEAD_ALIGN = 16
+C8_FIXPIPE_M_ALIGN = 2
+C8_FIXPIPE_N_ALIGN = 8
+
+
+def packed_row_bytes(rope):
+    """One packed C8 row: INT8 payload, FP32 group scales and BF16 rotary."""
+    return C8_PAYLOAD_BYTES + C8_SCALE_BYTES + int(rope) * C8_BF16_BYTES
+
+
+def packed_cache_declaration(rope):
+    """Declared packed row layout shared by both reviewed schedules."""
+    row_bytes = packed_row_bytes(rope)
+    return {
+        "payload_bytes": C8_PAYLOAD_BYTES, "scale_bytes": C8_SCALE_BYTES,
+        "scale_dtype": "fp32", "group_size": C8_SCALE_GROUP,
+        "rotary_bytes": int(rope) * C8_BF16_BYTES, "rotary_dtype": "bf16",
+        "row_bytes": row_bytes,
+        "local_padded_row_bytes": -(-row_bytes // ROW_ALIGNMENT_BYTES)
+        * ROW_ALIGNMENT_BYTES,
+        "key_value_alias": True,
+    }
+
+
+def _dequant_lane_ops(latent):
+    return sum(weight for _name, weight in C8_DEQUANT_PASSES) * latent
+
+
+def recipe(*, scratch_policy, compact=True, operand_modes=True,
+           schedule=SCHEDULE_ARCH22, tile_size=None, slots=None):
+    """Select explicitly; this recipe never changes ordinary BF16 defaults."""
+    if schedule == SCHEDULE_ARCH35 and tile_size is None:
+        tile_size = C8_KEY_TILE
+    if schedule == SCHEDULE_ARCH35 and slots is None:
+        slots = C8_TILE_SLOTS
+    return PlannedRecipe(partial(build, scratch_policy=scratch_policy,
+                                 compact=compact, operand_modes=operand_modes,
+                                 schedule=schedule, tile_size=tile_size, slots=slots))
+
+
+def phases(keys, heads, latent, rope, *, first, last, scratch_policy,
+           operand_modes=False, flash_decode=False):
+    """Alias-aware gather plus element work of the declared conversion chain."""
+    common = _phases(keys, heads, latent, rope, first=first, last=last,
+                     scratch_policy=scratch_policy, operand_modes=operand_modes,
+                     flash_decode=flash_decode)
+    # DataCopyPad transfers valid bytes, pads only the local destination. The
+    # retained kernel's arbitrary-index/page reads are accounted as two INT32
+    # fields per selected row; dependent scalar response remains unmodeled.
+    packed_bytes = keys * (latent + latent // KV_SCALE_GROUP_SIZE * KV_SCALE_ELEMENT_BYTES + rope * 2)
+    gather = Work(resources={"hbm": packed_bytes + keys * GATHER_INDEX_BYTES_PER_KEY,
+                             "mte2_aiv": packed_bytes + keys * GATHER_INDEX_BYTES_PER_KEY})
+    # INT8 -> FP16 -> FP32, multiply scale, FP32 -> BF16, ND -> NZ copy.
+    # A scale is broadcast to eight FP32 lanes before repeated vector Mul.
+    # These are typed element service counts, not a measured instruction CPI.
+    # Rotary data is already BF16. Its source Copy to NZ adds a lane move,
+    # not an INT8 dequantization pass.
+    convert = Work(resources={"vector": keys * (DEQUANT_OPS_PER_VALUE * latent + latent // KV_SCALE_GROUP_SIZE * DEQUANT_OPS_PER_SCALE + rope // DEQUANT_ROPE_COPY_DIVISOR)})
+    return (("gather", gather), ("dequantize", convert), *common[1:])
+
+
+def phase_unit_weights(name, key, rope=0):
+    if name not in {"gather", "dequantize", "publish"}:
+        return {}
+    keys = key[0]
+    # MergeKv assigns pairs: ceil(ceil(rows/2)/2) pairs to AIV0.
+    first = min(keys, ((keys + (AIV_KEY_GROUP_ALIGNMENT - 1)) // AIV_KEY_GROUP_ALIGNMENT) * 2)
+    if name == "publish":
+        # Each paired AIV publishes its own valid rows plus one 512-byte
+        # valid-size descriptor, including the sibling with no KV payload.
+        width = INDEXED_LATENT_DIM + rope
+        total = keys * width * 2 + 1024
+        return {"mte3": ((first * width * 2 + AIV_STORE_HEADER_BYTES) / total,
+                         ((keys - first) * width * 2 + AIV_STORE_HEADER_BYTES) / total)}
+    role = "mte2_aiv" if name == "gather" else "vector"
+    return {role: (first / keys, (keys - first) / keys)}
+
+
+def phase_unit_weights_rope64(name, key):
+    return phase_unit_weights(name, key, rope=INDEXED_ROPE_DIM)
+
+
+def _stats_mte3_placement(context, owner_count, *, single_aiv=False, split_g=False):
+    """Distribute LSE statistics stores across every active query owner's MTE3 pipe."""
+    mte3_res = context.resource_names.get(context.physical_role("mte3"))
+    if not mte3_res:
+        return {}
+    phys_count = max(1, owner_count) * (2 if split_g else 1)
+    units = []
+    for phys in range(min(phys_count, context.core_count)):
+        owned = context.owned(phys, context.core_count, {"mte3"}).get(mte3_res, ())
+        if single_aiv and owned:
+            owned = owned[:1]
+        units.extend(owned)
+    return {mte3_res: tuple(dict.fromkeys(units))} if units else {}
+
+
+def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
+          schedule=SCHEDULE_ARCH22, tile_size=None, slots=None):
+    shape = dict(op.metadata).get("indexed_attention_geometry")
+    if (not shape or shape["query_dtype"] != "bf16" or shape["cache_dtype"] != "int8"
+            or shape["latent"] != INDEXED_LATENT_DIM or shape["rope"] not in {0, INDEXED_ROPE_DIM}
+            or shape["window"] or shape["compression_ratio"] != 1 or shape["cp"] != 1
+            or shape.get("sparse_block_size", 1) != 1 or not 1 <= shape["heads"] <= MAX_QUANT_INDEXED_HEADS):
+        raise ModelingError("packed_int8_indexed_attention_requires_bf16_q_int8_latent512_rope0_or64")
+    if scratch_policy not in {"resident", "offchip"}:
+        raise ModelingError("indexed_attention_scratch_policy_required")
+    if any(geometry.resource_units.get(role) != geometry.compute_units * ratio
+           for role, ratio in (("vector", 2), ("mte2_aiv", 2), ("mte3", 2),
+                               ("mte2_aic", 1), ("mte1", 1), ("fixpipe", 1))):
+        raise ModelingError("packed_int8_indexed_attention_requires_paired_aic_aiv_pipes")
+    if (geometry.buffer_units.get("ub") != geometry.compute_units * 2
+            or geometry.buffers.get("ub", 0) < VECTOR_BUFFER_BYTES):
+        raise ModelingError("packed_int8_indexed_attention_requires_declared_vector_scratch")
+    compute_arch = getattr(geometry, "compute_arch", None) or getattr(
+        getattr(geometry, "datapath", None), "compute_arch", None)
+    preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "") or None
+    if preset == "npu_arch_3510" and shape["rope"] != INDEXED_ROPE_DIM:
+        raise ModelingError("packed_int8_indexed_attention_arch35_requires_rope64")
+    if schedule == SCHEDULE_ARCH35:
+        if preset != "npu_arch_3510":
+            raise ModelingError(f"packed_int8_indexed_attention_arch35_unsupported_on_{preset}")
+        return arch35_plan(shape, geometry, tile_size=tile_size, slots=slots)
+    if schedule != SCHEDULE_ARCH22:
+        raise ModelingError("packed_int8_indexed_attention_schedule_unknown")
+    plan = build_pipeline(
+        shape, geometry, scratch_policy=scratch_policy, compact=compact,
+        operand_modes=operand_modes, phase_factory=phases,
+        source_items=tuple(SOURCE.items()), paired_vector_stages=("dequantize",),
+        vector_buffer_bytes=VECTOR_BUFFER_BYTES,
+        phase_unit_weights=phase_unit_weights_rope64 if shape["rope"] else phase_unit_weights)
+    paired = max(1, int(shape.get("paired_calls", 1)))
+    stats_bytes = int(shape.get("statistics_bytes", 0) or 0)
+    extra = stats_bytes + int(shape.get("padding_output_bytes", 0) or 0)
+    stats_work = Work(resources={"hbm": extra, "mte3": extra}) if extra else Work()
+    sequences = tuple(tuple(row) for row in shape.get(
+        "sequences", ((shape.get("query", 0), shape.get("context", 0)),)))
+    active_owners = min(sum(row[0] for row in sequences), geometry.compute_units)
+    single_aiv_stats = shape["heads"] <= SINGLE_AIV_HEAD_LIMIT
+    if paired > 1 or stats_work.resources:
+        base_program = plan.program
+
+        def _wrapped_arch22_program(context):
+            stages = [
+                Stage(
+                    f"call{idx}",
+                    after=() if idx == 0 else (f"call{idx - 1}",),
+                    program=base_program(context),
+                )
+                for idx in range(paired)
+            ]
+            if stats_work.resources:
+                stages.append(Stage(
+                    "lse_statistics",
+                    work=context.bind(stats_work),
+                    after=(f"call{paired - 1}",),
+                    placement=_stats_mte3_placement(
+                        context, active_owners, single_aiv=single_aiv_stats),
+                ))
+            return KernelProgram(tuple(stages))
+
+        plan = replace(plan, work=plan.work.scaled(paired) + stats_work, program=_wrapped_arch22_program)
+    row_bytes = packed_row_bytes(shape["rope"])
+    return replace(plan, metadata={
+        "kind": "indexed_attention_packed_int8",
+        "coverage": "source_phases_declared_dispatch" if shape["rope"] else "analytic_adaptation",
+        "source_execution_domain": "mixed", "source": SOURCE,
+        "packed_cache": {**packed_cache_declaration(shape["rope"]),
+                         "row_bytes": row_bytes,
+                         "local_padded_row_bytes": -(-row_bytes // ROW_ALIGNMENT_BYTES)
+                         * ROW_ALIGNMENT_BYTES},
+        "kernel_schedule": SCHEDULE_ARCH22,
+        "paired_calls": paired,
+        "vector_buffer_bytes_per_aiv": VECTOR_BUFFER_BYTES,
+        "buffer_basis": "retained_InitBuffers_preload3; no_rope_adaptation_keeps_allocation",
+        "unmodeled_features": [
+            "captured_kernel_dispatch_and_binary", "captured_valid_index_values",
+            "scalar_index_and_page_lookup_response", "cross_core_flag_latency",
+            "external_cache_eviction", "conversion_instruction_issue_rate"],
+        "abstraction": "shared_finite_pipeline_with_fluid_compact_contention",
+    })
+
+
+def arch35_tile_phases(keys, heads, latent, rope, *, first, last, private_hbm=0,
+                       ws_hbm=False, ws_l2=False):
+    """One ``arch35`` C8 key tile: address, gather/dequant, QK, PV, accumulate.
+
+    The ``2-AIV`` ``index/page lookup -> packed-row gather -> C8 dequant + NZ
+    publish`` block is one source subtile loop over a double-buffered UB slot,
+    so its steady service is the busiest of the copy, vector and publish pipes.
+    The AIC ``QK -> Fixpipe -> online softmax -> probability -> PV`` chain stays
+    explicit because every step consumes the result of the previous one.
+    """
+    padded_h = _align(heads, C8_HEAD_ALIGN)
+    width = latent + rope
+    row_bytes = packed_row_bytes(rope)
+    first_size = heads * width * C8_BF16_BYTES if first else 0
+    output_bytes = heads * latent * C8_BF16_BYTES if last else 0
+    kv_publish_bytes = keys * width * C8_BF16_BYTES
+    # kv_quant_sparse_flash_attention_service_vector_mla_arch35.h:661 copies full s2BaseSize columns.
+    prob_bytes = heads * C8_KEY_TILE * C8_BF16_BYTES if keys else 0
+    kv_resources = {
+        # One aliased KV row plus the two dependent INT32 scalar lookups.
+        "mte2_aiv": keys * (row_bytes
+                            + C8_ADDRESS_LOOKUPS * C8_ADDRESS_ENTRY_BYTES),
+        "vector": keys * _dequant_lane_ops(latent),
+        "mte3": kv_publish_bytes,
+        "hbm": private_hbm + (kv_publish_bytes if ws_hbm else 0),
+    }
+    if ws_l2:
+        kv_resources["l2"] = kv_publish_bytes
+    # QK and PV are each one matrix-pipeline unit: MTE1 operand loads, the cube
+    # MMA and the Fixpipe result write overlap inside the unit, so the steady
+    # service of the unit is its busiest declared pipe, never their sum.
+    # service_cube_mla_arch35.h:276-278 aligns Fixpipe output to Align2(M) x Align8(S2).
+    qk_work = Work(matrix={"bf16": 2 * padded_h * keys * width}, resources={
+        "mte1": (padded_h + keys) * width * C8_BF16_BYTES,
+        "fixpipe": _align(heads, C8_FIXPIPE_M_ALIGN) * _align(keys, C8_FIXPIPE_N_ALIGN) * C8_FP32_BYTES})
+    pv_work = Work(matrix={"bf16": 2 * padded_h * keys * latent}, resources={
+        "mte1": (padded_h * keys + keys * latent) * C8_BF16_BYTES,
+        "fixpipe": padded_h * latent * C8_FP32_BYTES})
+    return (
+        ("kv_stage", Work(resources=kv_resources), ()),
+        ("query", Work(resources={"hbm": first_size, "mte2_aic": first_size}), ()),
+        ("qk", qk_work, ("kv_stage", "query") if first else ("kv_stage",)),
+        ("softmax", Work(resources={
+            "vector": C8_SOFTMAX_PAIR_OPS * heads * keys
+                      + C8_SOFTMAX_ROW_OPS * heads}), ("qk",)),
+        ("probability", Work(resources={"mte3": prob_bytes}), ("softmax",)),
+        ("pv", pv_work, ("probability",)),
+        ("accumulate", Work(resources={"vector": heads * latent * (
+            C8_ACCUM_FIRST_OPS if first else C8_ACCUM_PASS_OPS)}), ("pv",)),
+        ("output", Work(resources={
+            "hbm": output_bytes, "mte3": output_bytes}), ("accumulate",)),
+    )
+
+
+@lru_cache(maxsize=C8_TILE_CACHE_SIZE)
+def cached_tile(keys, heads, latent, rope, first, last, private_hbm=0,
+                ws_hbm=False, ws_l2=False):
+    """Bounded cache of the pure per-tile phase payloads."""
+    return arch35_tile_phases(keys, heads, latent, rope, first=first, last=last,
+                              private_hbm=private_hbm, ws_hbm=ws_hbm, ws_l2=ws_l2)
+
+
+def tile_stream(sequences, topk, compute_units, tile_size, pool_size, pool_tail,
+                *, per_sequence_topk=None):
+    """One finite owner -> query row -> key tile stream for every owner."""
+    rows = sum(query for query, _ in sequences)
+    owners = min(rows, compute_units)
+    return owners, tuple(
+        tuple(owner_row_tiles(owner, sequences, compute_units, topk, tile_size,
+                              pool_size=pool_size, pool_tail=pool_tail,
+                              per_sequence_topk=per_sequence_topk))
+        for owner in range(owners))
+
+
+def _row_partition(shape, sequences, topk):
+    from mindie_sim.catalog.index_pool import selected_tokens
+    from mindie_sim.prediction.operators.attention.batch_prefix_attention import (
+        nested_prefix_union, prefix_members, selected_prefix_count,
+    )
+    pool = shape.get("index_pool_size", 1)
+    tail = shape.get("index_pool_tail", False)
+    per_seq_topk = shape.get("per_sequence_topk")
+    by_key, private, maximum = {}, [], 0
+    for seq_idx, ((query, context), (key, extent)) in enumerate(
+            zip(sequences, prefix_members(shape, sequences))):
+        seq_topk = (
+            int(per_seq_topk[seq_idx])
+            if isinstance(per_seq_topk, (tuple, list)) and seq_idx < len(per_seq_topk)
+            else int(topk)
+        )
+        row_counts = []
+        for offset in range(query):
+            visible = context + offset + 1
+            selected = selected_tokens(visible, seq_topk, pool, tail)
+            # The calibrated estimate samples historical complete pools. Any
+            # selected causal tail is a known interval, including its identity.
+            history = visible // pool
+            picked = min(history, seq_topk // pool)
+            prefix_pools, rest = divmod(extent, pool)
+            population = context // pool
+            whole = selected_prefix_count(picked, prefix_pools, history, population)
+            # A prefix ending inside a complete pool can supply only its
+            # overlapping lanes. Select it if the declared history forces it.
+            partial = (rest if prefix_pools < history and picked == history else 0)
+            suffix = (max(0, extent - history * pool) if tail else 0)
+            shared = whole * pool + partial + suffix
+            if shared:
+                by_key.setdefault(key, []).append((extent, shared))
+            maximum = max(maximum, shared)
+            row_counts.append(max(0, selected - shared))
+        private.append(tuple(row_counts))
+    return sum(nested_prefix_union(g) for g in by_key.values()), tuple(private), maximum
+
+
+def prefix_partition(shape, sequences, topk, *, sequence_keys=False):
+    shared, private, maximum = _row_partition(shape, sequences, topk)
+    result = shared, sum(map(sum, private)), maximum
+    if sequence_keys:
+        return (*result, tuple(max(counts, default=0) for counts in private))
+    return result
+
+
+def _priced_streams(streams, sequences, units, private):
+    from .indexed_attention import sequence_query_positions
+    result = []
+    for owner, parts in enumerate(streams):
+        priced = []
+        for (sequence, pos), (_, tiles) in zip(
+                sequence_query_positions(owner, sequences, units), parts, strict=True):
+            selected = sum(k for k, _, _ in tiles)
+            count = private[sequence][pos]
+            start = 0
+            for keys, first, last in tiles:
+                stop = start + keys
+                owned = (stop * count // selected - start * count // selected) if selected > 0 else 0
+                priced.append((keys, first, last, owned))
+                start = stop
+        result.append(tuple(priced))
+    return tuple(result)
+
+
+def _kv_stage_work(keys, latent, rope, *, private_hbm=0, ws_hbm=False, ws_l2=False):
+    width = latent + rope
+    row_bytes = packed_row_bytes(rope)
+    publish_bytes = keys * width * C8_BF16_BYTES
+    resources = {
+        "mte2_aiv": keys * (row_bytes + C8_ADDRESS_LOOKUPS * C8_ADDRESS_ENTRY_BYTES),
+        "vector": keys * _dequant_lane_ops(latent),
+        "mte3": publish_bytes,
+        "hbm": private_hbm + (publish_bytes if ws_hbm else 0),
+    }
+    if ws_l2:
+        resources["l2"] = publish_bytes
+    return Work(resources=resources)
+
+
+def _arch35_split_g_phases(keys, head_splits, latent, rope, *, first, last, private_rows=0,
+                           ws_hbm=False, ws_l2=False):
+    """``IS_SPLIT_G`` (``heads > 64``): split gather across both AIV pairs, publish to GM, refill both AICs."""
+    h0, h1 = head_splits
+    width = latent + rope
+    row_bytes = packed_row_bytes(rope)
+    # service_vector_mla_arch35.h:499-521 splits keys CeilDiv(s2, 2) / remainder across the two AIC pairs.
+    k0 = (keys + 1) // 2
+    k1 = keys - k0
+    priv0 = (private_rows * k0) // keys if keys else 0
+    priv1 = private_rows - priv0
+    # service_cube_mla_arch35.h:244 refills Align16(s2RealSize) * dSize into each AIC's L1.
+    refill_bytes = _align(keys, C8_HEAD_ALIGN) * width * C8_BF16_BYTES
+    refill_res = {"mte2_aic": refill_bytes}
+    if ws_hbm:
+        refill_res["hbm"] = refill_bytes
+    elif ws_l2:
+        refill_res["l2"] = refill_bytes
+    refill_work = Work(resources=refill_res)
+    kv_work_0 = _kv_stage_work(k0, latent, rope, private_hbm=priv0 * row_bytes,
+                               ws_hbm=ws_hbm, ws_l2=ws_l2)
+    kv_deps = ("kv_stage", "kv_stage_g1") if k1 else ("kv_stage",)
+    base = cached_tile(keys, h0, latent, rope, first, last, 0, ws_hbm=ws_hbm, ws_l2=ws_l2)
+    peer = cached_tile(keys, h1, latent, rope, first, last, 0)
+    stages = []
+    for name, work, after in base:
+        if name == "kv_stage":
+            stages.append(("kv_stage", kv_work_0, after, 0))
+            if k1:
+                kv_work_1 = _kv_stage_work(k1, latent, rope, private_hbm=priv1 * row_bytes,
+                                           ws_hbm=ws_hbm, ws_l2=ws_l2)
+                stages.append(("kv_stage_g1", kv_work_1, after, 1))
+            stages.append(("kv_refill", refill_work, kv_deps, 0))
+            continue
+        remapped = tuple("kv_refill" if dep == "kv_stage" else dep for dep in after)
+        stages.append((name, work, remapped, 0))
+    stages.append(("kv_refill_g1", refill_work, kv_deps, 1))
+    for name, work, after in peer:
+        if name == "kv_stage":
+            continue
+        remapped = tuple(
+            "kv_refill_g1" if dep == "kv_stage" else f"{dep}_g1" for dep in after
+        )
+        stages.append((f"{name}_g1", work, remapped, 1))
+    return tuple(stages)
+
+
+def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
+    """Declared ``arch35`` C8 schedule: one ``1c2v`` group (or pair when ``G > 64``)."""
+    tile_size = C8_KEY_TILE if tile_size is None else tile_size
+    slots = C8_TILE_SLOTS if slots is None else slots
+    if tile_size != C8_KEY_TILE or slots != C8_TILE_SLOTS:
+        raise ModelingError("arch35_c8_requires_tile128_and_two_slots")
+    sequences = tuple(tuple(row) for row in shape.get(
+        "sequences", ((shape.get("query", 0), shape.get("context", 0)),)))
+    heads, latent, rope = shape["heads"], shape["latent"], shape["rope"]
+    if rope != INDEXED_ROPE_DIM:
+        raise ModelingError("packed_int8_indexed_attention_arch35_requires_rope64")
+    topk, paired = shape["topk"], max(1, int(shape.get("paired_calls", 1)))
+    compute_units = geometry.compute_units
+    split_g = heads > C8_MAX_SINGLE_CORE_HEADS
+    if split_g and compute_units < 2:
+        raise ModelingError("arch35_c8_split_g_requires_two_compute_units")
+    head_splits = (((heads + 1) // 2, heads // 2) if split_g else (heads,))
+    owner_units = (compute_units // 2) if split_g else compute_units
+    _owners, streams = tile_stream(
+        sequences, topk, owner_units, tile_size,
+        shape.get("index_pool_size", 1), shape.get("index_pool_tail", False),
+        per_sequence_topk=shape.get("per_sequence_topk"))
+    empty_rows = tuple(sum(1 for _, tiles in parts if not tiles) for parts in streams)
+    kv_slot_bytes = tile_size * (latent + rope) * C8_BF16_BYTES
+    accumulator_bytes = _align(max(head_splits), C8_HEAD_ALIGN) * latent * C8_FP32_BYTES
+    if (geometry.buffer_units.get("l1", 0) < compute_units
+            or geometry.buffer_units.get("l0c", 0) < compute_units
+            or C8_TILE_SLOTS * kv_slot_bytes > geometry.buffers.get("l1", 0)
+            or C8_TILE_SLOTS * accumulator_bytes > geometry.buffers.get("l0c", 0)):
+        raise ModelingError("arch35_c8_requires_two_kv_and_accumulator_slots_per_owner")
+    shared_rows, private, _ = _row_partition(shape, sequences, topk)
+    private_rows = sum(map(sum, private))
+    streams = _priced_streams(streams, sequences, owner_units, private)
+    external = shared_rows * packed_row_bytes(rope)
+    ws_bytes = (
+        C8_SPLIT_G_WS_SLOTS * tile_size * (latent + rope) * C8_BF16_BYTES * len(streams)
+        if split_g else 0
+    )
+    l2_cap = int(geometry.buffers.get("l2", 0) or 0)
+    ws_l2_resident = split_g and l2_cap > 0 and ws_bytes <= l2_cap
+    ws_hbm = split_g and not ws_l2_resident
+    ws_l2 = ws_l2_resident and "l2" in geometry.rates
+    from collections import Counter
+    counts = Counter(tile for parts in streams for tile in parts)
+    call_work = Work()
+    for tile, count in counts.items():
+        if split_g:
+            keys, first, last, priv = tile
+            for _name, work, _after, _half in _arch35_split_g_phases(
+                    keys, head_splits, latent, rope,
+                    first=first, last=last, private_rows=priv,
+                    ws_hbm=ws_hbm, ws_l2=ws_l2):
+                call_work += work.scaled(count)
+        else:
+            for _name, work, _after in _tile_phases(tile, heads, latent, rope):
+                call_work += work.scaled(count)
+    total_empty = sum(empty_rows)
+    if total_empty:
+        empty_bytes = total_empty * heads * latent * C8_BF16_BYTES
+        call_work += Work(resources={"hbm": empty_bytes, "mte3": empty_bytes})
+    fill = Work(resources={"hbm": external} if external else {})
+    stats_bytes = int(shape.get("statistics_bytes", 0) or 0)
+    extra = stats_bytes + int(shape.get("padding_output_bytes", 0))
+    stats_work = Work(resources={"hbm": extra, "mte3": extra}) if extra else Work()
+    shape = {**shape, "waves": -(-sum(q for q, _ in sequences) // owner_units)}
+    return OperatorPlan(
+        call_work.scaled(paired) + fill + stats_work,
+        _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes,
+                        accumulator_bytes, fill, paired,
+                        stats_work, empty_rows, ws_hbm=ws_hbm, ws_l2=ws_l2),
+        _arch35_metadata(shape, external, private_rows, sequences, tile_size,
+                         slots, paired, head_splits),
+        context_binder=bind_sustained_dram)
+
+
+def _tile_phases(key, heads, latent, rope):
+    keys, first, last, private = key
+    return cached_tile(keys, heads, latent, rope, first, last,
+                       private * packed_row_bytes(rope))
+
+
+def _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes, accumulator_bytes,
+                    fill, paired, stats_work, empty_rows=(), *, ws_hbm=False, ws_l2=False):
+    """Cold prefix fill once, then the declared paired query-owner programs."""
+    split_g = len(head_splits) == 2
+
+    def program(context):
+        context = bind_sustained_dram(context)
+        has_l2 = "l2" in context.resource_names
+
+        def bind_work(work):
+            if not has_l2 and "l2" in work.resources:
+                work = Work(
+                    matrix=work.matrix,
+                    resources={k: v for k, v in work.resources.items() if k != "l2"},
+                )
+            return context.bind(work)
+
+        def one(owner, parts):
+            flat = parts
+            phys_owners = (2 * owner, 2 * owner + 1) if split_g else (owner,)
+            allocations = tuple(
+                [context.allocate(f"c8kv{phys}_{index}", "l1", kv_slot_bytes, (phys,))
+                 for phys in phys_owners for index in range(C8_TILE_SLOTS)]
+                + [context.allocate(f"c8acc{phys}_{index}", "l0c", accumulator_bytes,
+                                    (phys,))
+                   for phys in phys_owners for index in range(C8_TILE_SLOTS)])
+
+            @lru_cache(maxsize=OWNER_TILE_CACHE_SIZE)
+            def stages(key):
+                result = []
+                if split_g:
+                    keys, first, last, priv = key
+                    items = _arch35_split_g_phases(
+                        keys, head_splits, latent, rope,
+                        first=first, last=last, private_rows=priv,
+                        ws_hbm=ws_hbm, ws_l2=ws_l2)
+                else:
+                    items = tuple(
+                        (name, work, after, 0)
+                        for name, work, after in _tile_phases(key, head_splits[0], latent, rope))
+                for name, work, after, half in items:
+                    roles = set(work.resources) | ({"cube"} if work.matrix else set())
+                    # The two declared KV slots bound the live tiles; inside a
+                    # row the online-softmax accumulator is a strict recurrence.
+                    is_acc = name in {"accumulate", "accumulate_g1"}
+                    previous = ((name,) if is_acc and not key[1] else ())
+                    result.append(Stage(
+                        name, bind_work(work), after=tuple(after),
+                        previous=previous,
+                        placement=context.owned(
+                            phys_owners[half], context.core_count, roles - {"hbm", "l2"})))
+                return tuple(result)
+
+            owner_stages = [
+                Stage("reserve", acquire=allocations),
+                Stage("tiles", after=("reserve",), program=PipelineProgram(
+                    len(flat), C8_TILE_SLOTS, lambda index: stages(flat[index]))),
+            ]
+            tail = "tiles"
+            owner_empty = empty_rows[owner] if owner < len(empty_rows) else 0
+            if owner_empty:
+                if split_g:
+                    branches = tuple(
+                        KernelProgram((Stage(
+                            f"empty_output_g{half}",
+                            context.bind(Work(resources={
+                                "hbm": owner_empty * h_cnt * latent * C8_BF16_BYTES,
+                                "mte3": owner_empty * h_cnt * latent * C8_BF16_BYTES,
+                            })),
+                            placement=context.owned(phys_owners[half], context.core_count, {"mte3"}),
+                        ),))
+                        for half, h_cnt in enumerate(head_splits)
+                    )
+                    owner_stages.append(Stage(
+                        "empty_output", after=(tail,), program=ParallelProgram(branches)))
+                else:
+                    empty_bytes = owner_empty * head_splits[0] * latent * C8_BF16_BYTES
+                    owner_stages.append(Stage(
+                        "empty_output",
+                        context.bind(Work(resources={"hbm": empty_bytes, "mte3": empty_bytes})),
+                        after=(tail,),
+                        placement=context.owned(phys_owners[0], context.core_count, {"mte3"}),
+                    ))
+                tail = "empty_output"
+            owner_stages.append(Stage("release", after=(tail,), free=allocations))
+            return KernelProgram(tuple(owner_stages))
+
+        call = ParallelProgram(tuple(one(owner, parts)
+                                     for owner, parts in enumerate(streams)))
+        calls = tuple(Stage(f"call{index}", after=(
+            ("prefix_fill",) if index == 0 else (f"call{index - 1}",)), program=call)
+            for index in range(paired))
+        stages = (Stage("prefix_fill", work=context.bind(fill)), *calls)
+        if stats_work.resources:
+            stages = (*stages, Stage(
+                "lse_statistics", work=context.bind(stats_work),
+                after=(f"call{paired - 1}",),
+                placement=_stats_mte3_placement(
+                    context, len(streams), split_g=split_g)))
+        return KernelProgram(stages)
+
+    return program
+
+
+def _arch35_metadata(shape, external, private_rows, sequences, tile_size, slots,
+                     paired, head_splits):
+    return {
+        "kind": "indexed_attention_packed_int8",
+        "coverage": "source_phases_declared_dispatch",
+        "source_execution_domain": "mixed", "source": ARCH35_SOURCE,
+        "kernel_schedule": SCHEDULE_ARCH35,
+        "packed_cache": packed_cache_declaration(shape["rope"]),
+        "c8_schedule": {
+            "key_tile": tile_size, "tile_slots": slots,
+            "query_rows": sum(query for query, _ in sequences),
+            "waves": shape["waves"],
+            "head_tile": _align(max(head_splits), C8_HEAD_ALIGN),
+            "head_splits": head_splits,
+            "split_g": len(head_splits) == 2,
+            "dequant_lane_ops_per_value": sum(
+                weight for _name, weight in C8_DEQUANT_PASSES),
+            "external_fill_bytes": external, "private_rows": private_rows,
+            "paired_calls": paired,
+            "key_tile_owners": (
+                "two_1c2v_groups_split_g_per_query_row"
+                if len(head_splits) == 2 else "one_1c2v_group_per_query_row"
+            ),
+        },
+        "unmodeled_features": [
+            "captured_kernel_dispatch_and_binary", "captured_valid_index_values",
+            "cross_core_flag_latency", "conversion_instruction_issue_rate"],
+        "abstraction": "finite_tile_pipeline_with_sustained_dram_and_l2_prefix_reuse",
+    }

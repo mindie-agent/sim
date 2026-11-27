@@ -251,7 +251,7 @@
       },
       "lowerings": {
         "mqsmla_attention": {
-          "implementation": "cannbot_mixed_quant_sparse_flash_mla",
+          "implementation": "aclnn_mixed_quant_sparse_flash_mla",
           "options": {
             "metadata_support_fd": false,
             "addressing": "scalar",
@@ -383,7 +383,7 @@
       },
       "native_attention": {
         "dsl": {
-          "path": "repository://refs/cannbot-dsl/samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+          "path": "repository://refs/archived-prototype-dsl/samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
           "bytes": 111124,
           "sha256": "40b5b14ced15bb7c3d3687ab7387d508a19065eb5353dfb0675348e0de22fa3f",
           "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
@@ -513,7 +513,7 @@
         "context_basis": "explicit 2048-token condition, not live context reconstructed from N/A ABI",
         "source": {
           "attention": {
-            "repository": "cannbot-dsl",
+            "repository": "archived-prototype-dsl",
             "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
             "kernel": {
               "path": "samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",

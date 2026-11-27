@@ -1,0 +1,2497 @@
+{
+  "arch_preset": "npu_arch_3510",
+  "cann_version": "9.3.0",
+  "envelope_sha256": "d288dd2f012a4879d6d131d78c0e9bd7ac9ba0d2968458e38ce023c121afb0d0",
+  "primitives": {
+    "P01_datacopy": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "hbm_read_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 4000000000000.0,
+          "cv_pct": 1.807,
+          "n_samples": 24,
+          "p05": 3640912349316.989,
+          "p50": 3813653678428.2827,
+          "p95": 3851983427577.8687,
+          "p99": 3865942524165.2773,
+          "trimmed_cv_pct": 1.2637,
+          "trimmed_mean": 3796431451519.3657
+        },
+        "hbm_rw11_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 4000000000000.0,
+          "cv_pct": 0.8691,
+          "n_samples": 24,
+          "p05": 3137445623417.174,
+          "p50": 3191995424352.1387,
+          "p95": 3223186293754.6025,
+          "p99": 3230050020930.5454,
+          "trimmed_cv_pct": 0.6518,
+          "trimmed_mean": 3188619079254.869
+        },
+        "hbm_rw21_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 4000000000000.0,
+          "cv_pct": 1.2751,
+          "n_samples": 24,
+          "p05": 3177447310209.8125,
+          "p50": 3244764628430.672,
+          "p95": 3290616938352.051,
+          "p99": 3292667192540.88,
+          "trimmed_cv_pct": 1.0546,
+          "trimmed_mean": 3239283696900.116
+        },
+        "hbm_rw_alpha": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "hbm_write_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 4000000000000.0,
+          "cv_pct": 1.1812,
+          "n_samples": 24,
+          "p05": 3437347351267.4443,
+          "p50": 3493797586239.782,
+          "p95": 3560073645939.877,
+          "p99": 3568632429367.571,
+          "trimmed_cv_pct": 0.895,
+          "trimmed_mean": 3499410826714.7017
+        },
+        "mte2_aic_hit_bytes_per_s_per_core": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 165000000000.0,
+          "cv_pct": 0.1406,
+          "n_samples": 12,
+          "p05": 162816989322.03012,
+          "p50": 163355042774.75272,
+          "p95": 163473379471.2994,
+          "p99": 163489499408.15698,
+          "trimmed_cv_pct": 0.1125,
+          "trimmed_mean": 163304662129.33496
+        },
+        "mte2_aiv_hit_bytes_per_s_per_core": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 165000000000.0,
+          "cv_pct": 0.3386,
+          "n_samples": 24,
+          "p05": 80845716869.38411,
+          "p50": 81258981886.12839,
+          "p95": 81528600417.48004,
+          "p99": 81536395629.79541,
+          "trimmed_cv_pct": 0.3071,
+          "trimmed_mean": 81236649467.55986
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "bisheng_version": "2026-11-10T23:30:14+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+        "burst_turn_penalty": [
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 64,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 223.15
+          },
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 64,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 224.0
+          },
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 64,
+            "max_stride_bytes": null,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 224.0
+          },
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 128,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 177.86
+          },
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 128,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 192.0
+          },
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 128,
+            "max_stride_bytes": null,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 192.0
+          },
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 256,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 115.81
+          },
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 256,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 128.0
+          },
+          {
+            "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+            "max_row_bytes": 256,
+            "max_stride_bytes": null,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 128.0
+          }
+        ],
+        "core_clock_scale_ratio": 1.0,
+        "gather_v2_cold_surface": {
+          "1024B": {
+            "random_scatter_rw_bps": 2258687739071.89,
+            "row_bytes": 1024,
+            "scatter_penalty_ratio": 0.9984,
+            "sequential_rw_bps": 2255134253437.41
+          },
+          "128B": {
+            "random_scatter_rw_bps": 1667614831996.66,
+            "row_bytes": 128,
+            "scatter_penalty_ratio": 1.2134,
+            "sequential_rw_bps": 2023419849009.69
+          },
+          "2048B": {
+            "random_scatter_rw_bps": 4000472062527.78,
+            "row_bytes": 2048,
+            "scatter_penalty_ratio": 1.0741,
+            "sequential_rw_bps": 4296893614923.45
+          },
+          "256B": {
+            "random_scatter_rw_bps": 2029340847454.5,
+            "row_bytes": 256,
+            "scatter_penalty_ratio": 1.0666,
+            "sequential_rw_bps": 2164587196867.13
+          },
+          "4096B": {
+            "random_scatter_rw_bps": 4578719865499.12,
+            "row_bytes": 4096,
+            "scatter_penalty_ratio": 1.0491,
+            "sequential_rw_bps": 4803317971256.77
+          },
+          "512B": {
+            "random_scatter_rw_bps": 2190228252868.71,
+            "row_bytes": 512,
+            "scatter_penalty_ratio": 1.011,
+            "sequential_rw_bps": 2214322221272.04
+          },
+          "576B": {
+            "random_scatter_rw_bps": 2127129203117.72,
+            "row_bytes": 576,
+            "scatter_penalty_ratio": 1.0862,
+            "sequential_rw_bps": 2310520593918.75
+          }
+        },
+        "gm_alignment_cold_bps": {
+          "off_0B": 3787289365680.89,
+          "off_128B": 3725826689392.66,
+          "off_256B": 3729520468045.03,
+          "off_32B": 3720405640677.67,
+          "off_64B": 3727167748041.19
+        },
+        "hbm_burst_granule_bytes": 256,
+        "hbm_read_datacopy_blocked_bps_p50": 3813653678428.28,
+        "hbm_scatter_row_open_bytes": 2048,
+        "ini_filename": "Ascend950DT_9582.ini",
+        "ini_sha256": "26a9caca4d1854e5eb95dbc5725249ddf0d7fcd85676f2f377149d38cb3ed251",
+        "l2_cache_ctl_mechanism": "va_bits_62_60",
+        "l2_cache_ctl_supported": true,
+        "metric_diagnostics": {
+          "hbm_read_bytes_per_s": {
+            "cv_pct": 1.807,
+            "nominal_bound": 4000000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw11_bytes_per_s": {
+            "cv_pct": 0.8691,
+            "nominal_bound": 4000000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw21_bytes_per_s": {
+            "cv_pct": 1.2751,
+            "nominal_bound": 4000000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw_alpha": {
+            "admissible_max": 1.0,
+            "cv_pct": 1.6057,
+            "nominal_bound": 0.0,
+            "observed_p05": 1.274838,
+            "observed_p50": 1.297963,
+            "observed_p99": 1.345524,
+            "status": "p99_exceeds_nominal_conflict"
+          },
+          "hbm_write_bytes_per_s": {
+            "cv_pct": 1.1812,
+            "nominal_bound": 4000000000000.0,
+            "status": "calibrated"
+          },
+          "mte2_aic_hit_bytes_per_s_per_core": {
+            "cv_pct": 0.1406,
+            "nominal_bound": 165000000000.0,
+            "status": "calibrated"
+          },
+          "mte2_aiv_hit_bytes_per_s_per_core": {
+            "cv_pct": 0.3386,
+            "nominal_bound": 165000000000.0,
+            "status": "calibrated"
+          }
+        },
+        "mte2_aic_cold_scaling_bps": {
+          "1": 164603745614.75,
+          "12": 1903841194715.5,
+          "16": 2314082729694.17,
+          "2": 328568002455.27,
+          "32": 2786688040727.84,
+          "4": 653378939051.02,
+          "8": 1291026823127.51
+        },
+        "mte2_aic_warm_scaling_bps": {
+          "1": 164958487409.28,
+          "12": 1973421576191.28,
+          "16": 2629445165693.17,
+          "2": 329778451000.95,
+          "32": 5227361368792.09,
+          "4": 659235597463.04,
+          "8": 1317330747217.48
+        },
+        "nominal_cube_freq_mhz": 1650.0,
+        "observed_aicore_freq_mhz": 1650,
+        "observed_cur_freq_mhz": 100,
+        "payload_ramp_bytes_per_s": {
+          "1024KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "evicted_bytes": 402653184,
+            "read_bps": 222397411672.9,
+            "reuse_distance_bytes": 805306368,
+            "rw11_bps": 596374804350.32,
+            "touched_bytes": 218103808,
+            "write_bps": 400726481630.41
+          },
+          "131072KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "evicted_bytes": 0,
+            "read_bps": 3488122562464.84,
+            "reuse_distance_bytes": 805306368,
+            "rw11_bps": 3184854491927.5,
+            "touched_bytes": 3489660928,
+            "write_bps": 3486899328167.71
+          },
+          "16384KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "evicted_bytes": 0,
+            "read_bps": 1857119353410.37,
+            "reuse_distance_bytes": 805306368,
+            "rw11_bps": 2792014696807.07,
+            "touched_bytes": 436207616,
+            "write_bps": 2602530955131.78
+          },
+          "16KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "evicted_bytes": 402653184,
+            "read_bps": 8108382113.57,
+            "reuse_distance_bytes": 805306368,
+            "rw11_bps": 51664170421.87,
+            "touched_bytes": 3407872,
+            "write_bps": 15685974467.35
+          },
+          "256KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "evicted_bytes": 402653184,
+            "read_bps": 58442536475.99,
+            "reuse_distance_bytes": 805306368,
+            "rw11_bps": 652505307763.04,
+            "touched_bytes": 54525952,
+            "write_bps": 99838232330.44
+          },
+          "4096KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "evicted_bytes": 402653184,
+            "read_bps": 745654045679.01,
+            "reuse_distance_bytes": 805306368,
+            "rw11_bps": 1721976326024.06,
+            "touched_bytes": 109051904,
+            "write_bps": 1309492374631.42
+          },
+          "64KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "evicted_bytes": 402653184,
+            "read_bps": 14508945377.58,
+            "reuse_distance_bytes": 805306368,
+            "rw11_bps": 205281127156.05,
+            "touched_bytes": 13631488,
+            "write_bps": 51441131098.35
+          },
+          "65536KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "evicted_bytes": 0,
+            "read_bps": 3145555969735.47,
+            "reuse_distance_bytes": 805306368,
+            "rw11_bps": 3135561973298.09,
+            "touched_bytes": 1744830464,
+            "write_bps": 3354772315412.94
+          }
+        },
+        "runtime_cann_version": "9.3.0",
+        "sector_bytes": 32,
+        "strided_cold_surface": [
+          {
+            "bps_p50": 478287670488.97,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 211445013605.99,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 173467858148.58,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 1009161393189.43,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 406536980069.86,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 336221122271.45,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 2002187703455.48,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 819480609779.65,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 692932076469.68,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 3392021428472.09,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 1653173140589.09,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 1375071006520.11,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 2782868487260.46,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 2513919838656.37,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 2048
+          },
+          {
+            "bps_p50": 2375875681053.12,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 2774529010337.62,
+            "cold_evicted": true,
+            "row_bytes": 1024,
+            "stride_bytes": 2048
+          },
+          {
+            "bps_p50": 2659363620777.43,
+            "cold_evicted": true,
+            "row_bytes": 1024,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 2738594872175.64,
+            "cold_evicted": true,
+            "row_bytes": 2048,
+            "stride_bytes": 4096
+          }
+        ]
+      },
+      "status": "calibrated",
+      "units": {
+        "alpha": "dimensionless",
+        "penalty": "bytes",
+        "rate": "bytes_per_s"
+      }
+    },
+    "P02_load_data": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "l1_to_l0a_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 422400000000.0,
+          "cv_pct": 0.1066,
+          "n_samples": 24,
+          "p05": 409839690293.86084,
+          "p50": 410586035518.69073,
+          "p95": 411048749330.8911,
+          "p99": 411068501815.6052,
+          "trimmed_cv_pct": 0.0856,
+          "trimmed_mean": 410500627137.6645
+        },
+        "l1_to_l0a_transpose_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 422400000000.0,
+          "cv_pct": 0.0624,
+          "n_samples": 24,
+          "p05": 410168986184.5584,
+          "p50": 410611126789.05084,
+          "p95": 410914041138.3673,
+          "p99": 411053476241.5405,
+          "trimmed_cv_pct": 0.048,
+          "trimmed_mean": 410633860143.56055
+        },
+        "l1_to_l0b_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 422400000000.0,
+          "cv_pct": 0.0631,
+          "n_samples": 24,
+          "p05": 410172805715.9463,
+          "p50": 410754606784.3402,
+          "p95": 411044193259.4244,
+          "p99": 411066517977.14386,
+          "trimmed_cv_pct": 0.0415,
+          "trimmed_mean": 410750553671.1256
+        },
+        "l1_to_l0b_transpose_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 211200000000.0
+        },
+        "setup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.6167,
+          "n_samples": 24,
+          "p05": 17.360975,
+          "p50": 17.542498,
+          "p95": 17.684625,
+          "p99": 17.685769,
+          "trimmed_cv_pct": 0.4988,
+          "trimmed_mean": 17.531724
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "fractal_bytes": 512,
+        "measured_l0a_transpose_ratio": 0.999939,
+        "measured_l0b_transpose_ratio": 0.999784,
+        "metric_diagnostics": {
+          "l1_to_l0a_bytes_per_s_per_aic": {
+            "cv_pct": 0.1066,
+            "nominal_bound": 422400000000.0,
+            "status": "calibrated"
+          },
+          "l1_to_l0a_transpose_bytes_per_s_per_aic": {
+            "cv_pct": 0.0624,
+            "nominal_bound": 422400000000.0,
+            "status": "calibrated"
+          },
+          "l1_to_l0b_bytes_per_s_per_aic": {
+            "cv_pct": 0.0631,
+            "nominal_bound": 422400000000.0,
+            "status": "calibrated"
+          },
+          "l1_to_l0b_transpose_bytes_per_s_per_aic": {
+            "cv_pct": 0.0507,
+            "nominal_bound": 211200000000.0,
+            "observed_p05": 410440048820.3074,
+            "observed_p50": 410843454048.2158,
+            "observed_p99": 411081335337.60626,
+            "status": "p99_exceeds_nominal_conflict"
+          },
+          "setup_ns": {
+            "cv_pct": 0.6167,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mx_scale_bytes_per_cyc": 32,
+        "mx_scale_supported": true,
+        "transpose_factor": 1.0,
+        "transpose_l0b_factor": 0.5
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns",
+        "rate": "bytes_per_s_per_aic"
+      }
+    },
+    "P03_fixpipe": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "fixpipe_in_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 422400000000.0,
+          "cv_pct": 0.0412,
+          "n_samples": 24,
+          "p05": 231486048907.44547,
+          "p50": 231618114070.17535,
+          "p95": 231787642662.28613,
+          "p99": 231795413062.74658,
+          "trimmed_cv_pct": 0.0306,
+          "trimmed_mean": 231635065398.4685
+        },
+        "fixpipe_out_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 211200000000.0,
+          "cv_pct": 0.0412,
+          "n_samples": 24,
+          "p05": 115743024453.72273,
+          "p50": 115809057035.08768,
+          "p95": 115893821331.14307,
+          "p99": 115897706531.37329,
+          "trimmed_cv_pct": 0.0306,
+          "trimmed_mean": 115817532699.23425
+        },
+        "setup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.202,
+          "n_samples": 24,
+          "p05": 128.329089,
+          "p50": 128.763491,
+          "p95": 129.167699,
+          "p99": 129.247752,
+          "trimmed_cv_pct": 0.1499,
+          "trimmed_mean": 128.781294
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "dual_target_ub_supported": true,
+        "has_l0c_to_l1": true,
+        "has_l0c_to_ub": true,
+        "metric_diagnostics": {
+          "fixpipe_in_bytes_per_s_per_aic": {
+            "cv_pct": 0.0412,
+            "nominal_bound": 422400000000.0,
+            "status": "calibrated"
+          },
+          "fixpipe_out_bytes_per_s_per_aic": {
+            "cv_pct": 0.0412,
+            "nominal_bound": 211200000000.0,
+            "status": "calibrated"
+          },
+          "setup_ns": {
+            "cv_pct": 0.202,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "nz2dn_stride_gt1_div": 4,
+        "split_m_supported": true,
+        "ub_split_n_align_elems": 32
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns",
+        "rate": "bytes_per_s_per_aic"
+      }
+    },
+    "P04_mte3_store": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "atomic_contention_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "atomic_rmw_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 772000000000.0
+        },
+        "mte3_store_bytes_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 132000000000.0,
+          "cv_pct": 1.2264,
+          "n_samples": 24,
+          "p05": 59615355483.4184,
+          "p50": 60666184580.72729,
+          "p95": 61508047697.98576,
+          "p99": 61860582548.60672,
+          "trimmed_cv_pct": 0.9835,
+          "trimmed_mean": 60553727629.705894
+        },
+        "setup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "has_ub_to_l1": true,
+        "indexed_update_diagnostic": {
+          "band": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 13516800000000.0,
+            "cv_pct": 3.5908,
+            "n_samples": 24,
+            "p05": 377374584619.61676,
+            "p50": 403587533268.65686,
+            "p95": 424048764231.78644,
+            "p99": 427027076261.2299,
+            "trimmed_cv_pct": 2.6276,
+            "trimmed_mean": 403561784442.9256
+          },
+          "diagnostic": {
+            "cv_pct": 3.5908,
+            "nominal_bound": 13516800000000.0,
+            "status": "calibrated"
+          }
+        },
+        "metric_diagnostics": {
+          "atomic_contention_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "atomic_rmw_bytes_per_s": {
+            "nominal_bound": 772000000000.0,
+            "status": "unmeasured"
+          },
+          "mte3_store_bytes_per_s_per_aiv": {
+            "cv_pct": 1.2264,
+            "nominal_bound": 132000000000.0,
+            "status": "calibrated"
+          },
+          "setup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        }
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns",
+        "rate": "bytes_per_s"
+      }
+    },
+    "P05_l2_residency_reuse": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "l2_die_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 13516800000000.0,
+          "cv_pct": 1.6724,
+          "n_samples": 24,
+          "p05": 4339308396481.1567,
+          "p50": 4446356890991.475,
+          "p95": 4558329838713.77,
+          "p99": 4565596528595.357,
+          "trimmed_cv_pct": 1.3918,
+          "trimmed_mean": 4446629689046.894
+        },
+        "l2_effective_fraction": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 1.0
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "buffer_units_l2": 1,
+        "cache_disable_mechanism": "va_bits_62_60",
+        "cache_disable_supported": true,
+        "cache_persistent_supported": true,
+        "granule_bytes": 128,
+        "l2_bytes": 134217728,
+        "l2_line_bytes": 512,
+        "l2_sector_bytes": 128,
+        "l2_stride_conflict": [
+          {
+            "bps_p50": 5200574840712.22,
+            "kind": "contiguous",
+            "stride_bytes": 128
+          },
+          {
+            "bps_p50": 3596775972000.84,
+            "kind": "row128_2d",
+            "stride_bytes": 128
+          },
+          {
+            "bps_p50": 3700960360169.7,
+            "kind": "pow2",
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 2414427729319.29,
+            "kind": "coprime",
+            "stride_bytes": 544
+          },
+          {
+            "bps_p50": 3591431643861.59,
+            "kind": "pow2",
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 2411690788228.77,
+            "kind": "coprime",
+            "stride_bytes": 1056
+          },
+          {
+            "bps_p50": 3666282051996.02,
+            "kind": "pow2",
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 1176774586752.47,
+            "kind": "coprime",
+            "stride_bytes": 4128
+          },
+          {
+            "bps_p50": 2601358005485.1,
+            "kind": "pow2",
+            "stride_bytes": 16384
+          },
+          {
+            "bps_p50": 1989068523580.03,
+            "kind": "coprime",
+            "stride_bytes": 16416
+          },
+          {
+            "bps_p50": 1623790811574.97,
+            "kind": "pow2",
+            "stride_bytes": 32768
+          },
+          {
+            "bps_p50": 1258930329001.64,
+            "kind": "coprime",
+            "stride_bytes": 32800
+          },
+          {
+            "bps_p50": 890931192453.72,
+            "kind": "pow2",
+            "stride_bytes": 65536
+          },
+          {
+            "bps_p50": 616511040565.2,
+            "kind": "coprime",
+            "stride_bytes": 65568
+          },
+          {
+            "bps_p50": 459889928733.25,
+            "kind": "pow2",
+            "stride_bytes": 131072
+          }
+        ],
+        "metric_diagnostics": {
+          "l2_die_bytes_per_s": {
+            "cv_pct": 1.6724,
+            "nominal_bound": 13516800000000.0,
+            "status": "calibrated"
+          },
+          "l2_effective_fraction": {
+            "cv_pct": 1.3149,
+            "nominal_bound": 1.0,
+            "observed_p05": 1.204144,
+            "observed_p50": 1.21819,
+            "observed_p99": 1.250439,
+            "status": "p99_exceeds_nominal_conflict"
+          }
+        },
+        "ws_sweep_bytes_per_s": {
+          "112MiB": 4293197616081.28,
+          "128MiB": 4446356890991.47,
+          "144MiB": 4430994904129.54,
+          "160MiB": 4023796720898.08,
+          "16MiB": 2252961591889.75,
+          "192MiB": 3699462356950.37,
+          "208MiB": 3683441365528.23,
+          "224MiB": 3455212374425.52,
+          "256MiB": 3718586633494.43,
+          "320MiB": 3758042605343.61,
+          "32MiB": 3174196740466.86,
+          "4MiB": 844752976290.51,
+          "64MiB": 3953133700650.04,
+          "8MiB": 1435579185987.67,
+          "96MiB": 4271819766486.52
+        }
+      },
+      "status": "calibrated",
+      "units": {
+        "capacity": "bytes",
+        "fraction": "dimensionless",
+        "rate": "bytes_per_s"
+      }
+    },
+    "P06_mmad": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "pipe_m_barrier_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.2172,
+          "n_samples": 24,
+          "p05": 1.81078,
+          "p50": 1.818313,
+          "p95": 1.82398,
+          "p99": 1.827813,
+          "trimmed_cv_pct": 0.1182,
+          "trimmed_mean": 1.817808
+        }
+      },
+      "modes": {
+        "bf16": {
+          "cube_k": 16,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 13516800000000.0,
+            "cv_pct": 0.0429,
+            "n_samples": 24,
+            "p05": 13467971110679.516,
+            "p50": 13481246054646.219,
+            "p95": 13485425370954.43,
+            "p99": 13485573275157.846,
+            "trimmed_cv_pct": 0.0336,
+            "trimmed_mean": 13479648481624.46
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 16,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 16,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "fp16": {
+          "cube_k": 16,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 13516800000000.0,
+            "cv_pct": 0.017,
+            "n_samples": 24,
+            "p05": 13480202664091.451,
+            "p50": 13484047067852.54,
+            "p95": 13486281119166.412,
+            "p99": 13486464497606.201,
+            "trimmed_cv_pct": 0.0115,
+            "trimmed_mean": 13483838860605.156
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 16,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 16,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "fp32": {
+          "cube_k": 1,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 844800000000.0,
+            "cv_pct": 0.0061,
+            "n_samples": 24,
+            "p05": 844062206780.889,
+            "p50": 844165319951.6102,
+            "p95": 844212206527.973,
+            "p99": 844236800840.2379,
+            "trimmed_cv_pct": 0.0046,
+            "trimmed_mean": 844153904951.6052
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 8,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 8,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "fp8_e4m3": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 27033600000000.0,
+            "cv_pct": 0.0114,
+            "n_samples": 24,
+            "p05": 26968237737913.707,
+            "p50": 26974350792892.867,
+            "p95": 26976160573578.473,
+            "p99": 26976576020841.664,
+            "trimmed_cv_pct": 0.0072,
+            "trimmed_mean": 26973857787368.695
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 32,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 32,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "fp8_e5m2": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 27033600000000.0,
+            "cv_pct": 0.0076,
+            "n_samples": 24,
+            "p05": 26970058126532.91,
+            "p50": 26973270693288.797,
+            "p95": 26975845084757.137,
+            "p99": 26977357455693.637,
+            "trimmed_cv_pct": 0.0059,
+            "trimmed_mean": 26973192205175.293
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 32,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 32,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "hf32": {
+          "cube_k": 8,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 6758400000000.0,
+            "cv_pct": 0.0134,
+            "n_samples": 24,
+            "p05": 6740627493789.485,
+            "p50": 6741900306415.664,
+            "p95": 6743236478621.81,
+            "p99": 6743579323923.476,
+            "trimmed_cv_pct": 0.006,
+            "trimmed_mean": 6741911300090.956
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 8,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 8,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "hifloat8": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 27033600000000.0,
+            "cv_pct": 0.0072,
+            "n_samples": 24,
+            "p05": 26967450021638.0,
+            "p50": 26970973995297.58,
+            "p95": 26973108607890.51,
+            "p99": 26973299324821.516,
+            "trimmed_cv_pct": 0.005,
+            "trimmed_mean": 26970791801967.36
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 32,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 32,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "int8": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 27033600000000.0,
+            "cv_pct": 0.0088,
+            "n_samples": 24,
+            "p05": 26965475272529.4,
+            "p50": 26970973992985.37,
+            "p95": 26972720181604.695,
+            "p99": 26973310016994.324,
+            "trimmed_cv_pct": 0.0054,
+            "trimmed_mean": 26970867990016.645
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 32,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 32,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "mxfp4": {
+          "cube_k": 64,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 54067200000000.0,
+            "cv_pct": 0.0163,
+            "n_samples": 24,
+            "p05": 53912781303954.234,
+            "p50": 53927759202312.695,
+            "p95": 53939237181505.85,
+            "p99": 53939835030277.64,
+            "trimmed_cv_pct": 0.0116,
+            "trimmed_mean": 53927727453713.0
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 64,
+          "m_iss": 16,
+          "scale_group": 32,
+          "status": "calibrated",
+          "tile_k": 64,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "mxfp8": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 27033600000000.0,
+            "cv_pct": 0.0098,
+            "n_samples": 24,
+            "p05": 26957412522858.31,
+            "p50": 26961198309106.734,
+            "p95": 26966422789478.08,
+            "p99": 26966709276266.156,
+            "trimmed_cv_pct": 0.0071,
+            "trimmed_mean": 26961660911601.84
+          },
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "k_0": 32,
+          "m_iss": 16,
+          "scale_group": 32,
+          "status": "calibrated",
+          "tile_k": 32,
+          "tile_m": 16,
+          "tile_n": 16
+        }
+      },
+      "parameters": {
+        "fp32_allow_hf32_recorded": true,
+        "gemm_e2e_flops_per_s_per_aic": {
+          "bf16": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 13516800000000.0,
+              "cv_pct": 0.0299,
+              "n_samples": 24,
+              "p05": 13360599259831.367,
+              "p50": 13367347937039.676,
+              "p95": 13371655193304.348,
+              "p99": 13371919216984.863,
+              "trimmed_cv_pct": 0.0253,
+              "trimmed_mean": 13366819775211.508
+            },
+            "diagnostic": {
+              "cv_pct": 0.0299,
+              "nominal_bound": 13516800000000.0,
+              "status": "calibrated"
+            }
+          },
+          "fp16": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 13516800000000.0,
+              "cv_pct": 0.0467,
+              "n_samples": 24,
+              "p05": 13362904049688.14,
+              "p50": 13369095041478.635,
+              "p95": 13372603152631.68,
+              "p99": 13372851864092.291,
+              "trimmed_cv_pct": 0.013,
+              "trimmed_mean": 13368745091740.822
+            },
+            "diagnostic": {
+              "cv_pct": 0.0467,
+              "nominal_bound": 13516800000000.0,
+              "status": "calibrated"
+            }
+          },
+          "fp32": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 844800000000.0,
+              "cv_pct": 0.0034,
+              "n_samples": 24,
+              "p05": 843746476251.9158,
+              "p50": 843793403507.0051,
+              "p95": 843840806475.433,
+              "p99": 843852079849.5525,
+              "trimmed_cv_pct": 0.0022,
+              "trimmed_mean": 843791253828.2651
+            },
+            "diagnostic": {
+              "cv_pct": 0.0034,
+              "nominal_bound": 844800000000.0,
+              "status": "calibrated"
+            }
+          },
+          "fp8_e4m3": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 27033600000000.0,
+              "cv_pct": 0.0914,
+              "n_samples": 24,
+              "p05": 20439586059228.637,
+              "p50": 20463480711605.523,
+              "p95": 20492539733807.01,
+              "p99": 20493940577638.38,
+              "trimmed_cv_pct": 0.0729,
+              "trimmed_mean": 20462276781840.34
+            },
+            "diagnostic": {
+              "cv_pct": 0.0914,
+              "nominal_bound": 27033600000000.0,
+              "status": "calibrated"
+            }
+          },
+          "hf32": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 6758400000000.0,
+              "cv_pct": 0.047,
+              "n_samples": 24,
+              "p05": 6580943600059.629,
+              "p50": 6586893133810.809,
+              "p95": 6590465029023.498,
+              "p99": 6591109473677.823,
+              "trimmed_cv_pct": 0.0366,
+              "trimmed_mean": 6586065617603.166
+            },
+            "diagnostic": {
+              "cv_pct": 0.047,
+              "nominal_bound": 6758400000000.0,
+              "status": "calibrated"
+            }
+          },
+          "int8": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 27033600000000.0,
+              "cv_pct": 0.1934,
+              "n_samples": 24,
+              "p05": 25993605232874.113,
+              "p50": 26067093569089.316,
+              "p95": 26125058100011.285,
+              "p99": 26135073541748.152,
+              "trimmed_cv_pct": 0.1495,
+              "trimmed_mean": 26068609295857.75
+            },
+            "diagnostic": {
+              "cv_pct": 0.1934,
+              "nominal_bound": 27033600000000.0,
+              "status": "calibrated"
+            }
+          },
+          "mxfp4": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 54067200000000.0,
+              "cv_pct": 0.0732,
+              "n_samples": 24,
+              "p05": 52501237537578.08,
+              "p50": 52567164681796.05,
+              "p95": 52609031905574.56,
+              "p99": 52613762335898.37,
+              "trimmed_cv_pct": 0.0595,
+              "trimmed_mean": 52566666984159.17
+            },
+            "diagnostic": {
+              "cv_pct": 0.0732,
+              "nominal_bound": 54067200000000.0,
+              "status": "calibrated"
+            }
+          },
+          "mxfp8": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 27033600000000.0,
+              "cv_pct": 0.2953,
+              "n_samples": 24,
+              "p05": 26346566186808.453,
+              "p50": 26487782832809.863,
+              "p95": 26577972497439.168,
+              "p99": 26587577099391.97,
+              "trimmed_cv_pct": 0.2329,
+              "trimmed_mean": 26477388259018.355
+            },
+            "diagnostic": {
+              "cv_pct": 0.2953,
+              "nominal_bound": 27033600000000.0,
+              "status": "calibrated"
+            }
+          }
+        },
+        "metric_diagnostics": {
+          "pipe_m_barrier_ns": {
+            "cv_pct": 0.2172,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mode_coverage": {
+          "calibrated_count": 10,
+          "calibrated_modes": [
+            "bf16",
+            "fp16",
+            "fp32",
+            "hf32",
+            "int8",
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "hifloat8",
+            "mxfp8",
+            "mxfp4"
+          ],
+          "conflict_modes": [],
+          "mode_diagnostics": {
+            "bf16": {
+              "cv_pct": 0.0429,
+              "nominal_bound": 13516800000000.0,
+              "status": "calibrated"
+            },
+            "fp16": {
+              "cv_pct": 0.017,
+              "nominal_bound": 13516800000000.0,
+              "status": "calibrated"
+            },
+            "fp32": {
+              "cv_pct": 0.0061,
+              "nominal_bound": 844800000000.0,
+              "status": "calibrated"
+            },
+            "fp8_e4m3": {
+              "cv_pct": 0.0114,
+              "nominal_bound": 27033600000000.0,
+              "status": "calibrated"
+            },
+            "fp8_e5m2": {
+              "cv_pct": 0.0076,
+              "nominal_bound": 27033600000000.0,
+              "status": "calibrated"
+            },
+            "hf32": {
+              "cv_pct": 0.0134,
+              "nominal_bound": 6758400000000.0,
+              "status": "calibrated"
+            },
+            "hifloat8": {
+              "cv_pct": 0.0072,
+              "nominal_bound": 27033600000000.0,
+              "status": "calibrated"
+            },
+            "int8": {
+              "cv_pct": 0.0088,
+              "nominal_bound": 27033600000000.0,
+              "status": "calibrated"
+            },
+            "mxfp4": {
+              "cv_pct": 0.0163,
+              "nominal_bound": 54067200000000.0,
+              "status": "calibrated"
+            },
+            "mxfp8": {
+              "cv_pct": 0.0098,
+              "nominal_bound": 27033600000000.0,
+              "status": "calibrated"
+            }
+          },
+          "supported_count": 10,
+          "unmeasured_modes": [],
+          "unsupported_modes": [
+            "int4"
+          ]
+        },
+        "pipe_m_barrier_fractal_threshold": 10,
+        "small_m_bf16_ns": {
+          "1": 13642.5,
+          "128": 22105.0,
+          "16": 14138.0,
+          "256": 26293.0,
+          "32": 14546.5,
+          "64": 19051.0
+        },
+        "small_m_bf16_warm_ns": {
+          "1": 8667.12,
+          "128": 18172.75,
+          "16": 10397.25,
+          "256": 23624.63,
+          "32": 11147.62,
+          "64": 14516.37
+        }
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns",
+        "rate": "flops_per_s_per_aic"
+      }
+    },
+    "P07_vec_alu": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "raw_latency_cycles": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "vec_alu_ops_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 105600000000.0,
+          "cv_pct": 0.6478,
+          "n_samples": 24,
+          "p05": 90802848011.81099,
+          "p50": 91667087841.30615,
+          "p95": 92619721733.2528,
+          "p99": 92701433565.74416,
+          "trimmed_cv_pct": 0.5181,
+          "trimmed_mean": 91719381072.59192
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "bf16_lanes": 128,
+        "fp32_lanes": 64,
+        "metric_diagnostics": {
+          "raw_latency_cycles": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "vec_alu_ops_per_s_per_aiv": {
+            "cv_pct": 0.6478,
+            "nominal_bound": 105600000000.0,
+            "status": "calibrated"
+          }
+        },
+        "probe_ops_per_element": 2.0,
+        "ub_bank_groups": 8,
+        "ub_bank_size_bytes": 16384,
+        "ub_banks_per_group": 2,
+        "vector_width_bytes": 256,
+        "work_unit": "elementary_alu_ops_per_s"
+      },
+      "status": "calibrated",
+      "units": {
+        "rate": "ops_per_s_per_aiv"
+      }
+    },
+    "P08_vec_sfu": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "raw_latency_cycles": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "vec_sfu_ops_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 105600000000.0,
+          "cv_pct": 2.378,
+          "n_samples": 24,
+          "p05": 74478487738.44414,
+          "p50": 77268464329.31346,
+          "p95": 80187434836.34895,
+          "p99": 80296221468.57455,
+          "trimmed_cv_pct": 1.9456,
+          "trimmed_mean": 77033865231.03629
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "bf16_lanes": 128,
+        "fp32_lanes": 64,
+        "metric_diagnostics": {
+          "raw_latency_cycles": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "vec_sfu_ops_per_s_per_aiv": {
+            "cv_pct": 2.378,
+            "nominal_bound": 105600000000.0,
+            "status": "calibrated"
+          }
+        },
+        "ub_bank_groups": 8,
+        "ub_bank_size_bytes": 16384,
+        "ub_banks_per_group": 2,
+        "vector_width_bytes": 256
+      },
+      "status": "calibrated",
+      "units": {
+        "rate": "ops_per_s_per_aiv"
+      }
+    },
+    "P09_vec_reduce_cast": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "cast_bytes_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 422400000000.0,
+          "cv_pct": 0.551,
+          "n_samples": 24,
+          "p05": 399076421153.1373,
+          "p50": 402176483700.81525,
+          "p95": 405512616039.3332,
+          "p99": 405817523223.5739,
+          "trimmed_cv_pct": 0.4682,
+          "trimmed_mean": 401882953445.7777
+        },
+        "vec_reduce_ops_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 105600000000.0,
+          "cv_pct": 1.029,
+          "n_samples": 24,
+          "p05": 72245329608.21138,
+          "p50": 73461794486.39534,
+          "p95": 74703797179.37418,
+          "p99": 74950295328.18076,
+          "trimmed_cv_pct": 0.7405,
+          "trimmed_mean": 73580844698.40298
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "metric_diagnostics": {
+          "cast_bytes_per_s_per_aiv": {
+            "cv_pct": 0.551,
+            "nominal_bound": 422400000000.0,
+            "status": "calibrated"
+          },
+          "vec_reduce_ops_per_s_per_aiv": {
+            "cv_pct": 1.029,
+            "nominal_bound": 105600000000.0,
+            "status": "calibrated"
+          }
+        },
+        "mx_dynamic_quant_supported": true,
+        "mx_scale_group": 32,
+        "ub_bank_groups": 8,
+        "ub_bank_size_bytes": 16384,
+        "ub_banks_per_group": 2
+      },
+      "status": "calibrated",
+      "units": {
+        "cast_rate": "bytes_per_s_per_aiv",
+        "rate": "ops_per_s_per_aiv"
+      }
+    },
+    "P10_sort_topk": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "sort_elems_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 105600000000.0
+        },
+        "sort_elems_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 105600000000.0,
+          "cv_pct": 0.3366,
+          "n_samples": 24,
+          "p05": 2702645738.472905,
+          "p50": 2716054238.34059,
+          "p95": 2731824948.274566,
+          "p99": 2732399011.276453,
+          "trimmed_cv_pct": 0.2701,
+          "trimmed_mean": 2715790330.806088
+        }
+      },
+      "modes": {
+        "masked_hist256": {
+          "sort_elems_per_s_per_aiv": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 105600000000.0
+          },
+          "status": "unmeasured",
+          "unmeasured_reason": "requires_histogram_microkernel"
+        },
+        "sort32_mrgsort4": {
+          "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+          "sort_elems_per_s_per_aiv": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 105600000000.0,
+            "cv_pct": 0.3366,
+            "n_samples": 24,
+            "p05": 2702645738.472905,
+            "p50": 2716054238.34059,
+            "p95": 2731824948.274566,
+            "p99": 2732399011.276453,
+            "trimmed_cv_pct": 0.2701,
+            "trimmed_mean": 2715790330.806088
+          },
+          "status": "calibrated"
+        }
+      },
+      "parameters": {
+        "histogram_trunk_elems": 16384,
+        "masked_hist256_supported": true,
+        "metric_diagnostics": {
+          "sort_elems_per_s": {
+            "nominal_bound": 105600000000.0,
+            "status": "unmeasured"
+          },
+          "sort_elems_per_s_per_aiv": {
+            "cv_pct": 0.3366,
+            "nominal_bound": 105600000000.0,
+            "status": "calibrated"
+          }
+        },
+        "probe_sort_length": 1024,
+        "probe_sort_passes": 4,
+        "sort_algorithm": "sort32_mrgsort4",
+        "sort_die_elems_per_s_p50": 173827471253.8,
+        "supported_sortall_lengths": [
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048
+        ],
+        "work_unit": "elem_passes_per_s"
+      },
+      "status": "calibrated",
+      "units": {
+        "rate": "elem_passes_per_s_per_aiv"
+      }
+    },
+    "P11_simt": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "simt_launch_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.3681,
+          "n_samples": 24,
+          "p05": 2831.155313,
+          "p50": 2851.771303,
+          "p95": 2864.170155,
+          "p99": 2867.142504,
+          "trimmed_cv_pct": 0.2775,
+          "trimmed_mean": 2850.785373
+        },
+        "simt_ops_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 6600000000.0,
+          "cv_pct": 0.5065,
+          "n_samples": 24,
+          "p05": 1634066209.721907,
+          "p50": 1649420785.289562,
+          "p95": 1658100706.635086,
+          "p99": 1667656332.251742,
+          "trimmed_cv_pct": 0.2803,
+          "trimmed_mean": 1648277725.595612
+        },
+        "simt_warp_instructions_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 6600000000.0,
+          "cv_pct": 0.5065,
+          "n_samples": 24,
+          "p05": 1634066209.721907,
+          "p50": 1649420785.289562,
+          "p95": 1658100706.635086,
+          "p99": 1667656332.251742,
+          "trimmed_cv_pct": 0.2803,
+          "trimmed_mean": 1648277725.595612
+        },
+        "syncthreads_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.7333,
+          "n_samples": 24,
+          "p05": 28.037751,
+          "p50": 28.492999,
+          "p95": 28.649448,
+          "p99": 28.856049,
+          "trimmed_cv_pct": 0.467,
+          "trimmed_mean": 28.4742
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "catlass_max_threads": 1024,
+        "metric_diagnostics": {
+          "simt_launch_ns": {
+            "cv_pct": 0.3681,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "simt_ops_per_s_per_aiv": {
+            "cv_pct": 0.5065,
+            "nominal_bound": 6600000000.0,
+            "status": "calibrated"
+          },
+          "simt_warp_instructions_per_s_per_aiv": {
+            "cv_pct": 0.5065,
+            "nominal_bound": 6600000000.0,
+            "status": "calibrated"
+          },
+          "syncthreads_ns": {
+            "cv_pct": 0.7333,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "simt_scalar_flops_per_s_per_aiv_p50": 105562930258.53,
+        "simt_ub_carveout_bytes": 32768,
+        "simt_ub_carveout_min_bytes": 32768,
+        "supported": true,
+        "tla_max_threads": 2048,
+        "warp_schedulers": 4,
+        "warp_size": 32
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns",
+        "rate": "warp_instructions_per_s_per_aiv"
+      }
+    },
+    "P12_intracore_flag": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "flag_m_fix_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.1541,
+          "n_samples": 24,
+          "p05": 2.420366,
+          "p50": 2.424453,
+          "p95": 2.431767,
+          "p99": 2.433439,
+          "trimmed_cv_pct": 0.0974,
+          "trimmed_mean": 2.425147
+        },
+        "flag_mte2_v_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.261,
+          "n_samples": 24,
+          "p05": 2.414645,
+          "p50": 2.424656,
+          "p95": 2.436678,
+          "p99": 2.438901,
+          "trimmed_cv_pct": 0.1377,
+          "trimmed_mean": 2.425684
+        },
+        "flag_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.1772,
+          "n_samples": 24,
+          "p05": 2.416869,
+          "p50": 2.424656,
+          "p95": 2.428609,
+          "p99": 2.430868,
+          "trimmed_cv_pct": 0.0961,
+          "trimmed_mean": 2.424266
+        },
+        "flag_v_mte3_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.2304,
+          "n_samples": 24,
+          "p05": 2.414041,
+          "p50": 2.424203,
+          "p95": 2.432733,
+          "p99": 2.436948,
+          "trimmed_cv_pct": 0.1217,
+          "trimmed_mean": 2.423562
+        },
+        "pipe_v_barrier_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "unitflag_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "event_ids": 8,
+        "metric_diagnostics": {
+          "flag_m_fix_ns": {
+            "cv_pct": 0.1541,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_mte2_v_ns": {
+            "cv_pct": 0.261,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_ns": {
+            "cv_pct": 0.1772,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_v_mte3_ns": {
+            "cv_pct": 0.2304,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "pipe_v_barrier_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "unitflag_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "unit_flag_requires_single_l0c_stage": true
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns"
+      }
+    },
+    "P13_crosscore_sync": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "mode0_aic_barrier_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "mode0_aiv_barrier_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.0754,
+          "n_samples": 24,
+          "p05": 194.775664,
+          "p50": 194.867004,
+          "p95": 195.188104,
+          "p99": 195.251131,
+          "trimmed_cv_pct": 0.05,
+          "trimmed_mean": 194.899751
+        },
+        "mode1_subblock_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "mode2_paired_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.2314,
+          "n_samples": 24,
+          "p05": 148.418926,
+          "p50": 149.029501,
+          "p95": 149.504096,
+          "p99": 149.657841,
+          "trimmed_cv_pct": 0.1644,
+          "trimmed_mean": 149.046524
+        },
+        "mode4_intra_block_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 3.6665,
+          "n_samples": 24,
+          "p05": 4.0807,
+          "p50": 4.244,
+          "p95": 4.5835,
+          "p99": 4.679045,
+          "trimmed_cv_pct": 1.9096,
+          "trimmed_mean": 4.268875
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "aic_inter_block_barrier_id": 9,
+        "aiv_inter_block_barrier_id": 8,
+        "ffts_max_flag_id": 7,
+        "hw_flag_ids": 16,
+        "intra_subblock_barrier_id": 10,
+        "metric_diagnostics": {
+          "mode0_aic_barrier_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "mode0_aiv_barrier_ns": {
+            "cv_pct": 0.0754,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "mode1_subblock_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "mode2_paired_ns": {
+            "cv_pct": 0.2314,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "mode4_intra_block_ns": {
+            "cv_pct": 3.6665,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mode4_supported": true,
+        "reverse_depth": 15
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns"
+      }
+    },
+    "P14_mutex_block_mmad": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "mutex_overhead_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.1086,
+          "n_samples": 24,
+          "p05": 3.026158,
+          "p50": 3.031406,
+          "p95": 3.037073,
+          "p99": 3.037895,
+          "trimmed_cv_pct": 0.0741,
+          "trimmed_mean": 3.032102
+        },
+        "mutex_xpipe_handoff_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.0612,
+          "n_samples": 24,
+          "p05": 5.449441,
+          "p50": 5.456141,
+          "p95": 5.461497,
+          "p99": 5.461635,
+          "trimmed_cv_pct": 0.0382,
+          "trimmed_mean": 5.455917
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "hw_mutex_ids": 32,
+        "max_mutex_ids": 28,
+        "metric_diagnostics": {
+          "mutex_overhead_ns": {
+            "cv_pct": 0.1086,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "mutex_xpipe_handoff_ns": {
+            "cv_pct": 0.0612,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "supported": true,
+        "unit_flag_requires_single_l0c_stage": true
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns"
+      }
+    },
+    "P15_rts_stars": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "aic_first_issue_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 4.0553,
+          "n_samples": 24,
+          "p05": 1187.068748,
+          "p50": 1233.437499,
+          "p95": 1307.043749,
+          "p99": 1307.44248,
+          "trimmed_cv_pct": 3.863,
+          "trimmed_mean": 1244.462498
+        },
+        "aiv_first_issue_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 2.5204,
+          "n_samples": 24,
+          "p05": 854.400006,
+          "p50": 878.499985,
+          "p95": 909.58125,
+          "p99": 921.877498,
+          "trimmed_cv_pct": 2.185,
+          "trimmed_mean": 880.137497
+        },
+        "host_submit_burst_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 2.2672,
+          "n_samples": 24,
+          "p05": 8388.530296,
+          "p50": 8510.54665,
+          "p95": 8980.186794,
+          "p99": 9024.398551,
+          "trimmed_cv_pct": 1.6279,
+          "trimmed_mean": 8559.625167
+        },
+        "host_submit_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.813,
+          "n_samples": 24,
+          "p05": 7051.917969,
+          "p50": 7176.25,
+          "p95": 7350.25,
+          "p99": 7357.530469,
+          "trimmed_cv_pct": 1.1134,
+          "trimmed_mean": 7189.84375
+        },
+        "issue_interval_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.2136,
+          "n_samples": 24,
+          "p05": 790.242709,
+          "p50": 807.052071,
+          "p95": 821.516666,
+          "p99": 823.866057,
+          "trimmed_cv_pct": 0.9076,
+          "trimmed_mean": 807.574999
+        },
+        "npugraph_issue_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.9139,
+          "n_samples": 24,
+          "p05": 910.393725,
+          "p50": 923.578133,
+          "p95": 962.603893,
+          "p99": 974.178893,
+          "trimmed_cv_pct": 1.2989,
+          "trimmed_mean": 925.929693
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "first_issue_includes_min_kernel": true,
+        "issue_interval_includes_min_kernel": true,
+        "issue_interval_owner": "aiv",
+        "lanes": 1,
+        "metric_diagnostics": {
+          "aic_first_issue_ns": {
+            "cv_pct": 4.0553,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "aiv_first_issue_ns": {
+            "cv_pct": 2.5204,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "host_submit_burst_ns": {
+            "cv_pct": 2.2672,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "host_submit_ns": {
+            "cv_pct": 1.813,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "issue_interval_ns": {
+            "cv_pct": 1.2136,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "npugraph_issue_ns": {
+            "cv_pct": 1.9139,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "queue_depth": 64,
+        "queue_scope": "die"
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns"
+      }
+    },
+    "P16_multistream_core_control": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "set_limit_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "stream_event_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.9913,
+          "n_samples": 24,
+          "p05": 727.200767,
+          "p50": 733.132823,
+          "p95": 745.510915,
+          "p99": 748.842009,
+          "trimmed_cv_pct": 0.5704,
+          "trimmed_mean": 734.39765
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "metric_diagnostics": {
+          "set_limit_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "stream_event_ns": {
+            "cv_pct": 0.9913,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "modes": [
+          "disjoint",
+          "shared_cap"
+        ]
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns"
+      }
+    },
+    "P17_aicpu_metadata_launch": {
+      "evidence_id": "",
+      "metrics": {
+        "aicpu_base_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "eager_d2h_sync_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.6771,
+          "n_samples": 24,
+          "p05": 23943.515625,
+          "p50": 24252.421875,
+          "p95": 24351.007812,
+          "p99": 24412.164062,
+          "trimmed_cv_pct": 0.393,
+          "trimmed_mean": 24234.523438
+        },
+        "gm_pub_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "host_select_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "aclgraph_cacheable": true,
+        "metric_diagnostics": {
+          "aicpu_base_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "eager_d2h_sync_ns": {
+            "cv_pct": 0.6771,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "gm_pub_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "host_select_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "unmeasured_reason": "requires_aicpu_metadata_select_probe"
+      },
+      "status": "unmeasured",
+      "units": {
+        "latency": "ns"
+      }
+    },
+    "P18_hccl_collective_band": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "link_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 56000000000.0,
+          "cv_pct": 0.0191,
+          "n_samples": 24,
+          "p05": 47803509021.802315,
+          "p50": 47822591979.98805,
+          "p95": 47831410456.82037,
+          "p99": 47831529329.30712,
+          "trimmed_cv_pct": 0.0137,
+          "trimmed_mean": 47822298655.62282
+        },
+        "startup_blocked_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.2296,
+          "n_samples": 24,
+          "p05": 12307.435926,
+          "p50": 12348.109391,
+          "p95": 12397.688814,
+          "p99": 12399.281831,
+          "trimmed_cv_pct": 0.1744,
+          "trimmed_mean": 12344.115693
+        },
+        "startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 2.9547,
+          "n_samples": 24,
+          "p05": 61697.778665,
+          "p50": 64058.251679,
+          "p95": 67617.815733,
+          "p99": 67748.459205,
+          "trimmed_cv_pct": 2.3647,
+          "trimmed_mean": 64275.974967
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "bandwidth_definition": "two_rank_allreduce_busbw_equals_algbw",
+        "curves_by_topology": {},
+        "group_max": 2,
+        "group_min": 2,
+        "mc2_contention": {},
+        "measured_collective": "all_reduce",
+        "measured_scope": "node",
+        "measured_world_size": 2,
+        "metric_diagnostics": {
+          "link_bytes_per_s": {
+            "cv_pct": 0.0191,
+            "nominal_bound": 56000000000.0,
+            "status": "calibrated"
+          },
+          "startup_blocked_ns": {
+            "cv_pct": 0.2296,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "startup_ns": {
+            "cv_pct": 2.9547,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "payload_bytes_per_frame": 1024,
+        "short_final_frame_policy": "exact_plus_header",
+        "wire_bytes_per_frame": 1024
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns",
+        "rate": "bytes_per_s"
+      }
+    },
+    "P19_direct_peer_window": {
+      "evidence_id": "",
+      "metrics": {
+        "peer_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 56000000000.0
+        },
+        "status_sync_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "curves_by_topology": {},
+        "hccl_duplex_diagnostics": {
+          "hccl_duplex_4k_blocked_ns": {
+            "band": {
+              "bound_kind": "latency_lower",
+              "certified_upper_capacity": 0.0
+            },
+            "diagnostic": {
+              "cv_pct": 28.0875,
+              "nominal_bound": 0.0,
+              "observed_p50": 11066.703126,
+              "observed_p99": 23259.999324,
+              "status": "high_cv_unsealed"
+            }
+          },
+          "hccl_duplex_4k_ns": {
+            "band": {
+              "bound_kind": "latency_lower",
+              "certified_upper_capacity": 0.0,
+              "cv_pct": 2.11,
+              "n_samples": 24,
+              "p05": 70802.540332,
+              "p50": 72456.747293,
+              "p95": 75674.371049,
+              "p99": 75912.047401,
+              "trimmed_cv_pct": 1.329,
+              "trimmed_mean": 72479.393706
+            },
+            "diagnostic": {
+              "cv_pct": 2.11,
+              "nominal_bound": 0.0,
+              "status": "calibrated"
+            }
+          },
+          "hccl_duplex_bytes_per_s": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 56000000000.0,
+              "cv_pct": 0.9362,
+              "n_samples": 24,
+              "p05": 41656356942.38899,
+              "p50": 42292670709.68007,
+              "p95": 43039935121.55815,
+              "p99": 43098887243.3559,
+              "trimmed_cv_pct": 0.5225,
+              "trimmed_mean": 42302553655.632576
+            },
+            "diagnostic": {
+              "cv_pct": 0.9362,
+              "nominal_bound": 56000000000.0,
+              "status": "calibrated"
+            }
+          }
+        },
+        "metric_diagnostics": {
+          "peer_bytes_per_s": {
+            "nominal_bound": 56000000000.0,
+            "status": "unmeasured"
+          },
+          "status_sync_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "token_payload_bytes_per_frame": 480,
+        "token_wire_bytes_per_frame": 512,
+        "transport": "a5_ub_shmem_mte",
+        "unmeasured_reason": "requires_direct_window_kernel"
+      },
+      "status": "unmeasured",
+      "units": {
+        "latency": "ns",
+        "rate": "bytes_per_s"
+      }
+    },
+    "P20_host_dma_sync": {
+      "evidence_id": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+      "metrics": {
+        "eager_d2h_sync_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.6771,
+          "n_samples": 24,
+          "p05": 23943.515625,
+          "p50": 24252.421875,
+          "p95": 24351.007812,
+          "p99": 24412.164062,
+          "trimmed_cv_pct": 0.393,
+          "trimmed_mean": 24234.523438
+        },
+        "host_d2h_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 64000000000.0,
+          "cv_pct": 3.2272,
+          "n_samples": 24,
+          "p05": 46639463776.72008,
+          "p50": 48093211123.1341,
+          "p95": 50503308882.518684,
+          "p99": 50525577270.66069,
+          "trimmed_cv_pct": 3.0209,
+          "trimmed_mean": 48259394271.457794
+        },
+        "host_h2d_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 64000000000.0,
+          "cv_pct": 3.2022,
+          "n_samples": 24,
+          "p05": 44155759308.997055,
+          "p50": 44484086459.52977,
+          "p95": 47769079267.14869,
+          "p99": 47795268928.167885,
+          "trimmed_cv_pct": 2.6696,
+          "trimmed_mean": 45109413462.6158
+        },
+        "host_rc_d2h_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 400000000000.0
+        },
+        "host_rc_h2d_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 400000000000.0
+        },
+        "pageable_d2h_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pageable_dma_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pageable_h2d_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pinned_d2h_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pinned_dma_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pinned_h2d_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        }
+      },
+      "modes": {},
+      "parameters": {
+        "contention_scope": "root_complex",
+        "dma_curve_by_size": {},
+        "metric_diagnostics": {
+          "eager_d2h_sync_ns": {
+            "cv_pct": 0.6771,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "host_d2h_bytes_per_s": {
+            "cv_pct": 3.2272,
+            "nominal_bound": 64000000000.0,
+            "status": "calibrated"
+          },
+          "host_h2d_bytes_per_s": {
+            "cv_pct": 3.2022,
+            "nominal_bound": 64000000000.0,
+            "status": "calibrated"
+          },
+          "host_rc_d2h_bytes_per_s": {
+            "nominal_bound": 400000000000.0,
+            "status": "unmeasured"
+          },
+          "host_rc_h2d_bytes_per_s": {
+            "nominal_bound": 400000000000.0,
+            "status": "unmeasured"
+          },
+          "pageable_d2h_startup_ns": {
+            "cv_pct": 113.5396,
+            "nominal_bound": 0.0,
+            "observed_p50": 50298.49868,
+            "observed_p99": 378148.93635,
+            "status": "high_cv_unsealed"
+          },
+          "pageable_dma_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pageable_h2d_startup_ns": {
+            "cv_pct": 109.3476,
+            "nominal_bound": 0.0,
+            "observed_p50": 49715.510384,
+            "observed_p99": 335091.461367,
+            "status": "high_cv_unsealed"
+          },
+          "pinned_d2h_startup_ns": {
+            "cv_pct": 6.221,
+            "nominal_bound": 0.0,
+            "observed_p50": 38763.599906,
+            "observed_p99": 47118.209054,
+            "status": "high_cv_unsealed"
+          },
+          "pinned_dma_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pinned_h2d_startup_ns": {
+            "cv_pct": 23.5748,
+            "nominal_bound": 0.0,
+            "observed_p50": 40305.808817,
+            "observed_p99": 76062.439985,
+            "status": "high_cv_unsealed"
+          }
+        }
+      },
+      "status": "calibrated",
+      "units": {
+        "latency": "ns",
+        "rate": "bytes_per_s"
+      }
+    }
+  },
+  "provenance": {
+    "calibrated": true,
+    "campaign_id": "live-a5-9582-cann930-20261123",
+    "capture_uri": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
+    "clock_calibration": {
+      "core_clock_scale_ratio": 1.0,
+      "nominal_cube_freq_mhz": 1650.0,
+      "observed_aicore_freq_mhz": 1650
+    },
+    "collected_utc": "2026-11-23T03:16:34Z",
+    "endpoint_alias": "a5-9582-ep",
+    "silicon_fingerprint": {
+      "aic_count": 32,
+      "aiv_count": 64,
+      "hbm_gib": 96,
+      "l0a_bytes": 65536,
+      "l0b_bytes": 65536,
+      "l0c_bytes": 262144,
+      "l1_bytes": 524288,
+      "l2_bytes": 134217728,
+      "ub_bytes": 253952
+    }
+  },
+  "schema_version": "mindie-l0-primitives/1",
+  "sku": "Ascend950DT_9582"
+}

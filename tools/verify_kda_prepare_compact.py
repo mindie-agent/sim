@@ -10,10 +10,10 @@ import json
 from pathlib import Path
 import time
 
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import PlannedRecipe
-from mindie_sim.prediction.operators import kda_prepare, kda_prepare_compact
+from mindie_sim.prediction.operators.kda import kda_prepare, kda_prepare_compact
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import IterationWork

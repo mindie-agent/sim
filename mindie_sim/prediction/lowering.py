@@ -50,12 +50,14 @@ class Builder:
             row_bytes=row_bytes, dtype=dtype, kind=name, recipe=name, **self.common,
         ))
 
-    def communicate(self, name, deps, volume, family, axis="tp", **metadata):
-        return self.add(comm_op(
+    def communicate(self, name, deps, volume, family, axis="tp", *, dtype=None, shape=None, **metadata):
+        from dataclasses import replace
+        op = comm_op(
             op_id=self.prefix + "." + name, deps=tuple(deps), link_bytes=volume,
-            family=family, recipe=name, shape=(volume,),
+            family=family, recipe=name, shape=(tuple(shape) if shape is not None else (volume,)),
             metadata=tuple(sorted({"group_axis": axis, **metadata}.items())), **self.common,
-        ))
+        )
+        return self.add(replace(op, dtype=str(dtype or self.model.activation_dtype)))
 
     def work(self, name, deps, shape, *, flops=0, matrix_flops=(), vector=0,
              read=0, write=0, hbm_read=None, family="attention", dtype=None,

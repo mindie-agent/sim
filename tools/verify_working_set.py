@@ -17,9 +17,9 @@ from mindie_sim import predict
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.matrix import HierarchicalMatmul
+from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul
 from mindie_sim.prediction.program import PipelineProgram, RecipeContext, Stage
-from mindie_sim.prediction.transfer import FiniteTransfer
+from mindie_sim.prediction.collectives.transfer import FiniteTransfer
 from mindie_sim.prediction.transactions import QueuedStore
 from mindie_sim.prediction.collectives import RingGroup
 from mindie_sim.prediction.communication import MessageFlow, RoutedHop, RoutedMessage

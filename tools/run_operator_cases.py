@@ -14,7 +14,7 @@ import json
 import math
 from pathlib import Path
 
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.prediction.instructions import REGISTER_RESOURCES
 
 

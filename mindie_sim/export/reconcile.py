@@ -1,0 +1,522 @@
+"""Streaming ``msprof`` ``kernel_details.csv`` ingress and 1-to-N reconciliation.
+
+[Role] Stream Ascend ``msprof`` ``kernel_details.csv`` or JSON observation
+  bundles into typed ``KernelObservationRow`` records and perform
+  sample-conserving 1-to-N matching against lowered ``OperatorExportRow`` items.
+[Invariants] Every observed kernel row is matched at most once; unmatched
+  kernels are accounted for explicitly rather than dropped; bounded JSON reads
+  (``<= 50 MiB``) and streaming CSV iteration keep memory bounded.
+[Timeouts & Locks] Local read-only file streaming; no locks or device contexts.
+[Side-Effect Policy] Read-only over caller observation paths.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+import csv
+import json
+import math
+from pathlib import Path
+from statistics import median
+from typing import Any
+
+from mindie_sim.prediction.results import OpOccurrence
+from mindie_sim.schema.common import ModelingError
+
+from .models import (
+    MAX_OBSERVATION_JSON_BYTES,
+    MIN_MATCH_TOKEN_LEN,
+    P90_QUANTILE,
+    RECONCILE_ABS_FLOOR_US,
+    RECONCILE_APE_THRESHOLD_PCT,
+    KernelObservationRow,
+    OperatorExportRow,
+    ReconciledKernelGroup,
+    ReconciliationSummary,
+)
+
+_CSV_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "name": ("name", "kernel_name", "op name", "op_name"),
+    "op_type": ("type", "op type", "op_type", "kernel_type"),
+    "core": ("accelerator core", "core", "kernel_type", "task type"),
+    "start_us": ("start time(us)", "task start time(us)", "task_start(us)", "start_us"),
+    "duration_us": ("duration(us)", "task duration(us)", "task_time(us)", "duration_us"),
+    "stream_id": ("stream id", "stream_id"),
+    "task_id": ("task id", "task_id"),
+    "input_shapes": ("input shapes", "input_shapes"),
+    "input_dtypes": ("input data types", "input_dtypes"),
+}
+_FUSED_KERNEL_HINTS: dict[str, tuple[str, ...]] = {
+    "qkv_projection": ("qkv", "q_proj", "k_proj", "v_proj", "matmul", "mm"),
+    "add_rmsnorm_quant": ("add", "rmsnorm", "rms_norm", "quant", "dynamicquant"),
+    "add_rmsnorm": ("add", "rmsnorm", "rms_norm"),
+    "mla_prolog": ("mla", "prolog", "rope", "rotary", "quant", "matmul"),
+    "gate_up_projection": ("gate", "up", "matmul", "mm"),
+    "grouped_gemm": ("grouped", "gmm", "moe", "matmul"),
+    "attention": ("flashattention", "mla", "attention", "fia", "ifa", "pfa", "sfa"),
+    "allreduce": ("allreduce", "all_reduce"),
+    "all_reduce": ("allreduce", "all_reduce"),
+    "allgather": ("allgather", "all_gather"),
+    "all_gather": ("allgather", "all_gather"),
+    "reduce_scatter": ("reducescatter", "reduce_scatter"),
+    "reducescatter": ("reducescatter", "reduce_scatter"),
+    "alltoall": ("alltoall", "all_to_all"),
+    "all_to_all": ("alltoall", "all_to_all"),
+    "alltoallv": ("alltoallv", "all_to_all_v"),
+    "all_to_all_v": ("alltoallv", "all_to_all_v"),
+    "moe_dispatch": ("moedistributedispatch", "dispatch"),
+    "moe_combine": ("moedistributecombine", "combine"),
+    "broadcast": ("hcombroadcast", "hcclbroadcast", "broadcast"),
+    "reduce": ("hcomreduce", "hcclreduce", "reduce"),
+    "p2p_send": ("hcomsend", "hcclsend", "p2psend", "send"),
+    "p2p_recv": ("hcomrecv", "hcomreceive", "hcclrecv", "hcclreceive", "p2precv", "p2preceive", "recv", "receive"),
+    "scatter": ("hcomscatter", "hcclscatter", "scatter"),
+    "gather": ("hcomgather", "hcclgather", "gather"),
+    "rmsnorm": ("rmsnorm", "rms_norm", "norm"),
+    "rotary": ("rotary", "rope"),
+    "swiglu": ("swiglu", "silu", "mul"),
+    "quantize": ("quant", "dynamicquant"),
+}
+_GENERIC_COLLECTIVE_TOKENS = frozenset({"hccl", "hcom", "collective", "p2p"})
+_COLLECTIVE_FAMILIES = frozenset({
+    "collective", "allreduce", "all_reduce", "allgather", "all_gather",
+    "reduce_scatter", "reducescatter", "alltoall", "all_to_all",
+    "alltoallv", "all_to_all_v", "broadcast", "reduce", "scatter", "gather",
+    "p2p", "send", "recv", "receive", "moe_dispatch", "moe_combine",
+    "mc2_dispatch", "mc2_combine",
+})
+_COMPUTE_CORES = frozenset({"AI_CORE", "AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV", "AIC", "AIV"})
+_NON_COLLECTIVE_VECTOR_KINDS = (
+    "broadcastto", "reducesum", "reducemean", "reducemax", "reducemin",
+    "reduceprod", "reduceany", "reduceall", "reducestd", "argmax", "argmin",
+)
+
+
+def _clean_text(raw: Any) -> str:
+    text = str(raw or "").strip().strip('"').strip()
+    return "" if text.upper() in {"N/A", "NA", "NONE", "NULL"} else text
+
+
+def _parse_float(raw: str, label: str) -> float:
+    cleaned = _clean_text(raw)
+    if not cleaned:
+        raise ModelingError(f"kernel_csv_missing_{label}")
+    try:
+        value = float(cleaned)
+    except ValueError as exc:
+        raise ModelingError(f"kernel_csv_invalid_{label}:{raw!r}") from exc
+    if not math.isfinite(value):
+        raise ModelingError(f"kernel_csv_nonfinite_{label}:{raw!r}")
+    return value
+
+
+def load_kernel_details_csv(path: str | Path) -> tuple[KernelObservationRow, ...]:
+    """Stream an Ascend ``msprof`` ``kernel_details.csv`` into typed observation rows."""
+    target = Path(path)
+    if not target.is_file():
+        raise FileNotFoundError(f"kernel_details_csv_not_found:{target}")
+    rows: list[KernelObservationRow] = []
+    with target.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise ModelingError(f"kernel_csv_empty_header:{target.name}")
+        cols = {str(key).strip().lower(): key for key in reader.fieldnames}
+        selected = {
+            field: next((cols[alias] for alias in aliases if alias in cols), None)
+            for field, aliases in _CSV_COLUMN_ALIASES.items()
+        }
+        if not selected["name"] or not selected["duration_us"]:
+            raise ModelingError(f"kernel_csv_missing_required_columns:{target.name}")
+        for idx, raw in enumerate(reader):
+            name = _clean_text(raw.get(selected["name"]))
+            if not name:
+                continue
+            dur_us = _parse_float(raw.get(selected["duration_us"], ""), "duration_us")
+            if dur_us <= 0.0:
+                continue
+            start_raw = raw.get(selected["start_us"], "") if selected["start_us"] else ""
+            start_us = _parse_float(start_raw, "start_us") if _clean_text(start_raw) else float(idx)
+            rows.append(KernelObservationRow(
+                index=len(rows),
+                name=name,
+                op_type=_clean_text(raw.get(selected["op_type"])) if selected["op_type"] else "",
+                core=_clean_text(raw.get(selected["core"])) if selected["core"] else "",
+                start_us=start_us,
+                duration_us=dur_us,
+                stream_id=_clean_text(raw.get(selected["stream_id"])) if selected["stream_id"] else "",
+                task_id=_clean_text(raw.get(selected["task_id"])) if selected["task_id"] else "",
+                input_shapes=_clean_text(raw.get(selected["input_shapes"])) if selected["input_shapes"] else "",
+                input_dtypes=_clean_text(raw.get(selected["input_dtypes"])) if selected["input_dtypes"] else "",
+            ))
+    rows.sort(key=lambda item: (item.start_us, item.index))
+    return tuple(rows)
+
+
+def load_observation_bundle(
+    path: str | Path,
+) -> tuple[tuple[KernelObservationRow, ...], dict[str, tuple[str, ...]]]:
+    """Load an observation JSON bundle or ``kernel_details.csv`` with optional 1-to-N map."""
+    target = Path(path)
+    if not target.is_file():
+        raise FileNotFoundError(f"observation_bundle_not_found:{target}")
+    if target.suffix.lower() == ".csv":
+        return load_kernel_details_csv(target), {}
+    if target.stat().st_size > MAX_OBSERVATION_JSON_BYTES:
+        raise ModelingError("observation_json_exceeds_50_mib_limit")
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ModelingError("observation_bundle_must_be_mapping")
+    kernels: list[KernelObservationRow] = []
+    explicit_map: dict[str, tuple[str, ...]] = {}
+    if payload.get("kernel_csv"):
+        csv_path = Path(str(payload["kernel_csv"]))
+        if not csv_path.is_absolute():
+            csv_path = (target.parent / csv_path).resolve()
+        kernels.extend(load_kernel_details_csv(csv_path))
+    next_index = max((k.index for k in kernels), default=-1) + 1
+    for idx, entry in enumerate(payload.get("kernels", ()) or ()):
+        if not isinstance(entry, Mapping):
+            continue
+        dur = float(entry.get("duration_us", 0.0) or 0.0)
+        if dur <= 0.0 or not math.isfinite(dur):
+            continue
+        kernels.append(KernelObservationRow(
+            index=next_index,
+            name=str(entry.get("name", f"kernel_{idx}")),
+            op_type=str(entry.get("op_type", entry.get("type", ""))),
+            core=str(entry.get("core", "")),
+            start_us=float(entry.get("start_us", idx) or idx),
+            duration_us=dur,
+            stream_id=str(entry.get("stream_id", "")),
+            task_id=str(entry.get("task_id", "")),
+            input_shapes=str(entry.get("input_shapes", "")),
+            input_dtypes=str(entry.get("input_dtypes", "")),
+        ))
+        next_index += 1
+    for group in (payload.get("mappings") or payload.get("groups") or ()):
+        if not isinstance(group, Mapping):
+            continue
+        sim_id = str(group.get("sim_op_id") or group.get("op_id") or "").strip()
+        if not sim_id:
+            continue
+        has_kernels_field = "kernels" in group
+        raw_k_list = group.get("kernels")
+        names: list[str] = []
+        for k_entry in (raw_k_list or ()):
+            if isinstance(k_entry, str):
+                names.append(k_entry)
+            elif isinstance(k_entry, Mapping):
+                kname = str(k_entry.get("name", "")).strip()
+                kdur = float(k_entry.get("duration_us", 0.0) or 0.0)
+                if kname and kdur > 0.0:
+                    names.append(kname)
+                    kernels.append(KernelObservationRow(
+                        index=next_index, name=kname,
+                        op_type=str(k_entry.get("op_type", "")),
+                        core=str(k_entry.get("core", "")),
+                        start_us=float(k_entry.get("start_us", next_index) or next_index),
+                        duration_us=kdur,
+                        stream_id=str(k_entry.get("stream_id", "")),
+                        task_id=str(k_entry.get("task_id", "")),
+                        input_shapes=str(k_entry.get("input_shapes", "")),
+                        input_dtypes=str(k_entry.get("input_dtypes", "")),
+                    ))
+                    next_index += 1
+        if names or (
+            has_kernels_field
+            and isinstance(raw_k_list, Sequence)
+            and not isinstance(raw_k_list, (str, bytes))
+        ):
+            explicit_map[sim_id] = tuple(names)
+    return tuple(kernels), explicit_map
+
+
+def _collective_kind_from_text(
+    text: str,
+    *,
+    is_hccl: bool = False,
+    is_compute_core: bool = False,
+) -> str | None:
+    """Classify canonical collective operation kind from an op/kernel descriptor."""
+    compact = "".join(ch for ch in text.lower() if ch.isalnum())
+    if not compact:
+        return None
+    has_hcom_prefix = "hcom" in compact or "hccl" in compact
+    if not has_hcom_prefix and any(tok in compact for tok in _NON_COLLECTIVE_VECTOR_KINDS):
+        return None
+    if "reducescatter" in compact:
+        return "reduce_scatter"
+    if "allgather" in compact:
+        return "all_gather"
+    if "allreduce" in compact:
+        return "all_reduce"
+    if "alltoallv" in compact:
+        return "all_to_all_v"
+    if "alltoall" in compact:
+        return "all_to_all"
+    if "moedistributedispatch" in compact:
+        return "moe_dispatch"
+    if "moedistributecombine" in compact:
+        return "moe_combine"
+    if "broadcast" in compact:
+        if is_hccl or has_hcom_prefix or (not is_compute_core and compact == "broadcast"):
+            return "broadcast"
+        return None
+    if "hcomsend" in compact or "hcclsend" in compact or "p2psend" in compact:
+        return "p2p_send"
+    if (
+        "hcomrecv" in compact or "hcomreceive" in compact
+        or "hcclrecv" in compact or "hcclreceive" in compact
+        or "p2precv" in compact or "p2preceive" in compact
+    ):
+        return "p2p_recv"
+    if "hcomreduce" in compact or "hcclreduce" in compact:
+        return "reduce"
+    if is_hccl or has_hcom_prefix:
+        if "dispatch" in compact:
+            return "moe_dispatch"
+        if "combine" in compact:
+            return "moe_combine"
+        if compact == "send" or compact.endswith("send"):
+            return "p2p_send"
+        if compact in {"recv", "receive"} or compact.endswith("recv") or compact.endswith("receive"):
+            return "p2p_recv"
+        if compact == "reduce":
+            return "reduce"
+        if compact == "scatter":
+            return "scatter"
+        if compact == "gather":
+            return "gather"
+    return None
+
+
+def _operator_collective_kinds(op: OperatorExportRow) -> tuple[frozenset[str], bool]:
+    """Return ``(collective_kinds, is_pure_collective)`` for heuristic agreement checks."""
+    is_hccl = op.task_type.strip().upper() == "HCCL" or op.family.strip().lower() in _COLLECTIVE_FAMILIES
+    kinds: set[str] = set()
+    for text in (
+        op.family,
+        op.recipe,
+        op.ascend_kernel or op.implementation,
+        op.op_id.rsplit(".", 1)[-1],
+        *op.absorbed_source_ops,
+    ):
+        if not text:
+            continue
+        kind = _collective_kind_from_text(text, is_hccl=is_hccl)
+        if kind is not None:
+            kinds.add(kind)
+    # Prefer specific all-to-all specializations over the broad ``alltoall`` family tag.
+    if "all_to_all" in kinds and (kinds & {"all_to_all_v", "moe_dispatch", "moe_combine"}):
+        kinds.discard("all_to_all")
+    fam_rec = f"{op.family} {op.recipe}".lower()
+    has_compute = any(tok in fam_rec for tok in ("matmul", "gemm", "mm_", "_mm"))
+    return frozenset(kinds), bool(is_hccl and not has_compute)
+
+
+def _kernel_collective_kind(kernel: KernelObservationRow) -> str | None:
+    core_up = kernel.core.strip().upper()
+    is_hccl = core_up == "HCCL"
+    is_compute = core_up in _COMPUTE_CORES
+    for text in (kernel.name, kernel.op_type):
+        kind = _collective_kind_from_text(text, is_hccl=is_hccl, is_compute_core=is_compute)
+        if kind is not None:
+            return kind
+    return None
+
+
+def _operator_match_tokens(op: OperatorExportRow, op_colls: frozenset[str] = frozenset()) -> tuple[str, ...]:
+    tokens: list[str] = []
+    skip_broad_a2a = bool(op_colls & {"all_to_all_v", "moe_dispatch", "moe_combine"}) and "all_to_all" not in op_colls
+    suffix = op.op_id.rsplit(".", 1)[-1].lower()
+    if suffix and len(suffix) >= MIN_MATCH_TOKEN_LEN and suffix not in _GENERIC_COLLECTIVE_TOKENS:
+        if not (skip_broad_a2a and suffix in {"alltoall", "all_to_all"}):
+            tokens.append(suffix)
+    for source in (op.family, op.recipe, op.ascend_kernel or op.implementation, *op.absorbed_source_ops):
+        lower = source.strip().lower()
+        if lower and len(lower) >= MIN_MATCH_TOKEN_LEN and lower not in _GENERIC_COLLECTIVE_TOKENS:
+            if skip_broad_a2a and lower in {"alltoall", "all_to_all"}:
+                continue
+            tokens.append(lower)
+            for hint in _FUSED_KERNEL_HINTS.get(lower, ()):
+                tokens.append(hint)
+    for kind in sorted(op_colls):
+        for hint in _FUSED_KERNEL_HINTS.get(kind, ()):
+            tokens.append(hint)
+    return tuple(dict.fromkeys(tokens))
+
+
+def _kernel_matches_tokens(
+    kernel: KernelObservationRow,
+    tokens: Sequence[str],
+    *,
+    op_colls: frozenset[str] = frozenset(),
+    op_is_pure_collective: bool = False,
+) -> bool:
+    kern_coll = _kernel_collective_kind(kernel)
+    if kern_coll is not None and kern_coll not in op_colls:
+        return False
+    if op_is_pure_collective:
+        if op_colls:
+            if kern_coll not in op_colls:
+                return False
+        elif kern_coll is None and kernel.core.strip().upper() != "HCCL":
+            return False
+    haystack = f"{kernel.name} {kernel.op_type}".lower()
+    return any(tok in haystack for tok in tokens)
+
+
+def _build_reconciled_group(
+    op: OperatorExportRow, matched: tuple[KernelObservationRow, ...],
+) -> ReconciledKernelGroup:
+    meas_sum = math.fsum(k.duration_us for k in matched)
+    if meas_sum <= 0.0:
+        return ReconciledKernelGroup(op.op_id, matched, None, None, None)
+    abs_err = abs(op.dur_us - meas_sum)
+    ape_pct = 100.0 * abs_err / meas_sum
+    gate_limit = max((RECONCILE_APE_THRESHOLD_PCT / 100.0) * meas_sum, RECONCILE_ABS_FLOOR_US)
+    return ReconciledKernelGroup(
+        sim_op_id=op.op_id,
+        kernels=matched,
+        measured_sum_us=meas_sum,
+        ape_pct=ape_pct,
+        within_gate=abs_err <= gate_limit,
+    )
+
+
+def _nearest_rank_percentile(sorted_vals: Sequence[float], frac: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    idx = max(0, min(len(sorted_vals) - 1, math.ceil(frac * len(sorted_vals)) - 1))
+    return float(sorted_vals[idx])
+
+
+def _consume_explicit_kernels(
+    wanted: Sequence[str],
+    by_name: Mapping[str, Sequence[tuple[int, KernelObservationRow]]],
+    kernels: Sequence[KernelObservationRow],
+    consumed: set[int],
+) -> list[KernelObservationRow]:
+    matched: list[KernelObservationRow] = []
+    tentative: set[int] = set()
+    for pattern in wanted:
+        chosen = next(
+            ((pos, k) for pos, k in by_name.get(pattern, ()) if pos not in consumed and pos not in tentative),
+            None,
+        )
+        if chosen is None:
+            pat_low = pattern.lower()
+            chosen = next(
+                (
+                    (pos, k)
+                    for pos, k in enumerate(kernels)
+                    if pos not in consumed and pos not in tentative and pat_low in k.name.lower()
+                ),
+                None,
+            )
+        if chosen is None:
+            return []
+        tentative.add(chosen[0])
+        matched.append(chosen[1])
+    consumed.update(tentative)
+    return matched
+
+
+def reconcile_operators_with_kernels(
+    operators: Sequence[OperatorExportRow],
+    kernels: Sequence[KernelObservationRow],
+    *,
+    explicit_map: Mapping[OpOccurrence | str, Sequence[str]] | None = None,
+    source_label: str = "kernel_details.csv",
+) -> tuple[dict[OpOccurrence, ReconciledKernelGroup], ReconciliationSummary]:
+    """Perform sample-conserving ``OpOccurrence``-keyed 1-to-N reconciliation."""
+    seen_occurrences: set[OpOccurrence] = set()
+    for op in operators:
+        if op.occurrence in seen_occurrences:
+            raise ModelingError(f"duplicate_operator_occurrence:{op.occurrence!r}")
+        seen_occurrences.add(op.occurrence)
+
+    consumed: set[int] = set()
+    groups: dict[OpOccurrence, ReconciledKernelGroup] = {}
+    explicit = dict(explicit_map or {})
+    by_name: dict[str, list[tuple[int, KernelObservationRow]]] = defaultdict(list)
+    for pos, row in enumerate(kernels):
+        by_name[row.name].append((pos, row))
+
+    explicit_bound: set[OpOccurrence] = set()
+    for op in operators:
+        if op.occurrence not in explicit:
+            continue
+        explicit_bound.add(op.occurrence)
+        wanted = explicit[op.occurrence]
+        if not wanted:
+            continue
+        matched = _consume_explicit_kernels(wanted, by_name, kernels, consumed)
+        if matched:
+            groups[op.occurrence] = _build_reconciled_group(op, tuple(matched))
+
+    for op in operators:
+        if op.occurrence in explicit_bound or op.op_id not in explicit:
+            continue
+        explicit_bound.add(op.occurrence)
+        wanted = explicit[op.op_id]
+        if not wanted:
+            continue
+        matched = _consume_explicit_kernels(wanted, by_name, kernels, consumed)
+        if matched:
+            groups[op.occurrence] = _build_reconciled_group(op, tuple(matched))
+
+    cursor = 0
+    for op in operators:
+        if op.occurrence in groups or op.occurrence in explicit_bound:
+            continue
+        op_colls, op_is_pure_coll = _operator_collective_kinds(op)
+        tokens = _operator_match_tokens(op, op_colls)
+        matched = []
+        scan_idx = cursor
+        max_group = max(1, len(op.absorbed_source_ops) + 1)
+        while scan_idx < len(kernels) and len(matched) < max_group:
+            pos = scan_idx
+            cand = kernels[pos]
+            scan_idx += 1
+            if pos in consumed:
+                continue
+            if _kernel_matches_tokens(
+                cand,
+                tokens,
+                op_colls=op_colls,
+                op_is_pure_collective=op_is_pure_coll,
+            ):
+                consumed.add(pos)
+                matched.append(cand)
+                cursor = scan_idx
+            elif matched:
+                break
+        if matched:
+            groups[op.occurrence] = _build_reconciled_group(op, tuple(matched))
+
+    unmatched = tuple(k for pos, k in enumerate(kernels) if pos not in consumed)
+    apes = sorted(g.ape_pct for g in groups.values() if g.ape_pct is not None and math.isfinite(g.ape_pct))
+    med_ape = float(median(apes)) if apes else None
+    p90_ape = _nearest_rank_percentile(apes, P90_QUANTILE) if apes else None
+    within_count = sum(1 for g in groups.values() if g.within_gate is True)
+    within_pct = (100.0 * within_count / len(groups)) if groups else None
+    matched_sim_sum = math.fsum(op.dur_us for op in operators if op.occurrence in groups)
+    matched_meas_sum = math.fsum(k.duration_us for g in groups.values() for k in g.kernels)
+    unmatched_meas_sum = math.fsum(k.duration_us for k in unmatched)
+    summary = ReconciliationSummary(
+        source_label=source_label,
+        total_sim_ops=len(operators),
+        matched_sim_ops=len(groups),
+        total_kernels=len(kernels),
+        matched_kernels=len(consumed),
+        unmatched_kernels=unmatched,
+        matched_sim_sum_us=matched_sim_sum,
+        matched_measured_sum_us=matched_meas_sum,
+        unmatched_measured_us=unmatched_meas_sum,
+        median_ape_pct=med_ape,
+        p90_ape_pct=p90_ape,
+        within_gate_count=within_count,
+        within_gate_pct=within_pct,
+    )
+    return groups, summary

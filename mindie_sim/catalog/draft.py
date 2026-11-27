@@ -5,31 +5,180 @@
 [Timeouts & Locks] Pure computation.
 [Side-Effect Policy] No I/O.
 """
+from collections.abc import Mapping
+from dataclasses import replace
+
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.catalog.types import DraftSpec
-from dataclasses import replace
 
 ZERO_EXPERTS = 0
+FLOAT_WEIGHT_FORMATS = frozenset({"bf16", "fp16", "fp32", "bfloat16", "float16", "float32"})
+
+
+def _draft_layer_quant_overrides(model, quant, draft) -> dict[str, dict[str, object]]:
+    """Keep only draft-scoped ``native_layers``/``draft_layers`` overrides matching declared draft plans."""
+    if not getattr(quant, "layer_quant_overrides", ()):
+        return {}
+    plans = tuple(getattr(draft, "layer_plans", ()) or ())
+    draft_native_ids = {
+        str(int(getattr(plan, "native_layer_id", -1)))
+        for plan in plans
+        if getattr(plan, "scope", "") == "draft" and int(getattr(plan, "native_layer_id", -1)) >= 0
+    }
+    if not draft_native_ids:
+        return {}
+    target_native_ids = {
+        str(int(getattr(plan, "native_layer_id", -1)))
+        for plan in (getattr(model, "layer_plans", ()) or ())
+        if getattr(plan, "scope", "") != "draft" and int(getattr(plan, "native_layer_id", -1)) >= 0
+    }
+    raw = quant.layer_quant_overrides_dict()
+    kept: dict[str, dict[str, object]] = {}
+    for bucket in ("native_layers", "draft_layers"):
+        bucket_map = raw.get(bucket)
+        if not isinstance(bucket_map, Mapping):
+            continue
+        allowed_ids = (
+            draft_native_ids - target_native_ids
+            if bucket == "native_layers"
+            else draft_native_ids
+        )
+        matched = {
+            str(k): v
+            for k, v in bucket_map.items()
+            if str(k) in allowed_ids and v is not None
+        }
+        if matched:
+            kept[bucket] = matched
+    return kept
+
+
+def _draft_scoped_overrides(quant, draft) -> dict[str, dict[str, object]]:
+    """Extract only overrides explicitly scoped to this draft, never target roles."""
+    prefix = f"{draft.weight_category}."
+    kept: dict[str, dict[str, object]] = {}
+    for key, raw in quant.category_overrides:
+        fields = dict(raw)
+        if key.startswith(prefix):
+            kept[key] = fields
+        elif (
+            key == "dspark_routed_expert"
+            and draft.kind in {"dspark", "mtp_dspark", "standalone_draft"}
+            and str(fields.get("weight_format", "")).strip().lower() not in {"", *FLOAT_WEIGHT_FORMATS}
+        ):
+            kept[key] = fields
+    return kept
+
+
+def _draft_declared_native_dtype(model, draft, quant) -> str:
+    raw = str(
+        getattr(draft, "activation_dtype", "")
+        or getattr(quant, "native_format", "")
+        or getattr(model, "activation_dtype", "")
+        or ""
+    ).strip().lower()
+    if raw not in FLOAT_WEIGHT_FORMATS:
+        raise ModelingError(f"draft_native_dtype_missing_or_invalid:{raw!r}")
+    return raw
+
+
+def _draft_declared_kv_dtype(draft, *, fallback: str) -> str:
+    src = dict(getattr(draft, "source", ()) or ())
+    declared = str(src.get("kv_dtype") or getattr(draft, "kv_dtype", "") or "").strip().lower()
+    return declared if declared else fallback
 
 
 def draft_quant(model, draft):
-    """Use the draft's declared representation in both work and residency."""
+    """Use the draft's declared representation in both work and residency.
+
+    An explicitly all-FLOAT draft clears inherited target expert formats AND
+    target role overrides so draft graphs and weights never inherit target
+    quantization onto native float MTP/DSpark blocks. Preserves declared native
+    float activation formats (``fp16`` / ``bf16`` / ``fp32``) and declared
+    draft ``kv_dtype`` without silent BF16 coercion.
+    """
     quant = model.quant
+    if quant is None:
+        raise ModelingError("draft_quant_requires_model_quant")
     from .paired_sfa import independent_draft
-    if independent_draft(draft) and not draft.weight_category:
-        return replace(quant, weight_format="bf16", expert_weight_format="bf16",
-                       activation_format="bf16", kv_dtype="bf16",
-                       category_overrides=())
+    is_independent = independent_draft(draft)
+    if is_independent and not draft.weight_category:
+        native = _draft_declared_native_dtype(model, draft, quant)
+        kv_dtype = _draft_declared_kv_dtype(draft, fallback=native)
+        return replace(
+            quant,
+            weight_format=native,
+            expert_weight_format=native,
+            activation_format=native,
+            kv_dtype=kv_dtype,
+            native_format=native,
+            activation_group_size=0,
+            activation_scale_format="",
+            activation_scale_pack=1,
+            scale_format="",
+            scale_bytes=0.0,
+            output_format="",
+            category_overrides=(),
+            layer_quant_overrides=(),
+            expert_quant_count=0,
+            expert_quant_overrides=(),
+        )
     if not draft.weight_category:
-        return quant
-    fmt = quant.format_for(draft.weight_category)
+        draft_layer_ov = _draft_layer_quant_overrides(model, quant, draft)
+        return replace(quant, layer_quant_overrides=draft_layer_ov or ()) if quant.layer_quant_overrides else quant
+    fmt = str(quant.format_for(draft.weight_category)).strip().lower()
+    if fmt in FLOAT_WEIGHT_FORMATS:
+        draft_overrides = _draft_scoped_overrides(quant, draft)
+        has_quantized_draft_override = any(
+            str(fields.get("weight_format", "")).strip().lower() not in {"", *FLOAT_WEIGHT_FORMATS}
+            for fields in draft_overrides.values()
+        )
+        if not has_quantized_draft_override:
+            native_kv = _draft_declared_kv_dtype(
+                draft,
+                fallback=(
+                    _draft_declared_native_dtype(model, draft, quant)
+                    if is_independent and getattr(draft, "context_projection_mode", "") == "fused_kv_bank"
+                    else str(quant.kv_dtype)
+                ),
+            )
+            return replace(
+                quant,
+                weight_format=fmt,
+                expert_weight_format=fmt,
+                activation_format=fmt,
+                kv_dtype=native_kv,
+                activation_group_size=0,
+                activation_scale_format="",
+                activation_scale_pack=1,
+                scale_format="",
+                scale_bytes=0.0,
+                output_format="",
+                category_overrides=draft_overrides,
+                layer_quant_overrides=(),
+                expert_quant_count=0,
+                expert_quant_overrides=(),
+            )
     expert_fmt = quant.expert_weight_format if draft.num_experts > ZERO_EXPERTS else fmt
-    result = replace(quant, weight_format=fmt, expert_weight_format=expert_fmt,
-                     activation_format="bf16" if fmt == "bf16" else quant.activation_format)
-    if independent_draft(draft) and getattr(draft, "context_projection_mode", "") == "fused_kv_bank":
-        result = replace(result, kv_dtype="bf16")
-    return result
+    act_fmt = fmt if fmt in FLOAT_WEIGHT_FORMATS else quant.activation_format
+    kv_dt = _draft_declared_kv_dtype(
+        draft,
+        fallback=(
+            _draft_declared_native_dtype(model, draft, quant)
+            if is_independent and getattr(draft, "context_projection_mode", "") == "fused_kv_bank"
+            else str(quant.kv_dtype)
+        ),
+    )
+    draft_layer_ov = _draft_layer_quant_overrides(model, quant, draft)
+    return replace(
+        quant,
+        weight_format=fmt,
+        expert_weight_format=expert_fmt,
+        activation_format=act_fmt,
+        kv_dtype=kv_dt,
+        layer_quant_overrides=draft_layer_ov or (),
+    )
 
 
 def optional_draft_spec(model: ModelSpec, kind: str) -> DraftSpec:

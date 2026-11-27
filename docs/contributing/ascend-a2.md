@@ -9,7 +9,7 @@
 
 ## 1. 已注册 SKU 标称几何基线与硬件别名
 
-在 [`mindie_sim/compose.py`](../../mindie_sim/compose.py) 中，常用硬件别名映射为：`a2` / `910b` / `910b4` -> `Ascend910B4`；`800i-a2` -> `Ascend910B4` + `a2_standard`（8P HCCS）；`910b1` / `910b2` / `910b3` 分别对应各自精确 SKU。[`ascend.json`](../../mindie_sim/backends/profiles/ascend.json) 中注册的 6 款 A2 SKU 基线如下（采集前请先通过 `npu-smi info` 核对真机芯片型号）：
+在 [`mindie_sim/compose/inputs.py`](../../mindie_sim/compose/inputs.py) 中，常用硬件别名映射为：`a2` / `910b` / `910b4` -> `Ascend910B4`；`800i-a2` -> `Ascend910B4` + `a2_standard`（8P HCCS）；`910b1` / `910b2` / `910b3` 分别对应各自精确 SKU。[`ascend.json`](../../mindie_sim/backends/profiles/ascend.json) 中注册的 6 款 A2 SKU 基线如下（采集前请先通过 `npu-smi info` 核对真机芯片型号）：
 
 | SKU 键名 | 封装形态 | AIC / AIV | 标称主频 | HBM 容量 / 标称带宽 | 共享 L2 容量（`buffer_units.l2 = 1`） | BF16 / INT8 / INT4 标称峰值 | 冷 HBM 旋转环下限（`>= 3 × L2`） |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -32,11 +32,11 @@
    - 每个 AIV 私有：**`UB = 192 KiB`（`196,608 B`）**，单周期向量执行宽度 `128 B/cycle/AIV`（`32` FP32 lane-ops/cycle）；
    - **分块铁律**：FP32 累加下 `256 × 256 × 4 B = 262,144 B` **超出 A2 的 `128 KiB` `L0C` 上限**！因此 A2 稠密/分组矩阵 `base_tiles` 只能使用 `[128, 128]`、`[128, 256]`、`[256, 128]` 及更小分块，切勿照搬 A5 的 `[256, 256]`。
 2. **原生矩阵计算精度（支持 W8A8 / W4A8 / W4A16，严禁原生 FP8 Cube）**：
-   - [`mindie_sim/schema/compute_arch.py`](../../mindie_sim/schema/compute_arch.py) 为 `npu_arch_2201` 固定声明 `fp8=False, int4_operand=True`：原生支持 `bf16` / `fp16`（`cubek16`）、`fp32`（`cubek4`）、`hf32`（`cubek8`）、`int8`（`cubek32`，`npu_quant_matmul` W8A8）及 **`int4`（`cubek64`，[`w4a8.py`](../../mindie_sim/prediction/w4a8.py) MSD / `npu_weight_quant_batchmatmul` W4A16）**；
+   - [`mindie_sim/schema/compute_arch.py`](../../mindie_sim/schema/compute_arch.py) 为 `npu_arch_2201` 固定声明 `fp8=False, int4_operand=True`：原生支持 `bf16` / `fp16`（`cubek16`）、`fp32`（`cubek4`）、`hf32`（`cubek8`）、`int8`（`cubek32`，`npu_quant_matmul` W8A8）及 **`int4`（`cubek64`，[`w4a8.py`](../../mindie_sim/prediction/operators/mx_quant_matrix/w4a8.py) MSD / `npu_weight_quant_batchmatmul` W4A16）**；
    - **严禁向 A2 的 `compute_peaks` 添加 `fp8` / `fp8_e4m3` / `fp8_e5m2`**，否则触发 `ModelingError("native_compute_mode_unsupported:matrix:fp8...")`。
 3. **AIC <-> AIV 核间数据通路（无片上 `l0c->ub` 直连）**：
    - 在 `npu_arch_2201`（`_paths_2201`）中，独立的 AIC 与 AIV 核**必须经由 GM（共享 L2 或 HBM）交换中间张量**（`l0c->gm` 经 `fixpipe`，`gm->ub` 经 `mte2_aiv`，`ub->gm` 经 `mte3`）；
-   - 编写 A2 融合算子配方（如 [`paged_mla_arch22.py`](../../mindie_sim/prediction/paged_mla_arch22.py) 或自定义 AscendC/Triton Attention）时，`supported_output_paths` 不得声明 A5 专属的 `"l0c_to_ub"`，且跨核传递 Score / Probability / 中间激活必须计入 `fixpipe` / `mte2_aiv` / `mte3`（及未命中 L2 时的 `hbm`）流量。
+   - 编写 A2 融合算子配方（如 [`operators/paged_mla/`](../../mindie_sim/prediction/operators/paged_mla/__init__.py) 或自定义 AscendC/Triton Attention）时，`supported_output_paths` 不得声明 A5 专属的 `"l0c_to_ub"`，且跨核传递 Score / Probability / 中间激活必须计入 `fixpipe` / `mte2_aiv` / `mte3`（及未命中 L2 时的 `hbm`）流量。
 4. **Attention 开箱默认基线与自定义内核扩展**：
    - 开箱默认基线覆盖 `npu_fusion_attention`（Prefill）、`npu_incre_flash_attention`（IFA）、`npu_fused_infer_attention_score`（FIA）及 `ascend_paged_mla_decode_arch22`（`KEY_TILE = 512`，`decode_max_q = 16`，物理头数 `8` 或 `16`）；
    - 若使用自研 AscendC / Triton-Ascend / TileLang / FlashMLA 内核，直接按 [总指南 `3.4` 节](../../CONTRIBUTING.md#34-专项实战如何接入自定义-attention-算子ascendc--triton--稀疏与融合变体) 的 Tiers 1–3 接入，无需迁就 IFA / FIA。

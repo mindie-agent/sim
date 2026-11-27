@@ -14,8 +14,8 @@ from pathlib import Path
 import time
 
 from mindie_sim import graph_costs, target_graphs
-from mindie_sim.prediction.hccl_hierarchy import contract
-from mindie_sim.prediction.hccl_contracts import select
+from mindie_sim.prediction.operators.collectives.hccl_hierarchy import contract
+from mindie_sim.prediction.operators.collectives.hccl_contracts import select
 from mindie_sim.prediction.structure import parse_case
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -85,7 +85,7 @@ def main():
                         'selection': plan.selection.to_dict(),
                         'payload_wire_bytes_per_call': payload,
                         'declared_signal_wire_bytes_per_call': signals, 'scans': scans})
-    paths = ['mindie_sim/prediction/hccl_hierarchy.py', 'mindie_sim/prediction/topology.py',
+    paths = ['mindie_sim/prediction/operators/collectives/hccl_hierarchy.py', 'mindie_sim/prediction/topology.py',
              'mindie_sim/backends/ascend.py', 'mindie_sim/backends/profiles/ascend.json']
     print(json.dumps({'schema': 'mindie-sim.a3-physical-hierarchy/1',
         'boundary': 'two isolated ordinary-body AllReduce calls per TP configuration',

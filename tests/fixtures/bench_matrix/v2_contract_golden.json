@@ -1,0 +1,962 @@
+{
+  "bench_plan_v2": {
+    "cache_partition": "shared",
+    "cases": [
+      {
+        "acquisition_uid": "acq-0001",
+        "boundary": "device_kernel",
+        "canonical_key": {
+          "abi_backend": "cann_aclnn",
+          "aclgraph_padded_bucket": 8,
+          "bench_builder": "absorbed_mla",
+          "canonical_shapes": {
+            "block_size": 128,
+            "head_dim": 512,
+            "heads": 16,
+            "is_prefill": 0,
+            "kv_heads": 1,
+            "kv_len": 32768,
+            "q_len": 1,
+            "rope_dim": 64,
+            "sequences": 8,
+            "tokens": 8
+          },
+          "capture_mode": "aclgraph",
+          "collective_algorithm": null,
+          "cp_kv_cache_interleave_size": 128,
+          "dtypes": {
+            "cache": "int8",
+            "input": "bf16",
+            "output": "bf16",
+            "weight": "bf16"
+          },
+          "edges": null,
+          "kind": "operator",
+          "kv_allocator_block_size": 128,
+          "kv_kernel_block_size": 128,
+          "layouts": {
+            "cache": "PA_BBND",
+            "input": "TND",
+            "output": "TND",
+            "weight": "FRACTAL_NZ"
+          },
+          "link_tiers": null,
+          "op_attrs": {
+            "scale": 0.04419417382415922
+          },
+          "ordered_rank_placement": null,
+          "page_geometry": {
+            "num_pages": 2048,
+            "page_bytes": 73728,
+            "slot_stride": 576
+          },
+          "per_expert_token_counts": null,
+          "per_rank_token_counts": null,
+          "quant_meta": {
+            "format_code": 29,
+            "group_size": 128,
+            "per_token_scale": true,
+            "quant_mode": "int8_c8",
+            "scale_dtype": "fp32"
+          },
+          "residency": "cold_hbm",
+          "sig_version": 2,
+          "sku": "Ascend950DT_9582",
+          "soc_arch": "A5",
+          "split_sizes": null,
+          "storage_offsets": {
+            "kv_cache": 0,
+            "query": 0
+          },
+          "stream_dependencies": [],
+          "strides": {
+            "kv_cache": [
+              73728,
+              576,
+              1
+            ],
+            "query": [
+              9216,
+              576,
+              1
+            ]
+          },
+          "timed_nodes": null,
+          "upstream_abi": "aclnnFusedInferAttentionScoreV4",
+          "workspace_policy": "default"
+        },
+        "canonical_key_digest": "a9cdeca563731ad4",
+        "capture_mode": "aclgraph",
+        "case_id": "k2-a9cdeca563731ad4",
+        "clock_operator": "busy_union",
+        "edges": [],
+        "identities": {},
+        "kind": "operator",
+        "level": "L1",
+        "nodes": [
+          {
+            "abi_backend": "cann_aclnn",
+            "builder": "absorbed_mla",
+            "kind": "operator",
+            "node_id": "n0",
+            "upstream_abi": "aclnnFusedInferAttentionScoreV4"
+          }
+        ],
+        "phase": "decode",
+        "residency": "cold_hbm",
+        "split": "heldout",
+        "stage": "s0_local",
+        "timed_boundary": {
+          "include": [
+            "n0"
+          ]
+        },
+        "work_bytes": 603979776,
+        "work_flops": 1073741824
+      },
+      {
+        "acquisition_uid": "acq-0002",
+        "boundary": "device_kernel",
+        "canonical_key": {
+          "abi_backend": "cann_aclnn",
+          "aclgraph_padded_bucket": null,
+          "bench_builder": "dense_gemm",
+          "canonical_shapes": {
+            "k": 2048,
+            "m": 2048,
+            "n": 2048
+          },
+          "capture_mode": "eager",
+          "collective_algorithm": null,
+          "cp_kv_cache_interleave_size": null,
+          "dtypes": {
+            "input": "bf16",
+            "output": "bf16",
+            "weight": "bf16"
+          },
+          "edges": null,
+          "kind": "operator",
+          "kv_allocator_block_size": null,
+          "kv_kernel_block_size": null,
+          "layouts": {
+            "input": "ND",
+            "output": "ND",
+            "weight": "ND"
+          },
+          "link_tiers": null,
+          "op_attrs": {},
+          "ordered_rank_placement": null,
+          "page_geometry": null,
+          "per_expert_token_counts": null,
+          "per_rank_token_counts": null,
+          "quant_meta": {},
+          "residency": "cold_hbm",
+          "sig_version": 2,
+          "sku": "Ascend950DT_9582",
+          "soc_arch": "A5",
+          "split_sizes": null,
+          "storage_offsets": {
+            "a": 0,
+            "b": 0
+          },
+          "stream_dependencies": [],
+          "strides": {
+            "a": [
+              2048,
+              1
+            ],
+            "b": [
+              2048,
+              1
+            ]
+          },
+          "timed_nodes": null,
+          "upstream_abi": "aclnnMm",
+          "workspace_policy": "default"
+        },
+        "canonical_key_digest": "5376db209f9e54dc",
+        "capture_mode": "eager",
+        "case_id": "k2-5376db209f9e54dc",
+        "clock_operator": "elapsed_span",
+        "edges": [],
+        "identities": {},
+        "kind": "operator",
+        "level": "L1",
+        "nodes": [
+          {
+            "abi_backend": "cann_aclnn",
+            "builder": "dense_gemm",
+            "kind": "operator",
+            "node_id": "n0",
+            "upstream_abi": "aclnnMm"
+          }
+        ],
+        "phase": "prefill",
+        "residency": "cold_hbm",
+        "split": "train",
+        "stage": "s0_local",
+        "timed_boundary": {
+          "include": [
+            "n0"
+          ]
+        },
+        "work_bytes": 25165824,
+        "work_flops": 17179869184
+      },
+      {
+        "acquisition_uid": "acq-0003",
+        "boundary": "device_kernel",
+        "canonical_key": {
+          "abi_backend": "cann_aclnn",
+          "aclgraph_padded_bucket": null,
+          "bench_builder": "dense_gemm",
+          "canonical_shapes": {
+            "k": 2048,
+            "m": 2048,
+            "n": 2048
+          },
+          "capture_mode": "eager",
+          "collective_algorithm": null,
+          "cp_kv_cache_interleave_size": null,
+          "dtypes": {
+            "input": "bf16",
+            "output": "bf16",
+            "weight": "bf16"
+          },
+          "edges": null,
+          "kind": "operator",
+          "kv_allocator_block_size": null,
+          "kv_kernel_block_size": null,
+          "layouts": {
+            "input": "ND",
+            "output": "ND",
+            "weight": "ND"
+          },
+          "link_tiers": null,
+          "op_attrs": {},
+          "ordered_rank_placement": null,
+          "page_geometry": null,
+          "per_expert_token_counts": null,
+          "per_rank_token_counts": null,
+          "quant_meta": {},
+          "residency": "cold_hbm",
+          "sig_version": 2,
+          "sku": "Ascend950DT_9582",
+          "soc_arch": "A5",
+          "split_sizes": null,
+          "storage_offsets": {
+            "a": 0,
+            "b": 0
+          },
+          "stream_dependencies": [],
+          "strides": {
+            "a": [
+              2048,
+              1
+            ],
+            "b": [
+              1,
+              2048
+            ]
+          },
+          "timed_nodes": null,
+          "upstream_abi": "aclnnMm",
+          "workspace_policy": "default"
+        },
+        "canonical_key_digest": "0cc2980f51b2d66e",
+        "capture_mode": "eager",
+        "case_id": "k2-0cc2980f51b2d66e",
+        "clock_operator": "elapsed_span",
+        "edges": [],
+        "identities": {},
+        "kind": "operator",
+        "level": "L1",
+        "nodes": [
+          {
+            "abi_backend": "cann_aclnn",
+            "builder": "dense_gemm",
+            "kind": "operator",
+            "node_id": "n0",
+            "upstream_abi": "aclnnMm"
+          }
+        ],
+        "phase": "prefill",
+        "residency": "cold_hbm",
+        "split": "abi_rejection",
+        "stage": "s0_local",
+        "timed_boundary": {
+          "include": [
+            "n0"
+          ]
+        },
+        "work_bytes": 25165824,
+        "work_flops": 17179869184
+      }
+    ],
+    "plan_id": "plan2-golden-a5-0001",
+    "plan_kind": "model_matrix",
+    "plan_sha256": "44d39c7aa8d7e0b13ea8b1582679f17d9436ce7eb3be5d8d4dd850e26ea49b53",
+    "reverse_index": {
+      "k2-5376db209f9e54dc": [
+        {
+          "cell_id": "cell-prefill-2k-b1",
+          "concurrency": 1,
+          "layer_archetype_id": "body_mla",
+          "model_id": "synth-mla",
+          "model_step_share_pct": 12.0,
+          "native_layer": 0,
+          "occurrence_count": 1,
+          "op_id": "l0.dense_gemm",
+          "parallel_arm": "tp8_ep8_dcp2",
+          "phase": "prefill",
+          "rank": 0,
+          "replica": 0,
+          "scope": "target",
+          "seq_len": 2048,
+          "sku": "Ascend950DT_9582",
+          "stage": "before"
+        }
+      ],
+      "k2-a9cdeca563731ad4": [
+        {
+          "cell_id": "cell-decode-32k-b8",
+          "concurrency": 8,
+          "layer_archetype_id": "body_mla",
+          "model_id": "synth-mla",
+          "model_step_share_pct": 18.5,
+          "native_layer": 0,
+          "occurrence_count": 1,
+          "op_id": "l0.latent_attention",
+          "parallel_arm": "tp8_ep8_dcp2",
+          "phase": "decode",
+          "rank": 0,
+          "replica": 0,
+          "scope": "target",
+          "seq_len": 32768,
+          "sku": "Ascend950DT_9582",
+          "stage": "before"
+        }
+      ]
+    },
+    "schema": "mindie-bench-plan/2",
+    "sku": "Ascend950DT_9582",
+    "soc_arch": "A5",
+    "stage": "s0_local",
+    "training_manifest_sha256": null,
+    "world_size": 1
+  },
+  "campaign_manifest_v1": {
+    "blocked_cases": [
+      {
+        "abi_error": "expected_abi_rejection_for_negative_probe",
+        "abi_rejected": true,
+        "acquisition_uid": "acq-0003",
+        "boundary": "device_kernel",
+        "canonical_key_digest": "0cc2980f51b2d66e",
+        "case_id": "k2-0cc2980f51b2d66e",
+        "observed_clock_mhz": 1650.0,
+        "qualified": false,
+        "split": "abi_rejection",
+        "status": "abi_rejected",
+        "unmodeled_hint": null
+      }
+    ],
+    "cache_partition": "shared",
+    "campaign_id": "camp-golden-0001",
+    "campaign_sha256": "05cfd0615e3504bc48d8e7c13e96b8b23be5325888b07055a0c4823936514af3",
+    "cases": [
+      {
+        "abi_backend": "cann_aclnn",
+        "acquisition_uid": "acq-0001",
+        "actual_executed_shape": {
+          "block_size": 128,
+          "head_dim": 512,
+          "heads": 16,
+          "is_prefill": 0,
+          "kv_heads": 1,
+          "kv_len": 32768,
+          "q_len": 1,
+          "rope_dim": 64,
+          "sequences": 8,
+          "tokens": 8
+        },
+        "bench_builder": "absorbed_mla",
+        "boundary": "device_kernel",
+        "cache_status": "measured",
+        "canonical_key_digest": "a9cdeca563731ad4",
+        "capture_mode": "aclgraph",
+        "capture_uri": "capture://camp-golden-0001/mla.json",
+        "case_id": "k2-a9cdeca563731ad4",
+        "clock_operator": "busy_union",
+        "cold_coverage_verified": true,
+        "cv_pct": 1.1,
+        "family": "absorbed_mla",
+        "geometry_key": "a9cdeca563731ad4",
+        "hbm_peak_bytes": 1241513984,
+        "iqr_us": 0.8,
+        "measured_in_run_id": "run-golden-0001",
+        "min_us": 40.9146,
+        "observed_clock_mhz": 1650.0,
+        "p50_us": 42.18,
+        "p90_us": 43.114999999999995,
+        "p99_us": 44.05,
+        "participating_ranks": [
+          0
+        ],
+        "qualified": true,
+        "rank": 0,
+        "raw_sha256": "772db0acf6647ef0e36ea0711ec58d64cfa8385d87e9a2e543ae17744cde5581",
+        "residency": "cold_hbm",
+        "run_shard": "runs/run-golden-0001.jsonl",
+        "samples_count": 60,
+        "split": "heldout",
+        "status": "ok",
+        "timed_nodes": [
+          "n0"
+        ],
+        "timing_mode": "aclgraph",
+        "traced_interval_verified": true,
+        "upstream_abi": "aclnnFusedInferAttentionScoreV4"
+      },
+      {
+        "abi_backend": "cann_aclnn",
+        "acquisition_uid": "acq-0002",
+        "actual_executed_shape": {
+          "k": 2048,
+          "m": 2048,
+          "n": 2048
+        },
+        "bench_builder": "dense_gemm",
+        "boundary": "device_kernel",
+        "cache_status": "measured",
+        "canonical_key_digest": "5376db209f9e54dc",
+        "capture_mode": "eager",
+        "capture_uri": "capture://camp-golden-0001/gemm.json",
+        "case_id": "k2-5376db209f9e54dc",
+        "clock_operator": "elapsed_span",
+        "cold_coverage_verified": true,
+        "cv_pct": 1.1,
+        "family": "dense_gemm",
+        "geometry_key": "5376db209f9e54dc",
+        "hbm_peak_bytes": 1241513984,
+        "iqr_us": 0.8,
+        "measured_in_run_id": "run-golden-0001",
+        "min_us": 53.35,
+        "observed_clock_mhz": 1650.0,
+        "p50_us": 55.0,
+        "p90_us": 56.25,
+        "p99_us": 57.5,
+        "participating_ranks": [
+          0
+        ],
+        "qualified": true,
+        "rank": 0,
+        "raw_sha256": "4f012d5e9999673551955260cdd52ae5154bd321c60166d9bc0108ba9228de24",
+        "residency": "cold_hbm",
+        "run_shard": "runs/run-golden-0001.jsonl",
+        "samples_count": 60,
+        "split": "train",
+        "status": "ok",
+        "timed_nodes": [
+          "n0"
+        ],
+        "timing_mode": "eager",
+        "traced_interval_verified": false,
+        "upstream_abi": "aclnnMm"
+      }
+    ],
+    "clock_operator": "busy_union",
+    "env_fingerprint_id": "env-ascend950dt_9582-cann9.3.rc1-ba2b259d7df2ef68",
+    "observations_jsonl": "runs/run-golden-0001.jsonl",
+    "observations_sha256": "5ff84de8ef9b71d43d71c59db0e5219a54b73dfda90f1f104c632eccb882009e",
+    "plan_id": "plan2-golden-a5-0001",
+    "plan_sha256": "44d39c7aa8d7e0b13ea8b1582679f17d9436ce7eb3be5d8d4dd850e26ea49b53",
+    "run_shards": [
+      {
+        "observations_sha256": "5ff84de8ef9b71d43d71c59db0e5219a54b73dfda90f1f104c632eccb882009e",
+        "path": "runs/run-golden-0001.jsonl",
+        "record_count": 3,
+        "run_id": "run-golden-0001"
+      }
+    ],
+    "schema": "mindie-bench-campaign/1",
+    "training_manifest_sha256": null,
+    "version_fingerprint": {
+      "cache_partition": "shared",
+      "cann_innerversion": "V100R001C25SPC001B010",
+      "cann_packages": {
+        "atb": "absent",
+        "hccl": "9.3.RC1",
+        "ops_nn": "9.3.RC1",
+        "ops_transformer": "9.3.RC1"
+      },
+      "cann_version": "9.3.RC1",
+      "clock_source": "npu-smi_cur_freq_mhz",
+      "custom_op_libs": {
+        "fla_npu": "0.3.1",
+        "vllm_ascend_csrc": "elf:a1b2c3d4e5f60708"
+      },
+      "driver_version": "25.0.rc1",
+      "env_fingerprint_id": "env-ascend950dt_9582-cann9.3.rc1-ba2b259d7df2ef68",
+      "hw_geometry": {
+        "aic_count": 32,
+        "aiv_count": 64,
+        "hbm_bytes": 154618822656,
+        "l2_bytes": 134217728
+      },
+      "observed_clock_mhz": 1650.0,
+      "profiler_version": "0.5.17",
+      "schema": "mindie-bench-env/1",
+      "sku": "Ascend950DT_9582",
+      "soc_arch": "A5",
+      "timing_protocol_id": "certified_5w_3t_20r_3xl2_2p5ms",
+      "torch_npu_version": "2.6.0.post1",
+      "torch_version": "2.6.0",
+      "triton_version": "3.2.0+ascend",
+      "va_commit": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+    },
+    "worker_diagnostics": []
+  },
+  "canonical_json_rule": "json.dumps(obj, sort_keys=True, separators=(\",\", \":\"), ensure_ascii=True, allow_nan=False)",
+  "canonical_key_samples": [
+    {
+      "canonical_json": "{\"abi_backend\":\"cann_aclnn\",\"aclgraph_padded_bucket\":8,\"bench_builder\":\"absorbed_mla\",\"canonical_shapes\":{\"block_size\":128,\"head_dim\":512,\"heads\":16,\"is_prefill\":0,\"kv_heads\":1,\"kv_len\":32768,\"q_len\":1,\"rope_dim\":64,\"sequences\":8,\"tokens\":8},\"capture_mode\":\"aclgraph\",\"collective_algorithm\":null,\"cp_kv_cache_interleave_size\":128,\"dtypes\":{\"cache\":\"int8\",\"input\":\"bf16\",\"output\":\"bf16\",\"weight\":\"bf16\"},\"edges\":null,\"kind\":\"operator\",\"kv_allocator_block_size\":128,\"kv_kernel_block_size\":128,\"layouts\":{\"cache\":\"PA_BBND\",\"input\":\"TND\",\"output\":\"TND\",\"weight\":\"FRACTAL_NZ\"},\"link_tiers\":null,\"op_attrs\":{\"scale\":0.04419417382415922},\"ordered_rank_placement\":null,\"page_geometry\":{\"num_pages\":2048,\"page_bytes\":73728,\"slot_stride\":576},\"per_expert_token_counts\":null,\"per_rank_token_counts\":null,\"quant_meta\":{\"format_code\":29,\"group_size\":128,\"per_token_scale\":true,\"quant_mode\":\"int8_c8\",\"scale_dtype\":\"fp32\"},\"residency\":\"cold_hbm\",\"sig_version\":2,\"sku\":\"Ascend950DT_9582\",\"soc_arch\":\"A5\",\"split_sizes\":null,\"storage_offsets\":{\"kv_cache\":0,\"query\":0},\"stream_dependencies\":[],\"strides\":{\"kv_cache\":[73728,576,1],\"query\":[9216,576,1]},\"timed_nodes\":null,\"upstream_abi\":\"aclnnFusedInferAttentionScoreV4\",\"workspace_policy\":\"default\"}",
+      "canonical_key_digest": "a9cdeca563731ad4",
+      "case_id": "k2-a9cdeca563731ad4",
+      "key": {
+        "abi_backend": "cann_aclnn",
+        "aclgraph_padded_bucket": 8,
+        "bench_builder": "absorbed_mla",
+        "canonical_shapes": {
+          "block_size": 128,
+          "head_dim": 512,
+          "heads": 16,
+          "is_prefill": 0,
+          "kv_heads": 1,
+          "kv_len": 32768,
+          "q_len": 1,
+          "rope_dim": 64,
+          "sequences": 8,
+          "tokens": 8
+        },
+        "capture_mode": "aclgraph",
+        "collective_algorithm": null,
+        "cp_kv_cache_interleave_size": 128,
+        "dtypes": {
+          "cache": "int8",
+          "input": "bf16",
+          "output": "bf16",
+          "weight": "bf16"
+        },
+        "edges": null,
+        "kind": "operator",
+        "kv_allocator_block_size": 128,
+        "kv_kernel_block_size": 128,
+        "layouts": {
+          "cache": "PA_BBND",
+          "input": "TND",
+          "output": "TND",
+          "weight": "FRACTAL_NZ"
+        },
+        "link_tiers": null,
+        "op_attrs": {
+          "scale": 0.04419417382415922
+        },
+        "ordered_rank_placement": null,
+        "page_geometry": {
+          "num_pages": 2048,
+          "page_bytes": 73728,
+          "slot_stride": 576
+        },
+        "per_expert_token_counts": null,
+        "per_rank_token_counts": null,
+        "quant_meta": {
+          "format_code": 29,
+          "group_size": 128,
+          "per_token_scale": true,
+          "quant_mode": "int8_c8",
+          "scale_dtype": "fp32"
+        },
+        "residency": "cold_hbm",
+        "sig_version": 2,
+        "sku": "Ascend950DT_9582",
+        "soc_arch": "A5",
+        "split_sizes": null,
+        "storage_offsets": {
+          "kv_cache": 0,
+          "query": 0
+        },
+        "stream_dependencies": [],
+        "strides": {
+          "kv_cache": [
+            73728,
+            576,
+            1
+          ],
+          "query": [
+            9216,
+            576,
+            1
+          ]
+        },
+        "timed_nodes": null,
+        "upstream_abi": "aclnnFusedInferAttentionScoreV4",
+        "workspace_policy": "default"
+      },
+      "name": "absorbed_mla_decode_aclgraph"
+    },
+    {
+      "canonical_json": "{\"abi_backend\":\"cann_aclnn\",\"aclgraph_padded_bucket\":null,\"bench_builder\":\"dense_gemm\",\"canonical_shapes\":{\"k\":2048,\"m\":2048,\"n\":2048},\"capture_mode\":\"eager\",\"collective_algorithm\":null,\"cp_kv_cache_interleave_size\":null,\"dtypes\":{\"input\":\"bf16\",\"output\":\"bf16\",\"weight\":\"bf16\"},\"edges\":null,\"kind\":\"operator\",\"kv_allocator_block_size\":null,\"kv_kernel_block_size\":null,\"layouts\":{\"input\":\"ND\",\"output\":\"ND\",\"weight\":\"ND\"},\"link_tiers\":null,\"op_attrs\":{},\"ordered_rank_placement\":null,\"page_geometry\":null,\"per_expert_token_counts\":null,\"per_rank_token_counts\":null,\"quant_meta\":{},\"residency\":\"cold_hbm\",\"sig_version\":2,\"sku\":\"Ascend950DT_9582\",\"soc_arch\":\"A5\",\"split_sizes\":null,\"storage_offsets\":{\"a\":0,\"b\":0},\"stream_dependencies\":[],\"strides\":{\"a\":[2048,1],\"b\":[2048,1]},\"timed_nodes\":null,\"upstream_abi\":\"aclnnMm\",\"workspace_policy\":\"default\"}",
+      "canonical_key_digest": "5376db209f9e54dc",
+      "case_id": "k2-5376db209f9e54dc",
+      "key": {
+        "abi_backend": "cann_aclnn",
+        "aclgraph_padded_bucket": null,
+        "bench_builder": "dense_gemm",
+        "canonical_shapes": {
+          "k": 2048,
+          "m": 2048,
+          "n": 2048
+        },
+        "capture_mode": "eager",
+        "collective_algorithm": null,
+        "cp_kv_cache_interleave_size": null,
+        "dtypes": {
+          "input": "bf16",
+          "output": "bf16",
+          "weight": "bf16"
+        },
+        "edges": null,
+        "kind": "operator",
+        "kv_allocator_block_size": null,
+        "kv_kernel_block_size": null,
+        "layouts": {
+          "input": "ND",
+          "output": "ND",
+          "weight": "ND"
+        },
+        "link_tiers": null,
+        "op_attrs": {},
+        "ordered_rank_placement": null,
+        "page_geometry": null,
+        "per_expert_token_counts": null,
+        "per_rank_token_counts": null,
+        "quant_meta": {},
+        "residency": "cold_hbm",
+        "sig_version": 2,
+        "sku": "Ascend950DT_9582",
+        "soc_arch": "A5",
+        "split_sizes": null,
+        "storage_offsets": {
+          "a": 0,
+          "b": 0
+        },
+        "stream_dependencies": [],
+        "strides": {
+          "a": [
+            2048,
+            1
+          ],
+          "b": [
+            2048,
+            1
+          ]
+        },
+        "timed_nodes": null,
+        "upstream_abi": "aclnnMm",
+        "workspace_policy": "default"
+      },
+      "name": "square_gemm_contiguous"
+    },
+    {
+      "canonical_json": "{\"abi_backend\":\"cann_aclnn\",\"aclgraph_padded_bucket\":null,\"bench_builder\":\"dense_gemm\",\"canonical_shapes\":{\"k\":2048,\"m\":2048,\"n\":2048},\"capture_mode\":\"eager\",\"collective_algorithm\":null,\"cp_kv_cache_interleave_size\":null,\"dtypes\":{\"input\":\"bf16\",\"output\":\"bf16\",\"weight\":\"bf16\"},\"edges\":null,\"kind\":\"operator\",\"kv_allocator_block_size\":null,\"kv_kernel_block_size\":null,\"layouts\":{\"input\":\"ND\",\"output\":\"ND\",\"weight\":\"ND\"},\"link_tiers\":null,\"op_attrs\":{},\"ordered_rank_placement\":null,\"page_geometry\":null,\"per_expert_token_counts\":null,\"per_rank_token_counts\":null,\"quant_meta\":{},\"residency\":\"cold_hbm\",\"sig_version\":2,\"sku\":\"Ascend950DT_9582\",\"soc_arch\":\"A5\",\"split_sizes\":null,\"storage_offsets\":{\"a\":0,\"b\":0},\"stream_dependencies\":[],\"strides\":{\"a\":[2048,1],\"b\":[1,2048]},\"timed_nodes\":null,\"upstream_abi\":\"aclnnMm\",\"workspace_policy\":\"default\"}",
+      "canonical_key_digest": "0cc2980f51b2d66e",
+      "case_id": "k2-0cc2980f51b2d66e",
+      "key": {
+        "abi_backend": "cann_aclnn",
+        "aclgraph_padded_bucket": null,
+        "bench_builder": "dense_gemm",
+        "canonical_shapes": {
+          "k": 2048,
+          "m": 2048,
+          "n": 2048
+        },
+        "capture_mode": "eager",
+        "collective_algorithm": null,
+        "cp_kv_cache_interleave_size": null,
+        "dtypes": {
+          "input": "bf16",
+          "output": "bf16",
+          "weight": "bf16"
+        },
+        "edges": null,
+        "kind": "operator",
+        "kv_allocator_block_size": null,
+        "kv_kernel_block_size": null,
+        "layouts": {
+          "input": "ND",
+          "output": "ND",
+          "weight": "ND"
+        },
+        "link_tiers": null,
+        "op_attrs": {},
+        "ordered_rank_placement": null,
+        "page_geometry": null,
+        "per_expert_token_counts": null,
+        "per_rank_token_counts": null,
+        "quant_meta": {},
+        "residency": "cold_hbm",
+        "sig_version": 2,
+        "sku": "Ascend950DT_9582",
+        "soc_arch": "A5",
+        "split_sizes": null,
+        "storage_offsets": {
+          "a": 0,
+          "b": 0
+        },
+        "stream_dependencies": [],
+        "strides": {
+          "a": [
+            2048,
+            1
+          ],
+          "b": [
+            1,
+            2048
+          ]
+        },
+        "timed_nodes": null,
+        "upstream_abi": "aclnnMm",
+        "workspace_policy": "default"
+      },
+      "name": "square_gemm_transposed"
+    },
+    {
+      "canonical_json": "{\"abi_backend\":\"hccl_mc2\",\"aclgraph_padded_bucket\":null,\"bench_builder\":\"all_reduce\",\"canonical_shapes\":{\"bytes\":16777216,\"group_size\":4},\"capture_mode\":\"eager\",\"collective_algorithm\":\"ring\",\"cp_kv_cache_interleave_size\":null,\"dtypes\":{\"input\":\"bf16\",\"output\":\"bf16\"},\"edges\":null,\"kind\":\"collective\",\"kv_allocator_block_size\":null,\"kv_kernel_block_size\":null,\"layouts\":{\"input\":\"ND\",\"output\":\"ND\"},\"link_tiers\":[\"intra_4p\"],\"op_attrs\":{},\"ordered_rank_placement\":[0,1,2,3],\"page_geometry\":null,\"per_expert_token_counts\":null,\"per_rank_token_counts\":null,\"quant_meta\":{},\"residency\":\"cold_hbm\",\"sig_version\":2,\"sku\":\"Ascend950DT_9582\",\"soc_arch\":\"A5\",\"split_sizes\":[4194304,4194304,4194304,4194304],\"storage_offsets\":{\"payload\":0},\"stream_dependencies\":[],\"strides\":{\"payload\":[1]},\"timed_nodes\":null,\"upstream_abi\":\"hcclAllReduce\",\"workspace_policy\":\"default\"}",
+      "canonical_key_digest": "d02c08d779071ce7",
+      "case_id": "k2-d02c08d779071ce7",
+      "key": {
+        "abi_backend": "hccl_mc2",
+        "aclgraph_padded_bucket": null,
+        "bench_builder": "all_reduce",
+        "canonical_shapes": {
+          "bytes": 16777216,
+          "group_size": 4
+        },
+        "capture_mode": "eager",
+        "collective_algorithm": "ring",
+        "cp_kv_cache_interleave_size": null,
+        "dtypes": {
+          "input": "bf16",
+          "output": "bf16"
+        },
+        "edges": null,
+        "kind": "collective",
+        "kv_allocator_block_size": null,
+        "kv_kernel_block_size": null,
+        "layouts": {
+          "input": "ND",
+          "output": "ND"
+        },
+        "link_tiers": [
+          "intra_4p"
+        ],
+        "op_attrs": {},
+        "ordered_rank_placement": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "page_geometry": null,
+        "per_expert_token_counts": null,
+        "per_rank_token_counts": null,
+        "quant_meta": {},
+        "residency": "cold_hbm",
+        "sig_version": 2,
+        "sku": "Ascend950DT_9582",
+        "soc_arch": "A5",
+        "split_sizes": [
+          4194304,
+          4194304,
+          4194304,
+          4194304
+        ],
+        "storage_offsets": {
+          "payload": 0
+        },
+        "stream_dependencies": [],
+        "strides": {
+          "payload": [
+            1
+          ]
+        },
+        "timed_nodes": null,
+        "upstream_abi": "hcclAllReduce",
+        "workspace_policy": "default"
+      },
+      "name": "s1_allreduce_4p_ring"
+    }
+  ],
+  "env_fingerprint": {
+    "cache_partition": "shared",
+    "cann_innerversion": "V100R001C25SPC001B010",
+    "cann_packages": {
+      "atb": "absent",
+      "hccl": "9.3.RC1",
+      "ops_nn": "9.3.RC1",
+      "ops_transformer": "9.3.RC1"
+    },
+    "cann_version": "9.3.RC1",
+    "clock_source": "npu-smi_cur_freq_mhz",
+    "custom_op_libs": {
+      "fla_npu": "0.3.1",
+      "vllm_ascend_csrc": "elf:a1b2c3d4e5f60708"
+    },
+    "driver_version": "25.0.rc1",
+    "env_fingerprint_id": "env-ascend950dt_9582-cann9.3.rc1-ba2b259d7df2ef68",
+    "hw_geometry": {
+      "aic_count": 32,
+      "aiv_count": 64,
+      "hbm_bytes": 154618822656,
+      "l2_bytes": 134217728
+    },
+    "observed_clock_mhz": 1650.0,
+    "profiler_version": "0.5.17",
+    "schema": "mindie-bench-env/1",
+    "sku": "Ascend950DT_9582",
+    "soc_arch": "A5",
+    "timing_protocol_id": "certified_5w_3t_20r_3xl2_2p5ms",
+    "torch_npu_version": "2.6.0.post1",
+    "torch_version": "2.6.0",
+    "triton_version": "3.2.0+ascend",
+    "va_commit": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+  },
+  "observations_v2": [
+    {
+      "acquisition_uid": "acq-0001",
+      "actual_executed_shape": {
+        "kv_len": 32768,
+        "q_len": 1,
+        "sequences": 8,
+        "tokens": 8
+      },
+      "boundary": "device_kernel",
+      "cache_status": "measured",
+      "canonical_key_digest": "a9cdeca563731ad4",
+      "capture_mode": "aclgraph",
+      "case_id": "k2-a9cdeca563731ad4",
+      "clock_operator": "busy_union",
+      "cold_coverage_verified": true,
+      "duration_ms": 0.04218,
+      "env_fingerprint_id": "env-ascend950dt_9582-cann9.3.rc1-ba2b259d7df2ef68",
+      "hbm_peak_bytes": 1241513984,
+      "identity": {
+        "boundary": "device_kernel",
+        "dtype": "bf16",
+        "execution": {
+          "mode": "aclgraph"
+        },
+        "hardware": "Ascend950DT_9582",
+        "implementation": "aclnnFusedInferAttentionScoreV4",
+        "layout": "TND",
+        "level": "operator",
+        "phase": "decode",
+        "shape": {
+          "kv_len": 32768,
+          "tokens": 8
+        }
+      },
+      "observed_clock_mhz": 1650.0,
+      "qualified": true,
+      "rank": 0,
+      "record_type": "observation",
+      "residency": "cold_hbm",
+      "run_id": "run-golden-0001",
+      "sample_id": "obs-golden-0001",
+      "schema": "mindie-bench-observation/2",
+      "source": "capture://camp-golden-0001/mla.json",
+      "split": "heldout",
+      "status": "ok",
+      "timing_mode": "aclgraph",
+      "work_bytes": 603979776
+    },
+    {
+      "acquisition_uid": "acq-0002",
+      "actual_executed_shape": {
+        "k": 2048,
+        "m": 2048,
+        "n": 2048
+      },
+      "boundary": "device_kernel",
+      "cache_status": "measured",
+      "canonical_key_digest": "5376db209f9e54dc",
+      "capture_mode": "eager",
+      "case_id": "k2-5376db209f9e54dc",
+      "clock_operator": "elapsed_span",
+      "cold_coverage_verified": true,
+      "duration_ms": 0.055,
+      "env_fingerprint_id": "env-ascend950dt_9582-cann9.3.rc1-ba2b259d7df2ef68",
+      "hbm_peak_bytes": 536870912,
+      "identity": {
+        "boundary": "device_kernel",
+        "dtype": "bf16",
+        "execution": {
+          "mode": "eager"
+        },
+        "hardware": "Ascend950DT_9582",
+        "implementation": "aclnnMm",
+        "layout": "ND",
+        "level": "operator",
+        "phase": "prefill",
+        "shape": {
+          "k": 2048,
+          "m": 2048,
+          "n": 2048
+        }
+      },
+      "observed_clock_mhz": 1650.0,
+      "qualified": true,
+      "rank": 0,
+      "record_type": "observation",
+      "residency": "cold_hbm",
+      "run_id": "run-golden-0001",
+      "sample_id": "obs-golden-0002",
+      "schema": "mindie-bench-observation/2",
+      "source": "capture://camp-golden-0001/gemm.json",
+      "split": "train",
+      "status": "ok",
+      "timing_mode": "eager",
+      "work_bytes": 25165824
+    },
+    {
+      "abi_error": "expected_abi_rejection_for_negative_probe",
+      "abi_rejected": true,
+      "acquisition_uid": "acq-0003",
+      "boundary": "device_kernel",
+      "cache_status": "measured",
+      "canonical_key_digest": "0cc2980f51b2d66e",
+      "capture_mode": "eager",
+      "case_id": "k2-0cc2980f51b2d66e",
+      "clock_operator": "elapsed_span",
+      "cold_coverage_verified": true,
+      "duration_ms": null,
+      "env_fingerprint_id": "env-ascend950dt_9582-cann9.3.rc1-ba2b259d7df2ef68",
+      "observed_clock_mhz": 1650.0,
+      "qualified": false,
+      "rank": 0,
+      "record_type": "case_outcome",
+      "residency": "cold_hbm",
+      "run_id": "run-golden-0001",
+      "sample_id": "obs-golden-0003",
+      "schema": "mindie-bench-observation/2",
+      "source": "capture://camp-golden-0001/abi_rej.json",
+      "split": "abi_rejection",
+      "status": "abi_rejected",
+      "timing_mode": "eager",
+      "unmodeled_hint": null
+    }
+  ],
+  "observations_v2_jsonl_sha256": "5ff84de8ef9b71d43d71c59db0e5219a54b73dfda90f1f104c632eccb882009e",
+  "schema": "mindie-bench-v2-golden-contract/1"
+}

@@ -8,15 +8,14 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields
-import json
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any
 
 from .hardware import Hardware
 from .model import ModelSpec, SloSpec, WorkloadSpec
 from .parallel import PARALLEL_AXIS_ALIASES, PARALLEL_SWITCHES, ParallelSpec
-from .common import ModelingError
+from .common import ModelingError, _unknown
 from . import runtime_features
 
 
@@ -54,8 +53,7 @@ def _capture_sizes(value: Any, reason: str) -> tuple[int, ...]:
     return tuple(sorted(set(sizes)))
 
 
-def _compilation_fields(raw: Mapping[str, Any], declared: Mapping[str, Any]
-                         ) -> dict[str, Any]:
+def _compilation_fields(raw: Mapping[str, Any], default_mode: str) -> dict[str, Any]:
     """Map a vLLM ``compilation_config`` onto the simulation graph fields.
 
     The raw cudagraph mode is preserved as ``captured_execution_mode`` metadata
@@ -76,32 +74,21 @@ def _compilation_fields(raw: Mapping[str, Any], declared: Mapping[str, Any]
     if unknown:
         raise ModelingError(
             "runtime_compilation_config_unknown:" + ",".join(sorted(unknown)))
-    mode_raw = str(config.get("cudagraph_mode") or "").strip().upper()
+    declared_mode = str(config.get("cudagraph_mode") or "").strip().upper()
+    metadata_mode = dict(raw.get("metadata") or ()).get("captured_execution_mode")
+    mode_raw = declared_mode or str(metadata_mode or raw.get("graph_capture_mode") or default_mode).strip().upper()
+    if mode_raw not in _CUDAGRAPH_MODES:
+        raise ModelingError(f"runtime_cudagraph_mode_unsupported:{mode_raw}")
+    mode, full_keys, piecewise_keys = _CUDAGRAPH_MODES[mode_raw]
     fields: dict[str, Any] = {}
-    if mode_raw:
-        if mode_raw not in _CUDAGRAPH_MODES:
-            raise ModelingError(f"runtime_cudagraph_mode_unsupported:{mode_raw}")
-        mode, full_keys, piecewise_keys = _CUDAGRAPH_MODES[mode_raw]
-        if declared.get("graph_capture_mode") is not None and str(
-                declared["graph_capture_mode"]) != mode:
-            raise ModelingError(
-                "runtime_compilation_conflict:graph_capture_mode:"
-                f"{declared['graph_capture_mode']}!={mode}")
+    if declared_mode:
         fields["graph_capture_mode"] = mode
-        sizes = _capture_sizes(config.get("cudagraph_capture_sizes"),
-                               "runtime_cudagraph_capture_sizes_invalid")
-        if sizes:
-            if full_keys:
-                if declared.get("graph_capture_keys") not in (None, (), sizes):
-                    raise ModelingError(
-                        "runtime_compilation_conflict:graph_capture_keys")
-                fields["graph_capture_keys"] = sizes
-            if piecewise_keys:
-                if declared.get("piecewise_capture_keys") not in (None, (), sizes):
-                    raise ModelingError(
-                        "runtime_compilation_conflict:piecewise_capture_keys")
-                fields["piecewise_capture_keys"] = sizes
         fields["metadata"] = (("captured_execution_mode", mode_raw),)
+    sizes = _capture_sizes(config.get("cudagraph_capture_sizes"),
+                           "runtime_cudagraph_capture_sizes_invalid")
+    for key, active in (("graph_capture_keys", full_keys), ("piecewise_capture_keys", piecewise_keys)):
+        if active and sizes:
+            fields[key] = sizes
     npu_cfg = config.get("npugraph_ex_config")
     if npu_cfg is not None:
         if not isinstance(npu_cfg, Mapping):
@@ -128,7 +115,7 @@ def _compilation_fields(raw: Mapping[str, Any], declared: Mapping[str, Any]
         if not isinstance(ops, (list, tuple)) or not all(
                 isinstance(item, str) and item for item in ops):
             raise ModelingError("runtime_splitting_ops_invalid")
-        declared_ops = declared.get("splitting_ops")
+        declared_ops = raw.get("splitting_ops")
         if declared_ops is not None and tuple(declared_ops) != tuple(ops):
             raise ModelingError("runtime_compilation_conflict:splitting_ops")
         fields["splitting_ops"] = tuple(ops)
@@ -208,13 +195,70 @@ class Software:
             val = getattr(self, flag)
             if not isinstance(val, bool):
                 raise ModelingError(f"runtime_feature_invalid:{flag}:{val!r}")
-        if not self.enable_torch_compile or self.graph_capture_mode != "full":
+        full_decode_eligible = (
+            self.graph_capture_mode == "full"
+            or self.captured_execution_mode == "FULL_AND_PIECEWISE"
+        )
+        if not self.enable_torch_compile or not full_decode_eligible:
             object.__setattr__(self, "enable_npugraph_ex", False)
             object.__setattr__(self, "enable_static_kernel", False)
             object.__setattr__(self, "enable_super_kernel", False)
         elif not self.enable_npugraph_ex:
             object.__setattr__(self, "enable_static_kernel", False)
             object.__setattr__(self, "enable_super_kernel", False)
+
+    @property
+    def captured_execution_mode(self) -> str:
+        """Return declared raw capture mode (preserving ``FULL_AND_PIECEWISE`` and ``FULL_DECODE_ONLY``)."""
+        for key, value in self.metadata:
+            if key == "captured_execution_mode" and isinstance(value, str):
+                return value.strip().upper()
+        return ""
+
+    @property
+    def supports_full_decode_capture(self) -> bool:
+        """True when decode steps may select full-graph capture (including ``FULL_AND_PIECEWISE``)."""
+        return (
+            not self.invalid_full_modes
+            and (
+                self.graph_capture_mode == "full"
+                or self.captured_execution_mode == "FULL_AND_PIECEWISE"
+            )
+        )
+
+    @property
+    def supports_full_prefill_capture(self) -> bool:
+        """True when prefill steps may select full-graph capture (excludes ``FULL_DECODE_ONLY``)."""
+        return (
+            not self.invalid_full_modes
+            and self.graph_capture_mode == "full"
+            and self.captured_execution_mode != "FULL_DECODE_ONLY"
+        )
+
+    @property
+    def supports_piecewise_capture(self) -> bool:
+        """True when piecewise capture is eligible (``piecewise`` or ``FULL_AND_PIECEWISE``)."""
+        return (
+            self.graph_capture_mode == "piecewise"
+            or self.captured_execution_mode == "FULL_AND_PIECEWISE"
+        )
+
+    def effective_capture_scope(self, phase: str, *, uniform: bool = True) -> str:
+        """Resolve non-lossy capture scope for ``phase`` without collapsing ``FULL_AND_PIECEWISE``."""
+        if self.graph_mode.lower() in {"none", "off", "eager", "disabled"} or self.deepep_high_throughput:
+            return "none"
+        norm_phase = str(phase or "").strip().lower()
+        if norm_phase == "decode" and uniform and self.supports_full_decode_capture:
+            return "full"
+        if norm_phase == "prefill" and uniform and self.supports_full_prefill_capture:
+            return "full"
+        if self.supports_piecewise_capture and (
+            norm_phase in {"decode", "prefill"}
+            or self.mixed_mode not in {"none", "off"}
+            or self.captured_execution_mode == "FULL_AND_PIECEWISE"
+        ):
+            return "piecewise"
+        return "none"
 
     @staticmethod
     def parallel_mapping(raw):
@@ -247,16 +291,17 @@ class Software:
             raise ModelingError("runtime_unknown_fields:" + ",".join(sorted(unknown)))
         kwargs = {key: value for key, value in raw.items() if key in names}
         kwargs["parallel"] = ParallelSpec.from_mapping(cls.parallel_mapping(raw))
-        declared = dict(raw)
         metadata = dict(raw.get("metadata", {}) or {})
         # --- vLLM graph / compilation configuration ---------------------
-        compiled = _compilation_fields(raw, declared)
+        compiled = _compilation_fields(raw, cls.graph_capture_mode)
         merged_metadata = dict(compiled.pop("metadata", ()))
         for key, value in merged_metadata.items():
             if key in metadata and metadata[key] != value:
                 raise ModelingError(f"runtime_metadata_conflict:{key}")
             metadata[key] = value
         for key, value in compiled.items():
+            if key in kwargs and key in {"graph_capture_keys", "piecewise_capture_keys"}:
+                kwargs[key] = _capture_sizes(kwargs[key], f"runtime_{key}_invalid")
             if key in kwargs and kwargs[key] != value:
                 raise ModelingError(f"runtime_compilation_conflict:{key}")
             kwargs[key] = value
@@ -328,6 +373,48 @@ class Software:
         return data
 
 
+_CASE_NORMALIZER: Callable[[Case], Case] | None = None
+
+
+def register_case_normalizer(normalizer: Callable[[Case], Case]) -> None:
+    """Register the L3 case normalizer without introducing an L0->L3 import edge."""
+    global _CASE_NORMALIZER
+    _CASE_NORMALIZER = normalizer
+
+
+def _decode_raw_case(value: Case | Mapping[str, Any]) -> Case:
+    if not isinstance(value, Mapping):
+        case = value
+        if not isinstance(case.machine, Hardware):
+            return Case(
+                Hardware.from_mapping(case.machine.to_dict()),
+                case.model,
+                case.workload,
+                Software.from_mapping(case.runtime.to_dict()),
+                case.slo,
+            )
+        return case
+    normalized = runtime_features.normalize_case_runtime(value)
+    _unknown(
+        normalized,
+        {"machine", "model", "workload", "runtime", "slo",
+         "schema", "structure_variant", "software"},
+        "case",
+    )
+    missing = {"machine", "model", "workload"} - normalized.keys()
+    if missing:
+        raise ModelingError("case_missing_fields:" + ",".join(sorted(missing)))
+    if normalized.get("structure_variant"):
+        raise ModelingError("structure_variant_retired:use_model_layer_plans_or_layer_overrides")
+    return Case(
+        machine=Hardware.from_mapping(normalized["machine"]),
+        model=ModelSpec.from_mapping(normalized["model"]),
+        workload=WorkloadSpec.from_mapping(normalized["workload"]),
+        runtime=Software.from_mapping(normalized.get("runtime", {})),
+        slo=SloSpec.from_mapping(normalized.get("slo")),
+    )
+
+
 @dataclass(frozen=True)
 class Case:
     machine: Hardware
@@ -338,8 +425,10 @@ class Case:
 
     @classmethod
     def from_mapping(cls, value):
-        from mindie_sim.prediction.structure import parse_case
-        return parse_case(value)
+        raw_case = _decode_raw_case(value)
+        if _CASE_NORMALIZER is not None:
+            return _CASE_NORMALIZER(raw_case)
+        return replace(raw_case, model=raw_case.model.normalized())
 
     def to_dict(self):
         return {

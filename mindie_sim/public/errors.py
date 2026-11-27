@@ -27,6 +27,14 @@ class ExtensionError(ModelingError):
     """A declared extension source or selected provider is unusable."""
 
 
+def _unpickle_capability_gap(kwargs: dict[str, Any]) -> "CapabilityGap":
+    return CapabilityGap(**kwargs)
+
+
+def _unpickle_unmodeled_capability_error(kwargs: dict[str, Any]) -> "UnmodeledCapabilityError":
+    return UnmodeledCapabilityError(**kwargs)
+
+
 class CapabilityGap(ExtensionError):
     """An actionable gap: what is missing, what it affects and how to replay.
 
@@ -73,6 +81,15 @@ class CapabilityGap(ExtensionError):
     def to_dict(self) -> dict[str, Any]:
         return dict(self.gap)
 
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (_unpickle_capability_gap, ({
+            "capability": self.capability, "entry": self.entry,
+            "kind": self.kind, "code": self.code, "message": self.message,
+            "affected_results": self.affected_results,
+            "minimal_replay_input": self.minimal_replay_input,
+            "fallback": self.fallback,
+        },))
+
     def __repr__(self) -> str:
         return ("CapabilityGap(capability=%r, kind=%r, code=%r)"
                 % (self.capability, self.kind, self.code))
@@ -118,6 +135,16 @@ class UnmodeledCapabilityError(CapabilityGap):
         payload["unmodeled_structure_onboarding_hints"] = [
             dict(hint) for hint in self.unmodeled_structure_onboarding_hints]
         return payload
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (_unpickle_unmodeled_capability_error, ({
+            "capability": self.capability, "entry": self.entry,
+            "code": self.code, "message": self.message,
+            "blockers": self.blockers,
+            "hints": self.unmodeled_structure_onboarding_hints,
+            "affected_results": self.affected_results,
+            "minimal_replay_input": self.minimal_replay_input,
+        },))
 
     def __repr__(self) -> str:
         return ("UnmodeledCapabilityError(capability=%r, entry=%r, code=%r)"

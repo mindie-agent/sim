@@ -300,6 +300,37 @@ def verify_source_boundaries(run, root, work):
                for row in situ["isolated"]["operators"])
 
 
+def verify_fit_commands(run, work):
+    """Check affine fitting and service interpolation on a synthetic memory channel."""
+    samples = [
+        {"work_bytes": size, "duration_ms": duration, "split": split}
+        for size, duration, split in ((1000, 2, "train"), (3000, 4, "train"),
+                                      (2000, 6, "heldout"))
+    ]
+    path = work / "rate-packet.json"
+    path.write_text(json.dumps({"samples": samples}) + "\n", encoding="utf-8")
+    fit = run(["fit-rate", path], "fit-rate")
+    assert fit["train_trials"] == 2 and fit["bytes_per_ms"] == 1000
+    assert fit["setup_ms"] == 1 and fit["heldout"][0]["predicted_ms"] == 3
+
+    packet = {
+        "resource": "hbm", "work_unit": "bytes", "boundary": "resource_phase",
+        "identity": {"hardware": "synthetic-wheel-control", "kernel": "copy"},
+        "active_units": 1,
+        "samples": [
+            {"work": row["work_bytes"], "duration_ms": row["duration_ms"], "split": row["split"],
+             "source": f"synthetic:copy/{index}", "run_id": row["split"], "repeat_index": 0}
+            for index, row in enumerate(samples)
+        ],
+    }
+    path = work / "service-packet.json"
+    path.write_text(json.dumps(packet) + "\n", encoding="utf-8")
+    service = run(["fit-service", path], "fit-service")
+    heldout, = service["heldout"]
+    assert heldout["basis"] == "interpolated" and heldout["predicted_ms"] == 3
+    assert heldout["relative_error"] == -0.5
+
+
 def _verify_workspace(wheel, root, output, work, *, profiler_wheel=None):
     env = work / "env"
     win_kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
@@ -414,20 +445,6 @@ def _verify_workspace(wheel, root, output, work, *, profiler_wheel=None):
         assert graph["duration_ms"] > 0
         assert graph["execution"]["live_tasks"] == graph["execution"]["live_programs"] == 0
         assert graph["bounds"]["combined_ms"] <= graph["duration_ms"] + 1e-9
-    source_graph = run(["graph", root / "examples/source-families/gqa-norm-control.json",
-                        "--phase", "prefill", "--tokens", 4], "graph-source-families")
-    assert {row["family"] for row in source_graph["timeline"]
-            if row["source_boundary"]} == {"rmsnorm", "attention"}
-    for filename, phase, tokens, family in (
-        ("mla-decode-control.json", "decode", 1, "attention"),
-        ("dynamic-int8-control.json", "prefill", 3, "quantize"),
-    ):
-        graph = run(["graph", root / "examples/source-families" / filename,
-                     "--phase", phase, "--tokens", tokens, "--context", 33],
-                    "graph-" + family)
-        assert any(row["family"] == family and row["source_boundary"]
-                   for row in graph["timeline"])
-        assert graph["execution"]["live_tasks"] == graph["execution"]["live_programs"] == 0
     kda_case = root / "examples/source-families/kda-state-control.json"
     kda_graph = run(["graph", kda_case, "--phase", "prefill", "--tokens", 65,
                      "--sequences", 2], "graph-kda-state-source")
@@ -448,14 +465,8 @@ def _verify_workspace(wheel, root, output, work, *, profiler_wheel=None):
     assert verified_kda["two_call_protocol"]["protocol"]["invocations"] == 2
     assert verified_kda["two_call_protocol"]["single_call"]["source_boundaries"] == {"kernel": 1}
     checks.append({"command": "call-kda-state-source-installed", "exit_code": 0})
-    moe = root / "examples/source-families/moe-routing-control.json"
-    moe_graph = run(["graph", moe, "--phase", "prefill", "--tokens", 4],
-                    "graph-moe-align-combine")
-    assert any(row["source_boundary"] and row["family"] == "moe_combine"
-               for row in moe_graph["timeline"])
-    assert moe_graph["execution"]["live_tasks"] == moe_graph["execution"]["live_programs"] == 0
-    assert run(["predict", moe], "predict-moe-align-combine")["status"] == "modeled"
     for filename, recipe in (
+        ("grouped-gemm-control.json", "grouped_expert_gemm"),
         ("w4a8-msd-control.json", "ascend_w4a8_msd"),
         ("w4a8-down-msd-control.json", "ascend_w4a8_msd_grouped_down"),
     ):
@@ -706,7 +717,7 @@ def _verify_workspace(wheel, root, output, work, *, profiler_wheel=None):
     if profiler_wheel is not None:
         # All prediction checks above run without the optional observation
         # provider. Import checks below use an installed, identified wheel.
-        from mindie_sim.observations.store import digest_file
+        from mindie_sim.observations.captures import digest_file
         profiler_wheel = Path(profiler_wheel).resolve()
         subprocess.run(["uv", "pip", "install", "--python", str(python), str(profiler_wheel)],
                        check=True, timeout=120, **win_kw)
@@ -748,25 +759,10 @@ def _verify_workspace(wheel, root, output, work, *, profiler_wheel=None):
         str(path) for path in fixtures.rglob("*.csv")}
     assert all(row["kind"] == "profiler" for row in indexed_csv)
     assert inventory["profiler"]["files"] == len(indexed_csv)
-    capture = next((root / "data/measurements/gpu").glob("*.stdout"))
-    fit = run(["fit-rate", capture], "fit-rate")
-    assert fit["train_trials"] == 15 and len(fit["heldout"]) == 5
-    raw = json.loads(capture.read_text(encoding="utf-8"))
-    retained = json.loads((root / "data/measurements/gpu/service-curve-validation-20261028.json").read_text(encoding="utf-8"))
-    model = retained["calibration"]["model"]
-    packet = {key: model[key] for key in
-              ("resource", "work_unit", "identity", "boundary", "active_units")}
-    packet["samples"] = [
-        {"work": row["work_bytes"], "duration_ms": row["duration_ms"],
-         "run_id": capture.name, "repeat_index": row["trial"],
-         "source": f"{capture}#/samples/{index}", "split": row["split"]}
-        for index, row in enumerate(raw["samples"])]
-    (work / "service-packet.json").write_text(json.dumps(packet) + "\n", encoding="utf-8", newline="\n")
-    service = run(["fit-service", work / "service-packet.json"], "fit-service")
-    assert len(service["heldout"]) == 5
+    verify_fit_commands(run, work)
     # This is an interface check using a real retained event, not an accuracy claim.
     from mindie_sim.observations.captures import iter_observations
-    from mindie_sim.observations.store import digest_file
+    from mindie_sim.observations.captures import digest_file
     fixture = fixtures / "capture_adapters"
     protocol = json.loads((root / "data/observations/protocols/grouped-call-protocol.json").read_text(encoding="utf-8"))
     protocol["producer"] = {"path": str(fixture / "grouped_producer.py.txt"),

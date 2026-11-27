@@ -1,0 +1,428 @@
+"""Bounded executable startup waves for generic all-to-all collectives.
+
+[Role]
+  Realize the declared startup model as an executable physical schedule: each
+  wave owns a contiguous, balanced range of cyclic peer offsets, all sends in a
+  wave start concurrently (bounded by the declared per-rank inflight window),
+  and a rank enters its next wave only after its own sends and receives for the
+  previous wave complete.  Every hop delay and all peer payloads are preserved.
+
+[Invariants]
+  * ``S`` in ``[1, G-1]`` partitions all ``G-1`` offsets exactly once; ``S=G-1``
+    recovers serial peer phases and ``S=1`` permits all-peer concurrency.
+  * No global barrier is introduced; only per-rank wave completion is a
+    dependency.  Routing, framing, useful/wire bytes and receive caps are the
+    existing topology ones.
+  * Explicit ``steps`` controls ``S``; a source-bound recipe wins and is never
+    silently replaced by this generic program.
+  * Inflight work is bounded by the declared window and lazy offset iteration;
+    no unlimited fabric bandwidth is invented.
+
+[Timeouts & Locks]
+  Pure construction plus Engine event submission; no I/O or locks.
+
+[Side-Effect Policy]
+  Submits causal Engine work only; returns immutable plan/program records.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import math
+from typing import Any
+
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.prediction.communication import MessageFlow
+from .transport import DEFAULT_MAX_PHYSICAL_CHUNKS, TransportOptions
+
+
+REL_TOL = 1e-12
+ABS_TOL = 1e-9
+OFFSET_FIRST = 1
+DEFAULT_MAX_INFLIGHT: int | None = None
+ALLTOALL_FAMILIES = frozenset({"alltoall", "alltoallv"})
+NONLEGACY_STARTUP_MODES = frozenset({"ring", "log2", "concurrent", "topology"})
+
+
+def validate_wave_rounds(group_size: int, rounds: int) -> int:
+    """Validate ``S`` against the nonempty cyclic-offset range."""
+    if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size < 1:
+        raise ModelingError(f"collective_group_size_invalid:{group_size}")
+    if isinstance(rounds, bool) or not isinstance(rounds, int):
+        raise ModelingError(f"communication_round_count_invalid:{rounds}")
+    if group_size <= 1 or rounds < 1 or rounds > group_size - 1:
+        raise ModelingError(f"communication_round_count_invalid:{rounds}")
+    return int(rounds)
+
+
+def wave_ranges(group_size: int, rounds: int) -> tuple[tuple[int, int], ...]:
+    """Contiguous balanced inclusive cyclic-offset ranges, one per wave."""
+    validate_wave_rounds(group_size, rounds)
+    offsets = group_size - 1
+    return tuple(
+        (OFFSET_FIRST + wave * offsets // rounds,
+         (wave + 1) * offsets // rounds)
+        for wave in range(rounds)
+    )
+
+
+def wave_offsets(group_size: int, rounds: int):
+    """Lazily iterate ``(wave, offset)`` pairs in ascending offset order."""
+    for wave, (start, end) in enumerate(wave_ranges(group_size, rounds)):
+        for offset in range(start, end + 1):
+            yield wave, offset
+
+
+def startup_waves_recipe(op, recipe, runtime_mode):
+    """Resolve the same generic replacement before and after preparation."""
+    if (not getattr(recipe, "source_bound", False)
+            and not getattr(recipe, "native", False)
+            and not getattr(recipe, "algorithm", None)
+            and startup_waves_selected(op, runtime_mode)):
+        return RECIPE
+    return recipe
+
+
+def startup_waves_selected(op: Any, runtime_mode: str) -> bool:
+    """True for an unbound generic all-to-all with waves or explicit steps."""
+    if getattr(op, "source_boundary", ""):
+        return False
+    metadata = dict(getattr(op, "metadata", ()) or ())
+    if metadata.get("implementation") or metadata.get("hccl_selection"):
+        return False
+    family = str(metadata.get("collective", op.family)).strip().lower()
+    if family not in ALLTOALL_FAMILIES:
+        return False
+    steps = metadata.get("steps")
+    if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
+        mode_raw = metadata.get("collective_startup_mode", runtime_mode)
+        norm = {"direct": "concurrent"}.get(str(mode_raw).strip().lower(),
+                                            str(mode_raw).strip().lower())
+        if norm in NONLEGACY_STARTUP_MODES:
+            return True
+    mode = metadata.get("collective_startup_mode", runtime_mode)
+    if not isinstance(mode, str):
+        return False
+    normalized = {"direct": "concurrent"}.get(mode.strip().lower(), mode.strip().lower())
+    return normalized in NONLEGACY_STARTUP_MODES
+
+
+@dataclass(frozen=True)
+class WaveGroup:
+    """One all-to-all group executed as bounded startup waves."""
+
+    ranks: tuple[int, ...]
+    volumes: tuple[tuple[int, float], ...]
+    startup_rounds: int
+    topology: object = field(repr=False, compare=False)
+    peer_traffic: object | None = field(default=None, repr=False, compare=False)
+    max_inflight_per_rank: int | None = DEFAULT_MAX_INFLIGHT
+    chunk_bytes: float | None = None
+    hop_startup_us: float = 0.0
+    receive_capacity_bytes_per_peer: float | None = None
+    receive_buffer_id: str | None = None
+    max_physical_chunks: int | None = DEFAULT_MAX_PHYSICAL_CHUNKS
+
+    @property
+    def _uses_chunked_transport(self) -> bool:
+        return (
+            self.chunk_bytes is not None
+            or bool(self.hop_startup_us)
+            or self.receive_capacity_bytes_per_peer is not None
+        )
+
+    def _submit_chunked_peer(
+        self, engine, prefix: str, source: int, destination: int, payload: float,
+        ready, dest_ready, *, owner: str, on_send_done, on_recv_done,
+    ) -> None:
+        recv_cap = (
+            {destination: self.receive_capacity_bytes_per_peer}
+            if self.receive_capacity_bytes_per_peer is not None else None
+        )
+        recv_buf = None
+        if self.receive_capacity_bytes_per_peer is not None:
+            buf_id = (
+                self.receive_buffer_id
+                or f"{getattr(self.topology, 'namespace', '')}peer:{source}>{destination}"
+            )
+            recv_buf = {destination: buf_id}
+        plan = self.topology.transport_plan(
+            (MessageFlow(source, destination, payload),),
+            chunk_bytes=self.chunk_bytes,
+            hop_startup_us=self.hop_startup_us,
+            receive_capacity_bytes=recv_cap,
+            receive_buffer_id=recv_buf,
+            max_physical_chunks=self.max_physical_chunks,
+        )
+        run = plan.start(
+            engine, prefix, {source: ready, destination: dest_ready}, owner=owner,
+        )
+        engine.submit(
+            prefix + ":sent",
+            after=(run.send_completions[0],),
+            owner=owner,
+            on_complete=on_send_done,
+            native_hook=True,
+        )
+        engine.submit(
+            prefix + ":received",
+            after=(run.completions[0], dest_ready),
+            owner=owner,
+            on_complete=on_recv_done,
+            native_hook=True,
+        )
+
+    def _payload(self, source_index: int, destination_index: int, count: int) -> float:
+        if self.peer_traffic is not None:
+            return self.peer_traffic.payload(source_index, destination_index)
+        if count <= 1:
+            return 0.0
+        return dict(self.volumes)[self.ranks[source_index]] / (count - 1)
+
+    def start_participants(self, engine, name, ready_by_rank, *, owner=""):
+        from mindie_sim.prediction.collectives import _ready_by_rank
+
+        initial = _ready_by_rank(self.ranks, ready_by_rank)
+        count = len(self.ranks)
+        if count <= 1 or not any(dict(self.volumes).values()):
+            return initial
+        rounds = validate_wave_rounds(count, self.startup_rounds)
+        if self.peer_traffic is not None:
+            if self.peer_traffic.size != count:
+                raise ModelingError("pairwise_collective_peer_group_size_mismatch")
+            for index, rank in enumerate(self.ranks):
+                if not math.isclose(
+                        self.peer_traffic.row_total(index),
+                        dict(self.volumes)[rank], rel_tol=REL_TOL, abs_tol=ABS_TOL):
+                    raise ModelingError(
+                        f"pairwise_collective_peer_row_total_mismatch:{rank}")
+        waves = wave_ranges(count, rounds)
+        complete = {rank: engine.future(f"{name}:rank{rank}:complete")
+                    for rank in self.ranks}
+        wave_index = [0] * count
+        send_pending = [0] * count
+        recv_pending = [0] * count
+        pending = [{} for _ in range(count)]
+        queued: list[list[int]] = [[] for _ in range(count)]
+        window = self.max_inflight_per_rank
+
+        def parse_wave(index: int) -> tuple[int, int]:
+            return waves[wave_index[index]]
+
+        def retire(index: int) -> None:
+            if wave_index[index] >= len(waves):
+                event = complete[self.ranks[index]]
+                if not event.done:
+                    engine.resolve(event)
+
+        def enter_next(index: int) -> None:
+            if queued[index] or send_pending[index] or recv_pending[index]:
+                return
+            wave_index[index] += 1
+            if wave_index[index] >= len(waves):
+                retire(index)
+                return
+            begin(index)
+
+        def deliver(index: int, wave: int, event) -> None:
+            del event
+            if wave < wave_index[index]:
+                raise ModelingError("startup_wave_receive_wave_regressed")
+            if wave > wave_index[index]:
+                pending[index][wave] = pending[index].get(wave, 0) + 1
+                return
+            recv_pending[index] -= 1
+            if recv_pending[index] < 0:
+                raise ModelingError("startup_wave_receive_underflow")
+            if recv_pending[index] == 0:
+                pending[index].pop(wave, None)
+            enter_next(index)
+
+        def send_done(index: int, event) -> None:
+            del event
+            send_pending[index] -= 1
+            if send_pending[index] < 0:
+                raise ModelingError("startup_wave_send_underflow")
+            if window is None or send_pending[index] < window:
+                issue(index)
+            enter_next(index)
+
+        def issue(index: int) -> None:
+            if not queued[index]:
+                return
+            send_pending[index] += 1
+            source = self.ranks[index]
+            wave = wave_index[index]
+            offset = queued[index].pop(0)
+            destination_index = (index + offset) % count
+            destination = self.ranks[destination_index]
+            payload = self._payload(index, destination_index, count)
+            prefix = f"{name}:rank{source}:wave{wave}:offset{offset}"
+            dependencies = [initial[source]]
+            if payload:
+                dependencies.append(initial[destination])
+            ready = engine.submit(
+                prefix + ":ready", after=tuple(dependencies), owner=owner,
+                metadata={"source_rank": source,
+                          "destination_rank": destination,
+                          "wave": wave, "offset": offset})
+            if payload and self._uses_chunked_transport:
+                self._submit_chunked_peer(
+                    engine, prefix, source, destination, payload,
+                    ready, initial[destination], owner=owner,
+                    on_send_done=lambda arrival, src_i=index: send_done(src_i, arrival),
+                    on_recv_done=lambda arrival, dst_i=destination_index, w=wave: deliver(dst_i, w, arrival),
+                )
+                return
+            received_after = []
+            if payload:
+                message = self.topology.route_message(MessageFlow(
+                    source, destination, payload))
+                previous = ready
+                for hop_index, hop in enumerate(message.hops):
+                    service = engine.submit(
+                        f"{prefix}:hop{hop_index}:service", hop.demand,
+                        after=(previous,), owner=owner, coupled=True,
+                        native_hook=hop_index == 0,
+                        on_complete=((lambda arrival: send_done(index, arrival))
+                                     if hop_index == 0 else None),
+                    )
+                    previous = engine.submit(
+                        f"{prefix}:hop{hop_index}:arrival", after=(service,),
+                        latency=hop.latency_ms, owner=owner)
+                received_after.append(previous)
+                if not message.hops:
+                    engine.submit(prefix + ":done", after=(ready,), owner=owner,
+                                  on_complete=lambda arrival: send_done(index, arrival),
+                                  native_hook=True)
+            else:
+                engine.submit(prefix + ":done", after=(ready,), owner=owner,
+                              on_complete=lambda arrival: send_done(index, arrival),
+                              native_hook=True)
+            engine.submit(
+                prefix + ":received",
+                after=tuple(received_after) + (initial[destination],),
+                owner=owner,
+                on_complete=lambda arrival: deliver(destination_index, wave, arrival),
+                native_hook=True,
+            )
+
+        def begin(index: int) -> None:
+            start, end = parse_wave(index)
+            offsets = tuple(range(start, end + 1))
+            recv_pending[index] = len(offsets) - int(
+                pending[index].pop(wave_index[index], 0))
+            queued[index] = list(offsets)
+            if recv_pending[index] < 0:
+                raise ModelingError("startup_wave_receive_underflow")
+            limit = len(offsets) if window is None else min(window, len(offsets))
+            for _ in range(limit):
+                issue(index)
+            enter_next(index)
+
+        for index in range(count):
+            begin(index)
+        return complete
+
+
+@dataclass(frozen=True)
+class WavePlan:
+    family: str
+    groups: tuple[WaveGroup, ...]
+    startup_rounds: int | None = None
+
+    @property
+    def ranks(self):
+        return tuple(sorted({rank for group in self.groups for rank in group.ranks}))
+
+    def start(self, engine, name, ready, *, owner=""):
+        from .ring_pairwise import _joint_complete
+
+        events = self.start_participants(
+            engine, name, {rank: ready for rank in self.ranks}, owner=owner)
+        return _joint_complete(engine, name, events.values(), ready, owner)
+
+    def start_participants(self, engine, name, ready_by_rank, *, owner=""):
+        from .ring_pairwise import _ready_by_rank
+
+        _ready_by_rank(self.ranks, ready_by_rank)
+        events = {}
+        for index, group in enumerate(self.groups):
+            part = group.start_participants(
+                engine, f"{name}:group{index}",
+                {rank: ready_by_rank[rank] for rank in group.ranks},
+                owner=owner,
+            )
+            overlap = set(events) & set(part)
+            if overlap:
+                raise ModelingError(
+                    "startup_waves_rank_accounted_twice:"
+                    + ",".join(map(str, sorted(overlap))))
+            events.update(part)
+        if set(events) != set(self.ranks):
+            raise ModelingError("startup_waves_group_completion_missing")
+        return events
+
+    def validate_path_model(self, path_model) -> None:
+        if path_model is not None:
+            raise ModelingError(
+                f"startup_waves_path_model_unsupported:{path_model}")
+
+
+@dataclass(frozen=True)
+class StartupWaves:
+    """Generic executable recipe for a declared nonlegacy startup model."""
+
+    algorithm = "startup_waves"
+
+    def lower(self, context):
+        from mindie_sim.prediction.program.stages import KernelProgram, Stage
+
+        if any(amount for role, amount in context.native_work.items()
+               if role != "link"):
+            raise ModelingError("startup_waves_requires_transport_only_work")
+        if context.collective_plan is None:
+            if not context.native_work.get("link"):
+                return KernelProgram((), minimum_ms=context.minimum_ms)
+            raise ModelingError("startup_waves_requires_bound_topology")
+        plan = context.collective_plan()
+        rounds = getattr(plan, "startup_rounds", None)
+        if rounds is None:
+            raise ModelingError("startup_waves_requires_resolved_startup_rounds")
+        raw_options = getattr(context, "transport_options", None)
+        options = (
+            TransportOptions.from_mapping(raw_options)
+            if raw_options is not None else None
+        )
+
+        def _pick(group, attr: str, default):
+            val = getattr(options, attr, None)
+            if val is not None and (attr != "hop_startup_us" or val):
+                return val
+            return getattr(group, attr, default)
+
+        groups = tuple(
+            WaveGroup(
+                group.ranks, group.volumes, rounds, group.topology,
+                peer_traffic=group.peer_traffic,
+                max_inflight_per_rank=_pick(group, "max_inflight_per_rank", DEFAULT_MAX_INFLIGHT),
+                chunk_bytes=_pick(group, "chunk_bytes", None),
+                hop_startup_us=_pick(group, "hop_startup_us", 0.0),
+                receive_capacity_bytes_per_peer=_pick(
+                    group, "receive_capacity_bytes_per_peer", None
+                ),
+                receive_buffer_id=_pick(group, "receive_buffer_id", None),
+                max_physical_chunks=(
+                    options.max_physical_chunks
+                    if options is not None
+                    else getattr(group, "max_physical_chunks", DEFAULT_MAX_PHYSICAL_CHUNKS)
+                ),
+            )
+            for group in getattr(plan, "groups", ())
+        )
+        return KernelProgram(
+            (Stage("startup_waves", program=WavePlan(
+                getattr(plan, "family", "alltoall"), groups, rounds)),),
+            minimum_ms=context.minimum_ms)
+
+
+RECIPE = StartupWaves()
