@@ -1027,7 +1027,7 @@ class _SLASizingRun:
         stage_vec: dict[int, float],
         stage_link: dict[int, float],
     ) -> tuple[float, float, bool]:
-        """Accumulate one op's stage work floors and return ``(a_op, c_op, used_gg)``."""
+        """[Cohesive-Pipeline] Accumulate one op's stage work floors and return ``(a_op, c_op, used_gg)``."""
         (
             max_hbm_ms, max_vec_ms, cube_peaks_ms, max_cube_ms,
             max_link_ms, hop_lat_ms, _max_l2_bytes, min_inv_by_class, _links, coll_floor_info,

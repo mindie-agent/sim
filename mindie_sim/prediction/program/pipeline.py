@@ -233,6 +233,7 @@ class PipelineProgram:
         return PipelineTemplateProgram(template).start(engine, name, ready, owner=owner)
 
     def start(self, engine: Engine, name: str, ready: Event, *, owner: str = "") -> Event:
+        """[Cohesive-Pipeline] Launch finite-slot pipeline execution (template, static DAG, or callback window)."""
         if self.count < 0 or self.slots < 1:
             raise ValueError("pipeline_requires_nonnegative_tiles_and_positive_slots")
         if self.homogeneous and self.template_start:

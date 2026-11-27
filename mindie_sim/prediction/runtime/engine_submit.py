@@ -66,6 +66,7 @@ class _EngineSubmitMixin:
         memory_bindings=None, acquire_override=None, free_override=None,
         native_hook: bool = False, deliveries=(), inline_control: bool = False,
     ) -> Event:
+        """[Cohesive-Pipeline] Submit one pre-validated prepared task onto the Engine fast path."""
         # Dependencies and allocations remain live invocation state. Only static
         # work, supply and placement validation can be shared by repeated tiles.
         if self._hbm_bus_aliases and prepared.hbm_bus_epoch != self._hbm_bus_epoch:

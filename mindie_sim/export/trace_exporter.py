@@ -1294,6 +1294,7 @@ def _build_prepared_variant(
     link_peak: float,
     json_encode: Any = None,
 ) -> _PreparedOpVariant:
+    """[Cohesive-Pipeline] Build one pre-encoded Chrome/msprof trace variant with pipe-lane spans."""
     op = spec.op
     flops, vec_ops, hbm_r, hbm_w, hbm_tot, mte2_b, mte3_b, fp_raw, link_b, op_cube_pk = work_tuple
     dur = max(0.0, float(dur_us))
